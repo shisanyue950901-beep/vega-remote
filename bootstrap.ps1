@@ -42,7 +42,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('host', 'client')]
+    [ValidateSet('host', 'client', '')]
     [string]$Role = '',
 
     [string]$ZipUrl = '',
