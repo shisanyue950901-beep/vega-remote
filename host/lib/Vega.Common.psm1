@@ -1655,7 +1655,7 @@ function Set-VegaSunshineServiceStartType {
         Set-Service -Name $Name -StartupType $StartupType -ErrorAction Stop
     }
     catch {
-        Write-Warning "设置服务 $Name 启动类型失败：$($_.Exception.Message)"
+        Write-Verbose "设置服务 $Name 启动类型失败：$($_.Exception.Message)"
         return $false
     }
 
@@ -1664,6 +1664,68 @@ function Set-VegaSunshineServiceStartType {
     catch { $actual = '' }
 
     return ($actual -eq $StartupType)
+}
+
+function Restore-VegaSunshineServiceState {
+    <#
+      卸载用：只恢复清单记录的启动类型与运行状态，不无条件 Stop。
+      安装时记录的是 Running 就保证它 Running；记录的是 Stopped 才停。
+      没记录运行状态时不碰运行状态。每一步都回读确认，失败返回 Success = $false。
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name,
+
+        [Parameter(Mandatory)]
+        [string]$StartType,
+
+        [AllowEmptyString()]
+        [string]$OriginalStatus = ''
+    )
+
+    $service = Get-Service -Name $Name -ErrorAction SilentlyContinue
+    if ($null -eq $service) {
+        return [pscustomobject]@{ Success = $true; Message = "服务已不存在，无需恢复：$Name" }
+    }
+
+    if (-not $PSCmdlet.ShouldProcess($Name, "恢复启动类型 $StartType 与运行状态 $OriginalStatus")) {
+        return [pscustomobject]@{ Success = $false; Message = "已跳过（WhatIf）：$Name" }
+    }
+
+    if (-not (Set-VegaSunshineServiceStartType -Name $Name -StartupType $StartType -Confirm:$false)) {
+        return [pscustomobject]@{ Success = $false; Message = "恢复服务启动类型失败：$Name → $StartType" }
+    }
+
+    $wanted = [string]$OriginalStatus
+    if ($wanted -notin @('Running', 'Stopped')) {
+        return [pscustomobject]@{
+            Success = $true
+            Message = "服务 $Name 已恢复启动类型 $StartType（未记录原运行状态，运行状态未改动）"
+        }
+    }
+
+    try {
+        $current = [string](Get-Service -Name $Name -ErrorAction Stop).Status
+        if ($wanted -eq 'Running' -and $current -ne 'Running') {
+            Start-Service -Name $Name -ErrorAction Stop
+        }
+        elseif ($wanted -eq 'Stopped' -and $current -ne 'Stopped') {
+            Stop-Service -Name $Name -Force -ErrorAction Stop
+        }
+    }
+    catch {
+        return [pscustomobject]@{ Success = $false; Message = "恢复服务运行状态失败：$Name → $wanted（$($_.Exception.Message)）" }
+    }
+
+    $actual = ''
+    try { $actual = [string](Get-Service -Name $Name -ErrorAction Stop).Status }
+    catch { $actual = '' }
+    if ($actual -ne $wanted) {
+        return [pscustomobject]@{ Success = $false; Message = "服务状态回读是 $actual，期望 $wanted：$Name" }
+    }
+
+    return [pscustomobject]@{ Success = $true; Message = "服务 $Name 已恢复启动类型 $StartType、运行状态 $wanted" }
 }
 
 function Restart-VegaSunshineService {
@@ -3056,15 +3118,17 @@ function Invoke-VegaHostUninstallCore {
             continue
         }
 
-        if (-not (Set-VegaSunshineServiceStartType -Name $serviceName -StartupType $startType -Confirm:$false)) {
-            $failures.Add("恢复服务启动类型失败：$serviceName → $startType")
+        $restore = Restore-VegaSunshineServiceState -Name $serviceName -StartType $startType `
+            -OriginalStatus ([string]$entry.OriginalStatus) -Confirm:$false
+        if (-not $restore.Success) {
+            $failures.Add($restore.Message)
             Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
             continue
         }
 
         $state = Set-VegaStateServiceRestored -State $state -Name $serviceName
         $null = Save-VegaState -State $state -Path $StatePath
-        Write-VegaStatus "服务 $serviceName 已恢复启动类型 $startType"
+        Write-VegaStatus $restore.Message
     }
 
     if ($RemoveApps) {
@@ -3381,6 +3445,7 @@ Export-ModuleMember -Function @(
     'Restore-VegaManagedConfig',
     'Get-VegaSunshineService',
     'Set-VegaSunshineServiceStartType',
+    'Restore-VegaSunshineServiceState',
     'Restart-VegaSunshineService',
     'Get-VegaSunshinePorts',
     'Get-VegaSunshineBasePort',
