@@ -356,8 +356,8 @@ Describe 'Invoke-VegaRustDeskSetup 提权设备码' {
 
         $result = Invoke-VegaRustDeskSetup -Settings ([pscustomobject]@{ Server = 'relay.example.com'; RelayServer = 'relay.example.com:21117'; Key = ('A' * 43 + '=') })
 
-        Should -Invoke Get-VegaRustDeskInstall -Times 1 -Exactly -ParameterFilter { $RequireSigned -eq $true }
-        Should -Invoke Get-VegaRustDeskDeviceId -Times 1 -Exactly -ParameterFilter {
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Get-VegaRustDeskInstall -Times 1 -Exactly -ParameterFilter { $RequireSigned -eq $true }
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Get-VegaRustDeskDeviceId -Times 1 -Exactly -ParameterFilter {
             $Exe -eq 'C:\Program Files\RustDesk\rustdesk.exe'
         }
         $result.DeviceId | Should -Be '123456789'
@@ -370,7 +370,7 @@ Describe 'Invoke-VegaRustDeskSetup 提权设备码' {
 
         $result = Invoke-VegaRustDeskSetup -Settings ([pscustomobject]@{ Server = 'relay.example.com'; RelayServer = 'relay.example.com:21117'; Key = ('A' * 43 + '=') })
 
-        Should -Invoke Get-VegaRustDeskDeviceId -Times 0 -Exactly
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Get-VegaRustDeskDeviceId -Times 0 -Exactly
         ($result.Warnings -join "`n") | Should -Match '打开 RustDesk 查看设备码'
     }
 
@@ -382,7 +382,7 @@ Describe 'Invoke-VegaRustDeskSetup 提权设备码' {
 
         $result = Invoke-VegaRustDeskSetup -Settings ([pscustomobject]@{ Server = 'relay.example.com'; RelayServer = 'relay.example.com:21117'; Key = ('A' * 43 + '=') })
 
-        Should -Invoke Get-VegaRustDeskDeviceId -Times 1 -Exactly
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Get-VegaRustDeskDeviceId -Times 1 -Exactly
         $result.DeviceId | Should -Be '987654321'
     }
 }
