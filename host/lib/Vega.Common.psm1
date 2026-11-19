@@ -4488,6 +4488,9 @@ function Get-VegaRustDeskConfigSummary {
                 $errorText = "探测结果为空：$ConfigPath"
             }
             elseif ([bool]$probe.PSIsContainer) {
+                # 路径确实存在，只是不是配置文件：按“读取失败 + 原因”上报，
+                # 不能当成“没装/没登录过”，也不能尝试把它当文件读。
+                $exists = $true
                 $errorText = "不是配置文件（是目录）：$ConfigPath"
             }
             else {
