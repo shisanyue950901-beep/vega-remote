@@ -2607,6 +2607,11 @@ function Set-VegaFirewallRule {
         if ([string]$check.Enabled -ne 'True' -or [string]$check.Action -ne 'Allow') {
             throw "防火墙规则 $($spec.Name) 状态异常（Enabled=$($check.Enabled)，Action=$($check.Action)）。"
         }
+
+        # Profile 必须覆盖所有活动接口的配置文件（Any 视为覆盖），否则补齐后回读。
+        $requiredProfiles = @(Get-VegaActiveFirewallProfiles)
+        $check = Repair-VegaFirewallRuleProfile -Name $spec.Name -Rule $check -RequiredProfiles $requiredProfiles -Confirm:$false
+
         $filter = Get-NetFirewallPortFilter -AssociatedNetFirewallRule $check -ErrorAction SilentlyContinue
         if ($null -eq $filter) {
             throw "无法读取防火墙规则 $($spec.Name) 的端口过滤器。"
@@ -2780,6 +2785,79 @@ function Test-VegaFirewallProfileCovered {
         if ($covered -notcontains $name) { return $false }
     }
     return $true
+}
+
+function Get-VegaActiveFirewallProfiles {
+    <#
+      返回所有活动网络接口对应的防火墙配置名（Domain / Private / Public），去重。
+      用于回读时确认规则 Profile 覆盖了每个活动接口；无法映射的分类直接抛异常，
+      宁可中止也不假装规则已覆盖。
+    #>
+    [CmdletBinding()]
+    param()
+
+    $required = New-Object System.Collections.Generic.List[string]
+    foreach ($connection in @(Get-NetConnectionProfile -ErrorAction Stop)) {
+        if ($null -eq $connection) { continue }
+        $profileName = Get-VegaFirewallProfileName -NetworkCategory ([string]$connection.NetworkCategory)
+        if ([string]::IsNullOrWhiteSpace($profileName)) {
+            throw "接口 $([string]$connection.InterfaceAlias) 的网络类别 $([string]$connection.NetworkCategory) 无法映射到防火墙配置。"
+        }
+        if (-not $required.Contains($profileName)) { $required.Add($profileName) }
+    }
+
+    return $required.ToArray()
+}
+
+function Repair-VegaFirewallRuleProfile {
+    <#
+      回读规则 Profile 是否覆盖所有活动接口的配置（Any 视为覆盖）。
+      不覆盖时用 Set-NetFirewallRule -Profile 补齐后重新回读；仍不覆盖就抛异常。
+      返回补齐后的规则对象。
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name,
+
+        [Parameter(Mandatory)]
+        [AllowNull()]
+        $Rule,
+
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [string[]]$RequiredProfiles
+    )
+
+    if ($null -eq $Rule) { throw "防火墙规则 $Name 回读为空，无法核对 Profile。" }
+    $required = @($RequiredProfiles | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    if ($required.Count -eq 0) { return $Rule }
+
+    $profileProperty = $Rule.PSObject.Properties['Profile']
+    $current = $(if ($null -ne $profileProperty) { $profileProperty.Value } else { $null })
+    if (Test-VegaFirewallProfileCovered -Profile $current -RequiredProfiles $required) { return $Rule }
+
+    $target = $required -join ','
+    if (-not $PSCmdlet.ShouldProcess($Name, "补齐防火墙规则 Profile 为 $target")) { return $Rule }
+
+    try {
+        $null = Set-NetFirewallRule -Name $Name -Profile $target -ErrorAction Stop
+    }
+    catch {
+        throw "补齐防火墙规则 $Name 的 Profile（$target）失败：$($_.Exception.Message)"
+    }
+
+    $updated = Get-NetFirewallRule -Name $Name -PolicyStore ActiveStore -ErrorAction SilentlyContinue
+    if ($null -eq $updated) { throw "补齐 Profile 后回读不到防火墙规则 $Name。" }
+
+    $updatedProperty = $updated.PSObject.Properties['Profile']
+    $updatedProfile = $(if ($null -ne $updatedProperty) { $updatedProperty.Value } else { $null })
+    if (-not (Test-VegaFirewallProfileCovered -Profile $updatedProfile -RequiredProfiles $required)) {
+        $actual = @(ConvertTo-VegaFirewallProfileNames -Profile $updatedProfile) -join ','
+        throw "防火墙规则 $Name 的 Profile 未覆盖活动接口的配置（实际：$actual，需要：$target）。"
+    }
+
+    return $updated
 }
 
 function Test-VegaEnforcementStatus {
@@ -3010,6 +3088,11 @@ function Set-VegaAdminBlockRule {
         throw "管理端口阻断规则状态异常（Enabled=$($check.Enabled)，Action=$($check.Action)，Direction=$($check.Direction)）。"
     }
 
+    # 规则 Profile 必须覆盖所有活动接口的配置文件；Any 视为覆盖。
+    # 不覆盖就用 Set-NetFirewallRule -Profile 补齐，再回读确认。
+    $requiredProfiles = @(Get-VegaActiveFirewallProfiles)
+    $check = Repair-VegaFirewallRuleProfile -Name $name -Rule $check -RequiredProfiles $requiredProfiles -Confirm:$false
+
     # 组策略/特殊策略可能让本地规则不生效：核对生效存储里的执行状态。
     # 旧系统没有这些属性时跳过，保持兼容。
     $primaryProperty = $check.PSObject.Properties['PrimaryStatus']
@@ -3018,8 +3101,10 @@ function Set-VegaAdminBlockRule {
     }
     $enforcementProperty = $check.PSObject.Properties['EnforcementStatus']
     if ($null -ne $enforcementProperty) {
-        $enforcement = (@($enforcementProperty.Value) | ForEach-Object { [string]$_ }) -join ','
-        if ($enforcement -notmatch '(^|,)Enforced(,|$)') {
+        # 字符串或数字都接受：Full / 1 / Enforced 视为成功；数组必须全部成功。
+        $enforcementValues = @($enforcementProperty.Value)
+        if (-not (Test-VegaEnforcementStatus -Value $enforcementValues)) {
+            $enforcement = ($enforcementValues | ForEach-Object { [string]$_ }) -join ','
             throw "管理端口阻断规则未被强制执行（EnforcementStatus=$enforcement），拒绝继续。"
         }
     }
@@ -4253,19 +4338,6 @@ function Invoke-VegaHostInstallCore {
         }
     }
 
-    # 旧版规则迁移放在防火墙/端口预检之后：预检中止时不能先删掉旧版规则。
-    # v0.1 只设了 DisplayName，内部 Name 是 Windows 生成的。
-    try {
-        $legacyRules = @(Remove-VegaLegacyFirewallRule -Confirm:$false)
-        if ($legacyRules.Count -gt 0) {
-            Write-VegaStatus ("已清理旧版 Vega 防火墙规则：{0}" -f ($legacyRules -join '、')) -Level Ok
-        }
-    }
-    catch {
-        $failures.Add("清理旧版防火墙规则失败：$($_.Exception.Message)")
-        Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
-    }
-
     # 管理端口隔离必须早于 winget 安装：安装器会先放行并启动服务。
     # 隔离失败直接中止，退出码非零。
     try {
@@ -4466,6 +4538,20 @@ function Invoke-VegaHostInstallCore {
             ExitCode = 1
             Failures = $failures.ToArray()
         }
+    }
+
+    # v0.1 旧规则只在新串流放行规则与阻断规则都回读成功之后才删除：
+    # 前面任何一步中止时，旧规则仍然守着端口。旧版只设了 DisplayName，
+    # 内部 Name 是 Windows 生成的，所以按 DisplayName 选、按 Name 删。
+    try {
+        $legacyRules = @(Remove-VegaLegacyFirewallRule -Confirm:$false)
+        if ($legacyRules.Count -gt 0) {
+            Write-VegaStatus ("已清理旧版 Vega 防火墙规则：{0}" -f ($legacyRules -join '、')) -Level Ok
+        }
+    }
+    catch {
+        $failures.Add("清理旧版防火墙规则失败：$($_.Exception.Message)")
+        Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
     }
 
     # 串流放行规则已回读确认，再隔离 Sunshine 安装器自带的对管理端口放行规则
@@ -5142,11 +5228,19 @@ Export-ModuleMember -Function @(
     'Restore-VegaSunshineServiceState',
     'Restart-VegaSunshineService',
     'Get-VegaSunshinePortMap',
+    'ConvertFrom-VegaSunshinePortValue',
     'Get-VegaSunshineBasePort',
+    'Get-VegaFirewallProfileName',
+    'ConvertTo-VegaFirewallProfileNames',
+    'Test-VegaFirewallProfileCovered',
+    'Get-VegaActiveFirewallProfiles',
+    'Repair-VegaFirewallRuleProfile',
+    'Test-VegaEnforcementStatus',
     'Get-VegaFirewallRuleSpec',
     'Get-VegaAdminBlockPortList',
     'Test-VegaFirewallSpecSafe',
     'Test-VegaManagementPortConflict',
+    'Get-VegaHostFirewallStatus',
     'Test-VegaHostFirewallEnabled',
     'Test-VegaPortInRange',
     'Select-VegaSunshineInstallerFirewallRule',

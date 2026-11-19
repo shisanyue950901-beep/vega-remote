@@ -160,10 +160,37 @@ Describe 'Get-VegaSunshineBasePort' {
         Get-VegaSunshineBasePort -ConfigPath $path | Should -Be 47989
     }
 
-    It '去掉行尾 # 注释后再解析' {
+    It '去掉行尾 # 注释且注释前没有空格时按十进制解析' {
         $path = Join-Path $TestDrive 'comment.conf'
-        Set-Content -LiteralPath $path -Value 'port = 50000 # 自定义端口' -Encoding UTF8
+        Set-Content -LiteralPath $path -Value 'port = 50000# 自定义端口' -Encoding UTF8
         Get-VegaSunshineBasePort -ConfigPath $path | Should -Be 50000
+    }
+
+    It '注释前有空格时与上游一致：保留空格导致十进制转换失败，按无法确定端口中止' {
+        # Sunshine 去注释后不 Trim，'50000 ' 的十进制转换失败；Vega 不替它修，直接中止
+        $path = Join-Path $TestDrive 'comment-space.conf'
+        Set-Content -LiteralPath $path -Value 'port = 50000 # 自定义端口' -Encoding UTF8
+        { Get-VegaSunshineBasePort -ConfigPath $path } | Should -Throw '*无法可靠确定端口*'
+    }
+
+    It '有效范围是 1019-65514，越界中止' {
+        $path = Join-Path $TestDrive 'range.conf'
+        Set-Content -LiteralPath $path -Value 'port = 1018' -Encoding UTF8
+        { Get-VegaSunshineBasePort -ConfigPath $path } | Should -Throw '*port 无效*'
+
+        Set-Content -LiteralPath $path -Value 'port = 65515' -Encoding UTF8
+        { Get-VegaSunshineBasePort -ConfigPath $path } | Should -Throw '*port 无效*'
+
+        Set-Content -LiteralPath $path -Value 'port = 1019' -Encoding UTF8
+        Get-VegaSunshineBasePort -ConfigPath $path | Should -Be 1019
+
+        Set-Content -LiteralPath $path -Value 'port = 65514' -Encoding UTF8
+        Get-VegaSunshineBasePort -ConfigPath $path | Should -Be 65514
+
+        ConvertFrom-VegaSunshinePortValue -Value '1018' | Should -BeNullOrEmpty
+        ConvertFrom-VegaSunshinePortValue -Value '65515' | Should -BeNullOrEmpty
+        ConvertFrom-VegaSunshinePortValue -Value '1019' | Should -Be 1019
+        ConvertFrom-VegaSunshinePortValue -Value '65514' | Should -Be 65514
     }
 
     It '端口值解析失败时中止，不再静默回退 47989' {
@@ -255,6 +282,22 @@ Describe 'Test-VegaHostFirewallEnabled' {
         Test-VegaHostFirewallEnabled | Should -BeFalse
     }
 
+    It '接口被 DisabledInterfaceAliases 排除时提示写出接口别名与配置文件，不说防火墙已关闭' {
+        Mock -ModuleName $script:ModuleName Get-NetConnectionProfile {
+            [pscustomobject]@{ InterfaceAlias = 'Ethernet 2'; NetworkCategory = 'Private' }
+        }
+        Mock -ModuleName $script:ModuleName Get-NetFirewallProfile {
+            [pscustomobject]@{ Name = 'Private'; Enabled = 'True'; DisabledInterfaceAliases = @('Ethernet 2') }
+        }
+
+        $status = Get-VegaHostFirewallStatus
+        $status.Enabled | Should -BeFalse
+        $status.Reason | Should -Be 'InterfaceExcluded'
+        $status.Message | Should -Match 'Ethernet 2'
+        $status.Message | Should -Match 'Private'
+        $status.Message | Should -Not -Match '已关闭'
+    }
+
     It '逐个接口核对：任一接口的配置关闭就返回 false' {
         Mock -ModuleName $script:ModuleName Get-NetConnectionProfile {
             @(
@@ -291,6 +334,10 @@ Describe 'Set-VegaAdminBlockRule' {
         # Windows 专有 cmdlet 在 Linux 上不存在，先塞同名 stub 再 Mock；
         # Windows 上本来就有，跳过。参数签名与真实 cmdlet 保持一致。
         $stubs = @{
+            'Get-NetConnectionProfile'  = {
+                [CmdletBinding()]
+                param()
+            }
             'Get-NetFirewallRule'       = {
                 [CmdletBinding()]
                 param([string]$Name, [string]$Direction, [string]$Action, [string]$PolicyStore)
@@ -305,8 +352,8 @@ Describe 'Set-VegaAdminBlockRule' {
             }
             'Set-NetFirewallRule'       = {
                 [CmdletBinding()]
-                param([string]$Name, $Enabled, $Action, [string]$Protocol, [string[]]$LocalPort)
-                $null = $Name, $Enabled, $Action, $Protocol, $LocalPort
+                param([string]$Name, $Enabled, $Action, [string]$Protocol, [string[]]$LocalPort, [Alias('Profile')][string]$FwProfile)
+                $null = $Name, $Enabled, $Action, $Protocol, $LocalPort, $FwProfile
             }
             'Get-NetFirewallPortFilter' = {
                 [CmdletBinding()]
@@ -326,6 +373,9 @@ Describe 'Set-VegaAdminBlockRule' {
     }
 
     BeforeEach {
+        Mock -ModuleName $script:ModuleName Get-NetConnectionProfile {
+            [pscustomobject]@{ InterfaceAlias = 'Ethernet'; NetworkCategory = 'Private' }
+        }
         Mock -ModuleName $script:ModuleName Get-NetFirewallRule { $null }
         Mock -ModuleName $script:ModuleName New-NetFirewallRule { }
         Mock -ModuleName $script:ModuleName Set-NetFirewallRule { }
@@ -340,7 +390,7 @@ Describe 'Set-VegaAdminBlockRule' {
             param($Name, $PolicyStore)
             $null = $PolicyStore
             if ($Name -ne 'Vega-Block-Admin') { return }
-            [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound' }
+            [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound'; Profile = 'Any' }
         }
         Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter -RemoveParameterType AssociatedNetFirewallRule {
             [pscustomobject]@{ LocalPort = @('47991'); Protocol = 'TCP' }
@@ -361,7 +411,7 @@ Describe 'Set-VegaAdminBlockRule' {
             if ($Name -ne 'Vega-Block-Admin') { return }
             # 只有 ActiveStore 回读才返回规则：确认实现真的读的是生效存储
             if ($PolicyStore -ne 'ActiveStore') { return }
-            [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound' }
+            [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound'; Profile = 'Any' }
         }
 
         { Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false } | Should -Not -Throw
@@ -376,7 +426,7 @@ Describe 'Set-VegaAdminBlockRule' {
             param($Name, $PolicyStore)
             $null = $PolicyStore
             if ($Name -ne 'Vega-Block-Admin' -or -not $script:BlockCreated) { return }
-            [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound' }
+            [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound'; Profile = 'Any' }
         }
         $name = Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false
 
@@ -392,7 +442,7 @@ Describe 'Set-VegaAdminBlockRule' {
             param($Name, $PolicyStore)
             $null = $PolicyStore
             if ($Name -ne 'Vega-Block-Admin') { return }
-            [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'False'; Action = 'Block'; Direction = 'Inbound' }
+            [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'False'; Action = 'Block'; Direction = 'Inbound'; Profile = 'Any' }
         }
 
         { Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false } | Should -Throw '*状态异常*'
@@ -404,7 +454,7 @@ Describe 'Set-VegaAdminBlockRule' {
             param($Name, $PolicyStore)
             $null = $PolicyStore
             if ($Name -ne 'Vega-Block-Admin') { return }
-            [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Outbound' }
+            [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Outbound'; Profile = 'Any' }
         }
         { Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false } | Should -Throw '*状态异常*'
 
@@ -412,7 +462,7 @@ Describe 'Set-VegaAdminBlockRule' {
             param($Name, $PolicyStore)
             $null = $PolicyStore
             if ($Name -ne 'Vega-Block-Admin') { return }
-            [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound' }
+            [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound'; Profile = 'Any' }
         }
         Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter -RemoveParameterType AssociatedNetFirewallRule {
             [pscustomobject]@{ LocalPort = @('47990'); Protocol = 'UDP' }
@@ -426,7 +476,7 @@ Describe 'Set-VegaAdminBlockRule' {
             $null = $PolicyStore
             if ($Name -ne 'Vega-Block-Admin') { return }
             [pscustomobject]@{
-                Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound'
+                Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound'; Profile = 'Any'
                 PrimaryStatus = 'Error'; EnforcementStatus = 'Enforced'
             }
         }
@@ -437,11 +487,135 @@ Describe 'Set-VegaAdminBlockRule' {
             $null = $PolicyStore
             if ($Name -ne 'Vega-Block-Admin') { return }
             [pscustomobject]@{
-                Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound'
+                Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound'; Profile = 'Any'
                 PrimaryStatus = 'OK'; EnforcementStatus = 'NotEnforced'
             }
         }
         { Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false } | Should -Throw '*未被强制执行*'
+    }
+
+    It 'EnforcementStatus 接受数字与 Full，数组必须全部成功' {
+        $env:VEGA_TEST_ENFORCEMENT = '1'
+        Mock -ModuleName $script:ModuleName Get-NetFirewallRule {
+            param($Name, $PolicyStore)
+            $null = $PolicyStore
+            if ($Name -ne 'Vega-Block-Admin') { return }
+            $value = $env:VEGA_TEST_ENFORCEMENT
+            if ($value -like '*,*') { $value = @($value -split ',') }
+            [pscustomobject]@{
+                Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound'; Profile = 'Any'
+                PrimaryStatus = 'OK'; EnforcementStatus = $value
+            }
+        }
+
+        try {
+            { Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false } | Should -Not -Throw
+
+            $env:VEGA_TEST_ENFORCEMENT = 'Full'
+            { Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false } | Should -Not -Throw
+
+            $env:VEGA_TEST_ENFORCEMENT = '1,Enforced,Full'
+            { Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false } | Should -Not -Throw
+
+            $env:VEGA_TEST_ENFORCEMENT = 'Enforced,NotEnforced'
+            { Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false } | Should -Throw '*未被强制执行*'
+
+            $env:VEGA_TEST_ENFORCEMENT = '2'
+            { Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false } | Should -Throw '*未被强制执行*'
+        }
+        finally {
+            Remove-Item Env:VEGA_TEST_ENFORCEMENT -ErrorAction SilentlyContinue
+        }
+    }
+
+    It '规则 Profile 不覆盖活动接口时用 Set-NetFirewallRule -Profile 补齐并回读' {
+        $env:VEGA_TEST_RULE_PROFILE = 'Public'
+        Mock -ModuleName $script:ModuleName Get-NetFirewallRule {
+            param($Name, $PolicyStore)
+            $null = $PolicyStore
+            if ($Name -ne 'Vega-Block-Admin') { return }
+            [pscustomobject]@{
+                Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound'
+                Profile = $env:VEGA_TEST_RULE_PROFILE
+            }
+        }
+        Mock -ModuleName $script:ModuleName Set-NetFirewallRule {
+            param($Name, $Enabled, $Action, $Protocol, $LocalPort, [Alias('Profile')][string]$FwProfile)
+            $null = $Name, $Enabled, $Action, $Protocol, $LocalPort
+            if ($PesterBoundParameters['Profile'] -eq 'Private') { $env:VEGA_TEST_RULE_PROFILE = 'Private' }
+        }
+
+        try {
+            { Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false } | Should -Not -Throw
+            $env:VEGA_TEST_RULE_PROFILE | Should -Be 'Private'
+            Should -Invoke -ModuleName $script:ModuleName -CommandName Set-NetFirewallRule -Times 1 -Exactly `
+                -ParameterFilter { $PesterBoundParameters['Profile'] -eq 'Private' }
+        }
+        finally {
+            Remove-Item Env:VEGA_TEST_RULE_PROFILE -ErrorAction SilentlyContinue
+        }
+    }
+
+    It '多个活动接口时补齐 Profile 必须覆盖全部配置' {
+        Mock -ModuleName $script:ModuleName Get-NetConnectionProfile {
+            @(
+                [pscustomobject]@{ InterfaceAlias = 'Ethernet'; NetworkCategory = 'Private' }
+                [pscustomobject]@{ InterfaceAlias = 'Wi-Fi'; NetworkCategory = 'Public' }
+            )
+        }
+        $env:VEGA_TEST_RULE_PROFILE = 'Private'
+        Mock -ModuleName $script:ModuleName Get-NetFirewallRule {
+            param($Name, $PolicyStore)
+            $null = $PolicyStore
+            if ($Name -ne 'Vega-Block-Admin') { return }
+            [pscustomobject]@{
+                Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound'
+                Profile = $env:VEGA_TEST_RULE_PROFILE
+            }
+        }
+        Mock -ModuleName $script:ModuleName Set-NetFirewallRule {
+            param($Name, $Enabled, $Action, $Protocol, $LocalPort, [Alias('Profile')][string]$FwProfile)
+            $null = $Name, $Enabled, $Action, $Protocol, $LocalPort
+            if ($PesterBoundParameters['Profile'] -eq 'Private,Public') { $env:VEGA_TEST_RULE_PROFILE = 'Private,Public' }
+        }
+
+        try {
+            { Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false } | Should -Not -Throw
+            Should -Invoke -ModuleName $script:ModuleName -CommandName Set-NetFirewallRule -Times 1 -Exactly `
+                -ParameterFilter { $PesterBoundParameters['Profile'] -eq 'Private,Public' }
+        }
+        finally {
+            Remove-Item Env:VEGA_TEST_RULE_PROFILE -ErrorAction SilentlyContinue
+        }
+    }
+
+    It '补齐后回读仍不覆盖活动接口时抛异常' {
+        Mock -ModuleName $script:ModuleName Get-NetFirewallRule {
+            param($Name, $PolicyStore)
+            $null = $PolicyStore
+            if ($Name -ne 'Vega-Block-Admin') { return }
+            [pscustomobject]@{
+                Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound'
+                Profile = 'Public'
+            }
+        }
+
+        { Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false } | Should -Throw '*未覆盖活动接口*'
+    }
+
+    It '规则 Profile 为 Any 时视为覆盖，不再调用 Set 补齐' {
+        Mock -ModuleName $script:ModuleName Get-NetFirewallRule {
+            param($Name, $PolicyStore)
+            $null = $PolicyStore
+            if ($Name -ne 'Vega-Block-Admin') { return }
+            [pscustomobject]@{
+                Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound'; Profile = 'Any'
+            }
+        }
+
+        { Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false } | Should -Not -Throw
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Set-NetFirewallRule -Times 0 -Exactly `
+            -ParameterFilter { -not [string]::IsNullOrWhiteSpace([string]$PesterBoundParameters['Profile']) }
     }
 
     It '旧系统没有 PrimaryStatus/EnforcementStatus 属性时视为通过' {
@@ -449,7 +623,7 @@ Describe 'Set-VegaAdminBlockRule' {
             param($Name, $PolicyStore)
             $null = $PolicyStore
             if ($Name -ne 'Vega-Block-Admin') { return }
-            [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound' }
+            [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound'; Profile = 'Any' }
         }
 
         { Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false } | Should -Not -Throw
@@ -460,7 +634,7 @@ Describe 'Set-VegaAdminBlockRule' {
             param($Name, $PolicyStore)
             $null = $PolicyStore
             if ($Name -ne 'Vega-Block-Admin') { return }
-            [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound' }
+            [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound'; Profile = 'Any' }
         }
         Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter -RemoveParameterType AssociatedNetFirewallRule {
             [pscustomobject]@{ LocalPort = @('47990'); Protocol = 'TCP' }
@@ -475,7 +649,7 @@ Describe 'Set-VegaAdminBlockRule' {
             param($Name, $PolicyStore)
             $null = $PolicyStore
             if ($Name -ne 'Vega-Block-Admin') { return }
-            [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound' }
+            [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound'; Profile = 'Any' }
         }
         Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter -RemoveParameterType AssociatedNetFirewallRule { $null }
 
@@ -487,7 +661,7 @@ Describe 'Set-VegaAdminBlockRule' {
             param($Name, $PolicyStore)
             $null = $PolicyStore
             if ($Name -ne 'Vega-Block-Admin') { return }
-            [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound' }
+            [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound'; Profile = 'Any' }
         }
         Mock -ModuleName $script:ModuleName Set-NetFirewallRule { throw '拒绝访问' }
 
@@ -501,6 +675,10 @@ Describe 'Set-VegaFirewallRule 回读' {
         $script:ModuleName = 'Vega.Common'
         $module = Get-Module $script:ModuleName
         $stubs = @{
+            'Get-NetConnectionProfile'  = {
+                [CmdletBinding()]
+                param()
+            }
             'New-NetFirewallRule'       = {
                 [CmdletBinding()]
                 param($Name, $DisplayName, $Direction, $Action, $Protocol, $LocalPort,
@@ -512,6 +690,11 @@ Describe 'Set-VegaFirewallRule 回读' {
                 [CmdletBinding()]
                 param([string]$Name, [string]$PolicyStore)
                 $null = $Name, $PolicyStore
+            }
+            'Set-NetFirewallRule'       = {
+                [CmdletBinding()]
+                param([string]$Name, [Alias('Profile')][string]$FwProfile)
+                $null = $Name, $FwProfile
             }
             'Get-NetFirewallPortFilter' = {
                 [CmdletBinding()]
@@ -531,6 +714,9 @@ Describe 'Set-VegaFirewallRule 回读' {
     }
 
     BeforeEach {
+        Mock -ModuleName $script:ModuleName Get-NetConnectionProfile {
+            [pscustomobject]@{ InterfaceAlias = 'Ethernet'; NetworkCategory = 'Private' }
+        }
         Mock -ModuleName $script:ModuleName Remove-VegaFirewallRule { 0 }
         Mock -ModuleName $script:ModuleName New-NetFirewallRule { }
     }
@@ -539,7 +725,7 @@ Describe 'Set-VegaFirewallRule 回读' {
         Mock -ModuleName $script:ModuleName Get-NetFirewallRule {
             param($Name, $PolicyStore)
             $null = $PolicyStore
-            [pscustomobject]@{ Name = $Name; Enabled = 'True'; Action = 'Allow' }
+            [pscustomobject]@{ Name = $Name; Enabled = 'True'; Action = 'Allow'; Profile = 'Any' }
         }
         Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter -RemoveParameterType AssociatedNetFirewallRule {
             param($AssociatedNetFirewallRule)
@@ -561,7 +747,7 @@ Describe 'Set-VegaFirewallRule 回读' {
         Mock -ModuleName $script:ModuleName Get-NetFirewallRule {
             param($Name, $PolicyStore)
             $null = $PolicyStore
-            [pscustomobject]@{ Name = $Name; Enabled = 'True'; Action = 'Allow' }
+            [pscustomobject]@{ Name = $Name; Enabled = 'True'; Action = 'Allow'; Profile = 'Any' }
         }
         Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter -RemoveParameterType AssociatedNetFirewallRule {
             [pscustomobject]@{ LocalPort = @('47984') }
@@ -570,11 +756,44 @@ Describe 'Set-VegaFirewallRule 回读' {
         { Set-VegaFirewallRule -Program 'C:\Sunshine\sunshine.exe' -Confirm:$false } | Should -Throw '*未覆盖端口*'
     }
 
+    It '串流规则 Profile 不覆盖活动接口时补齐后回读' {
+        $env:VEGA_TEST_RULE_PROFILE = 'Public'
+        Mock -ModuleName $script:ModuleName Get-NetFirewallRule {
+            param($Name, $PolicyStore)
+            $null = $PolicyStore
+            [pscustomobject]@{ Name = $Name; Enabled = 'True'; Action = 'Allow'; Profile = $env:VEGA_TEST_RULE_PROFILE }
+        }
+        Mock -ModuleName $script:ModuleName Set-NetFirewallRule {
+            param($Name, [Alias('Profile')][string]$FwProfile)
+            $null = $Name
+            if ($PesterBoundParameters['Profile'] -eq 'Private') { $env:VEGA_TEST_RULE_PROFILE = 'Private' }
+        }
+        Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter -RemoveParameterType AssociatedNetFirewallRule {
+            param($AssociatedNetFirewallRule)
+            if ($AssociatedNetFirewallRule.Name -eq 'Vega-Sunshine-TCP') {
+                [pscustomobject]@{ LocalPort = @('47984', '47989', '48010') }
+            }
+            else {
+                [pscustomobject]@{ LocalPort = @('47998-48000', '48002', '48010') }
+            }
+        }
+
+        try {
+            $created = @(Set-VegaFirewallRule -Program 'C:\Sunshine\sunshine.exe' -Confirm:$false)
+            $created | Should -Be @('Vega-Sunshine-TCP', 'Vega-Sunshine-UDP')
+            Should -Invoke -ModuleName $script:ModuleName -CommandName Set-NetFirewallRule -Times 1 -Exactly `
+                -ParameterFilter { $PesterBoundParameters['Profile'] -eq 'Private' }
+        }
+        finally {
+            Remove-Item Env:VEGA_TEST_RULE_PROFILE -ErrorAction SilentlyContinue
+        }
+    }
+
     It '回读 Enabled 不是 True 时抛异常' {
         Mock -ModuleName $script:ModuleName Get-NetFirewallRule {
             param($Name, $PolicyStore)
             $null = $PolicyStore
-            [pscustomobject]@{ Name = $Name; Enabled = 'False'; Action = 'Allow' }
+            [pscustomobject]@{ Name = $Name; Enabled = 'False'; Action = 'Allow'; Profile = 'Any' }
         }
         Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter -RemoveParameterType AssociatedNetFirewallRule {
             [pscustomobject]@{ LocalPort = @('Any') }

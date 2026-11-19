@@ -333,6 +333,37 @@ Describe 'Invoke-VegaHostInstall（mock）' {
         $result.ExitCode | Should -Be 1
         ($result.Failures -join "`n") | Should -Match '回读发现端口不全'
         Should -Invoke -ModuleName $script:ModuleName -CommandName Protect-VegaSunshineManagementPort -Times 0 -Exactly
+        # 新串流规则没确认成功，旧版规则必须留着守端口
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Remove-VegaLegacyFirewallRule -Times 0 -Exactly
+    }
+
+    It '阻断规则第二次回读失败时中止，旧版规则仍在' {
+        Mock -ModuleName $script:ModuleName Get-VegaSunshineInstall { $script:sunshine }
+        Mock -ModuleName $script:ModuleName Install-VegaPackage {
+            param($PackageId, $DisplayName, [switch]$Force)
+            $null = $PackageId
+            $null = $DisplayName
+            $null = $Force
+            [pscustomobject]@{ PackageId = 'LizardByte.Sunshine'; Installed = $true; PreExisting = $false }
+        }
+        $env:VEGA_TEST_BLOCK_CALLS = '0'
+        Mock -ModuleName $script:ModuleName Set-VegaAdminBlockRule {
+            $calls = [int]$env:VEGA_TEST_BLOCK_CALLS + 1
+            $env:VEGA_TEST_BLOCK_CALLS = [string]$calls
+            if ($calls -ge 2) { throw '阻断规则回读失败' }
+            'Vega-Block-Admin'
+        }
+
+        try {
+            $result = Invoke-VegaHostInstall -StatePath $script:statePath -TemplatePath $script:TemplatePath -SkipTailscale
+            $result.ExitCode | Should -Be 1
+            ($result.Failures -join "`n") | Should -Match '阻断规则回读失败'
+            Should -Invoke -ModuleName $script:ModuleName -CommandName Remove-VegaLegacyFirewallRule -Times 0 -Exactly
+            Should -Invoke -ModuleName $script:ModuleName -CommandName Set-VegaFirewallRule -Times 0 -Exactly
+        }
+        finally {
+            Remove-Item Env:VEGA_TEST_BLOCK_CALLS -ErrorAction SilentlyContinue
+        }
     }
 
     It '先确认 Vega 放行规则，再禁用安装器规则' {
@@ -361,12 +392,17 @@ Describe 'Invoke-VegaHostInstall（mock）' {
             Add-Content -LiteralPath $env:VEGA_TEST_ORDER_LOG -Encoding UTF8 -Value 'protect'
             $State
         }
+        Mock -ModuleName $script:ModuleName Remove-VegaLegacyFirewallRule {
+            Add-Content -LiteralPath $env:VEGA_TEST_ORDER_LOG -Encoding UTF8 -Value 'legacy'
+            @()
+        }
 
         try {
             $result = Invoke-VegaHostInstall -StatePath $script:statePath -TemplatePath $script:TemplatePath -SkipTailscale
             $result.ExitCode | Should -Be 0
             $log = @(Get-Content -LiteralPath $env:VEGA_TEST_ORDER_LOG -Encoding UTF8)
-            $log | Should -Be @('allow', 'protect')
+            # 旧版规则必须在新串流规则确认后、禁用安装器规则之前删除
+            $log | Should -Be @('allow', 'legacy', 'protect')
         }
         finally {
             Remove-Item Env:VEGA_TEST_ORDER_LOG -ErrorAction SilentlyContinue
