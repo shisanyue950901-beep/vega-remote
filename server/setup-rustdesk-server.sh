@@ -94,10 +94,12 @@ rollback_rules() {
   ADDED_RULES=()
 }
 
+# 退出路径统一走 EXIT trap：fail()/exit 1 这类“函数内 if 分支里的退出”
+# 不会触发 ERR trap，只有 EXIT 能保证撤销本次新增的 ufw 规则、停掉本次启动的容器。
 cleanup_on_error() {
   local code=$?
   if [[ "$CLEANED" == true ]]; then
-    exit "$code"
+    return 0
   fi
   CLEANED=true
   rollback_rules
@@ -105,9 +107,9 @@ cleanup_on_error() {
     echo "==> 清理本次启动的容器" >&2
     compose down >/dev/null 2>&1 || true
   fi
-  exit "$code"
+  return 0
 }
-trap cleanup_on_error ERR
+trap cleanup_on_error EXIT
 
 fail() {
   echo "$1" >&2
@@ -197,7 +199,9 @@ container_restarts() {
 
 wait_containers_ready() {
   local stable=0
-  for _ in $(seq 1 60); do
+  # 默认最多等 60 秒；测试里用 VEGA_READY_ATTEMPTS 缩短，不能延长就绪判定本身
+  local attempts="${VEGA_READY_ATTEMPTS:-60}"
+  for _ in $(seq 1 "$attempts"); do
     local ok=1
     local name
     for name in vega-hbbs vega-hbbr; do
