@@ -2772,7 +2772,7 @@ function Set-VegaAdminBlockRule {
     $enforcementProperty = $check.PSObject.Properties['EnforcementStatus']
     if ($null -ne $enforcementProperty) {
         $enforcement = (@($enforcementProperty.Value) | ForEach-Object { [string]$_ }) -join ','
-        if ($enforcement -notmatch 'Enforced') {
+        if ($enforcement -notmatch '(^|,)Enforced(,|$)') {
             throw "管理端口阻断规则未被强制执行（EnforcementStatus=$enforcement），拒绝继续。"
         }
     }
