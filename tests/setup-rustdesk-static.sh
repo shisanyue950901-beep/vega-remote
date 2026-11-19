@@ -43,6 +43,9 @@ require 'sudo ufw allow 21116/udp' 'ufw 示例必须包含 UDP 21116'
 require '云安全组建议' '必须给出云安全组建议'
 require '21118/21119（WebSocket）也会对外可达' '默认 allow / UFW 未启用时必须警告 WebSocket 暴露'
 require '请用云厂商安全组只放行 TCP 21115-21117、UDP 21116' '警告必须给出安全组最小放行范围'
+require '可选放行 WebSocket 端口 TCP 21118-21119' '完成提示必须直接列出可选 WebSocket 端口'
+require '启用时核对旧拒绝规则和云安全组' '完成提示必须提醒核对旧拒绝规则与云安全组'
+require '\-\-reinstall \-\-websocket' '完成提示必须说明重装时才用 --reinstall --websocket'
 
 echo "==> ss 端口预检只解析本地地址列"
 # shellcheck disable=SC2016  # 正则里的 $ 是 awk 字段
@@ -65,6 +68,7 @@ forbid '^[[:space:]]*ufw (allow|deny|delete)' '脚本不得修改 UFW 规则'
 forbid 'ADDED_RULES' '必须删除 UFW 规则记账'
 forbid 'rollback_rules' '必须删除 UFW 回滚逻辑'
 forbid 'ufw_status_has_port_rules' '必须删除 UFW 规则识别逻辑'
+forbid '用 --websocket 重跑' '完成提示不能建议用 --websocket 重跑'
 
 echo "==> 顺序：先 ATTEMPTED，再 compose up"
 attempted_line=$(grep -n 'ATTEMPTED=true' "$SCRIPT" | head -1 | cut -d: -f1)
