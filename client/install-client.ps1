@@ -62,6 +62,10 @@ if (-not $SkipTailscale) { $selected.Add('Tailscale') }
 if ($WithRustDesk) { $selected.Add('RustDesk') }
 
 if (-not (Test-VegaWingetAvailable)) {
+    if ($Uninstall -and -not $RemoveApps) {
+        Write-Host '没有指定 -RemoveApps，卸载模式不会改动系统（winget 不可用也不影响）。'
+        exit 0
+    }
     throw '未找到 winget。请先从微软商店安装「应用安装程序」(App Installer)。'
 }
 

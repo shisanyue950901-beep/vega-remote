@@ -56,12 +56,10 @@ function Get-VegaGpuName {
 }
 
 function Get-VegaSunshineInstall {
-    $candidates = @(
-        (Join-Path $env:ProgramFiles 'Sunshine'),
-        (Join-Path ${env:ProgramFiles(x86)} 'Sunshine')
-    )
-    foreach ($candidate in $candidates) {
-        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+    $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    foreach ($root in $roots) {
+        $candidate = Join-Path $root 'Sunshine'
         $exe = Join-Path $candidate 'sunshine.exe'
         if (-not (Test-Path -LiteralPath $exe)) { continue }
 
