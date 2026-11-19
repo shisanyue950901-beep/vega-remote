@@ -4496,7 +4496,7 @@ function Get-VegaRustDeskConfigSummary {
         catch {
             $notFound = ($_.Exception -is [System.Management.Automation.ItemNotFoundException]) -or
                 ([string]$_.FullyQualifiedErrorId -match 'ItemNotFound') -or
-                ($_.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::ObjectNotFound)
+                ($null -ne $_.CategoryInfo -and $_.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::ObjectNotFound)
             if ($notFound) {
                 $exists = $false
             }
