@@ -1,0 +1,10 @@
+# WebSocket 覆盖文件：只有 setup-rustdesk-server.sh --websocket 时才叠加。
+# 不加这个文件时 21118/21119 不发布，宿主机上也没有监听。
+services:
+  hbbs:
+    ports:
+      - "21118:21118/tcp"
+
+  hbbr:
+    ports:
+      - "21119:21119/tcp"

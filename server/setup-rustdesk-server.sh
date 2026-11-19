@@ -4,16 +4,21 @@
 # 设计要点：
 #   - 不从网络管道安装 Docker（不用 curl | sh）；未安装时提示按官方文档用软件源安装后退出。
 #   - 镜像固定 rustdesk/rustdesk-server:1.1.16，部署与 CI 使用同一份 compose 文件。
-#   - data 目录启动前建成 0700、拒绝符号链接与非 root 所有者；私钥落盘后收紧到 0600。
-#   - 默认只放行桌面客户端需要的 TCP 21115-21117 / UDP 21116；--websocket 才放行 21118/21119。
-#   - 就绪检查两个容器都 running、公钥是普通文件且非空；失败明确退出。
+#   - 不用 host 网络：只发布 21115-21117/tcp、21116/udp；
+#     WebSocket 的 21118/21119 在 docker-compose.websocket.yml 覆盖文件里，只有 --websocket 才叠加。
+#   - compose 一律 --env-file /dev/null，避免读取项目里的 .env 改变部署结果。
+#   - 启动前完成数据目录检查（0700、属主 root、非符号链接、父目录非他人可写）
+#     与已有私钥检查（普通文件、0600）；任何一项不满足立即退出。
+#   - 启动后要求两个容器持续 5 秒 running 且 restart 计数为 0，公钥是 44 字符 base64，
+#     私钥是普通文件且 0600；失败时只清理本次启动的容器并回滚本次新增的 ufw 规则。
+#   - ufw 每条 allow 失败都返回非零，只撤销本次新增的规则。
 set -euo pipefail
 cd "$(dirname "$0")"
 
 ALLOW_WEBSOCKET=false
 usage() {
   echo "用法: sudo bash setup-rustdesk-server.sh [--websocket]" >&2
-  echo "  --websocket  额外放行 WebSocket 端口 TCP 21118-21119" >&2
+  echo "  --websocket  额外发布并放行 WebSocket 端口 TCP 21118-21119" >&2
 }
 
 for arg in "$@"; do
@@ -30,13 +35,18 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 IMAGE="rustdesk/rustdesk-server:1.1.16"
-COMPOSE_FILE="$PWD/docker-compose.yml"
+BASE_COMPOSE="$PWD/docker-compose.yml"
+WS_COMPOSE="$PWD/docker-compose.websocket.yml"
 DATA_DIR="$PWD/data"
 PUB_KEY="$DATA_DIR/id_ed25519.pub"
 PRIV_KEY="$DATA_DIR/id_ed25519"
 
-if [[ ! -f "$COMPOSE_FILE" ]]; then
-  echo "缺少 compose 文件：$COMPOSE_FILE" >&2
+if [[ ! -f "$BASE_COMPOSE" ]]; then
+  echo "缺少 compose 文件：$BASE_COMPOSE" >&2
+  exit 1
+fi
+if [[ "$ALLOW_WEBSOCKET" == true && ! -f "$WS_COMPOSE" ]]; then
+  echo "缺少 WebSocket 覆盖文件：$WS_COMPOSE" >&2
   exit 1
 fi
 
@@ -58,35 +68,20 @@ else
   exit 1
 fi
 
+COMPOSE_FILES=(-f "$BASE_COMPOSE")
+if [[ "$ALLOW_WEBSOCKET" == true ]]; then
+  COMPOSE_FILES+=(-f "$WS_COMPOSE")
+fi
+
 compose() {
-  "${COMPOSE[@]}" -f "$COMPOSE_FILE" "$@"
+  # --env-file /dev/null：不读项目里的 .env，部署结果只由这两份 compose 文件决定
+  "${COMPOSE[@]}" --env-file /dev/null "${COMPOSE_FILES[@]}" "$@"
 }
-
-prepare_data_dir() {
-  if [[ -L "$DATA_DIR" ]]; then
-    echo "data 目录是符号链接，拒绝继续：$DATA_DIR" >&2
-    exit 1
-  fi
-  if [[ -e "$DATA_DIR" && ! -d "$DATA_DIR" ]]; then
-    echo "data 存在但不是目录：$DATA_DIR" >&2
-    exit 1
-  fi
-
-  mkdir -p "$DATA_DIR"
-  chmod 700 "$DATA_DIR"
-
-  local owner
-  owner=$(stat -c '%u' "$DATA_DIR")
-  if [[ "$owner" != "0" ]]; then
-    echo "data 目录所有者 uid=$owner，不是 root；请 sudo chown root:root \"$DATA_DIR\" 后重试。" >&2
-    exit 1
-  fi
-}
-
-echo "==> 准备数据目录（0700）"
-prepare_data_dir
 
 ADDED_RULES=()
+STARTED=false
+CLEANED=false
+
 rollback_rules() {
   if [[ ${#ADDED_RULES[@]} -eq 0 ]]; then
     return 0
@@ -99,87 +94,200 @@ rollback_rules() {
   ADDED_RULES=()
 }
 
-on_error() {
+cleanup_on_error() {
+  local code=$?
+  if [[ "$CLEANED" == true ]]; then
+    exit "$code"
+  fi
+  CLEANED=true
   rollback_rules
+  if [[ "$STARTED" == true ]]; then
+    echo "==> 清理本次启动的容器" >&2
+    compose down >/dev/null 2>&1 || true
+  fi
+  exit "$code"
 }
-trap on_error ERR
+trap cleanup_on_error ERR
 
-echo "==> 启动 hbbs / hbbr（$IMAGE）"
-compose up -d
+fail() {
+  echo "$1" >&2
+  exit 1
+}
+
+check_parent_dir() {
+  local parent
+  parent=$(dirname "$DATA_DIR")
+  [[ -L "$parent" ]] && fail "数据目录的父目录是符号链接，拒绝继续：$parent"
+  local owner_sid mode
+  owner_sid=$(stat -c '%u' "$parent")
+  if [[ "$owner_sid" != "0" ]]; then
+    fail "数据目录的父目录所有者 uid=$owner_sid，不是 root；请 sudo chown root:root \"$parent\" 后重试。"
+  fi
+  mode=$(stat -c '%a' "$parent")
+  # 其他用户可写（o+w）时不安全，父目录可被别人换掉
+  if (( 8#$mode & 8#002 )); then
+    fail "数据目录的父目录 $parent 其他人可写（$mode），请先 chmod o-w 后重试。"
+  fi
+}
+
+prepare_data_dir() {
+  if [[ -L "$DATA_DIR" ]]; then
+    fail "data 目录是符号链接，拒绝继续：$DATA_DIR"
+  fi
+  if [[ -e "$DATA_DIR" && ! -d "$DATA_DIR" ]]; then
+    fail "data 存在但不是目录：$DATA_DIR"
+  fi
+
+  check_parent_dir
+
+  if [[ ! -d "$DATA_DIR" ]]; then
+    # 先建目录再收权限：umask 077 保证创建瞬间就不是 0755
+    (umask 077 && mkdir -p "$DATA_DIR") || fail "无法创建数据目录：$DATA_DIR"
+  fi
+
+  local owner
+  owner=$(stat -c '%u' "$DATA_DIR")
+  if [[ "$owner" != "0" ]]; then
+    fail "data 目录所有者 uid=$owner，不是 root；请 sudo chown -R root:root \"$DATA_DIR\" 后重试。"
+  fi
+  if [[ -L "$DATA_DIR" ]]; then
+    fail "data 目录变成了符号链接，拒绝继续：$DATA_DIR"
+  fi
+
+  chmod 700 "$DATA_DIR"
+  local mode
+  mode=$(stat -c '%a' "$DATA_DIR")
+  if [[ "$mode" != "700" ]]; then
+    fail "data 目录权限是 $mode，不是 700。"
+  fi
+}
+
+check_existing_keys() {
+  if [[ -e "$PRIV_KEY" || -L "$PRIV_KEY" ]]; then
+    if [[ -L "$PRIV_KEY" ]]; then
+      fail "私钥是符号链接，拒绝启动：$PRIV_KEY"
+    fi
+    if [[ ! -f "$PRIV_KEY" ]]; then
+      fail "私钥不是普通文件，拒绝启动：$PRIV_KEY"
+    fi
+    chmod 600 "$PRIV_KEY"
+    local mode
+    mode=$(stat -c '%a' "$PRIV_KEY")
+    if [[ "$mode" != "600" ]]; then
+      fail "私钥权限是 $mode，无法收紧到 600：$PRIV_KEY"
+    fi
+  fi
+  if [[ -e "$PUB_KEY" || -L "$PUB_KEY" ]]; then
+    if [[ -L "$PUB_KEY" ]]; then
+      fail "公钥是符号链接，拒绝读取：$PUB_KEY"
+    fi
+    if [[ ! -f "$PUB_KEY" ]]; then
+      fail "公钥不是普通文件，拒绝读取：$PUB_KEY"
+    fi
+  fi
+}
 
 container_running() {
   docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null | grep -q '^true$'
 }
 
-echo "==> 等待容器就绪"
-ready=false
-for _ in $(seq 1 30); do
-  if container_running vega-hbbs && container_running vega-hbbr; then
-    ready=true
-    break
-  fi
-  sleep 1
-done
-if [[ "$ready" != true ]]; then
-  echo "hbbs / hbbr 未在 30 秒内进入 running 状态。日志：" >&2
+container_restarts() {
+  docker inspect -f '{{.RestartCount}}' "$1" 2>/dev/null || echo "unknown"
+}
+
+wait_containers_ready() {
+  local stable=0
+  for _ in $(seq 1 60); do
+    local ok=1
+    local name
+    for name in vega-hbbs vega-hbbr; do
+      local restarts
+      restarts=$(container_restarts "$name")
+      if ! container_running "$name" || [[ "$restarts" != "0" ]]; then
+        ok=0
+      fi
+    done
+    if [[ $ok -eq 1 ]]; then
+      stable=$((stable + 1))
+      if [[ $stable -ge 5 ]]; then
+        return 0
+      fi
+    else
+      stable=0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+echo "==> 检查数据目录与已有密钥"
+prepare_data_dir
+check_existing_keys
+
+echo "==> 启动 hbbs / hbbr（$IMAGE，端口发布，无 host 网络）"
+STARTED=true
+compose up -d
+
+echo "==> 等待容器就绪（running 且 restart 计数为 0，持续 5 秒）"
+if ! wait_containers_ready; then
+  echo "hbbs / hbbr 未在 60 秒内稳定运行。日志：" >&2
   compose logs --tail=50 hbbs hbbr >&2 || true
   exit 1
 fi
 
-echo "==> 等待生成密钥"
+echo "==> 等待并校验密钥对"
 KEY=""
 for _ in $(seq 1 20); do
   if [[ -L "$PUB_KEY" ]]; then
-    echo "公钥是符号链接，拒绝读取：$PUB_KEY" >&2
-    exit 1
+    fail "公钥是符号链接，拒绝读取：$PUB_KEY"
   fi
-  if [[ -f "$PUB_KEY" && -s "$PUB_KEY" ]]; then
-    KEY=$(cat "$PUB_KEY")
-    if [[ -n "$KEY" ]]; then
+  if [[ -f "$PUB_KEY" ]]; then
+    candidate=$(tr -d '[:space:]' <"$PUB_KEY" 2>/dev/null || true)
+    if [[ "$candidate" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+      KEY="$candidate"
       break
     fi
   fi
   sleep 1
 done
 if [[ -z "$KEY" ]]; then
-  echo "未在 20 秒内生成有效公钥：$PUB_KEY。日志：" >&2
+  echo "未在 20 秒内生成有效的 44 字符 base64 公钥：$PUB_KEY。日志：" >&2
   compose logs --tail=50 hbbs >&2 || true
   exit 1
 fi
 
 if [[ -L "$PRIV_KEY" ]]; then
-  echo "私钥是符号链接，拒绝处理：$PRIV_KEY" >&2
-  exit 1
+  fail "私钥是符号链接，拒绝处理：$PRIV_KEY"
 fi
-if [[ -f "$PRIV_KEY" ]]; then
-  chmod 600 "$PRIV_KEY"
-else
-  echo "警告: 未找到私钥文件 $PRIV_KEY，请人工确认服务端密钥" >&2
+if [[ ! -f "$PRIV_KEY" ]]; then
+  fail "未找到私钥文件 $PRIV_KEY，服务端密钥不完整。"
+fi
+chmod 600 "$PRIV_KEY"
+PRIV_MODE=$(stat -c '%a' "$PRIV_KEY")
+if [[ "$PRIV_MODE" != "600" ]]; then
+  fail "私钥权限是 $PRIV_MODE，不是 600：$PRIV_KEY"
 fi
 
 # 端口：默认只开桌面客户端需要的；WebSocket 需显式 --websocket
-TCP_RANGES=("21115:21117")
+TCP_RULES=("21115:21117/tcp")
+UDP_RULES=("21116/udp")
 if [[ "$ALLOW_WEBSOCKET" == true ]]; then
-  TCP_RANGES+=("21118:21119")
+  TCP_RULES+=("21118:21119/tcp")
 fi
 
-echo "==> 放行端口（启动成功后）"
+echo "==> 放行端口（容器就绪后，逐条检查失败即退出）"
 if command -v ufw >/dev/null 2>&1; then
   if ! UFW_STATUS=$(ufw status 2>/dev/null); then
     echo "ufw status 查询失败：未自动修改防火墙，请手动放行 TCP 21115-21117、UDP 21116。" >&2
   elif [[ "$UFW_STATUS" == *"Status: active"* ]]; then
-    for range in "${TCP_RANGES[@]}"; do
-      if ufw allow "$range/tcp" >/dev/null 2>&1; then
-        ADDED_RULES+=("$range/tcp")
+    for rule in "${TCP_RULES[@]}" "${UDP_RULES[@]}"; do
+      if ufw allow "$rule" >/dev/null 2>&1; then
+        ADDED_RULES+=("$rule")
       else
-        echo "ufw allow $range/tcp 失败，请手动放行。" >&2
+        echo "ufw allow $rule 失败。" >&2
+        exit 1
       fi
     done
-    if ufw allow 21116/udp >/dev/null 2>&1; then
-      ADDED_RULES+=("21116/udp")
-    else
-      echo "ufw allow 21116/udp 失败，请手动放行。" >&2
-    fi
   else
     echo "ufw 已安装但未启用，跳过；如使用 firewalld 或云安全组请自行放行端口。"
   fi
@@ -205,6 +313,8 @@ detect_public_ip() {
 }
 
 IP=$(detect_public_ip | tr -d '[:space:]')
+
+CLEANED=true
 
 echo
 echo "================ 完成 ================"
