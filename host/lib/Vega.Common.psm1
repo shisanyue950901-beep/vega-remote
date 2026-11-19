@@ -91,6 +91,13 @@ function Test-VegaAbsolutePath {
     )
 
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+
+    # 目标机器是 Windows：盘符路径与 UNC 路径在任何宿主平台（含 Linux 上的 pwsh 测试）
+    # 都按绝对路径处理，不能只依赖当前平台的 IsPathRooted。
+    if ($Path -match '^[A-Za-z]:[\\/]') { return $true }
+    if ($Path -match '^\\\\[^\\]') { return $true }
+    if ($Path -match '^[\\/]') { return $true }
+
     try {
         return [System.IO.Path]::IsPathRooted($Path)
     }
@@ -1262,7 +1269,7 @@ function Get-VegaFirewallRuleSpec {
     )
 }
 
-function Test-VegaPortRangeContains {
+function Test-VegaPortInRange {
     <#
       纯函数：端口过滤器（"Any" / "47990" / "47998-48000"）是否覆盖指定端口。
     #>
@@ -1334,7 +1341,7 @@ function Select-VegaSunshineInstallerFirewallRule {
         $ports = @()
         if ($null -ne $rule.PSObject.Properties['LocalPort']) { $ports = @($rule.LocalPort | ForEach-Object { [string]$_ }) }
 
-        if (-not (Test-VegaPortRangeContains -Ports $ports -Port 47990)) { continue }
+        if (-not (Test-VegaPortInRange -Ports $ports -Port 47990)) { continue }
 
         $selected.Add($rule)
     }
@@ -2372,7 +2379,7 @@ Export-ModuleMember -Function @(
     'Set-VegaSunshineServiceStartType',
     'Restart-VegaSunshineService',
     'Get-VegaFirewallRuleSpec',
-    'Test-VegaPortRangeContains',
+    'Test-VegaPortInRange',
     'Select-VegaSunshineInstallerFirewallRule',
     'Get-VegaSunshineInstallerFirewallRule',
     'Disable-VegaSunshineInstallerFirewallRule',
