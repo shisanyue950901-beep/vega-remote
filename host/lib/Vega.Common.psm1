@@ -639,6 +639,21 @@ function Write-VegaLegacyStateWarning {
         return $false
     }
 
+    # 新版管理员清单也用 %ProgramData%\Vega\state.json 记录 LocalService 的 RustDesk
+    # 受管键；带 SchemaVersion >= 2 的文件不是 v0.1 旧清单，不能误报。
+    try {
+        $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+        if (-not [string]::IsNullOrWhiteSpace($raw)) {
+            $data = $raw | ConvertFrom-Json
+            if ($null -ne $data -and $null -ne $data.PSObject.Properties['SchemaVersion'] -and [int]$data.SchemaVersion -ge 2) {
+                return $false
+            }
+        }
+    }
+    catch {
+        # 解析失败按旧清单处理：只警告，不读取内容回滚。
+    }
+
     Write-VegaStatus ("检测到旧版状态清单：{0}。旧版记录不会自动迁移；卸载时请手动检查 Sunshine 配置。" -f $Path) -Level Warn
     return $true
 }
@@ -1347,12 +1362,28 @@ function Add-VegaStateRustDeskKey {
 
     foreach ($key in $Snapshot.Keys) {
         $keyText = [string]$key
-        if ($known.Contains($keyText)) { continue }
         $item = $Snapshot[$key]
         $originalValue = [string]$item.Value
         if ($null -ne $item.PSObject.Properties['OriginalValue']) {
             $originalValue = [string]$item.OriginalValue
         }
+
+        if ($known.Contains($keyText)) {
+            # 上一轮卸载已经恢复过的记录，旧基线已经消费掉：重新安装时
+            # 重新采集基线并重置 Restored，否则这次改动卸载时没人回滚。
+            foreach ($entry in @($State.RustDeskConfigKeys)) {
+                if ($null -eq $entry) { continue }
+                if ([string]$entry.Path -ne $Path) { continue }
+                if (-not [string]::Equals([string]$entry.Key, $keyText, [StringComparison]::OrdinalIgnoreCase)) { continue }
+                if ($null -eq $entry.PSObject.Properties['Restored'] -or -not [bool]$entry.Restored) { break }
+                $entry | Add-Member -NotePropertyName Existed -NotePropertyValue ([bool]$item.Existed) -Force
+                $entry | Add-Member -NotePropertyName OriginalValue -NotePropertyValue $originalValue -Force
+                $entry | Add-Member -NotePropertyName Restored -NotePropertyValue $false -Force
+                break
+            }
+            continue
+        }
+
         $State.RustDeskConfigKeys = @(@($State.RustDeskConfigKeys) + [pscustomobject]@{
                 Path          = $Path
                 Key           = $keyText
@@ -2637,6 +2668,16 @@ function Set-VegaFirewallRule {
         $requiredProfiles = @(Get-VegaActiveFirewallProfile)
         $check = Repair-VegaFirewallRuleProfile -Name $spec.Name -Rule $check -RequiredProfiles $requiredProfiles -Confirm:$false
 
+        # 串流放行规则也必须真的处于执行状态：ActiveStore 里存在但未执行的规则不算成功。
+        $enforcementProperty = $check.PSObject.Properties['EnforcementStatus']
+        if ($null -ne $enforcementProperty) {
+            $enforcementValues = @($enforcementProperty.Value)
+            if (-not (Test-VegaEnforcementStatus -Value $enforcementValues)) {
+                $enforcement = ($enforcementValues | ForEach-Object { [string]$_ }) -join ','
+                throw "防火墙规则 $($spec.Name) 未被强制执行（EnforcementStatus=$enforcement），拒绝继续。"
+            }
+        }
+
         $filter = Get-NetFirewallPortFilter -AssociatedNetFirewallRule $check -ErrorAction SilentlyContinue
         if ($null -eq $filter) {
             throw "无法读取防火墙规则 $($spec.Name) 的端口过滤器。"
@@ -2860,11 +2901,11 @@ function Repair-VegaFirewallRuleProfile {
 
     $profileProperty = $Rule.PSObject.Properties['Profile']
     $current = $(if ($null -ne $profileProperty) { $profileProperty.Value } else { $null })
+    $currentNames = @(ConvertTo-VegaFirewallProfileName -FwProfile $current)
     if (Test-VegaFirewallProfileCovered -FwProfile $current -RequiredProfiles $required) { return $Rule }
 
     # 补齐值是原 Profile 与所需配置文件的并集，不能把规则原有的覆盖范围缩小。
     # 固定按 Domain、Private、Public 排序，保证 Set 的值和回读比较稳定。
-    $currentNames = @(ConvertTo-VegaFirewallProfileName -FwProfile $current)
     $union = New-Object System.Collections.Generic.List[string]
     foreach ($candidate in @('Domain', 'Private', 'Public')) {
         if (($currentNames -contains $candidate) -or ($required -contains $candidate)) {
@@ -2895,9 +2936,11 @@ function Repair-VegaFirewallRuleProfile {
 
     $updatedProperty = $updated.PSObject.Properties['Profile']
     $updatedProfile = $(if ($null -ne $updatedProperty) { $updatedProperty.Value } else { $null })
-    if (-not (Test-VegaFirewallProfileCovered -FwProfile $updatedProfile -RequiredProfiles $required)) {
+    # 回读必须同时覆盖原范围与活动配置：只核对活动配置会把规则原有 Profile 弄丢。
+    $expectedProfiles = @(@($currentNames) + @($required) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    if (-not (Test-VegaFirewallProfileCovered -FwProfile $updatedProfile -RequiredProfiles $expectedProfiles)) {
         $actual = @(ConvertTo-VegaFirewallProfileName -FwProfile $updatedProfile) -join ','
-        throw "防火墙规则 $Name 的 Profile 未覆盖活动接口的配置（实际：$actual，需要：$target）。"
+        throw "防火墙规则 $Name 的 Profile 未覆盖完整并集（实际：$actual，需要：$($expectedProfiles -join ',')）。"
     }
 
     return $updated
@@ -3443,6 +3486,20 @@ function Get-VegaDoctorAdvice {
     if ($Facts.ContainsKey('RustDeskDeviceId') -and $null -ne $Facts['RustDeskDeviceId']) {
         $rustDeskDevice = [string]$Facts['RustDeskDeviceId']
     }
+    $rustDeskServiceServer = ''
+    if ($Facts.ContainsKey('RustDeskServiceServer') -and $null -ne $Facts['RustDeskServiceServer']) {
+        $rustDeskServiceServer = [string]$Facts['RustDeskServiceServer']
+    }
+
+    # RustDesk 服务存在时实际生效的是 LocalService 配置：两份不一致要明确提示。
+    if (-not [string]::IsNullOrWhiteSpace($rustDeskServiceServer) -and
+        -not [string]::IsNullOrWhiteSpace($rustDeskActual) -and
+        $rustDeskServiceServer -ne $rustDeskActual) {
+        $advice.Add(("RustDesk 用户配置指向 {0}，服务配置指向 {1}：服务模式实际使用后者，需重新运行安装脚本以管理员身份写入。" -f $rustDeskActual, $rustDeskServiceServer))
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($rustDeskServiceServer) -and -not [string]::IsNullOrWhiteSpace($rustDeskExpected) -and $rustDeskServiceServer -ne $rustDeskExpected) {
+        $advice.Add(("RustDesk 服务配置指向 {0}，与配置的 {1} 不一致：以管理员身份重新运行安装脚本。" -f $rustDeskServiceServer, $rustDeskExpected))
+    }
 
     if (-not [string]::IsNullOrWhiteSpace($rustDeskExpected)) {
         if ([string]::IsNullOrWhiteSpace($rustDeskActual)) {
@@ -3507,7 +3564,9 @@ function Get-VegaRustDeskConfigPath {
 
 function Test-VegaRustDeskConfigPath {
     <#
-      卸载时的白名单：只允许 ...\config\RustDesk2.toml。
+      后缀白名单：只允许 ...\config\RustDesk2.toml。
+      只用于快速排除明显错误的记录；卸载前还会用 Test-VegaRustDeskManagedConfigPath
+      做规范化后的精确路径比较。
     #>
     [CmdletBinding()]
     param(
@@ -3525,6 +3584,76 @@ function Test-VegaRustDeskConfigPath {
     catch {
         return $false
     }
+}
+
+function Get-VegaRustDeskManagedKeyName {
+    <#
+      纯函数：Vega 只管理 RustDesk2.toml 的三个键，回滚时其他键一律忽略。
+    #>
+    [CmdletBinding()]
+    param()
+
+    return @('custom-rendezvous-server', 'relay-server', 'key')
+}
+
+function Get-VegaRustDeskServiceStatePath {
+    <#
+      LocalService（服务模式）RustDesk 配置的清单只能写管理员专用清单：
+      %ProgramData%\Vega\state.json。用户可写的 client-state.json 不允许记录服务路径。
+    #>
+    [CmdletBinding()]
+    param()
+
+    $root = $env:ProgramData
+    if ([string]::IsNullOrWhiteSpace($root)) { $root = [System.IO.Path]::GetTempPath() }
+    return (Join-Path (Join-Path $root 'Vega') 'state.json')
+}
+
+function Test-VegaRustDeskManagedConfigPath {
+    <#
+      回滚前的精确路径校验：
+        - 记录路径与预期路径规范化后必须完全相等（不是后缀匹配）；
+        - 文件与父目录都不得是重解析点。
+      -ServiceMode 预期 LocalService 路径，否则预期当前用户 %AppData% 路径。
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()]
+        [string]$Path,
+
+        [switch]$ServiceMode,
+
+        [AllowEmptyString()]
+        [string]$ExpectedPath = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+
+    if ([string]::IsNullOrWhiteSpace($ExpectedPath)) {
+        $ExpectedPath = Get-VegaRustDeskConfigPath -ServiceMode:$ServiceMode
+    }
+    if ([string]::IsNullOrWhiteSpace($ExpectedPath)) { return $false }
+
+    try {
+        $actualFull = [System.IO.Path]::GetFullPath($Path)
+        $expectedFull = [System.IO.Path]::GetFullPath($ExpectedPath)
+    }
+    catch {
+        return $false
+    }
+
+    if (-not [string]::Equals($actualFull, $expectedFull, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+
+    $parent = [System.IO.Path]::GetDirectoryName($actualFull)
+    if ([string]::IsNullOrWhiteSpace($parent)) { return $false }
+    if (Test-Path -LiteralPath $parent -PathType Container) {
+        if (Test-VegaReparsePoint -Path $parent) { return $false }
+    }
+    if (Test-Path -LiteralPath $actualFull -PathType Leaf) {
+        if (Test-VegaReparsePoint -Path $actualFull) { return $false }
+    }
+
+    return $true
 }
 
 function ConvertFrom-VegaRustDeskServerEndpoint {
@@ -3752,9 +3881,26 @@ function ConvertTo-VegaTomlString {
     return ('"{0}"' -f $escaped)
 }
 
+function Get-VegaTomlKeyValuePattern {
+    <#
+      内部辅助：匹配一行 [options] 键值，并把“值的文本区间”与行尾注释分开。
+      只用于 Merge/Convert 两处，避免关键字面量写两遍。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Key
+    )
+
+    $escaped = [regex]::Escape($Key)
+    return ('^\s*(?<prefix>\s*{0}\s*=\s*)(?<value>"(?:[^"\\]|\\.)*"|''[^'']*''|[^#]*)(?<suffix>\s*(?:#.*)?)$' -f $escaped)
+}
+
 function ConvertFrom-VegaRustDeskConfigText {
     <#
       纯函数：读取 [options] 段的键值，其余段忽略；同名键以第一次为准。
+      表头与键名都按精确大小写匹配（TOML 区分大小写），表头允许行尾 # 注释。
+      值只取引号内/注释前的文本，不会把行尾注释读进清单。
     #>
     [CmdletBinding()]
     param(
@@ -3768,12 +3914,13 @@ function ConvertFrom-VegaRustDeskConfigText {
 
     $section = ''
     foreach ($line in ($Text -split "\r?\n")) {
-        if ($line -match '^\s*\[(?<name>[^\]]+)\]\s*$') {
+        if ($line -cmatch '^\s*\[(?<name>[^\]]+)\]\s*(?:#.*)?$') {
             $section = ([string]$Matches['name']).Trim()
             continue
         }
-        if ($section -ne 'options') { continue }
-        if ($line -match '^\s*(?<key>[A-Za-z0-9_-]+)\s*=\s*(?<value>.*)$') {
+        if ($section -cne 'options') { continue }
+
+        if ($line -match '^\s*(?<key>[A-Za-z0-9_-]+)\s*=\s*(?<value>"(?:[^"\\]|\\.)*"|''[^'']*''|[^#]*)(?<suffix>\s*(?:#.*)?)$') {
             $key = [string]$Matches['key']
             if (-not $values.Contains($key)) {
                 $values[$key] = ConvertFrom-VegaTomlString -Value ([string]$Matches['value'])
@@ -3786,9 +3933,11 @@ function ConvertFrom-VegaRustDeskConfigText {
 
 function Merge-VegaRustDeskConfigText {
     <#
-      纯函数：只更新 [options] 段里给出的键，其他行原样保留。
+      纯函数：只替换 [options] 段里给出键的“值文本区间”，其他行、行尾注释、
+      换行风格（CRLF/LF）与尾部空行原样保留。
+      表头与键名按精确大小写匹配；[options] 允许行尾 # 注释。
       $RemoveKeys 里的键整行删除（回滚时“原本没有”的键）。
-      缺失的键追加到 [options] 段末尾；没有该段时新建。
+      缺失的键追加到 [options] 段末尾；没有该段时在文件末尾追加。
     #>
     [CmdletBinding()]
     param(
@@ -3804,90 +3953,107 @@ function Merge-VegaRustDeskConfigText {
         [string[]]$RemoveKeys = @()
     )
 
+    # 统一用 Ordinal 字典：调用方给的 [ordered]@{} 默认大小写不敏感，会把 Key 当成 key。
+    $wanted = [System.Collections.Specialized.OrderedDictionary]::new([System.StringComparer]::Ordinal)
+    foreach ($valueKey in $Values.Keys) {
+        $wanted[[string]$valueKey] = [string]$Values[$valueKey]
+    }
+
     $remove = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::Ordinal)
     foreach ($removeKey in @($RemoveKeys)) {
         if ([string]::IsNullOrWhiteSpace($removeKey)) { continue }
         $null = $remove.Add([string]$removeKey)
     }
 
-    $lines = New-Object System.Collections.Generic.List[string]
+    $newline = "`n"
+    if (-not [string]::IsNullOrEmpty($ExistingText) -and $ExistingText.Contains("`r`n")) { $newline = "`r`n" }
+
+    $output = New-Object System.Collections.Generic.List[string]
     if (-not [string]::IsNullOrEmpty($ExistingText)) {
-        foreach ($line in ($ExistingText -split "\r?\n")) { $lines.Add($line) }
-        while ($lines.Count -gt 0 -and [string]::IsNullOrWhiteSpace($lines[$lines.Count - 1])) {
-            $lines.RemoveAt($lines.Count - 1)
-        }
+        # 不裁剪尾部空行：它们属于原文件内容，要按原样保留。
+        foreach ($line in ($ExistingText -split "\r?\n")) { $output.Add($line) }
     }
 
     $written = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::Ordinal)
-    $output = New-Object System.Collections.Generic.List[string]
     $section = ''
+    $result = New-Object System.Collections.Generic.List[string]
 
-    foreach ($line in $lines) {
-        if ($line -match '^\s*\[(?<name>[^\]]+)\]\s*$') {
+    foreach ($line in $output) {
+        if ($line -cmatch '^\s*\[(?<name>[^\]]+)\]\s*(?:#.*)?$') {
             $section = ([string]$Matches['name']).Trim()
-            $output.Add($line)
+            $result.Add($line)
             continue
         }
 
-        if ($section -eq 'options') {
-            $key = $null
-            if ($line -match '^\s*(?<key>[A-Za-z0-9_-]+)\s*=') { $key = [string]$Matches['key'] }
+        if ($section -cne 'options') {
+            $result.Add($line)
+            continue
+        }
 
-            if ($null -ne $key -and $remove.Contains($key)) { continue }
-            if ($null -ne $key -and $Values.Contains($key)) {
-                if ($written.Contains($key)) { continue }
-                $output.Add("$key = $(ConvertTo-VegaTomlString -Value ([string]$Values[$key]))")
-                $null = $written.Add($key)
-                continue
+        if ($line -match '^\s*(?<key>[A-Za-z0-9_-]+)\s*=') {
+            $key = [string]$Matches['key']
+            if ($remove.Contains($key)) { continue }
+            if ($wanted.Contains($key)) {
+                if ($written.Contains($key)) {
+                    # 重复键不删除，避免改动受管值以外的文本
+                    $result.Add($line)
+                    continue
+                }
+                $pattern = Get-VegaTomlKeyValuePattern -Key $key
+                if ($line -cmatch $pattern) {
+                    $result.Add($Matches['prefix'] + (ConvertTo-VegaTomlString -Value ([string]$wanted[$key])) + $Matches['suffix'])
+                    $null = $written.Add($key)
+                    continue
+                }
             }
         }
 
-        $output.Add($line)
+        $result.Add($line)
     }
 
     $missing = New-Object System.Collections.Generic.List[string]
-    foreach ($key in $Values.Keys) {
+    foreach ($key in $wanted.Keys) {
         if (-not $written.Contains([string]$key)) { $missing.Add([string]$key) }
     }
 
     if ($missing.Count -eq 0) {
-        return (($output -join "`n") + "`n")
+        return ($result -join $newline)
     }
 
     $headerIndex = -1
-    for ($index = 0; $index -lt $output.Count; $index++) {
-        if ($output[$index] -match '^\s*\[(?<name>[^\]]+)\]\s*$' -and ([string]$Matches['name']).Trim() -eq 'options') {
+    for ($index = 0; $index -lt $result.Count; $index++) {
+        if ($result[$index] -cmatch '^\s*\[(?<name>[^\]]+)\]\s*(?:#.*)?$' -and ([string]$Matches['name']).Trim() -ceq 'options') {
             $headerIndex = $index
             break
         }
     }
 
     if ($headerIndex -lt 0) {
-        if ($output.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($output[$output.Count - 1])) { $output.Add('') }
-        $output.Add('[options]')
+        if ($result.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($result[$result.Count - 1])) { $result.Add('') }
+        $result.Add('[options]')
         foreach ($key in $missing) {
-            $output.Add("$key = $(ConvertTo-VegaTomlString -Value ([string]$Values[$key]))")
+            $result.Add("$key = $(ConvertTo-VegaTomlString -Value ([string]$wanted[$key]))")
         }
-        return (($output -join "`n") + "`n")
+        return ($result -join $newline)
     }
 
-    $insertAt = $output.Count
-    for ($index = $headerIndex + 1; $index -lt $output.Count; $index++) {
-        if ($output[$index] -match '^\s*\[[^\]]+\]\s*$') {
+    $insertAt = $result.Count
+    for ($index = $headerIndex + 1; $index -lt $result.Count; $index++) {
+        if ($result[$index] -cmatch '^\s*\[[^\]]+\]\s*(?:#.*)?$') {
             $insertAt = $index
             break
         }
     }
-    while ($insertAt -gt $headerIndex + 1 -and [string]::IsNullOrWhiteSpace($output[$insertAt - 1])) {
+    while ($insertAt -gt $headerIndex + 1 -and [string]::IsNullOrWhiteSpace($result[$insertAt - 1])) {
         $insertAt--
     }
 
     foreach ($key in $missing) {
-        $output.Insert($insertAt, "$key = $(ConvertTo-VegaTomlString -Value ([string]$Values[$key]))")
+        $result.Insert($insertAt, "$key = $(ConvertTo-VegaTomlString -Value ([string]$wanted[$key]))")
         $insertAt++
     }
 
-    return (($output -join "`n") + "`n")
+    return ($result -join $newline)
 }
 
 function Get-VegaRustDeskConfigKeySnapshot {
@@ -3930,11 +4096,61 @@ function Get-VegaRustDeskConfigKeySnapshot {
     return $snapshot
 }
 
+function Get-VegaRustDeskConfigSummary {
+    <#
+      诊断用：分别读取当前用户与 LocalService（服务模式）的 RustDesk2.toml。
+      -ServicePresent 时才把服务模式配置算作“应检查”；文件不存在只标记 Exists=false。
+      返回 { UserPath, UserExists, UserServer, ServicePath, ServiceExists, ServiceServer }。
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()]
+        [string]$UserConfigPath = '',
+
+        [AllowEmptyString()]
+        [string]$ServiceConfigPath = '',
+
+        [switch]$ServicePresent
+    )
+
+    if ([string]::IsNullOrWhiteSpace($UserConfigPath)) { $UserConfigPath = Get-VegaRustDeskConfigPath }
+    if ([string]::IsNullOrWhiteSpace($ServiceConfigPath)) { $ServiceConfigPath = Get-VegaRustDeskConfigPath -ServiceMode }
+
+    $read = {
+        param([string]$ConfigPath)
+        $exists = Test-Path -LiteralPath $ConfigPath -PathType Leaf
+        $server = ''
+        if ($exists) {
+            $text = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8
+            $values = ConvertFrom-VegaRustDeskConfigText -Text $text
+            if ($values.Contains('custom-rendezvous-server')) {
+                $server = [string]$values['custom-rendezvous-server']
+            }
+        }
+        return [pscustomobject]@{ Exists = $exists; Server = $server }
+    }
+
+    $user = & $read $UserConfigPath
+    $service = [pscustomobject]@{ Exists = $false; Server = '' }
+    if ($ServicePresent) { $service = & $read $ServiceConfigPath }
+
+    return [pscustomobject]@{
+        UserPath      = $UserConfigPath
+        UserExists    = [bool]$user.Exists
+        UserServer    = [string]$user.Server
+        ServicePath   = $ServiceConfigPath
+        ServiceExists = [bool]$service.Exists
+        ServiceServer = [string]$service.Server
+    }
+}
+
 function Set-VegaRustDeskConfig {
     <#
       写 RustDesk2.toml：当前用户路径总是写；RustDesk 服务存在时也写服务模式路径。
-      写前把受管键基线记进状态清单（调用方负责最终 Save-VegaState 的时机）。
-      返回 { Applied, Warnings, ServicePresent, Values }。
+      当前用户路径的记录写调用方给的清单（host-state / client-state）；
+      LocalService 路径的记录只写管理员清单 %ProgramData%\Vega\state.json。
+      只为实际变化的键登记基线，写入并回读确认后才保存（标记为待回滚）。
+      返回 { Applied, Warnings, ServicePresent, Values, State }。
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -3956,6 +4172,9 @@ function Set-VegaRustDeskConfig {
         [AllowEmptyString()]
         [string]$ServiceConfigPath = '',
 
+        [AllowEmptyString()]
+        [string]$ServiceStatePath = '',
+
         [switch]$ForceService
     )
 
@@ -3964,13 +4183,14 @@ function Set-VegaRustDeskConfig {
 
     if ([string]::IsNullOrWhiteSpace($UserConfigPath)) { $UserConfigPath = Get-VegaRustDeskConfigPath }
     if ([string]::IsNullOrWhiteSpace($ServiceConfigPath)) { $ServiceConfigPath = Get-VegaRustDeskConfigPath -ServiceMode }
+    if ([string]::IsNullOrWhiteSpace($ServiceStatePath)) { $ServiceStatePath = Get-VegaRustDeskServiceStatePath }
 
     $values = [ordered]@{
         'custom-rendezvous-server' = $endpoint.Server
         'relay-server'             = $endpoint.RelayServer
         'key'                      = $Key.Trim()
     }
-    $managedKeys = @('custom-rendezvous-server', 'relay-server', 'key')
+    $managedKeys = @(Get-VegaRustDeskManagedKeyName)
 
     $service = Get-Service -Name 'RustDesk' -ErrorAction SilentlyContinue
     $servicePresent = ($null -ne $service)
@@ -3990,11 +4210,27 @@ function Set-VegaRustDeskConfig {
             $existingText = Get-Content -LiteralPath $target -Raw -Encoding UTF8
         }
 
-        if ($null -ne $State) {
+        $isServiceTarget = [string]::Equals($target, $ServiceConfigPath, [StringComparison]::OrdinalIgnoreCase)
+        $targetState = $State
+        $targetStatePath = $StatePath
+        if ($isServiceTarget) {
+            $targetStatePath = $ServiceStatePath
+            if (-not [string]::Equals($targetStatePath, $StatePath, [StringComparison]::OrdinalIgnoreCase)) {
+                $targetState = Read-VegaState -Path $targetStatePath
+            }
+        }
+
+        $changed = $null
+        if ($null -ne $targetState) {
             $snapshot = Get-VegaRustDeskConfigKeySnapshot -Text $existingText -Keys $managedKeys
-            $State = Add-VegaStateRustDeskKey -State $State -Path $target -Snapshot $snapshot
-            if (-not [string]::IsNullOrWhiteSpace($StatePath)) {
-                $null = Save-VegaState -State $State -Path $StatePath
+            # 只登记实际变化的键：值相同、写入失败的键都不该留下待回滚记录。
+            $changed = [ordered]@{}
+            foreach ($managedKey in $managedKeys) {
+                $item = $snapshot[$managedKey]
+                if ($null -eq $item) { continue }
+                if (-not [bool]$item.Existed -or -not [string]::Equals([string]$item.OriginalValue, [string]$values[$managedKey], [StringComparison]::Ordinal)) {
+                    $changed[$managedKey] = $item
+                }
             }
         }
 
@@ -4004,6 +4240,28 @@ function Set-VegaRustDeskConfig {
 
         try {
             $null = Write-VegaTextFileAtomic -Path $target -Text $merged
+
+            # 回读确认：三个键都真的落到文件里，才把记录标记为待回滚。
+            $verifyText = Get-Content -LiteralPath $target -Raw -Encoding UTF8
+            $verified = ConvertFrom-VegaRustDeskConfigText -Text $verifyText
+            foreach ($managedKey in $managedKeys) {
+                if (-not $verified.Contains($managedKey) -or -not [string]::Equals([string]$verified[$managedKey], [string]$values[$managedKey], [StringComparison]::Ordinal)) {
+                    throw "回读 $target 时 $managedKey 与写入值不一致"
+                }
+            }
+
+            # 回读通过后才登记并保存待回滚记录。
+            if ($null -ne $targetState -and $null -ne $changed -and $changed.Count -gt 0) {
+                $targetState = Add-VegaStateRustDeskKey -State $targetState -Path $target -Snapshot $changed
+            }
+            if ($null -ne $targetState -and -not [string]::IsNullOrWhiteSpace($targetStatePath)) {
+                $null = Save-VegaState -State $targetState -Path $targetStatePath
+                # 服务模式记录写的是独立管理员清单，不要把调用方的 State 换成它。
+                if (-not $isServiceTarget -or [string]::Equals($targetStatePath, $StatePath, [StringComparison]::OrdinalIgnoreCase)) {
+                    $State = $targetState
+                }
+            }
+
             $applied.Add([pscustomobject]@{ Path = $target; Changed = ($merged -ne $existingText) })
         }
         catch {
@@ -4027,7 +4285,7 @@ function Set-VegaRustDeskConfig {
 function Restore-VegaRustDeskConfig {
     <#
       卸载用：只把清单记录的受管键恢复为首次写入前的原值；原本没有的键整行删除。
-      其他段与其他键原样保留。
+      其他段与其他键原样保留。只处理三个受管键，其他键忽略。
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -4043,12 +4301,14 @@ function Restore-VegaRustDeskConfig {
         return [pscustomobject]@{ Restored = $false; Changed = $false; Message = "配置不存在，跳过按键回滚：$Path" }
     }
 
+    $managedKeys = @(Get-VegaRustDeskManagedKeyName)
     $values = [ordered]@{}
     $remove = New-Object System.Collections.Generic.List[string]
     foreach ($record in @($Records)) {
         if ($null -eq $record) { continue }
         $key = [string]$record.Key
         if ([string]::IsNullOrWhiteSpace($key)) { continue }
+        if ($managedKeys -cnotcontains $key) { continue }
         if ([bool]$record.Existed) {
             $originalValue = ''
             if ($null -ne $record.PSObject.Properties['OriginalValue']) {
@@ -4080,6 +4340,75 @@ function Restore-VegaRustDeskConfig {
 
     $null = Write-VegaTextFileAtomic -Path $Path -Text $merged
     return [pscustomobject]@{ Restored = $true; Changed = $true; Message = "已把受管键恢复为原始值：$Path" }
+}
+
+function Restore-VegaRustDeskState {
+    <#
+      按清单回滚 RustDesk 配置：
+        - 记录路径规范化后必须与预期路径完全一致，且父目录不是重解析点；
+        - 只恢复 custom-rendezvous-server / relay-server / key，其他键忽略并警告；
+        - 每个成功回滚的键立即写回清单。
+      返回 { State, Failures, Messages }。
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [AllowNull()]
+        $State,
+
+        [AllowEmptyString()]
+        [string]$StatePath = '',
+
+        [switch]$ServiceMode,
+
+        [AllowEmptyString()]
+        [string]$ExpectedPath = ''
+    )
+
+    $failures = New-Object System.Collections.Generic.List[string]
+    $messages = New-Object System.Collections.Generic.List[string]
+    if ($null -eq $State) {
+        return [pscustomobject]@{ State = $State; Failures = $failures.ToArray(); Messages = $messages.ToArray() }
+    }
+
+    $managedKeys = @(Get-VegaRustDeskManagedKeyName)
+    $paths = @($State.RustDeskConfigKeys | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Path } | Select-Object -Unique)
+    foreach ($configPath in $paths) {
+        if (-not (Test-VegaRustDeskManagedConfigPath -Path $configPath -ServiceMode:$ServiceMode -ExpectedPath $ExpectedPath)) {
+            $failures.Add("清单里的 RustDesk 配置路径与预期路径不一致，拒绝回滚：$configPath")
+            $messages.Add($failures[$failures.Count - 1])
+            continue
+        }
+
+        $records = New-Object System.Collections.Generic.List[object]
+        foreach ($record in @(Get-VegaStateRustDeskKey -State $State -Path $configPath | Where-Object { -not [bool]$_.Restored })) {
+            if ($null -eq $record) { continue }
+            if ($managedKeys -cnotcontains [string]$record.Key) {
+                $message = "忽略清单里的非受管 RustDesk 键：$([string]$record.Key)"
+                $messages.Add($message)
+                Write-Warning $message
+                continue
+            }
+            $records.Add($record)
+        }
+
+        if ($records.Count -eq 0) { continue }
+
+        $restore = Restore-VegaRustDeskConfig -Path $configPath -Records $records.ToArray() -Confirm:$false
+        $messages.Add($restore.Message)
+        if ($restore.Restored) {
+            foreach ($record in $records) {
+                $State = Set-VegaStateRustDeskKeyRestored -State $State -Path $configPath -Key ([string]$record.Key)
+            }
+            if (-not [string]::IsNullOrWhiteSpace($StatePath)) {
+                $null = Save-VegaState -State $State -Path $StatePath
+            }
+        }
+        else {
+            $failures.Add("RustDesk 配置回滚未完成：$configPath")
+        }
+    }
+
+    return [pscustomobject]@{ State = $State; Failures = $failures.ToArray(); Messages = $messages.ToArray() }
 }
 
 function Test-VegaProcessElevated {
@@ -4873,28 +5202,29 @@ function Invoke-VegaHostUninstallCore {
         }
     }
 
-    Write-VegaStatus '回滚 RustDesk 配置（只动 Vega 改过的键）'
-    $rustDeskPaths = @($state.RustDeskConfigKeys | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Path } | Select-Object -Unique)
-    foreach ($rustDeskPath in $rustDeskPaths) {
-        if (-not (Test-VegaRustDeskConfigPath -Path $rustDeskPath)) {
-            $failures.Add("清单里的 RustDesk 配置路径不在白名单，拒绝回滚：$rustDeskPath")
-            Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
-            continue
-        }
+    Write-VegaStatus '回滚 RustDesk 配置（用户配置；只动三个受管键）'
+    $userRestore = Restore-VegaRustDeskState -State $state -StatePath $StatePath -Confirm:$false
+    $state = $userRestore.State
+    foreach ($message in @($userRestore.Messages)) { Write-VegaStatus $message }
+    foreach ($failure in @($userRestore.Failures)) {
+        $failures.Add([string]$failure)
+        Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
+    }
 
-        $records = @(Get-VegaStateRustDeskKey -State $state -Path $rustDeskPath | Where-Object { -not [bool]$_.Restored })
-        $restore = Restore-VegaRustDeskConfig -Path $rustDeskPath -Records $records -Confirm:$false
-        Write-VegaStatus $restore.Message
-        if ($restore.Restored) {
-            foreach ($record in $records) {
-                $state = Set-VegaStateRustDeskKeyRestored -State $state -Path $rustDeskPath -Key ([string]$record.Key)
-            }
-            $null = Save-VegaState -State $state -Path $StatePath
-        }
-        else {
-            $failures.Add("RustDesk 配置回滚未完成：$rustDeskPath")
+    # LocalService（服务模式）记录只能在管理员清单 state.json 里，并且只按精确路径回滚。
+    Write-VegaStatus '回滚 RustDesk 服务模式配置（管理员清单）'
+    $serviceStatePath = Get-VegaRustDeskServiceStatePath
+    if (Test-Path -LiteralPath $serviceStatePath -PathType Leaf) {
+        $serviceState = Read-VegaState -Path $serviceStatePath
+        $serviceRestore = Restore-VegaRustDeskState -State $serviceState -StatePath $serviceStatePath -ServiceMode -Confirm:$false
+        foreach ($message in @($serviceRestore.Messages)) { Write-VegaStatus $message }
+        foreach ($failure in @($serviceRestore.Failures)) {
+            $failures.Add([string]$failure)
             Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
         }
+    }
+    else {
+        Write-VegaStatus "没有服务模式 RustDesk 记录：$serviceStatePath"
     }
 
     Write-VegaStatus '恢复 Sunshine 服务状态'
@@ -5161,27 +5491,31 @@ function Invoke-VegaClientUninstallCore {
 
     # RustDesk 配置键即使不加 -RemoveApps 也要回滚：配置文件是 Vega 改的。
     if ($null -ne $state) {
-        $rustDeskPaths = @($state.RustDeskConfigKeys | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Path } | Select-Object -Unique)
-        foreach ($rustDeskPath in $rustDeskPaths) {
-            if (-not (Test-VegaRustDeskConfigPath -Path $rustDeskPath)) {
-                $failures.Add("清单里的 RustDesk 配置路径不在白名单，拒绝回滚：$rustDeskPath")
-                Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
-                continue
-            }
-            $records = @(Get-VegaStateRustDeskKey -State $state -Path $rustDeskPath | Where-Object { -not [bool]$_.Restored })
-            $restore = Restore-VegaRustDeskConfig -Path $rustDeskPath -Records $records -Confirm:$false
-            Write-VegaStatus $restore.Message
-            if ($restore.Restored) {
-                foreach ($record in $records) {
-                    $state = Set-VegaStateRustDeskKeyRestored -State $state -Path $rustDeskPath -Key ([string]$record.Key)
-                }
-                $null = Save-VegaState -State $state -Path $StatePath
-            }
-            else {
-                $failures.Add("RustDesk 配置回滚未完成：$rustDeskPath")
+        # 用户清单只能回滚当前用户 %AppData% 路径，其他路径（尤其是 LocalService）一律拒绝。
+        $userRestore = Restore-VegaRustDeskState -State $state -StatePath $StatePath -Confirm:$false
+        $state = $userRestore.State
+        foreach ($message in @($userRestore.Messages)) { Write-VegaStatus $message }
+        foreach ($failure in @($userRestore.Failures)) {
+            $failures.Add([string]$failure)
+            Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
+        }
+    }
+
+    # 服务模式记录只从管理员清单读取；非管理员不改机器级配置。
+    $serviceStatePath = Get-VegaRustDeskServiceStatePath
+    if (Test-VegaProcessElevated) {
+        if (Test-Path -LiteralPath $serviceStatePath -PathType Leaf) {
+            $serviceState = Read-VegaState -Path $serviceStatePath
+            $serviceRestore = Restore-VegaRustDeskState -State $serviceState -StatePath $serviceStatePath -ServiceMode -Confirm:$false
+            foreach ($message in @($serviceRestore.Messages)) { Write-VegaStatus $message }
+            foreach ($failure in @($serviceRestore.Failures)) {
+                $failures.Add([string]$failure)
                 Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
             }
         }
+    }
+    elseif (Test-Path -LiteralPath $serviceStatePath -PathType Leaf) {
+        Write-VegaStatus '检测到服务模式 RustDesk 记录；非管理员不回滚机器级配置，请以管理员身份卸载。' -Level Warn
     }
 
     if (-not $RemoveApps) {
@@ -5302,6 +5636,9 @@ Export-ModuleMember -Function @(
     'Set-VegaStateRustDeskKeyRestored',
     'Get-VegaRustDeskConfigPath',
     'Test-VegaRustDeskConfigPath',
+    'Get-VegaRustDeskManagedKeyName',
+    'Get-VegaRustDeskServiceStatePath',
+    'Test-VegaRustDeskManagedConfigPath',
     'ConvertFrom-VegaRustDeskServerEndpoint',
     'Test-VegaRustDeskServer',
     'Test-VegaRustDeskKey',
@@ -5311,8 +5648,10 @@ Export-ModuleMember -Function @(
     'ConvertFrom-VegaRustDeskConfigText',
     'Merge-VegaRustDeskConfigText',
     'Get-VegaRustDeskConfigKeySnapshot',
+    'Get-VegaRustDeskConfigSummary',
     'Set-VegaRustDeskConfig',
     'Restore-VegaRustDeskConfig',
+    'Restore-VegaRustDeskState',
     'Get-VegaRustDeskInstall',
     'Test-VegaRustDeskSignatureValid',
     'Test-VegaProcessElevated',

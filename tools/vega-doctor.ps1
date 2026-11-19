@@ -166,24 +166,40 @@ catch {
     Write-Host "读取 vega.config.json 失败：$($_.Exception.Message)" -ForegroundColor Yellow
 }
 
-$rustDeskToml = Get-VegaRustDeskConfigPath
-$rustDeskActual = ''
-if (Test-Path -LiteralPath $rustDeskToml -PathType Leaf) {
-    $tomlText = Get-Content -LiteralPath $rustDeskToml -Raw -Encoding UTF8
-    $tomlOptions = ConvertFrom-VegaRustDeskConfigText -Text $tomlText
-    if ($tomlOptions.Contains('custom-rendezvous-server')) {
-        $rustDeskActual = [string]$tomlOptions['custom-rendezvous-server']
-    }
-    Write-Host "配置: $rustDeskToml"
+$rustDeskService = Get-Service -Name 'RustDesk' -ErrorAction SilentlyContinue
+$rustDeskSummary = Get-VegaRustDeskConfigSummary -ServicePresent:([bool]$rustDeskService)
+$rustDeskToml = $rustDeskSummary.UserPath
+$rustDeskActual = [string]$rustDeskSummary.UserServer
+if ($rustDeskSummary.UserExists) {
+    Write-Host "用户配置: $rustDeskToml"
     if ([string]::IsNullOrWhiteSpace($rustDeskActual)) {
-        Write-Host '中继服务器: 未配置（custom-rendezvous-server 为空）' -ForegroundColor Yellow
+        Write-Host '用户配置中继服务器: 未配置（custom-rendezvous-server 为空）' -ForegroundColor Yellow
     }
     else {
-        Write-Host "中继服务器: $rustDeskActual" -ForegroundColor Green
+        Write-Host "用户配置中继服务器: $rustDeskActual" -ForegroundColor Green
     }
 }
 else {
-    Write-Host "未找到 RustDesk2.toml：$rustDeskToml（RustDesk 未安装或还没登录过）" -ForegroundColor Yellow
+    Write-Host "未找到用户 RustDesk2.toml：$rustDeskToml（RustDesk 未安装或还没登录过）" -ForegroundColor Yellow
+}
+
+if ($rustDeskService) {
+    # RustDesk 服务存在时实际生效的是 LocalService 配置，必须和用户配置一起报告。
+    if ($rustDeskSummary.ServiceExists) {
+        Write-Host "服务配置: $($rustDeskSummary.ServicePath)"
+        if ([string]::IsNullOrWhiteSpace($rustDeskSummary.ServiceServer)) {
+            Write-Host '服务配置中继服务器: 未配置（custom-rendezvous-server 为空）' -ForegroundColor Yellow
+        }
+        else {
+            Write-Host "服务配置中继服务器: $($rustDeskSummary.ServiceServer)" -ForegroundColor Green
+        }
+        if (-not [string]::IsNullOrWhiteSpace($rustDeskActual) -and $rustDeskSummary.ServiceServer -ne $rustDeskActual) {
+            Write-Host '用户配置与服务配置指向不同中继服务器，以服务配置为准。' -ForegroundColor Yellow
+        }
+    }
+    else {
+        Write-Host "未找到服务配置 RustDesk2.toml：$($rustDeskSummary.ServicePath)" -ForegroundColor Yellow
+    }
 }
 
 if ($null -ne $rustDeskExpected) {
@@ -316,6 +332,7 @@ $facts = @{
     TailscaleInstalled   = $tailscaleInstalled
     Peer                 = $Peer
     RustDeskTomlServer   = $rustDeskActual
+    RustDeskServiceServer = $rustDeskSummary.ServiceServer
     RustDeskDeviceId     = $rustDeskDeviceId
 }
 
