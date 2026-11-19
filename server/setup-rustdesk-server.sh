@@ -8,9 +8,10 @@
 #     会绕过已有的入站限制；host 网络下 ufw 规则才真正生效。
 #   - 只支持全新部署：启动前项目里已有容器时默认拒绝；--reinstall 先 compose down，
 #     数据目录和密钥保留，再按全新流程部署。
-#   - 启动前用 ss -lntup 检查 21115-21119 是否已被占用，占用则拒绝。
-#   - host 网络下服务本来就在 21115-21119 监听；--websocket 只决定是否额外 ufw allow
-#     21118/21119。未启用 WebSocket 且 UFW 默认 deny 时，额外 ufw deny 21118:21119/tcp。
+#   - 启动前用 ss -lntup 检查 21115-21119 是否已被占用（只看本地地址列的端口），占用则拒绝。
+#   - 本脚本不修改防火墙：不执行任何 ufw allow/deny，也不回滚规则。
+#     部署完成后只打印需要放行的端口清单、ufw 示例命令和云安全组建议。
+#     --websocket 只影响提示文字（是否列出 TCP 21118-21119）。
 #   - UFW 未启用/未安装，或已启用但默认入站为 allow 时，打印醒目警告：
 #     21118/21119（WebSocket）也会对外可达，请用云安全组只放行 TCP 21115-21117、UDP 21116。
 #   - compose 一律 --env-file /dev/null，避免读取项目里的 .env 改变部署结果。
@@ -18,8 +19,7 @@
 #     与已有私钥检查（普通文件、0600）；任何一项不满足立即退出。
 #   - compose up 之前置 ATTEMPTED=true；失败时一定 compose down（容器都是本次新建的）。
 #   - 就绪判定按 up 后采样的容器 ID：ID 必须不变、RestartCount 必须保持 0 持续 5 秒。
-#   - 公钥是 44 字符 base64，私钥是普通文件且 0600；失败时回滚本次新增的 ufw 规则。
-#   - ufw 里已有涉及 21115-21119 的规则时不再追加，只提示用户自查。
+#   - 公钥是 44 字符 base64，私钥是普通文件且 0600。
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -27,7 +27,7 @@ ALLOW_WEBSOCKET=false
 REINSTALL=false
 usage() {
   echo "用法: sudo bash setup-rustdesk-server.sh [--websocket] [--reinstall]" >&2
-  echo "  --websocket  额外放行 WebSocket 端口 TCP 21118-21119（host 网络下服务本来就监听）" >&2
+  echo "  --websocket  提示中额外列出 WebSocket 端口 TCP 21118-21119（脚本不改防火墙）" >&2
   echo "  --reinstall  已有部署时先 compose down（数据目录和密钥保留）再重新部署" >&2
 }
 
@@ -81,34 +81,16 @@ compose() {
   "${COMPOSE[@]}" --env-file /dev/null "${COMPOSE_FILES[@]}" "$@"
 }
 
-ADDED_RULES=()
 ATTEMPTED=false
 CLEANED=false
 
-rollback_rules() {
-  if [[ ${#ADDED_RULES[@]} -eq 0 ]]; then
-    return 0
-  fi
-  echo "==> 回滚本次新增的 ufw 规则" >&2
-  local entry action spec
-  for entry in "${ADDED_RULES[@]}"; do
-    action="${entry%% *}"
-    spec="${entry#* }"
-    if ! ufw delete "$action" "$spec" >/dev/null 2>&1; then
-      echo "回滚 ufw 规则失败，请手动执行：ufw delete $action $spec" >&2
-    fi
-  done
-  ADDED_RULES=()
-}
-
 # 退出路径统一走 EXIT trap：fail()/exit 1 这类“函数内 if 分支里的退出”
-# 不会触发 ERR trap，只有 EXIT 能保证撤销本次新增的 ufw 规则、停掉本次启动的容器。
+# 不会触发 ERR trap，只有 EXIT 能保证停掉本次启动的容器。
 cleanup_on_error() {
   if [[ "$CLEANED" == true ]]; then
     return 0
   fi
   CLEANED=true
-  rollback_rules
   if [[ "$ATTEMPTED" != true ]]; then
     return 0
   fi
@@ -217,7 +199,15 @@ check_ports_free() {
     fail "ss -lntup 查询失败，无法确认端口占用。"
   fi
   for port in 21115 21116 21117 21118 21119; do
-    if awk -v p="$port" '$0 ~ (":" p "([^0-9]|$)") { found = 1 } END { exit found ? 0 : 1 }' <<<"$listening"; then
+    # 只解析本地地址列（ss 的第 5 列，形如 0.0.0.0:21115 或 [::]:21115），
+    # 取最后一个冒号后的端口；进程名里的 21115 之类不能算作监听端口。
+    if awk -v p="$port" '
+      NR > 1 {
+        n = split($5, parts, ":")
+        if (parts[n] == p) { found = 1 }
+      }
+      END { exit found ? 0 : 1 }
+    ' <<<"$listening"; then
       fail "端口 $port 已被占用（ss -lntup），拒绝启动。请先释放端口后重试。"
     fi
   done
@@ -329,17 +319,7 @@ if [[ "$PRIV_MODE" != "600" ]]; then
   fail "私钥权限是 $PRIV_MODE，不是 600：$PRIV_KEY"
 fi
 
-# 端口：host 网络下服务自己监听 21115-21119；这里只决定 ufw 放行哪些
-TCP_RULES=("21115:21117/tcp")
-UDP_RULES=("21116/udp")
-if [[ "$ALLOW_WEBSOCKET" == true ]]; then
-  TCP_RULES+=("21118:21119/tcp")
-fi
-
-ufw_status_has_port_rules() {
-  awk '/2111[5-9]/ { found = 1 } END { exit found ? 0 : 1 }' <<<"$1"
-}
-
+# 端口：host 网络下服务自己监听 21115-21119；本脚本不修改防火墙，只打印放行清单。
 ufw_default_incoming() {
   local verbose="$1"
   if [[ "$verbose" =~ Default:\ (deny|reject|allow)\ \(incoming\) ]]; then
@@ -368,42 +348,29 @@ warn_websocket_reachable() {
 EOF
 }
 
-echo "==> 放行端口（容器就绪后，逐条检查失败即退出）"
+warn_ufw_unknown() {
+  cat >&2 <<'EOF'
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+警告：无法确认 UFW 状态，21115-21119 的入站范围需要你自行核对。
+      脚本不会修改防火墙规则；请按完成提示里的端口清单检查 ufw 与云安全组。
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+EOF
+}
+
+# 只读检查：脚本不执行任何 ufw allow/deny，也不回滚规则。
+echo "==> 检查防火墙状态（只提示，不修改规则）"
 if command -v ufw >/dev/null 2>&1; then
   if ! UFW_STATUS=$(ufw status 2>/dev/null); then
-    fail "ufw status 查询失败，无法确认端口放行状态；请修复 ufw 后重试。"
-  fi
-  if [[ "$UFW_STATUS" == *"Status: active"* ]]; then
+    warn_ufw_unknown
+  elif [[ "$UFW_STATUS" == *"Status: active"* ]]; then
     if ! UFW_VERBOSE=$(ufw status verbose 2>/dev/null); then
-      fail "ufw status verbose 查询失败，无法确认默认入站策略；请修复 ufw 后重试。"
-    fi
-    DEFAULT_IN=$(ufw_default_incoming "$UFW_VERBOSE")
-    if ufw_status_has_port_rules "$UFW_STATUS"; then
-      echo "警告：ufw 已有涉及 21115-21119 的规则，本次不追加。" >&2
-      echo "      请自行核对放行范围应为 TCP 21115-21117、UDP 21116。" >&2
-      if [[ "$DEFAULT_IN" == "allow" ]]; then
-        warn_websocket_reachable
-      fi
+      warn_ufw_unknown
     else
-      for rule in "${TCP_RULES[@]}" "${UDP_RULES[@]}"; do
-        if ufw allow "$rule" >/dev/null 2>&1; then
-          ADDED_RULES+=("allow $rule")
-        else
-          echo "ufw allow $rule 失败。" >&2
-          exit 1
-        fi
-      done
-      if [[ "$ALLOW_WEBSOCKET" != true && "$DEFAULT_IN" != "allow" ]]; then
-        if ufw deny 21118:21119/tcp >/dev/null 2>&1; then
-          ADDED_RULES+=("deny 21118:21119/tcp")
-          echo "    已额外阻断 WebSocket 端口：21118:21119/tcp"
-        else
-          echo "ufw deny 21118:21119/tcp 失败。" >&2
-          exit 1
-        fi
-      fi
+      DEFAULT_IN=$(ufw_default_incoming "$UFW_VERBOSE")
       if [[ "$DEFAULT_IN" == "allow" ]]; then
         warn_websocket_reachable
+      else
+        echo "UFW 已启用，默认入站为 $DEFAULT_IN。脚本不会修改规则，请按完成提示核对放行端口。"
       fi
     fi
   else
@@ -412,6 +379,31 @@ if command -v ufw >/dev/null 2>&1; then
 else
   warn_ufw_not_enabled
 fi
+
+print_port_guidance() {
+  local tcp_list="21115-21117"
+  if [[ "$ALLOW_WEBSOCKET" == true ]]; then
+    tcp_list="21115-21119"
+  fi
+  echo "需要放行的端口（脚本不会代跑 ufw，请自行确认）："
+  echo "  TCP: $tcp_list"
+  echo "  UDP: 21116"
+  if [[ "$ALLOW_WEBSOCKET" == true ]]; then
+    echo "  已含 WebSocket：TCP 21118-21119"
+  fi
+  cat <<EOF
+ufw 示例：
+  sudo ufw allow 21115:21117/tcp
+  sudo ufw allow 21116/udp
+EOF
+  if [[ "$ALLOW_WEBSOCKET" == true ]]; then
+    echo "  sudo ufw allow 21118:21119/tcp"
+  fi
+  cat <<EOF
+云安全组建议：只放行 TCP $tcp_list、UDP 21116。
+未启用 UFW 或默认入站为 allow 时，安全组是唯一防线。
+EOF
+}
 
 detect_public_ip() {
   local ip=""
@@ -442,10 +434,7 @@ else
   echo "ID 服务器 / 中继服务器: 未能自动探测，请用服务器公网 IP 或域名手动填写"
 fi
 echo "Key: $KEY"
-if [[ "$ALLOW_WEBSOCKET" == true ]]; then
-  echo "端口: TCP 21115-21119、UDP 21116（已启用 WebSocket）"
-  echo "提醒: 云厂商安全组也要放行 TCP 21115-21119、UDP 21116"
-else
-  echo "端口: TCP 21115-21117、UDP 21116"
-  echo "提醒: 云厂商安全组也要放行 TCP 21115-21117、UDP 21116；需要 WebSocket 时用 --websocket 重跑"
+if [[ "$ALLOW_WEBSOCKET" != true ]]; then
+  echo "提示: 需要 WebSocket 时用 --websocket 重跑，提示会额外列出 TCP 21118-21119。"
 fi
+print_port_guidance
