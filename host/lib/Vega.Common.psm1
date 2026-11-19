@@ -227,6 +227,7 @@ function Install-VegaPackage {
         'install', '--id', $PackageId, '-e', '--silent',
         '--accept-package-agreements', '--accept-source-agreements'
     )
+    if ($Force) { $arguments += '--force' }
     $result = Invoke-VegaWinget -ArgumentList $arguments -TimeoutSeconds 1800
     if ($result.ExitCode -ne 0) {
         throw "安装 $DisplayName 失败（winget 退出码 $($result.ExitCode)）。可手动执行：winget install --id $PackageId -e"
