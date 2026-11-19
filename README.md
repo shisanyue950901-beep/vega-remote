@@ -52,7 +52,9 @@ cd server && sudo bash setup-rustdesk-server.sh
 
 脚本输出服务器地址和 Key，填到两端 RustDesk 的「ID/中继服务器」里即可。
 
-镜像固定为 `rustdesk/rustdesk-server:1.1.16`，部署与 CI 使用同一份 `server/docker-compose.yml`。默认只放行桌面客户端需要的 TCP 21115-21117 与 UDP 21116；需要 WebSocket 时用 `sudo bash setup-rustdesk-server.sh --websocket` 额外放行 21118/21119。脚本不会用 `curl | sh` 安装 Docker：没装时会提示按官方文档用软件源安装后重新运行。
+镜像固定为 `rustdesk/rustdesk-server:1.1.16`，部署与 CI 使用同一份 `server/docker-compose.yml`。容器用 `network_mode: host`，不发布端口：Docker 的端口发布走 DNAT，不经过 UFW 的 INPUT 规则，等于绕过入站限制；host 网络下端口由服务自己监听，ufw 规则才真正生效。默认只放行桌面客户端需要的 TCP 21115-21117 与 UDP 21116；需要 WebSocket 时用 `sudo bash setup-rustdesk-server.sh --websocket` 额外放行 21118/21119。脚本不会用 `curl | sh` 安装 Docker：没装时会提示按官方文档用软件源安装后重新运行。
+
+未安装或未启用 UFW 时，脚本会打印醒目警告：**「未检测到启用的 UFW，21115-21119 将直接暴露，请在云厂商安全组只放行 TCP 21115-21117、UDP 21116」**。这种情况下安全组就是唯一防线，务必按提示收紧。
 
 ## 诊断
 

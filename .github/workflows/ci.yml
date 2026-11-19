@@ -92,7 +92,16 @@ jobs:
         run: shellcheck server/setup-rustdesk-server.sh
 
       - name: docker compose config
-        run: docker compose -f server/docker-compose.yml config
+        run: |
+          # 只用 server/docker-compose.yml 一份文件（WebSocket 覆盖文件已删除）
+          docker compose -f server/docker-compose.yml config > compose.rendered.yml
+          cat compose.rendered.yml
+          # host 网络 + 不发布端口：Docker 端口发布走 DNAT，会绕过 UFW 入站规则
+          grep -q 'network_mode: host' compose.rendered.yml
+          if grep -q 'published:' compose.rendered.yml; then
+            echo 'compose 里不应出现 ports 发布（host 网络）'
+            exit 1
+          fi
 
       - name: 部署脚本失败路径（非 root 应拒绝且无副作用）
         run: |
