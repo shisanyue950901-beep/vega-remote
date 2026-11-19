@@ -281,6 +281,135 @@ Describe 'P1-1 工作根创建与 ACL 校验' {
     }
 }
 
+Describe 'P1 工作根与 GUID 子目录统一校验' {
+    It '校验函数要求路径确实是个目录，缺失或文件都中止' {
+        $file = Join-Path $TestDrive 'not-a-dir'
+        Set-Content -LiteralPath $file -Value 'x' -Encoding UTF8
+
+        { Assert-VegaBootstrapProtectedDirectory -Path $file } | Should -Throw '*不存在或不是目录*'
+        { Assert-VegaBootstrapProtectedDirectory -Path (Join-Path $TestDrive 'no-such-dir') } | Should -Throw '*不存在或不是目录*'
+        { Assert-VegaBootstrapProtectedDirectory -Path '' } | Should -Throw '*路径为空*'
+    }
+
+    It '校验函数拒绝重解析点与不可信 ACL' {
+        Mock Test-VegaBootstrapReparsePoint { $true }
+        { Assert-VegaBootstrapProtectedDirectory -Path $TestDrive } | Should -Throw '*重解析点*'
+
+        Mock Test-VegaBootstrapReparsePoint { $false }
+        Mock Test-VegaBootstrapDirectoryAclTrusted { $false }
+        { Assert-VegaBootstrapProtectedDirectory -Path $TestDrive } |
+            Should -Throw '*请以管理员身份删除或修复该目录后重试*'
+    }
+
+    It '新建目录后无论创建调用成功与否都过同一个校验函数' {
+        Mock Test-VegaBootstrapWindows { $false }
+        Mock Assert-VegaBootstrapProtectedDirectory { }
+        $path = Join-Path $TestDrive 'new-root'
+
+        New-VegaBootstrapProtectedDirectory -Path $path -Confirm:$false | Should -Be $path
+        Should -Invoke Assert-VegaBootstrapProtectedDirectory -Times 1 -Exactly -ParameterFilter {
+            $Path -eq $path
+        }
+    }
+
+    It '创建调用报错时不直接放行，校验不通过即中止' {
+        Mock Test-VegaBootstrapWindows { $false }
+        Mock New-Item { throw '建目录炸了' } -ParameterFilter { $ItemType -eq 'Directory' }
+        $path = Join-Path $TestDrive 'create-failed'
+
+        $record = $null
+        try { New-VegaBootstrapProtectedDirectory -Path $path -Confirm:$false } catch { $record = $_ }
+        $record | Should -Not -BeNullOrEmpty
+        $record.Exception.Message | Should -Match '创建受保护目录失败'
+        $record.Exception.Message | Should -Match '建目录炸了'
+        $record.Exception.Message | Should -Match '不存在或不是目录'
+    }
+
+    It '创建调用成功但目录不可信时仍然中止' {
+        Mock Test-VegaBootstrapWindows { $false }
+        Mock Test-VegaBootstrapDirectoryAclTrusted { $false }
+        $path = Join-Path $TestDrive 'untrusted-root'
+        $null = New-Item -ItemType Directory -Path $path -Force
+
+        { Assert-VegaBootstrapProtectedDirectory -Path $path } |
+            Should -Throw '*请以管理员身份删除或修复该目录后重试*'
+    }
+
+    It '已存在的工作根与新建走同一个校验函数' {
+        $root = Join-Path $TestDrive 'existing-root'
+        $null = New-Item -ItemType Directory -Path $root -Force
+        Mock Assert-VegaBootstrapProtectedDirectory { }
+
+        Initialize-VegaBootstrapProtectedRoot -Path $root | Should -Be $root
+        Should -Invoke Assert-VegaBootstrapProtectedDirectory -Times 1 -Exactly -ParameterFilter {
+            $Path -eq $root
+        }
+    }
+
+    It 'GUID 子目录创建后逐级复验工作根与子目录' {
+        Mock Assert-VegaBootstrapWorkTree { }
+        $work = New-VegaBootstrapWorkDirectory -Root $TestDrive
+
+        Should -Invoke Assert-VegaBootstrapWorkTree -Times 1 -Exactly -ParameterFilter {
+            $RootPath -eq $TestDrive -and $WorkDirectory -eq $work
+        }
+    }
+
+    It '逐级复验先查工作根再查子目录，子目录不通过即中止' {
+        Mock Assert-VegaBootstrapProtectedDirectory { }
+        $null = Assert-VegaBootstrapWorkTree -RootPath (Join-Path $TestDrive 'root') -WorkDirectory (Join-Path $TestDrive 'root/guid')
+        Should -Invoke Assert-VegaBootstrapProtectedDirectory -Times 2 -Exactly
+
+        Mock Assert-VegaBootstrapProtectedDirectory { throw '子目录不安全' } -ParameterFilter { $Path -like '*guid*' }
+        { Assert-VegaBootstrapWorkTree -RootPath (Join-Path $TestDrive 'root') -WorkDirectory (Join-Path $TestDrive 'root/guid') } |
+            Should -Throw '*子目录不安全*'
+    }
+}
+
+Describe 'P2-1 带 ACL 建目录按运行时分支' {
+    It 'PS7/.NET Core 有 FileSystemAclExtensions 时用 (security, path) 重载' {
+        Mock Test-VegaBootstrapAclExtensionsAvailable { $true }
+        Mock New-VegaBootstrapAclDirectory { }
+        Mock New-VegaBootstrapLegacyDirectory { }
+
+        New-VegaBootstrapDirectoryWithAcl -Path 'P' -Security 'S' | Should -Be 'P'
+        Should -Invoke New-VegaBootstrapAclDirectory -Times 1 -Exactly -ParameterFilter {
+            $Path -eq 'P' -and $Security -eq 'S'
+        }
+        Should -Invoke New-VegaBootstrapLegacyDirectory -Times 0 -Exactly
+    }
+
+    It '5.1 没有该类型时退回 Directory.CreateDirectory(path, security)' {
+        Mock Test-VegaBootstrapAclExtensionsAvailable { $false }
+        Mock New-VegaBootstrapAclDirectory { }
+        Mock New-VegaBootstrapLegacyDirectory { }
+
+        New-VegaBootstrapDirectoryWithAcl -Path 'P' -Security 'S' | Should -Be 'P'
+        Should -Invoke New-VegaBootstrapLegacyDirectory -Times 1 -Exactly -ParameterFilter {
+            $Path -eq 'P' -and $security -eq 'S'
+        }
+        Should -Invoke New-VegaBootstrapAclDirectory -Times 0 -Exactly
+    }
+
+    It '两个重载各自按正确参数顺序调用' {
+        $script:ScriptText | Should -Match [regex]::Escape('[System.IO.FileSystemAclExtensions]::CreateDirectory($Security, $Path)')
+        $script:ScriptText | Should -Match [regex]::Escape('[System.IO.Directory]::CreateDirectory($Path, $security)')
+        $script:ScriptText | Should -Match 'Test-VegaBootstrapAclExtensionsAvailable'
+    }
+}
+
+Describe 'P3-2 资产名白名单用 \A...\z 与 -cmatch' {
+    It '%0A 与 %20 解码后仍被拒绝' {
+        { Get-VegaBootstrapAssetName -Uri 'https://example.com/vega%0A.zip' } | Should -Throw '*资产文件名无效*'
+        { Get-VegaBootstrapAssetName -Uri 'https://example.com/vega%20.zip' } | Should -Throw '*资产文件名无效*'
+    }
+
+    It '白名单用 \A...\z 且按大小写敏感比较' {
+        $script:ScriptText | Should -Match ([regex]::Escape('\A[A-Za-z0-9._-]+\z'))
+        $script:ScriptText | Should -Match '\$leaf -cnotmatch'
+    }
+}
+
 Describe 'Invoke-VegaBootstrap' {
     BeforeEach {
         Mock Test-VegaBootstrapAdmin { $true }
@@ -303,6 +432,24 @@ Describe 'Invoke-VegaBootstrap' {
             [pscustomobject]@{ ExtractRoot = (Join-Path $TestDrive 'extract'); Installer = 'C:\vega\host\install-host.ps1' }
         }
         Mock Invoke-VegaBootstrapInstaller { }
+        Mock Assert-VegaBootstrapWorkTree { }
+    }
+
+    It '解压后、执行前逐级复验工作根到 GUID 子目录' {
+        $script:Order = New-Object System.Collections.Generic.List[string]
+        Mock Expand-VegaBootstrapArchive {
+            $script:Order.Add('extract')
+            [pscustomobject]@{ ExtractRoot = (Join-Path $TestDrive 'extract'); Installer = 'C:\vega\host\install-host.ps1' }
+        }
+        Mock Assert-VegaBootstrapWorkTree { $script:Order.Add('verify') }
+        Mock Invoke-VegaBootstrapInstaller { $script:Order.Add('run') }
+
+        Invoke-VegaBootstrap -Role 'host' -WorkRoot $TestDrive -Confirm:$false
+
+        ($script:Order -join ',') | Should -Be 'extract,verify,run'
+        Should -Invoke Assert-VegaBootstrapWorkTree -Times 1 -Exactly -ParameterFilter {
+            $RootPath -eq $TestDrive -and $WorkDirectory -eq (Join-Path $TestDrive 'work-1')
+        }
     }
 
     It '下载到内存、校验、写入受保护目录、从受保护目录执行，最后删除工作目录' {
