@@ -202,12 +202,20 @@ if ($rustDeskService) {
     }
 }
 
+# 服务存在时实际生效的是 LocalService 配置；一致性检查以它为准，用户配置只作参考。
+$rustDeskEffective = $rustDeskActual
+$rustDeskEffectiveName = '用户配置'
+if ($rustDeskService) {
+    $rustDeskEffective = [string]$rustDeskSummary.ServiceServer
+    $rustDeskEffectiveName = '服务配置'
+}
+
 if ($null -ne $rustDeskExpected) {
-    if ($rustDeskActual -eq $rustDeskExpected.Server) {
-        Write-Host "与 vega.config.json 一致: $($rustDeskExpected.Server)" -ForegroundColor Green
+    if ($rustDeskEffective -eq $rustDeskExpected.Server) {
+        Write-Host "与 vega.config.json 一致（$rustDeskEffectiveName）: $($rustDeskExpected.Server)" -ForegroundColor Green
     }
     else {
-        Write-Host "与 vega.config.json 不一致：期望 $($rustDeskExpected.Server)，实际 $(if ($rustDeskActual) { $rustDeskActual } else { '未配置' })" -ForegroundColor Yellow
+        Write-Host ("与 vega.config.json 不一致（{0}）：期望 {1}，实际 {2}" -f $rustDeskEffectiveName, $rustDeskExpected.Server, $(if ($rustDeskEffective) { $rustDeskEffective } else { '未配置' })) -ForegroundColor Yellow
     }
 }
 
@@ -331,8 +339,9 @@ $facts = @{
     Ipv6                 = $ipv6
     TailscaleInstalled   = $tailscaleInstalled
     Peer                 = $Peer
-    RustDeskTomlServer   = $rustDeskActual
+    RustDeskTomlServer    = $rustDeskEffective
     RustDeskServiceServer = $rustDeskSummary.ServiceServer
+    RustDeskServicePresent = [bool]$rustDeskService
     RustDeskDeviceId     = $rustDeskDeviceId
 }
 

@@ -661,7 +661,7 @@ function Write-VegaLegacyStateWarning {
 function Test-VegaManagedHostStatePath {
     <#
       是否是被控端机器级清单（%ProgramData%\Vega\host-state.json）。
-      只有这个路径才强制所有权校验；测试/诊断用的临时路径不校验所有者。
+      只有机器级清单才强制所有权校验；测试/诊断用的临时路径不校验所有者。
     #>
     [CmdletBinding()]
     param(
@@ -677,6 +677,40 @@ function Test-VegaManagedHostStatePath {
     catch {
         return ($Path -eq $expected)
     }
+}
+
+function Test-VegaManagedServiceStatePath {
+    <#
+      是否是服务模式记录专用的管理员清单（%ProgramData%\Vega\state.json）。
+      用户可写的 client-state.json 永远不匹配这个路径。
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()]
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $expected = Get-VegaRustDeskServiceStatePath
+    try {
+        return ([System.IO.Path]::GetFullPath($Path) -eq [System.IO.Path]::GetFullPath($expected))
+    }
+    catch {
+        return ($Path -eq $expected)
+    }
+}
+
+function Test-VegaManagedStatePath {
+    <#
+      是否需要按机器级清单对待：host-state.json 或服务模式 state.json。
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()]
+        [string]$Path
+    )
+
+    return ((Test-VegaManagedHostStatePath -Path $Path) -or (Test-VegaManagedServiceStatePath -Path $Path))
 }
 
 function Test-VegaReparsePoint {
@@ -850,7 +884,9 @@ function Read-VegaState {
 
     $state = Get-VegaEmptyState
 
-    if (Test-VegaManagedHostStatePath -Path $Path) {
+    $managedHost = Test-VegaManagedHostStatePath -Path $Path
+    $managedService = Test-VegaManagedServiceStatePath -Path $Path
+    if ($managedHost -or $managedService) {
         if (-not (Test-VegaStatePathTrusted -Path $Path)) {
             throw "状态清单不可信（目录/文件所有者不是 Administrators/SYSTEM 或是重解析点），拒绝读取：$Path"
         }
@@ -875,7 +911,14 @@ function Read-VegaState {
     if ($null -eq $data) { return $state }
 
     $properties = @($data.PSObject.Properties.Name)
-    if ($properties -contains 'SchemaVersion') { $state.SchemaVersion = [int]$data.SchemaVersion }
+    $hasSchemaVersion = ($properties -contains 'SchemaVersion')
+    if ($hasSchemaVersion) { $state.SchemaVersion = [int]$data.SchemaVersion }
+
+    # %ProgramData%\Vega\state.json 在 v0.1 是旧版清单，没有 SchemaVersion。
+    # 只有 SchemaVersion >= 2 的才是本版的服务模式记录；旧文件不读取、不回滚。
+    if ($managedService -and (-not $hasSchemaVersion -or $state.SchemaVersion -lt 2)) {
+        return (Get-VegaEmptyState)
+    }
     foreach ($name in @('Packages', 'FirewallRules', 'DisabledFirewallRules', 'Services', 'ManagedConfigKeys', 'RustDeskConfigKeys')) {
         if ($properties -contains $name) { $state.$name = @($data.$name) }
     }
@@ -901,7 +944,7 @@ function Write-VegaState {
 
     if (-not $PSCmdlet.ShouldProcess($Path, '写入状态清单')) { return $Path }
 
-    if (Test-VegaManagedHostStatePath -Path $Path) {
+    if (Test-VegaManagedStatePath -Path $Path) {
         $null = Initialize-VegaStateDirectory -Path $Path
     }
 
@@ -3490,6 +3533,7 @@ function Get-VegaDoctorAdvice {
     if ($Facts.ContainsKey('RustDeskServiceServer') -and $null -ne $Facts['RustDeskServiceServer']) {
         $rustDeskServiceServer = [string]$Facts['RustDeskServiceServer']
     }
+    $rustDeskServicePresent = ($Facts.ContainsKey('RustDeskServicePresent') -and [bool]$Facts['RustDeskServicePresent'])
 
     # RustDesk 服务存在时实际生效的是 LocalService 配置：两份不一致要明确提示。
     if (-not [string]::IsNullOrWhiteSpace($rustDeskServiceServer) -and
@@ -3497,23 +3541,28 @@ function Get-VegaDoctorAdvice {
         $rustDeskServiceServer -ne $rustDeskActual) {
         $advice.Add(("RustDesk 用户配置指向 {0}，服务配置指向 {1}：服务模式实际使用后者，需重新运行安装脚本以管理员身份写入。" -f $rustDeskActual, $rustDeskServiceServer))
     }
-    elseif (-not [string]::IsNullOrWhiteSpace($rustDeskServiceServer) -and -not [string]::IsNullOrWhiteSpace($rustDeskExpected) -and $rustDeskServiceServer -ne $rustDeskExpected) {
-        $advice.Add(("RustDesk 服务配置指向 {0}，与配置的 {1} 不一致：以管理员身份重新运行安装脚本。" -f $rustDeskServiceServer, $rustDeskExpected))
+
+    # 服务存在时以服务配置为准；用户配置只作参考，不能因为用户配置对就判定“配置正确”。
+    $rustDeskTarget = $rustDeskActual
+    $rustDeskTargetName = 'RustDesk2.toml'
+    if ($rustDeskServicePresent) {
+        $rustDeskTarget = $rustDeskServiceServer
+        $rustDeskTargetName = 'RustDesk 服务配置'
     }
 
     if (-not [string]::IsNullOrWhiteSpace($rustDeskExpected)) {
-        if ([string]::IsNullOrWhiteSpace($rustDeskActual)) {
-            $advice.Add(("RustDesk2.toml 没有配置 custom-rendezvous-server（期望 {0}）：重新运行安装脚本并带 -RustDeskServer / -RustDeskKey。" -f $rustDeskExpected))
+        if ([string]::IsNullOrWhiteSpace($rustDeskTarget)) {
+            $advice.Add(("{0} 没有配置 custom-rendezvous-server（期望 {1}）：重新运行安装脚本并带 -RustDeskServer / -RustDeskKey。" -f $rustDeskTargetName, $rustDeskExpected))
         }
-        elseif ($rustDeskActual -ne $rustDeskExpected) {
-            $advice.Add(("RustDesk2.toml 指向 {0}，与配置的 {1} 不一致：重新运行安装脚本写入正确的中继地址。" -f $rustDeskActual, $rustDeskExpected))
+        elseif ($rustDeskTarget -ne $rustDeskExpected) {
+            $advice.Add(("{0} 指向 {1}，与配置的 {2} 不一致：重新运行安装脚本写入正确的中继地址。" -f $rustDeskTargetName, $rustDeskTarget, $rustDeskExpected))
         }
         else {
-            $advice.Add(("RustDesk 中继配置正确：{0}。" -f $rustDeskActual))
+            $advice.Add(("RustDesk 中继配置正确：{0}。" -f $rustDeskTarget))
         }
     }
-    elseif (-not [string]::IsNullOrWhiteSpace($rustDeskActual)) {
-        $advice.Add(("RustDesk 当前中继：{0}（没有在 vega.config.json 里配置期望值，跳过一致性检查）。" -f $rustDeskActual))
+    elseif (-not [string]::IsNullOrWhiteSpace($rustDeskTarget)) {
+        $advice.Add(("RustDesk 当前中继：{0}（没有在 vega.config.json 里配置期望值，跳过一致性检查）。" -f $rustDeskTarget))
     }
 
     if (-not [string]::IsNullOrWhiteSpace($rustDeskExpected) -and [string]::IsNullOrWhiteSpace($rustDeskDevice)) {
@@ -4216,7 +4265,16 @@ function Set-VegaRustDeskConfig {
         if ($isServiceTarget) {
             $targetStatePath = $ServiceStatePath
             if (-not [string]::Equals($targetStatePath, $StatePath, [StringComparison]::OrdinalIgnoreCase)) {
-                $targetState = Read-VegaState -Path $targetStatePath
+                try {
+                    $targetState = Read-VegaState -Path $targetStatePath
+                }
+                catch {
+                    # 管理员清单不可信/读不了：不动服务配置，也不把它记进用户清单。
+                    $message = "读取服务模式记录清单失败，跳过服务配置：$($_.Exception.Message)"
+                    $warnings.Add($message)
+                    Write-Warning $message
+                    continue
+                }
             }
         }
 
@@ -4380,7 +4438,7 @@ function Restore-VegaRustDeskState {
         }
 
         $records = New-Object System.Collections.Generic.List[object]
-        foreach ($record in @(Get-VegaStateRustDeskKey -State $State -Path $configPath | Where-Object { -not [bool]$_.Restored })) {
+        foreach ($record in @(Get-VegaStateRustDeskKey -State $State -Path $configPath)) {
             if ($null -eq $record) { continue }
             if ($managedKeys -cnotcontains [string]$record.Key) {
                 $message = "忽略清单里的非受管 RustDesk 键：$([string]$record.Key)"
@@ -4388,6 +4446,7 @@ function Restore-VegaRustDeskState {
                 Write-Warning $message
                 continue
             }
+            if ([bool]$record.Restored) { continue }
             $records.Add($record)
         }
 
@@ -5215,11 +5274,17 @@ function Invoke-VegaHostUninstallCore {
     Write-VegaStatus '回滚 RustDesk 服务模式配置（管理员清单）'
     $serviceStatePath = Get-VegaRustDeskServiceStatePath
     if (Test-Path -LiteralPath $serviceStatePath -PathType Leaf) {
-        $serviceState = Read-VegaState -Path $serviceStatePath
-        $serviceRestore = Restore-VegaRustDeskState -State $serviceState -StatePath $serviceStatePath -ServiceMode -Confirm:$false
-        foreach ($message in @($serviceRestore.Messages)) { Write-VegaStatus $message }
-        foreach ($failure in @($serviceRestore.Failures)) {
-            $failures.Add([string]$failure)
+        try {
+            $serviceState = Read-VegaState -Path $serviceStatePath
+            $serviceRestore = Restore-VegaRustDeskState -State $serviceState -StatePath $serviceStatePath -ServiceMode -Confirm:$false
+            foreach ($message in @($serviceRestore.Messages)) { Write-VegaStatus $message }
+            foreach ($failure in @($serviceRestore.Failures)) {
+                $failures.Add([string]$failure)
+                Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
+            }
+        }
+        catch {
+            $failures.Add("服务模式记录清单不可用，跳过回滚：$($_.Exception.Message)")
             Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
         }
     }
@@ -5505,11 +5570,17 @@ function Invoke-VegaClientUninstallCore {
     $serviceStatePath = Get-VegaRustDeskServiceStatePath
     if (Test-VegaProcessElevated) {
         if (Test-Path -LiteralPath $serviceStatePath -PathType Leaf) {
-            $serviceState = Read-VegaState -Path $serviceStatePath
-            $serviceRestore = Restore-VegaRustDeskState -State $serviceState -StatePath $serviceStatePath -ServiceMode -Confirm:$false
-            foreach ($message in @($serviceRestore.Messages)) { Write-VegaStatus $message }
-            foreach ($failure in @($serviceRestore.Failures)) {
-                $failures.Add([string]$failure)
+            try {
+                $serviceState = Read-VegaState -Path $serviceStatePath
+                $serviceRestore = Restore-VegaRustDeskState -State $serviceState -StatePath $serviceStatePath -ServiceMode -Confirm:$false
+                foreach ($message in @($serviceRestore.Messages)) { Write-VegaStatus $message }
+                foreach ($failure in @($serviceRestore.Failures)) {
+                    $failures.Add([string]$failure)
+                    Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
+                }
+            }
+            catch {
+                $failures.Add("服务模式记录清单不可用，跳过回滚：$($_.Exception.Message)")
                 Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
             }
         }
@@ -5606,6 +5677,8 @@ Export-ModuleMember -Function @(
     'Get-VegaLegacyStatePath',
     'Write-VegaLegacyStateWarning',
     'Test-VegaManagedHostStatePath',
+    'Test-VegaManagedServiceStatePath',
+    'Test-VegaManagedStatePath',
     'Test-VegaReparsePoint',
     'Get-VegaPathOwnerSid',
     'Test-VegaStatePathTrusted',
