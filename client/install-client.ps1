@@ -24,6 +24,13 @@
 .PARAMETER Force
   已安装时仍重新执行 winget install。
 
+.PARAMETER RustDeskServer
+  RustDesk 中继服务器地址（主机名/IPv4/IPv6，可带 :端口）。必须与 -RustDeskKey 同时提供；
+  都不提供时读取仓库根目录可选的 vega.config.json，仍没有就跳过并提示。
+
+.PARAMETER RustDeskKey
+  RustDesk 中继公钥（base64 样式，约 44 字符）。脚本不接收、不保存任何密码。
+
 .EXAMPLE
   .\install-client.ps1
 
@@ -36,7 +43,9 @@ param(
     [switch]$WithRustDesk,
     [switch]$Uninstall,
     [switch]$RemoveApps,
-    [switch]$Force
+    [switch]$Force,
+    [string]$RustDeskServer = '',
+    [string]$RustDeskKey = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -53,7 +62,8 @@ try {
         $result = Invoke-VegaClientUninstall -SkipTailscale:$SkipTailscale -WithRustDesk:$WithRustDesk -RemoveApps:$RemoveApps -Confirm:$false
     }
     else {
-        $result = Invoke-VegaClientInstall -SkipTailscale:$SkipTailscale -WithRustDesk:$WithRustDesk -Force:$Force -Confirm:$false
+        $result = Invoke-VegaClientInstall -SkipTailscale:$SkipTailscale -WithRustDesk:$WithRustDesk -Force:$Force `
+            -RustDeskServer $RustDeskServer -RustDeskKey $RustDeskKey -Confirm:$false
     }
 }
 catch {
