@@ -6,11 +6,11 @@
 .DESCRIPTION
   检查并打印：
     - 显卡列表与推荐编码器（NVENC / AMF / QSV）
-    - Sunshine 是否安装、服务状态、版本、配置路径
+    - Sunshine 是否安装、SunshineService 服务状态、版本、配置路径
     - Vega 防火墙规则是否存在
     - 公网 IPv6
     - Tailscale 是否安装、`tailscale status` 摘要
-    - 带 -Peer 时运行 `tailscale ping -c 3 <Peer>`，判断直连还是 DERP 中继
+    - 带 -Peer 时运行 `tailscale ping -c 3 <Peer>`，判断直连 / DERP 中继 / Peer Relay
   最后给出中文结论与建议。
 
   脚本本身不安装、不删除、不改配置，可放心重复运行。
@@ -55,40 +55,29 @@ function Get-VegaGpuName {
     }
 }
 
-function Get-VegaSunshineInstall {
-    $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) |
-        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-    foreach ($root in $roots) {
-        $candidate = Join-Path $root 'Sunshine'
-        $exe = Join-Path $candidate 'sunshine.exe'
-        if (-not (Test-Path -LiteralPath $exe)) { continue }
-
-        $version = ''
-        try {
-            $version = (Get-Item -LiteralPath $exe).VersionInfo.FileVersion
-        }
-        catch {
-            $version = ''
-        }
-
-        return [pscustomobject]@{
-            Directory = $candidate
-            Exe       = $exe
-            Config    = (Join-Path (Join-Path $candidate 'config') 'sunshine.conf')
-            Version   = $version
-        }
+function Get-VegaTailscaleExe {
+    <#
+      优先用默认安装目录的绝对路径，避免走 PATH 上的同名程序。
+    #>
+    if (-not [string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
+        $candidate = Join-Path (Join-Path $env:ProgramFiles 'Tailscale') 'tailscale.exe'
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
     }
+
+    $command = Get-Command tailscale.exe -ErrorAction SilentlyContinue
+    if ($command -and -not [string]::IsNullOrWhiteSpace($command.Source)) { return $command.Source }
+
     return $null
 }
 
-function Get-VegaTailscaleExe {
-    $command = Get-Command tailscale.exe -ErrorAction SilentlyContinue
-    if ($command) { return $command.Source }
-
-    $candidate = Join-Path (Join-Path $env:ProgramFiles 'Tailscale') 'tailscale.exe'
-    if (Test-Path -LiteralPath $candidate) { return $candidate }
-
-    return $null
+function Format-VegaPingPath {
+    param($Pong)
+    switch ($Pong.Mode) {
+        'Direct' { return ('直连({0})' -f $Pong.Endpoint) }
+        'Derp' { return ('DERP({0})' -f $Pong.Region) }
+        'PeerRelay' { return ('PeerRelay({0})' -f $Pong.Region) }
+        default { return '未知' }
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -109,11 +98,10 @@ else {
 $preferred = Select-VegaAdapter -GpuNames $gpuNames -SkipVirtual
 if (-not $preferred) { $preferred = Select-VegaAdapter -GpuNames $gpuNames }
 $encoderName = Get-VegaEncoderName -AdapterName $preferred
-$encoderId = Get-VegaEncoderId -AdapterName $preferred
 
 if ($preferred) {
     Write-Host "推荐显卡: $preferred" -ForegroundColor Green
-    Write-Host "推荐编码器: $encoderName（sunshine.conf 中 encoder 取值：$encoderId）" -ForegroundColor Green
+    Write-Host "推荐编码器: $encoderName（sunshine.conf 不写 encoder，由 Sunshine 自动选择）" -ForegroundColor Green
 }
 else {
     Write-Host '推荐编码器: SOFTWARE（未识别到可用显卡，将由 CPU 软编）' -ForegroundColor Yellow
@@ -142,7 +130,7 @@ else {
 $sunshineServices = @(Get-VegaSunshineService)
 $sunshineRunning = $false
 if ($sunshineServices.Count -eq 0) {
-    Write-Host '服务: 未找到 sunshine 服务'
+    Write-Host '服务: 未找到 SunshineService（旧版为 sunshinesvc）'
 }
 else {
     foreach ($service in $sunshineServices) {
@@ -185,7 +173,7 @@ Write-Section 'Tailscale'
 $tailscaleExe = Get-VegaTailscaleExe
 $tailscaleInstalled = [bool]$tailscaleExe
 if (-not $tailscaleInstalled) {
-    Write-Host '未检测到 Tailscale（tailscale.exe 不在 PATH，也不在默认安装目录）' -ForegroundColor Yellow
+    Write-Host '未检测到 Tailscale（默认安装目录与 PATH 上都没有 tailscale.exe）' -ForegroundColor Yellow
 }
 else {
     Write-Host "已安装: $tailscaleExe"
@@ -226,14 +214,25 @@ if (-not [string]::IsNullOrWhiteSpace($Peer)) {
         foreach ($line in $ping.Output) { Write-Host "  $line" }
 
         if ($pingResult.Succeeded) {
-            if ($pingResult.Mode -eq 'Direct') {
-                Write-Host "结论: 直连（$($pingResult.Endpoint)，$($pingResult.LatencyMs)ms）" -ForegroundColor Green
+            switch ($pingResult.Mode) {
+                'Direct' {
+                    Write-Host "结论: 直连（$($pingResult.Endpoint)，$($pingResult.LatencyMs)ms）" -ForegroundColor Green
+                }
+                'PeerRelay' {
+                    Write-Host "结论: 走 Peer Relay（$($pingResult.Endpoint)，$($pingResult.LatencyMs)ms），不是直连" -ForegroundColor Yellow
+                }
+                'Derp' {
+                    Write-Host "结论: 走 DERP 中继（$($pingResult.Region)）" -ForegroundColor Yellow
+                }
+                default {
+                    Write-Host '结论: 收到 pong，但无法识别连接类型（见上方原始输出）' -ForegroundColor Yellow
+                }
             }
-            else {
-                Write-Host "结论: 走 DERP 中继（$($pingResult.Region)）" -ForegroundColor Yellow
-            }
-            if ($pingResult.DerpCount -gt 0 -and $pingResult.DirectCount -gt 0) {
-                Write-Host "过程: 前 $($pingResult.DerpCount) 次中继，后 $($pingResult.DirectCount) 次直连（打洞成功）"
+
+            # 按 pong 的实际顺序打印路径，不靠计数推断
+            if (@($pingResult.Pongs).Count -gt 1) {
+                $paths = @(foreach ($pong in @($pingResult.Pongs)) { Format-VegaPingPath -Pong $pong })
+                Write-Host ("过程: {0}" -f ($paths -join ' → '))
             }
         }
         else {

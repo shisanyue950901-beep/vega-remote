@@ -31,7 +31,9 @@ Set-ExecutionPolicy -Scope Process Bypass -Force
 .\host\install-host.ps1
 ```
 
-脚本会：安装 Sunshine 和 Tailscale → 写入自适应配置 → 设置 Web 管理账号 → 放行防火墙 → 关闭睡眠。
+脚本会：安装 Sunshine 和 Tailscale → 写入自适应配置 → 只放行串流端口 → 关闭睡眠。
+
+管理密码不在脚本里设置，也不会作为命令行参数传给 Sunshine。装完后在**被控端本机**浏览器打开 <https://localhost:47990>，按页面提示首次设置账号密码。`sunshine.conf` 里的 `origin_web_ui_allowed = pc` 让管理页只接受本机访问，Vega 的防火墙规则也不放行 47990；如果 Sunshine 安装器自带了对 47990 的入站规则，脚本会禁用它并记进状态清单，卸载时恢复。
 
 ### 2. 主控端（你操作的电脑）
 
@@ -40,7 +42,7 @@ Set-ExecutionPolicy -Scope Process Bypass -Force
 .\client\install-client.ps1
 ```
 
-两台电脑登录同一个 Tailscale 账号，打开 Moonlight，添加被控端的 `100.x.x.x` 地址，输入 PIN 配对。
+两台电脑登录同一个 Tailscale 账号，打开 Moonlight，添加被控端的 `100.x.x.x` 地址，输入 PIN 配对（PIN 在刚才设密的管理页里确认）。
 
 ### 3. 备用中继（可选，需要一台 Linux VPS）
 
@@ -49,6 +51,8 @@ cd server && sudo bash setup-rustdesk-server.sh
 ```
 
 脚本输出服务器地址和 Key，填到两端 RustDesk 的「ID/中继服务器」里即可。
+
+镜像固定为 `rustdesk/rustdesk-server:1.1.16`，部署与 CI 使用同一份 `server/docker-compose.yml`。默认只放行桌面客户端需要的 TCP 21115-21117 与 UDP 21116；需要 WebSocket 时用 `sudo bash setup-rustdesk-server.sh --websocket` 额外放行 21118/21119。脚本不会用 `curl | sh` 安装 Docker：没装时会提示按官方文档用软件源安装后重新运行。
 
 ## 诊断
 
@@ -70,22 +74,25 @@ powershell -File .\tools\vega-doctor.ps1 -Peer vega-host
 
 ## 卸载
 
-两个安装脚本都可以反复执行：已安装的组件跳过，防火墙规则先删后建，配置只在第一次修改前备份一次。
-只想恢复原状时用 `-Uninstall`：
+两个安装脚本都可以反复执行：已安装的组件跳过，防火墙规则先删后建，`sunshine.conf` 只更新 Vega 管理的键（`sunshine_name`、`adapter_name`、`dd_*`、`origin_web_ui_allowed`、`address_family`），你后来加的端口、凭据、配对路径等键原样保留。
+
+安装时会写一份状态清单 `%ProgramData%\Vega\state.json`，记录 Vega 实际安装的包、创建的备份、禁用的安装器防火墙规则、服务的原始启动类型。卸载只按清单回滚：
 
 ```powershell
-# 被控端：删除 Vega 防火墙规则，恢复 sunshine.conf.bak（若存在），停止 Sunshine 服务
+# 被控端：删除 Vega 防火墙规则、恢复安装器规则、恢复配置与服务启动类型
 Set-ExecutionPolicy -Scope Process Bypass -Force
 .\host\install-host.ps1 -Uninstall
 
-# 被控端：连组件一起卸载（winget 卸载 Sunshine / Tailscale，加 -WithRustDesk 时也卸 RustDesk）
+# 被控端：连组件一起卸载（只卸清单里由 Vega 装的；你原来就有的应用不动）
 .\host\install-host.ps1 -Uninstall -RemoveApps
 
-# 主控端：卸载 Moonlight / Tailscale（加 -WithRustDesk 时也卸 RustDesk）
+# 主控端：卸载清单里由 Vega 安装的组件（加 -WithRustDesk 时也卸 RustDesk）
 .\client\install-client.ps1 -Uninstall -RemoveApps
 ```
 
-`-Uninstall` 不会改动睡眠/电源设置，也不会删除 Sunshine 安装目录里未备份的文件；`-RemoveApps` 才会调用 winget 卸载组件。
+如果 `sunshine.conf` 在安装后被手动改过，卸载会报告冲突并保留现状（备份文件仍在），不会覆盖你的修改。`-Uninstall` 不会改动睡眠/电源设置，也不会删除 Sunshine 安装目录。
+
+旧版本装的机器没有状态清单：此时卸载只清理 Vega 自己命名的防火墙规则，其余保持现状，避免误伤。
 
 ## 推荐设置
 

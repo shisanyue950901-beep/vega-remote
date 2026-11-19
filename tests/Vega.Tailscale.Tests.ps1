@@ -90,4 +90,46 @@ Describe 'ConvertFrom-VegaTailscalePing' {
         $result.PongCount | Should -Be 1
         $result.Mode | Should -Be 'Direct'
     }
+
+    It 'Peer Relay 识别为 PeerRelay，不冒充直连' {
+        $output = @(
+            'pong from vega-host (100.64.0.2) via peer-relay(100.64.0.9:41641) in 30ms'
+        )
+        $result = ConvertFrom-VegaTailscalePing -Output $output
+
+        $result.Succeeded | Should -BeTrue
+        $result.Mode | Should -Be 'PeerRelay'
+        $result.PeerRelayCount | Should -Be 1
+        $result.DirectCount | Should -Be 0
+        $result.DerpCount | Should -Be 0
+        $result.Endpoint | Should -Be 'peer-relay(100.64.0.9:41641)'
+        $result.Region | Should -Be '100.64.0.9:41641'
+    }
+
+    It '混合路径保留 pong 的实际顺序' {
+        $output = @(
+            'pong from vega-host (100.64.0.2) via DERP(tok) in 120ms',
+            'pong from vega-host (100.64.0.2) via peer-relay(100.64.0.9:41641) in 60ms',
+            'pong from vega-host (100.64.0.2) via 198.51.100.9:41641 in 20ms'
+        )
+        $result = ConvertFrom-VegaTailscalePing -Output $output
+
+        $modes = @($result.Pongs | ForEach-Object { $_.Mode })
+        $modes | Should -Be @('Derp', 'PeerRelay', 'Direct')
+        $result.Mode | Should -Be 'Direct'
+        $result.DerpCount | Should -Be 1
+        $result.PeerRelayCount | Should -Be 1
+        $result.DirectCount | Should -Be 1
+    }
+
+    It '只有 Peer Relay 时结论就是 PeerRelay' {
+        $output = @(
+            'pong from vega-host (100.64.0.2) via peer-relay(100.64.0.9:41641) in 60ms',
+            'pong from vega-host (100.64.0.2) via DERP(tok) in 90ms'
+        )
+        $result = ConvertFrom-VegaTailscalePing -Output $output
+
+        $result.Mode | Should -Be 'Derp'
+        $result.PeerRelayCount | Should -Be 1
+    }
 }

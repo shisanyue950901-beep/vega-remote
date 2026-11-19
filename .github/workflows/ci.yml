@@ -9,19 +9,18 @@ permissions:
   contents: read
 
 jobs:
-  powershell:
-    name: PSScriptAnalyzer + Pester (Windows)
+  lint:
+    name: PSScriptAnalyzer
     runs-on: windows-latest
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 安装 PSScriptAnalyzer 与 Pester 5
+      - name: 安装 PSScriptAnalyzer
         shell: pwsh
         run: |
           Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
           Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -MinimumVersion 1.21.0
-          Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.5.0 -SkipPublisherCheck
 
       - name: PSScriptAnalyzer（Error / Warning）
         shell: pwsh
@@ -36,7 +35,20 @@ jobs:
           }
           Write-Host 'PSScriptAnalyzer 通过'
 
-      - name: Pester（PowerShell 7）
+  pester-pwsh:
+    name: Pester（PowerShell 7）
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Pester 5
+        shell: pwsh
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.5.0 -SkipPublisherCheck
+
+      - name: 运行 Pester
         shell: pwsh
         run: |
           $config = New-PesterConfiguration
@@ -45,13 +57,24 @@ jobs:
           $config.Output.Verbosity = 'Detailed'
           Invoke-Pester -Configuration $config
 
-      - name: Pester（Windows PowerShell 5.1 兼容性）
+  pester-windows-powershell:
+    name: Pester（Windows PowerShell 5.1）
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Pester 5
         shell: powershell
         run: |
           Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
           if (-not (Get-Module -ListAvailable Pester | Where-Object { $_.Version -ge [version]'5.5.0' })) {
             Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.5.0 -SkipPublisherCheck
           }
+
+      - name: 运行 Pester
+        shell: powershell
+        run: |
           $config = New-PesterConfiguration
           $config.Run.Path = './tests'
           $config.Run.Exit = $true
@@ -59,7 +82,7 @@ jobs:
           Invoke-Pester -Configuration $config
 
   shell:
-    name: shellcheck + compose config (Linux)
+    name: shellcheck + compose config（Linux）
     runs-on: ubuntu-latest
     steps:
       - name: 检出代码
@@ -70,3 +93,19 @@ jobs:
 
       - name: docker compose config
         run: docker compose -f server/docker-compose.yml config
+
+      - name: 部署脚本失败路径（非 root 应拒绝且无副作用）
+        run: |
+          set +e
+          output=$(bash server/setup-rustdesk-server.sh 2>&1)
+          code=$?
+          set -e
+          echo "$output"
+          if [ "$code" -ne 1 ]; then
+            echo "期望退出码 1，实际 $code"
+            exit 1
+          fi
+          if [ -d server/data ]; then
+            echo "非 root 运行时不应创建 data 目录"
+            exit 1
+          fi

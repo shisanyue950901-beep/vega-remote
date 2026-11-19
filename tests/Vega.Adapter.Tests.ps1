@@ -84,25 +84,22 @@ Describe 'Select-VegaAdapter' {
     }
 }
 
-Describe 'Get-VegaEncoderName / Get-VegaEncoderId' {
-    It 'NVIDIA 映射到 NVENC / nvenc' {
+Describe 'Get-VegaEncoderName' {
+    It 'NVIDIA 映射到 NVENC' {
         Get-VegaEncoderName -AdapterName 'NVIDIA GeForce RTX 4070' | Should -Be 'NVENC'
-        Get-VegaEncoderId -AdapterName 'NVIDIA GeForce RTX 4070' | Should -Be 'nvenc'
     }
 
-    It 'AMD 映射到 AMF / amdvce' {
+    It 'AMD 映射到 AMF' {
         Get-VegaEncoderName -AdapterName 'AMD Radeon RX 6800' | Should -Be 'AMF'
-        Get-VegaEncoderId -AdapterName 'AMD Radeon RX 6800' | Should -Be 'amdvce'
     }
 
-    It 'Intel 映射到 QSV / quicksync' {
+    It 'Intel 映射到 QSV' {
         Get-VegaEncoderName -AdapterName 'Intel(R) UHD Graphics 770' | Should -Be 'QSV'
-        Get-VegaEncoderId -AdapterName 'Intel(R) UHD Graphics 770' | Should -Be 'quicksync'
     }
 
-    It '未知显卡与空值回退到 SOFTWARE / software' {
+    It '未知显卡与空值回退到 SOFTWARE' {
         Get-VegaEncoderName -AdapterName 'Some Unknown GPU' | Should -Be 'SOFTWARE'
-        Get-VegaEncoderId -AdapterName '' | Should -Be 'software'
-        Get-VegaEncoderId -AdapterName $null | Should -Be 'software'
+        Get-VegaEncoderName -AdapterName '' | Should -Be 'SOFTWARE'
+        Get-VegaEncoderName -AdapterName $null | Should -Be 'SOFTWARE'
     }
 }

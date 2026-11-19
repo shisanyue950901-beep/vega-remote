@@ -123,6 +123,40 @@ Describe 'Get-VegaDoctorAdvice' {
         ($advice -join "`n") | Should -Match '没有收到 pong'
     }
 
+    It '服务没在运行时提示正确的服务名 SunshineService' {
+        $advice = @(Get-VegaDoctorAdvice -Facts @{
+                SunshineInstalled    = $true
+                SunshineRunning      = $false
+                Encoder              = 'NVENC'
+                MissingFirewallRules = @()
+                Ipv6                 = @('2001:db8::1')
+                TailscaleInstalled   = $true
+            })
+
+        ($advice -join "`n") | Should -Match 'Restart-Service SunshineService'
+        ($advice -join "`n") | Should -Not -Match 'Restart-Service sunshine\b'
+    }
+
+    It 'Peer Relay 给出非直连的结论' {
+        $ping = ConvertFrom-VegaTailscalePing -Output @(
+            'pong from vega-host (100.64.0.2) via peer-relay(100.64.0.9:41641) in 30ms'
+        )
+        $advice = @(Get-VegaDoctorAdvice -Facts @{
+                SunshineInstalled    = $true
+                SunshineRunning      = $true
+                Encoder              = 'NVENC'
+                MissingFirewallRules = @()
+                Ipv6                 = @('2001:db8::1')
+                TailscaleInstalled   = $true
+                Peer                 = 'vega-host'
+                Ping                 = $ping
+            })
+
+        $text = $advice -join "`n"
+        $text | Should -Match 'Peer Relay'
+        $text | Should -Not -Match '已直连'
+    }
+
     It '任何事实都没给时也能给出可执行建议且不抛异常' {
         $advice = @(Get-VegaDoctorAdvice -Facts @{})
 

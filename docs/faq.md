@@ -15,17 +15,20 @@
 **能传文件吗？**
 Moonlight 不支持。用 RustDesk 或 Tailscale 的 Taildrop。
 
+**怎么设置 Sunshine 管理密码？**
+在**被控端本机**浏览器打开 <https://localhost:47990>，按页面提示首次设密。脚本不再用命令行参数传密码（那会进事件 4688 的命令行审计），也不会代替你设密。
+
 **是否安全？**
-Moonlight 首次连接要 PIN 配对；Tailscale 端到端加密；不要把 47990 管理端口暴露到公网。
+Moonlight 首次连接要 PIN 配对；Tailscale 端到端加密。管理页用 `origin_web_ui_allowed = pc` 限制为本机访问，Vega 防火墙只放行串流端口，不放行 47990；如果 Sunshine 安装器自带对 47990 的入站规则，安装脚本会禁用它（卸载时恢复）。所以不要在路由器上把 47990 映射出去。
 
 **安装脚本可以重复运行吗？**
-可以。已安装的组件会跳过，Vega 防火墙规则先删后建，`sunshine.conf` 只在第一次修改前备份为 `sunshine.conf.bak`，之后不会覆盖最初的备份。想强制重装组件加 `-Force`。
+可以。已安装的组件会跳过，Vega 防火墙规则先删后建。`sunshine.conf` 只更新 Vega 管理的键（`sunshine_name`、`adapter_name`、`dd_*`、`origin_web_ui_allowed`、`address_family`），其余内容原样保留，写入用临时文件 + 原子替换；第一次修改前会备份成 `sunshine.conf.bak`，之后不覆盖最初备份。想强制重装组件加 `-Force`。
 
 **脚本支持 Windows PowerShell 5.1 吗？**
 支持。Windows 10/11 自带的 Windows PowerShell 5.1 和 PowerShell 7 都能跑，文件是 UTF-8 with BOM。Win7 不在支持范围。
 
 **怎么卸载？**
-被控端运行 `.\host\install-host.ps1 -Uninstall`：删除 Vega 防火墙规则、恢复 `sunshine.conf.bak`、停止 Sunshine 服务。再加 `-RemoveApps` 会用 winget 卸载 Sunshine / Tailscale（加 `-WithRustDesk` 时也卸 RustDesk）。主控端用 `.\client\install-client.ps1 -Uninstall -RemoveApps`。卸载不恢复电源/睡眠设置。
+安装时会写 `%ProgramData%\Vega\state.json` 状态清单。被控端运行 `.\host\install-host.ps1 -Uninstall`：按清单删除 Vega 防火墙规则、恢复安装器规则、恢复 `sunshine.conf` 与服务的原始启动类型。配置文件在安装后被改过时只报告冲突、不覆盖。再加 `-RemoveApps` 只卸载清单里由 Vega 安装的 Sunshine / Tailscale（加 `-WithRustDesk` 时也卸 RustDesk），你原本就有的应用不会被删。主控端用 `.\client\install-client.ps1 -Uninstall -RemoveApps`。卸载不恢复电源/睡眠设置。
 
 **连不上或卡顿，先看哪里？**
 先跑只读诊断：`powershell -File .\tools\vega-doctor.ps1`。怀疑线路问题时加 `-Peer <被控端机器名>`，脚本会执行 `tailscale ping -c 3`，直接告诉你走的是直连还是 DERP 中继，并给出中文建议。它不会修改任何系统设置。
@@ -36,8 +39,11 @@ Moonlight 首次连接要 PIN 配对；Tailscale 端到端加密；不要把 479
 **诊断显示推荐编码器是 SOFTWARE？**
 没有识别到可用的硬件编码器。先更新显卡驱动；NVIDIA 需要 470 以上、AMD 需要 22.3.1 以上驱动。仍不行就降分辨率，由 CPU 软编。
 
-**winget 提示找不到包？**
-先更新「应用安装程序」(App Installer)，再执行 `winget source update`。仍失败可手动安装对应官方发行版，脚本检测到已安装会跳过。
+**winget 提示找不到包，或脚本说查询失败？**
+安装只使用 `--source winget` 源，并关掉了交互提示。没有匹配（例如源里确实没有该包）和查询失败（源故障、超时）是两种情况：前者跳过安装，后者会让脚本以非零退出码结束，不会假装成功。先更新「应用安装程序」(App Installer)，再执行 `winget source update`；仍失败可手动安装官方发行版。
 
 **服务器上 `docker compose` 不存在？**
-`server/setup-rustdesk-server.sh` 会自动回退到独立的 `docker-compose` 命令；两者都没有时会提示先安装 Docker Compose。没有 ufw 的系统（如部分云镜像）会跳过防火墙步骤，请改用 firewalld 或云厂商安全组放行 TCP 21115-21119、UDP 21116。
+`server/setup-rustdesk-server.sh` 会优先用 `docker compose`，回退到独立的 `docker-compose` 命令；两者都没有时会提示先安装 Docker Compose 插件。脚本不会用 `curl | sh` 安装 Docker，没装 Docker 时会提示按官方文档用软件源安装后重新运行。没有 ufw 的系统（如部分云镜像）会跳过防火墙步骤，请改用 firewalld 或云厂商安全组放行 TCP 21115-21117、UDP 21116。
+
+**RustDesk 中继要开哪些端口？**
+默认只放行桌面客户端需要的 TCP 21115-21117 与 UDP 21116。需要 WebSocket（`--websocket`）时才额外放行 TCP 21118-21119。私钥文件落盘后会被收紧到 0600，数据目录要求在 0700 且属于 root。
