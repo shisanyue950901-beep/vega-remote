@@ -187,7 +187,7 @@ Describe 'Invoke-VegaBootstrap' {
         }
         Mock New-VegaBootstrapWorkDirectory { Join-Path $TestDrive 'work-1' }
         Mock Remove-VegaBootstrapWorkDirectory { }
-        Mock Get-VegaBootstrapBytes { , [System.Text.Encoding]::UTF8.GetBytes('zip-bytes') }
+        Mock Get-VegaBootstrapByteArray { , [System.Text.Encoding]::UTF8.GetBytes('zip-bytes') }
         Mock Get-VegaBootstrapText { 'unused' }
         Mock Write-VegaBootstrapFile { $Path }
         Mock Test-VegaBootstrapChecksum { $true }
@@ -201,12 +201,12 @@ Describe 'Invoke-VegaBootstrap' {
         Invoke-VegaBootstrap -Role 'host' -WorkRoot $TestDrive -SkipTailscale `
             -RustDeskServer 'relay.example.com' -RustDeskKey ('A' * 43 + '=') -Confirm:$false
 
-        Should -Invoke Get-VegaBootstrapBytes -Times 1 -Exactly
+        Should -Invoke Get-VegaBootstrapByteArray -Times 1 -Exactly
         Should -Invoke Test-VegaBootstrapChecksum -Times 1 -Exactly -ParameterFilter {
-            $Bytes.Length -eq 8 -and $AssetName -eq 'vega-remote-0.2.0.zip'
+            $Bytes.Length -eq [System.Text.Encoding]::UTF8.GetByteCount('zip-bytes') -and $AssetName -eq 'vega-remote-0.2.0.zip'
         }
         Should -Invoke Write-VegaBootstrapFile -Times 1 -Exactly -ParameterFilter {
-            $Path -like '*work-1*vega-remote-0.2.0.zip' -and $Bytes.Length -eq 8
+            $Path -like '*work-1*vega-remote-0.2.0.zip' -and $Bytes.Length -eq [System.Text.Encoding]::UTF8.GetByteCount('zip-bytes')
         }
         Should -Invoke Expand-VegaBootstrapArchive -Times 1 -Exactly -ParameterFilter {
             $ArchivePath -like '*work-1*vega-remote-0.2.0.zip'
@@ -239,7 +239,7 @@ Describe 'Invoke-VegaBootstrap' {
     It '-ZipUrl 是 http 时直接拒绝' {
         { Invoke-VegaBootstrap -Role 'host' -ZipUrl 'http://mirror.example.com/x.zip' -WorkRoot $TestDrive -Confirm:$false } |
             Should -Throw '*只接受 https*'
-        Should -Invoke Get-VegaBootstrapBytes -Times 0 -Exactly
+        Should -Invoke Get-VegaBootstrapByteArray -Times 0 -Exactly
     }
 
     It '非管理员且未跳过检查时拒绝运行' {
