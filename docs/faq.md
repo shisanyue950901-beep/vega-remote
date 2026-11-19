@@ -13,7 +13,7 @@ irm https://raw.githubusercontent.com/shisanyue950901-beep/vega-remote/main/boot
 按提示选 1（被控主机）或 2（控制端）。引导脚本下载最新 Release 的 zip，用同 Release 的 `SHA256SUMS.txt` 校验后解压，再调用对应安装脚本。带参数时用 `& ([scriptblock]::Create((irm <url>))) -Role host -RustDeskServer ... -RustDeskKey ...`。
 
 **引导脚本下载失败怎么办？**
-GitHub 直连可能被限速或阻断。用 `-ZipUrl https://镜像地址/vega-remote-<版本>.zip` 指定镜像（脚本会从同一目录取 `SHA256SUMS.txt`），或手动下载 zip、校验后解压运行 `host/install-host.ps1` / `client/install-client.ps1`。脚本不会跳过校验，校验失败直接停止。
+GitHub 直连可能被限速或阻断。用 `-ZipUrl https://镜像地址/vega-remote-<版本>.zip` 指定镜像：只接受 https，而且只使用可信镜像——镜像同时控制 zip 和校验文件，同源校验不能证明下载内容没被替换。更稳的做法是从 GitHub Release 页面独立取得 SHA256 摘要，用 `-Sha256 <64位十六进制>` 传入（优先于同源 `SHA256SUMS.txt`）。也可以手动下载 zip、校验后解压运行 `host/install-host.ps1` / `client/install-client.ps1`。脚本不会跳过校验，校验失败直接停止。
 
 **集显能用吗？**
 能。Intel 用 QuickSync，AMD 用 AMF。八代以后的 Intel 跑 2K 60 帧很稳。

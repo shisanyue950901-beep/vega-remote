@@ -1,13 +1,36 @@
 ﻿#Requires -Version 5.1
 <#
   bootstrap.ps1 的静态单元测试（Pester 5）：
-    Release 解析、SHA256 校验、解压后定位安装脚本、参数透传、管理员检查与下载失败提示。
-  所有网络与解压命令都被 Mock，不会真的下载或安装任何东西。
+    Release 解析、下载到内存后的 SHA256 校验（-Sha256 优先）、受保护工作目录、
+    解压后定位安装脚本、类型化参数传递、管理员检查与下载失败提示。
+  所有网络、ACL、解压命令都被 Mock，不会真的下载或安装任何东西。
 #>
 
 BeforeAll {
     $script:BootstrapPath = Join-Path (Join-Path $PSScriptRoot '..') 'bootstrap.ps1'
     . $script:BootstrapPath
+    $script:ScriptText = Get-Content -LiteralPath $script:BootstrapPath -Raw -Encoding UTF8
+}
+
+Describe 'Test-VegaBootstrapSecureUrl' {
+    It '只接受 https' {
+        Test-VegaBootstrapSecureUrl -Uri 'https://mirror.example.com/vega-remote-0.2.0.zip' | Should -BeTrue
+        Test-VegaBootstrapSecureUrl -Uri 'http://mirror.example.com/vega-remote-0.2.0.zip' | Should -BeFalse
+        Test-VegaBootstrapSecureUrl -Uri 'ftp://mirror.example.com/x.zip' | Should -BeFalse
+        Test-VegaBootstrapSecureUrl -Uri 'https://mirror.example.com/a b.zip' | Should -BeFalse
+        Test-VegaBootstrapSecureUrl -Uri '' | Should -BeFalse
+    }
+}
+
+Describe 'Hide-VegaBootstrapUri' {
+    It '去掉 userinfo 与查询参数' {
+        Hide-VegaBootstrapUri -Uri 'https://user:secret@example.com/a.zip?token=abc&x=1#frag' |
+            Should -Be 'https://example.com/a.zip'
+    }
+
+    It '普通地址保持原样' {
+        Hide-VegaBootstrapUri -Uri 'https://example.com/a.zip' | Should -Be 'https://example.com/a.zip'
+    }
 }
 
 Describe 'Resolve-VegaBootstrapRole' {
@@ -55,33 +78,47 @@ Describe 'Get-VegaBootstrapRelease' {
     }
 }
 
-Describe 'Test-VegaBootstrapChecksum' {
-    It '匹配 SHA256SUMS.txt 里的文件条目时通过' {
-        $zip = Join-Path $TestDrive 'vega-remote-0.2.0.zip'
-        Set-Content -LiteralPath $zip -Value 'payload' -Encoding UTF8 -NoNewline
-        $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
-        $sums = Join-Path $TestDrive 'SHA256SUMS.txt'
-        Set-Content -LiteralPath $sums -Value ("{0}  vega-remote-0.2.0.zip" -f $hash) -Encoding UTF8
+Describe 'Get-VegaBootstrapSha256 / Test-VegaBootstrapChecksum' {
+    It '对同一份字节算出稳定摘要' {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes('payload')
+        $hash = Get-VegaBootstrapSha256 -Bytes $bytes
+        $hash | Should -Match '^[0-9a-f]{64}$'
+        $hash | Should -Be (Get-VegaBootstrapSha256 -Bytes $bytes)
+    }
 
-        Test-VegaBootstrapChecksum -ArchivePath $zip -ChecksumPath $sums | Should -BeTrue
+    It '使用校验文件里的同名条目' {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes('payload')
+        $hash = Get-VegaBootstrapSha256 -Bytes $bytes
+        $sums = "{0}  vega-remote-0.2.0.zip" -f $hash
+
+        Test-VegaBootstrapChecksum -Bytes $bytes -ChecksumText $sums -AssetName 'vega-remote-0.2.0.zip' | Should -BeTrue
+    }
+
+    It '给出 -Sha256 时优先于校验文件（用户独立取得的摘要）' {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes('payload')
+        $hash = Get-VegaBootstrapSha256 -Bytes $bytes
+        $wrongSums = ('{0}  vega-remote-0.2.0.zip' -f ('0' * 64))
+
+        Test-VegaBootstrapChecksum -Bytes $bytes -ChecksumText $wrongSums -ExpectedHash $hash -AssetName 'vega-remote-0.2.0.zip' | Should -BeTrue
+    }
+
+    It '摘要格式非法时抛异常' {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes('payload')
+        { Test-VegaBootstrapChecksum -Bytes $bytes -ExpectedHash 'not-a-hash' } | Should -Throw '*摘要格式无效*'
     }
 
     It '哈希不一致时抛异常' {
-        $zip = Join-Path $TestDrive 'vega-remote-0.2.0.zip'
-        Set-Content -LiteralPath $zip -Value 'payload' -Encoding UTF8 -NoNewline
-        $sums = Join-Path $TestDrive 'bad-sums.txt'
-        Set-Content -LiteralPath $sums -Value ('{0}  vega-remote-0.2.0.zip' -f ('0' * 64)) -Encoding UTF8
-
-        { Test-VegaBootstrapChecksum -ArchivePath $zip -ChecksumPath $sums } | Should -Throw '*SHA256 校验失败*'
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes('payload')
+        $sums = ('{0}  vega-remote-0.2.0.zip' -f ('0' * 64))
+        { Test-VegaBootstrapChecksum -Bytes $bytes -ChecksumText $sums -AssetName 'vega-remote-0.2.0.zip' } |
+            Should -Throw '*SHA256 校验失败*'
     }
 
     It '找不到对应条目时抛异常，不把缺失当通过' {
-        $zip = Join-Path $TestDrive 'vega-remote-0.2.0.zip'
-        Set-Content -LiteralPath $zip -Value 'payload' -Encoding UTF8 -NoNewline
-        $sums = Join-Path $TestDrive 'other-sums.txt'
-        Set-Content -LiteralPath $sums -Value ('{0}  other.zip' -f ('a' * 64)) -Encoding UTF8
-
-        { Test-VegaBootstrapChecksum -ArchivePath $zip -ChecksumPath $sums } | Should -Throw '*没有*校验值*'
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes('payload')
+        $sums = ('{0}  other.zip' -f ('a' * 64))
+        { Test-VegaBootstrapChecksum -Bytes $bytes -ChecksumText $sums -AssetName 'vega-remote-0.2.0.zip' } |
+            Should -Throw '*没有*校验值*'
     }
 }
 
@@ -99,6 +136,36 @@ Describe 'Get-VegaBootstrapInstallerArgument' {
         $installerArgs = Get-VegaBootstrapInstallerArgument -RustDeskServer 'relay.example.com' -RustDeskKey ('A' * 43 + '=')
         @($installerArgs.Keys | Where-Object { $_ -match '(?i)password|passwd|pwd|secret' }).Count | Should -Be 0
     }
+
+    It '不再接受 RemainingArguments 透传' {
+        $command = Get-Command Invoke-VegaBootstrap
+        $command.Parameters.ContainsKey('RemainingArguments') | Should -BeFalse
+        (Get-Command Get-VegaBootstrapInstallerArgument).Parameters.ContainsKey('RemainingArguments') | Should -BeFalse
+    }
+}
+
+Describe '受保护工作目录' {
+    It '在给定根下创建新 GUID 子目录，结束后可删除' {
+        $work = New-VegaBootstrapWorkDirectory -Root $TestDrive
+        (Split-Path -Leaf $work) | Should -Match '^[0-9a-f]{32}$'
+        (Split-Path -Parent $work) | Should -Be $TestDrive
+        Test-Path -LiteralPath $work | Should -BeTrue
+
+        Remove-VegaBootstrapWorkDirectory -Path $work
+        Test-Path -LiteralPath $work | Should -BeFalse
+    }
+
+    It '父目录是重解析点时中止' {
+        $parent = Join-Path $TestDrive 'link-parent'
+        $null = New-Item -ItemType Directory -Path $parent -Force
+        Mock Test-VegaBootstrapReparsePoint { $true }
+        { Initialize-VegaBootstrapDirectory -Path (Join-Path $parent 'bootstrap') } | Should -Throw '*重解析点*'
+    }
+
+    It '不再使用 %TEMP% 作为工作目录' {
+        $script:ScriptText | Should -Not -Match 'env:TEMP'
+        $script:ScriptText | Should -Match 'ProgramData'
+    }
 }
 
 Describe 'Invoke-VegaBootstrap' {
@@ -113,7 +180,11 @@ Describe 'Invoke-VegaBootstrap' {
                 AssetName   = 'vega-remote-0.2.0.zip'
             }
         }
-        Mock Save-VegaBootstrapFile { }
+        Mock New-VegaBootstrapWorkDirectory { Join-Path $TestDrive 'work-1' }
+        Mock Remove-VegaBootstrapWorkDirectory { }
+        Mock Get-VegaBootstrapBytes { , [System.Text.Encoding]::UTF8.GetBytes('zip-bytes') }
+        Mock Get-VegaBootstrapText { 'unused' }
+        Mock Write-VegaBootstrapFile { $Path }
         Mock Test-VegaBootstrapChecksum { $true }
         Mock Expand-VegaBootstrapArchive {
             [pscustomobject]@{ ExtractRoot = (Join-Path $TestDrive 'extract'); Installer = 'C:\vega\host\install-host.ps1' }
@@ -121,45 +192,61 @@ Describe 'Invoke-VegaBootstrap' {
         Mock Invoke-VegaBootstrapInstaller { }
     }
 
-    It '下载、校验、解压后调用 host 安装脚本并透传参数' {
-        Invoke-VegaBootstrap -Role 'host' -DownloadDir $TestDrive -SkipTailscale -RustDeskServer 'relay.example.com' -RustDeskKey ('A' * 43 + '=') -Confirm:$false
+    It '下载到内存、校验、写入受保护目录、从受保护目录执行，最后删除工作目录' {
+        Invoke-VegaBootstrap -Role 'host' -WorkRoot $TestDrive -SkipTailscale `
+            -RustDeskServer 'relay.example.com' -RustDeskKey ('A' * 43 + '=') -Confirm:$false
 
-        Should -Invoke Save-VegaBootstrapFile -Times 2 -Exactly
-        Should -Invoke Test-VegaBootstrapChecksum -Times 1 -Exactly
-        Should -Invoke Expand-VegaBootstrapArchive -Times 1 -Exactly
+        Should -Invoke Get-VegaBootstrapBytes -Times 1 -Exactly
+        Should -Invoke Test-VegaBootstrapChecksum -Times 1 -Exactly -ParameterFilter {
+            $Bytes.Length -eq 8 -and $AssetName -eq 'vega-remote-0.2.0.zip'
+        }
+        Should -Invoke Write-VegaBootstrapFile -Times 1 -Exactly -ParameterFilter {
+            $Path -like '*work-1*vega-remote-0.2.0.zip' -and $Bytes.Length -eq 8
+        }
+        Should -Invoke Expand-VegaBootstrapArchive -Times 1 -Exactly -ParameterFilter {
+            $ArchivePath -like '*work-1*vega-remote-0.2.0.zip'
+        }
         Should -Invoke Invoke-VegaBootstrapInstaller -Times 1 -Exactly -ParameterFilter {
             $Installer -eq 'C:\vega\host\install-host.ps1' -and
             $Arguments['SkipTailscale'] -eq $true -and
             $Arguments['RustDeskServer'] -eq 'relay.example.com'
         }
+        Should -Invoke Remove-VegaBootstrapWorkDirectory -Times 1 -Exactly
     }
 
-    It '校验失败时抛异常，不调用安装脚本' {
+    It '给出 -Sha256 时不下载同源校验文件' {
+        Invoke-VegaBootstrap -Role 'host' -WorkRoot $TestDrive -Sha256 ('a' * 64) -Confirm:$false
+
+        Should -Invoke Get-VegaBootstrapText -Times 0 -Exactly
+        Should -Invoke Test-VegaBootstrapChecksum -Times 1 -Exactly -ParameterFilter {
+            $ExpectedHash -eq ('a' * 64)
+        }
+    }
+
+    It '校验失败时抛异常，不调用安装脚本，仍然清理工作目录' {
         Mock Test-VegaBootstrapChecksum { throw 'SHA256 校验失败' }
 
-        { Invoke-VegaBootstrap -Role 'client' -DownloadDir $TestDrive -Confirm:$false } | Should -Throw '*SHA256*'
+        { Invoke-VegaBootstrap -Role 'client' -WorkRoot $TestDrive -Confirm:$false } | Should -Throw '*SHA256*'
         Should -Invoke Invoke-VegaBootstrapInstaller -Times 0 -Exactly
+        Should -Invoke Remove-VegaBootstrapWorkDirectory -Times 1 -Exactly
+    }
+
+    It '-ZipUrl 是 http 时直接拒绝' {
+        { Invoke-VegaBootstrap -Role 'host' -ZipUrl 'http://mirror.example.com/x.zip' -WorkRoot $TestDrive -Confirm:$false } |
+            Should -Throw '*只接受 https*'
+        Should -Invoke Get-VegaBootstrapBytes -Times 0 -Exactly
     }
 
     It '非管理员且未跳过检查时拒绝运行' {
         Mock Test-VegaBootstrapAdmin { $false }
 
-        { Invoke-VegaBootstrap -Role 'host' -DownloadDir $TestDrive -Confirm:$false } | Should -Throw '*管理员*'
-        Should -Invoke Save-VegaBootstrapFile -Times 0 -Exactly
+        { Invoke-VegaBootstrap -Role 'host' -WorkRoot $TestDrive -Confirm:$false } | Should -Throw '*管理员*'
+        Should -Invoke New-VegaBootstrapWorkDirectory -Times 0 -Exactly
     }
 
     It '未给 Role 时走交互选择' {
         Mock Resolve-VegaBootstrapRole { 'client' }
-        Invoke-VegaBootstrap -DownloadDir $TestDrive -Confirm:$false
+        Invoke-VegaBootstrap -WorkRoot $TestDrive -Confirm:$false
         Should -Invoke Resolve-VegaBootstrapRole -Times 1 -Exactly
-    }
-}
-
-Describe 'Save-VegaBootstrapFile' {
-    It '下载失败时提示 -ZipUrl 镜像' {
-        Mock Invoke-WebRequest { throw '连不上' }
-
-        { Save-VegaBootstrapFile -Uri 'https://example.com/x.zip' -Path (Join-Path $TestDrive 'x.zip') } |
-            Should -Throw '*-ZipUrl*'
     }
 }

@@ -16,7 +16,15 @@ irm https://raw.githubusercontent.com/shisanyue950901-beep/vega-remote/main/boot
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/shisanyue950901-beep/vega-remote/main/bootstrap.ps1))) -Role host -RustDeskServer relay.example.com -RustDeskKey <公钥>
 ```
 
-引导脚本会下载最新 Release 的 `vega-remote-<版本>.zip`，用同 Release 的 `SHA256SUMS.txt` 校验后解压，再调用对应安装脚本。GitHub 直连受限时可用 `-ZipUrl` 指定镜像。需要管理员 PowerShell；脚本不接收、不保存任何密码。
+引导脚本会下载最新 Release 的 `vega-remote-<版本>.zip` 到内存，先对字节算 SHA256，校验通过后把同一份字节写进受保护的工作目录（`%ProgramData%\Vega\bootstrap\<新GUID>`，创建后立即设为仅 Administrators 与 SYSTEM 完全控制），再从该文件解压、从该目录执行安装脚本，结束后删除工作目录。
+
+GitHub 直连受限时可用 `-ZipUrl` 指定镜像，但**只接受 https，且只使用可信镜像：镜像同时控制 zip 和校验文件**。想避免同源校验被一起替换，可从 GitHub Release 页面独立取得摘要后传 `-Sha256`（优先于同源 `SHA256SUMS.txt`）：
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/shisanyue950901-beep/vega-remote/main/bootstrap.ps1))) -Role host -ZipUrl https://mirror.example.com/vega-remote-0.2.0.zip -Sha256 <64位十六进制摘要>
+```
+
+需要管理员 PowerShell；脚本不接收、不保存任何密码。
 
 > 不想用一行安装也可以按下面的步骤手动下载仓库后运行脚本。
 
