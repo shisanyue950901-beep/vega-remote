@@ -2212,6 +2212,131 @@ function Set-VegaFirewallRule {
     return $created.ToArray()
 }
 
+function Select-VegaLegacyFirewallRule {
+    <#
+      纯函数：挑出 v0.1 留下的旧规则。旧版只设了 DisplayName = Vega-Sunshine-TCP/UDP，
+      Windows 自己生成了内部 Name，所以必须按 DisplayName 匹配、按内部 Name 删除。
+      已经是对应内部名称的规则不算旧规则。
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]]$Rules
+    )
+
+    $legacyNames = Get-VegaAllowedFirewallRuleName | Where-Object { $_ -like 'Vega-Sunshine-*' }
+    $selected = New-Object System.Collections.Generic.List[object]
+
+    foreach ($rule in @($Rules)) {
+        if ($null -eq $rule) { continue }
+        $name = ''
+        if ($null -ne $rule.PSObject.Properties['Name']) { $name = [string]$rule.Name }
+        $display = ''
+        if ($null -ne $rule.PSObject.Properties['DisplayName']) { $display = [string]$rule.DisplayName }
+
+        if ([string]::IsNullOrWhiteSpace($name)) { continue }
+        if ($legacyNames -notcontains $display) { continue }
+        if ($legacyNames -contains $name) { continue }
+
+        $selected.Add($rule)
+    }
+
+    return $selected.ToArray()
+}
+
+function Remove-VegaLegacyFirewallRule {
+    <#
+      删除旧版只设了 DisplayName 的 Vega-Sunshine-TCP/UDP 规则，删后回读确认。
+      返回确认删除的规则内部名。
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+
+    $collected = New-Object System.Collections.Generic.List[object]
+    foreach ($rule in @(Get-NetFirewallRule -ErrorAction SilentlyContinue)) {
+        if ($null -eq $rule) { continue }
+        $collected.Add([pscustomobject]@{
+                Name        = [string]$rule.Name
+                DisplayName = [string]$rule.DisplayName
+            })
+    }
+
+    $legacy = @(Select-VegaLegacyFirewallRule -Rules $collected.ToArray())
+    $removed = New-Object System.Collections.Generic.List[string]
+    foreach ($rule in $legacy) {
+        $name = [string]$rule.Name
+        if (-not $PSCmdlet.ShouldProcess($name, '删除旧版 Vega 防火墙规则')) { continue }
+        if (Remove-VegaFirewallRuleByName -Name $name -Confirm:$false) {
+            $removed.Add($name)
+        }
+        else {
+            Write-Warning "旧版防火墙规则删除失败：$name"
+        }
+    }
+
+    return $removed.ToArray()
+}
+
+function Set-VegaAdminBlockRule {
+    <#
+      建立/刷新管理端口阻断规则（Vega-Block-Admin，入站 TCP，Action = Block）。
+      必须在 winget 安装 Sunshine 之前调用：安装器会先放行并启动服务，
+      先阻断才能保证首次设密前管理页不暴露在网络上。建完回读确认，失败抛异常。
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [int[]]$ManagementPorts
+    )
+
+    $name = 'Vega-Block-Admin'
+    $ports = @($ManagementPorts | Sort-Object -Unique | ForEach-Object { [string]$_ })
+    if ($ports.Count -eq 0) { throw '管理端口阻断规则需要至少一个端口。' }
+
+    if (-not $PSCmdlet.ShouldProcess($name, "阻断入站 TCP $($ports -join '/')")) { return $name }
+
+    $null = Remove-VegaFirewallRuleByName -Name $name -Confirm:$false
+
+    $params = @{
+        Name        = $name
+        DisplayName = $name
+        Direction   = 'Inbound'
+        Action      = 'Block'
+        Protocol    = 'TCP'
+        LocalPort   = $ports
+        Profile     = 'Any'
+        Enabled     = 'True'
+        Description = 'Vega Remote：阻止入站访问 Sunshine 管理页（本机浏览器仍可访问）'
+    }
+
+    try {
+        $null = New-NetFirewallRule @params -ErrorAction Stop
+    }
+    catch {
+        throw "创建管理端口阻断规则 $name 失败：$($_.Exception.Message)"
+    }
+
+    $check = Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue
+    if ($null -eq $check) { throw "管理端口阻断规则创建后未找到：$name" }
+    if ([string]$check.Enabled -ne 'True' -or [string]$check.Action -ne 'Block') {
+        throw "管理端口阻断规则状态异常（Enabled=$($check.Enabled)，Action=$($check.Action)）。"
+    }
+
+    $filter = Get-NetFirewallPortFilter -AssociatedNetFirewallRule $check -ErrorAction SilentlyContinue
+    if ($null -ne $filter) {
+        $actualPorts = @($filter.LocalPort | ForEach-Object { [string]$_ })
+        foreach ($port in $ports) {
+            if (-not (Test-VegaPortInRange -Ports $actualPorts -Port ([int]$port))) {
+                throw "管理端口阻断规则未覆盖端口 $port（实际：$($actualPorts -join ',')）。"
+            }
+        }
+    }
+
+    return $name
+}
+
 function Protect-VegaSunshineManagementPort {
     <#
       检测并禁用 Sunshine 安装器自带、对管理端口放行的入站规则，记录进清单。
@@ -2527,12 +2652,46 @@ function Invoke-VegaHostInstallCore {
     # 读清单：机器级清单会先校验所有者/重解析点，不可信直接抛异常
     $state = Read-VegaState -Path $StatePath
 
-    # 已经装过 Sunshine 的机器：先隔离管理端口，再动配置
+    # 旧版规则迁移：v0.1 只设了 DisplayName，内部 Name 是 Windows 生成的
+    try {
+        $legacyRules = @(Remove-VegaLegacyFirewallRule -Confirm:$false)
+        if ($legacyRules.Count -gt 0) {
+            Write-VegaStatus ("已清理旧版 Vega 防火墙规则：{0}" -f ($legacyRules -join '、')) -Level Ok
+        }
+    }
+    catch {
+        $failures.Add("清理旧版防火墙规则失败：$($_.Exception.Message)")
+        Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
+    }
+
     $existingSunshine = Get-VegaSunshineInstall
+    $basePort = 47989
     if ($null -ne $existingSunshine) {
-        $existingPort = Get-VegaSunshineBasePort -ConfigPath $existingSunshine.Config
+        $basePort = Get-VegaSunshineBasePort -ConfigPath $existingSunshine.Config
+    }
+    $managementPorts = @(47990, (Get-VegaSunshinePorts -BasePort $basePort).ManagementPort) | Sort-Object -Unique
+
+    # 管理端口隔离必须早于 winget 安装：安装器会先放行并启动服务。
+    # 隔离失败直接中止，退出码非零。
+    try {
+        $null = Set-VegaAdminBlockRule -ManagementPorts $managementPorts -Confirm:$false
+        $state = Add-VegaStateFirewallRule -State $state -Name 'Vega-Block-Admin'
+        $null = Save-VegaState -State $state -Path $StatePath
+        Write-VegaStatus ("已先阻断管理端口入站：{0}" -f ($managementPorts -join '/')) -Level Ok
+    }
+    catch {
+        $failures.Add("管理端口隔离失败，中止安装：$($_.Exception.Message)")
+        Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
+        return [pscustomobject]@{
+            ExitCode = 1
+            Failures = $failures.ToArray()
+        }
+    }
+
+    # 已经装过 Sunshine 的机器：隔离安装器自带的对管理端口放行规则
+    if ($null -ne $existingSunshine) {
         $state = Protect-VegaSunshineManagementPort -State $state -SunshineExe $existingSunshine.Exe `
-            -ManagementPort (Get-VegaSunshinePorts -BasePort $existingPort).ManagementPort -StatePath $StatePath -Confirm:$false
+            -ManagementPort (Get-VegaSunshinePorts -BasePort $basePort).ManagementPort -StatePath $StatePath -Confirm:$false
     }
 
     $componentNames = New-Object System.Collections.Generic.List[string]
@@ -2577,6 +2736,23 @@ function Invoke-VegaHostInstallCore {
 
     $basePort = Get-VegaSunshineBasePort -ConfigPath $sunshine.Config
     $ports = Get-VegaSunshinePorts -BasePort $basePort
+
+    # 安装器可能改过配置端口：按生效配置把管理端口补齐（规则保留，不删）
+    try {
+        $actualManagementPorts = @(47990, $ports.ManagementPort) | Sort-Object -Unique
+        $null = Set-VegaAdminBlockRule -ManagementPorts $actualManagementPorts -Confirm:$false
+        $state = Add-VegaStateFirewallRule -State $state -Name 'Vega-Block-Admin'
+        $null = Save-VegaState -State $state -Path $StatePath
+    }
+    catch {
+        $failures.Add("管理端口隔离失败，中止安装：$($_.Exception.Message)")
+        Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
+        return [pscustomobject]@{
+            ExitCode = 1
+            Failures = $failures.ToArray()
+        }
+    }
+
     $state = Protect-VegaSunshineManagementPort -State $state -SunshineExe $sunshine.Exe `
         -ManagementPort $ports.ManagementPort -StatePath $StatePath -Confirm:$false
 
@@ -2766,6 +2942,18 @@ function Invoke-VegaHostUninstallCore {
     $sunshineDirectory = ''
     if ($null -ne $sunshine) { $sunshineDirectory = [string]$sunshine.Directory }
 
+    Write-VegaStatus '清理旧版 Vega 防火墙规则'
+    try {
+        $legacyRules = @(Remove-VegaLegacyFirewallRule -Confirm:$false)
+        if ($legacyRules.Count -gt 0) {
+            Write-VegaStatus ("已删除旧版规则：{0}" -f ($legacyRules -join '、')) -Level Ok
+        }
+    }
+    catch {
+        $failures.Add("清理旧版防火墙规则失败：$($_.Exception.Message)")
+        Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
+    }
+
     Write-VegaStatus '删除 Vega 防火墙规则'
     foreach ($item in @($state.FirewallRules)) {
         if ($null -eq $item) { continue }
@@ -2783,6 +2971,14 @@ function Invoke-VegaHostUninstallCore {
         }
         else {
             $failures.Add("未能删除防火墙规则：$ruleName")
+            Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
+        }
+    }
+
+    # 清单里没有的固定名称规则（旧安装、无清单卸载）也一并清理，含 Vega-Block-Admin
+    foreach ($fixedName in (Get-VegaAllowedFirewallRuleName)) {
+        if (-not (Remove-VegaFirewallRuleByName -Name $fixedName -Confirm:$false)) {
+            $failures.Add("未能删除防火墙规则：$fixedName")
             Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
         }
     }
@@ -3176,6 +3372,9 @@ Export-ModuleMember -Function @(
     'Get-VegaSunshineInstallerFirewallRule',
     'Disable-VegaSunshineInstallerFirewallRule',
     'Enable-VegaSunshineInstallerFirewallRule',
+    'Select-VegaLegacyFirewallRule',
+    'Remove-VegaLegacyFirewallRule',
+    'Set-VegaAdminBlockRule',
     'Protect-VegaSunshineManagementPort',
     'Test-VegaFirewallRule',
     'Get-VegaFirewallRuleMissing',
