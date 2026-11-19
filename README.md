@@ -55,7 +55,7 @@ cd server && sudo bash setup-rustdesk-server.sh
 连不上、卡顿、怀疑编码器选错时，先跑只读诊断（不安装、不修改任何系统设置，无需管理员）：
 
 ```powershell
-pwsh -File .\tools\vega-doctor.ps1
+powershell -File .\tools\vega-doctor.ps1
 ```
 
 它会列出显卡与推荐编码器（NVENC / AMF / QSV）、Sunshine 安装与服务状态、Vega 防火墙规则、公网 IPv6、Tailscale 状态，并给中文结论。
@@ -63,7 +63,7 @@ pwsh -File .\tools\vega-doctor.ps1
 检查到被控端是否直连（把 `vega-host` 换成被控端的 Tailscale 机器名）：
 
 ```powershell
-pwsh -File .\tools\vega-doctor.ps1 -Peer vega-host
+powershell -File .\tools\vega-doctor.ps1 -Peer vega-host
 ```
 
 `tailscale ping -c 3` 会打进诊断输出，脚本自动判断是 `via 1.2.3.4:41641`（直连）还是 `via DERP(xxx)`（中继）。

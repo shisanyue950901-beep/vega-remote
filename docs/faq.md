@@ -28,7 +28,7 @@ Moonlight 首次连接要 PIN 配对；Tailscale 端到端加密；不要把 479
 被控端运行 `.\host\install-host.ps1 -Uninstall`：删除 Vega 防火墙规则、恢复 `sunshine.conf.bak`、停止 Sunshine 服务。再加 `-RemoveApps` 会用 winget 卸载 Sunshine / Tailscale（加 `-WithRustDesk` 时也卸 RustDesk）。主控端用 `.\client\install-client.ps1 -Uninstall -RemoveApps`。卸载不恢复电源/睡眠设置。
 
 **连不上或卡顿，先看哪里？**
-先跑只读诊断：`pwsh -File .\tools\vega-doctor.ps1`。怀疑线路问题时加 `-Peer <被控端机器名>`，脚本会执行 `tailscale ping -c 3`，直接告诉你走的是直连还是 DERP 中继，并给出中文建议。它不会修改任何系统设置。
+先跑只读诊断：`powershell -File .\tools\vega-doctor.ps1`。怀疑线路问题时加 `-Peer <被控端机器名>`，脚本会执行 `tailscale ping -c 3`，直接告诉你走的是直连还是 DERP 中继，并给出中文建议。它不会修改任何系统设置。
 
 **诊断显示“缺少 Vega 防火墙规则”？**
 管理员 PowerShell 重新运行一次 `.\host\install-host.ps1` 即可，脚本会先删后建；也可以用 `.\host\install-host.ps1 -Uninstall` 后重装。
