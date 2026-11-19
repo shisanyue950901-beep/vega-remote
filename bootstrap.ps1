@@ -523,7 +523,10 @@ function Initialize-VegaBootstrapProtectedRoot {
 
     # 已存在的目录与新建的目录走同一个校验函数：重解析点、非目录、
     # 所有者不是 SYSTEM/Administrators、非管理员写类权限，任一不满足即中止。
-    return (Assert-VegaBootstrapProtectedDirectory -Path $Path)
+    # 校验函数的返回值由它自己决定（校验失败会抛异常），这里的返回路径固定是本函数
+    # 的 -Path，避免校验函数被替换/被 mock 后把 $null 传给调用方。
+    $null = Assert-VegaBootstrapProtectedDirectory -Path $Path
+    return $Path
 }
 
 function Initialize-VegaBootstrapVegaRoot {
