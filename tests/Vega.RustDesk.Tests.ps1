@@ -604,7 +604,7 @@ Describe 'P1-2 用户/服务配置路径逐级拒绝重解析点' {
 
 Describe 'P2-4 TOML 保留缩进与逐行换行，引号结构写前中止' {
     It '保留行首缩进与每行原有换行符（允许混合）' {
-        $existing = "  custom-rendezvous-server = `"old`"  # 注释`r`nrelay-server = `"old:21117`"`n"
+        $existing = "[options]`r`n  custom-rendezvous-server = `"old`"  # 注释`r`nrelay-server = `"old:21117`"`n"
         $result = Merge-VegaRustDeskConfigText -ExistingText $existing -Values ([ordered]@{
                 'custom-rendezvous-server' = 'new.example.com'
             })
@@ -617,11 +617,11 @@ Describe 'P2-4 TOML 保留缩进与逐行换行，引号结构写前中止' {
     }
 
     It '引号键与引号表头在写前中止' {
-        { Merge-VegaRustDeskConfigText -ExistingText "[options]`n`"key`" = `"x`"`n" -Values ([ordered]@{ key = 'y' }) } |
+        { Merge-VegaRustDeskConfigText -ExistingText ('[options]' + "`n" + '"key" = "x"' + "`n") -Values ([ordered]@{ key = 'y' }) } |
             Should -Throw '*引号键*'
-        { Merge-VegaRustDeskConfigText -ExistingText "[\"options\"]`nkey = `"x`"`n" -Values ([ordered]@{ key = 'y' }) } |
+        { Merge-VegaRustDeskConfigText -ExistingText ('["options"]' + "`n" + 'key = "x"' + "`n") -Values ([ordered]@{ key = 'y' }) } |
             Should -Throw '*引号表头*'
-        { Merge-VegaRustDeskConfigText -ExistingText "[options]`n'key' = `"x`"`n" -Values ([ordered]@{ key = 'y' }) } |
+        { Merge-VegaRustDeskConfigText -ExistingText ('[options]' + "`n" + "'key' = " + '"x"' + "`n") -Values ([ordered]@{ key = 'y' }) } |
             Should -Throw '*引号键*'
     }
 
