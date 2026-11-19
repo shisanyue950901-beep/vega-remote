@@ -142,6 +142,11 @@ Describe 'Get-VegaBootstrapInstallerArgument' {
         $command.Parameters.ContainsKey('RemainingArguments') | Should -BeFalse
         (Get-Command Get-VegaBootstrapInstallerArgument).Parameters.ContainsKey('RemainingArguments') | Should -BeFalse
     }
+
+    It '未知参数由 PowerShell 直接报错' {
+        { Invoke-VegaBootstrap -Role 'host' -NotAVegaParameter 1 -SkipAdminCheck -Confirm:$false } |
+            Should -Throw '*NotAVegaParameter*'
+    }
 }
 
 Describe '受保护工作目录' {
@@ -248,5 +253,44 @@ Describe 'Invoke-VegaBootstrap' {
         Mock Resolve-VegaBootstrapRole { 'client' }
         Invoke-VegaBootstrap -WorkRoot $TestDrive -Confirm:$false
         Should -Invoke Resolve-VegaBootstrapRole -Times 1 -Exactly
+    }
+}
+
+Describe '镜像信任边界说明' {
+    It '脚本失败提示与 README 都写明只使用可信镜像' {
+        $readmePath = Join-Path (Join-Path $PSScriptRoot '..') 'README.md'
+        $readmeText = Get-Content -LiteralPath $readmePath -Raw -Encoding UTF8
+
+        $script:ScriptText | Should -Match '只使用可信镜像，镜像同时控制 zip 和校验文件'
+        $readmeText | Should -Match '只使用可信镜像：镜像同时控制 zip 和校验文件'
+        $readmeText | Should -Match '-Sha256'
+        $script:ScriptText | Should -Match '\[string\]\$Sha256'
+    }
+}
+
+Describe 'release.yml 打包与发布引用' {
+    BeforeAll {
+        $script:ReleasePath = Join-Path (Join-Path (Join-Path $PSScriptRoot '..') '.github') 'workflows/release.yml'
+        $script:ReleaseText = Get-Content -LiteralPath $script:ReleasePath -Raw -Encoding UTF8
+    }
+
+    It '打包步骤有 id，后续步骤引用 package 的输出' {
+        $script:ReleaseText | Should -Match '(?m)^\s*id:\s*package\s*$'
+        $script:ReleaseText | Should -Match 'steps\.package\.outputs\.archive\b'
+        $script:ReleaseText | Should -Match 'steps\.package\.outputs\.archive_name\b'
+        $script:ReleaseText | Should -Not -Match 'steps\.version\.outputs\.archive'
+    }
+
+    It 'github 上下文值通过 env 传入，脚本内先校验版本格式再使用' {
+        $script:ReleaseText | Should -Match 'TAG:\s*\$\{\{\s*github\.ref_name\s*\}\}'
+        $script:ReleaseText | Should -Match 'REPOSITORY:\s*\$\{\{\s*github\.repository\s*\}\}'
+        $script:ReleaseText | Should -Match ([regex]::Escape('^v(?<ver>\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?)$'))
+        $script:ReleaseText | Should -Match ([regex]::Escape('^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$'))
+
+        $runBlocks = [regex]::Matches($script:ReleaseText, '(?ms)^\s*run:\s*\|.*?(?=^\s*-\s+name:|\z)')
+        $runBlocks.Count | Should -BeGreaterThan 0
+        foreach ($block in $runBlocks) {
+            $block.Value | Should -Not -Match '\$\{\{\s*github\.'
+        }
     }
 }

@@ -825,6 +825,62 @@ Describe 'Set-VegaFirewallRule 回读' {
 
         { Set-VegaFirewallRule -Program 'C:\Sunshine\sunshine.exe' -Confirm:$false } | Should -Throw '*状态异常*'
     }
+    It '串流放行规则未被强制执行时抛异常，调用方不得删除旧规则' {
+        Mock -ModuleName $script:ModuleName Get-NetFirewallRule {
+            param($Name, $PolicyStore)
+            $null = $PolicyStore
+            [pscustomobject]@{
+                Name = $Name; Enabled = 'True'; Action = 'Allow'; Profile = 'Any'
+                EnforcementStatus = 'NotEnforced'
+            }
+        }
+        Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter -RemoveParameterType AssociatedNetFirewallRule {
+            [pscustomobject]@{ LocalPort = @('Any') }
+        }
+
+        { Set-VegaFirewallRule -Program 'C:\Sunshine\sunshine.exe' -Confirm:$false } | Should -Throw '*未被强制执行*'
+    }
+
+    It 'EnforcementStatus 是失败数组时也抛异常' {
+        Mock -ModuleName $script:ModuleName Get-NetFirewallRule {
+            param($Name, $PolicyStore)
+            $null = $PolicyStore
+            [pscustomobject]@{
+                Name = $Name; Enabled = 'True'; Action = 'Allow'; Profile = 'Any'
+                EnforcementStatus = @('Enforced', 'NotEnforced')
+            }
+        }
+        Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter -RemoveParameterType AssociatedNetFirewallRule {
+            [pscustomobject]@{ LocalPort = @('Any') }
+        }
+
+        { Set-VegaFirewallRule -Program 'C:\Sunshine\sunshine.exe' -Confirm:$false } | Should -Throw '*未被强制执行*'
+    }
+
+    It 'Profile 补齐后回读必须保留原有范围，只剩活动配置时抛异常' {
+        $env:VEGA_TEST_RULE_PROFILE = 'Public'
+        Mock -ModuleName $script:ModuleName Get-NetFirewallRule {
+            param($Name, $PolicyStore)
+            $null = $PolicyStore
+            [pscustomobject]@{ Name = $Name; Enabled = 'True'; Action = 'Allow'; Profile = $env:VEGA_TEST_RULE_PROFILE }
+        }
+        Mock -ModuleName $script:ModuleName Set-NetFirewallRule {
+            param($Name, [Alias('Profile')][string[]]$FwProfile)
+            $null = $Name, $FwProfile
+            # 模拟实现错误：只写活动配置，把原有 Public 范围弄丢
+            $env:VEGA_TEST_RULE_PROFILE = 'Private'
+        }
+        Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter -RemoveParameterType AssociatedNetFirewallRule {
+            [pscustomobject]@{ LocalPort = @('Any') }
+        }
+
+        try {
+            { Set-VegaFirewallRule -Program 'C:\Sunshine\sunshine.exe' -Confirm:$false } | Should -Throw '*完整并集*'
+        }
+        finally {
+            Remove-Item Env:VEGA_TEST_RULE_PROFILE -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 Describe 'Protect-VegaSunshineManagementPort' {
