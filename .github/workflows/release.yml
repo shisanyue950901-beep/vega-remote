@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: 打包并发布
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 计算版本
+        id: version
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'
+          if ($tag -notmatch '^v(?<ver>.+)$') {
+            throw "tag 必须以 v 开头：$tag"
+          }
+          "version=$($Matches['ver'])" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: 打包 zip（排除 tests/、.github/、work/）
+        shell: pwsh
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          $staging = Join-Path $env:RUNNER_TEMP 'vega-remote-stage'
+          $archive = Join-Path $env:RUNNER_TEMP ("vega-remote-{0}.zip" -f $version)
+          $exclude = @('tests', '.github', 'work', '.git')
+
+          if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force }
+          $null = New-Item -ItemType Directory -Path $staging -Force
+
+          Get-ChildItem -LiteralPath $PWD -Force | Where-Object { $exclude -notcontains $_.Name } | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination $staging -Recurse -Force
+          }
+
+          Compress-Archive -Path (Join-Path $staging '*') -DestinationPath $archive -CompressionLevel Optimal
+          "archive=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "archive_name=vega-remote-{0}.zip" -f $version | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: 生成 SHA256SUMS.txt
+        shell: pwsh
+        run: |
+          $archive = '${{ steps.version.outputs.archive }}'
+          $name = '${{ steps.version.outputs.archive_name }}'
+          $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          $sums = Join-Path $env:RUNNER_TEMP 'SHA256SUMS.txt'
+          Set-Content -LiteralPath $sums -Value ("{0}  {1}" -f $hash, $name) -Encoding UTF8
+          Get-Content -LiteralPath $sums
+          # 发布前自检：用 bootstrap 的校验规则再算一遍
+          $bootstrap = Join-Path $PWD 'bootstrap.ps1'
+          . $bootstrap
+          $checked = Test-VegaBootstrapChecksum -ArchivePath $archive -ChecksumPath $sums
+          if (-not $checked) { throw 'SHA256SUMS.txt 自检失败' }
+
+      - name: 创建 GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ steps.version.outputs.tag }}'
+          $archive = '${{ steps.version.outputs.archive }}'
+          $sums = Join-Path $env:RUNNER_TEMP 'SHA256SUMS.txt'
+          $url = "https://raw.githubusercontent.com/${{ github.repository }}/main/bootstrap.ps1"
+          $notes = "Vega Remote $tag`n`n一行安装：`nirm $url | iex`n`n下载后可用 SHA256SUMS.txt 校验 zip。"
+          gh release create $tag $archive $sums --title "Vega Remote $tag" --notes $notes

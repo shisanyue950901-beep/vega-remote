@@ -29,6 +29,8 @@ jobs:
           $results = @(foreach ($path in $paths) {
               Invoke-ScriptAnalyzer -Path $path -Recurse -Settings ./PSScriptAnalyzerSettings.psd1
             })
+          # 仓库根的一行安装引导脚本单独检查
+          $results += @(Invoke-ScriptAnalyzer -Path ./bootstrap.ps1 -Settings ./PSScriptAnalyzerSettings.psd1)
           if ($results.Count -gt 0) {
             $results | Sort-Object ScriptName, Line | Format-Table RuleName, Severity, ScriptName, Line, Message -AutoSize | Out-String -Width 200 | Write-Host
             throw "PSScriptAnalyzer 发现 $($results.Count) 个问题"
