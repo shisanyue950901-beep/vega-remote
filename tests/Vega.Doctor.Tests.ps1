@@ -373,4 +373,40 @@ Describe 'P3-1 doctor 分别比较 ID 与 relay，区分不存在与读取失败
         $scriptText | Should -Match 'ServiceError'
         $scriptText | Should -Match '配置读取失败'
     }
+
+    It '探测本身失败时报“读取失败”及原因，不误判为文件不存在' {
+        $unreadable = Join-Path $TestDrive 'unreadable/RustDesk2.toml'
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $unreadable) -Force
+        Set-Content -LiteralPath $unreadable -Encoding UTF8 -Value '[options]'
+        Mock -ModuleName 'Vega.Common' Get-Item { throw '拒绝访问' } -ParameterFilter { $LiteralPath -like '*unreadable*' }
+
+        $summary = Get-VegaRustDeskConfigSummary -UserConfigPath $unreadable -ServiceConfigPath (Join-Path $TestDrive 'none.toml')
+        $summary.UserExists | Should -BeTrue
+        $summary.UserError | Should -Match '读取失败'
+        $summary.UserError | Should -Match '拒绝访问'
+    }
+
+    It '只有明确的 ItemNotFound 才判“文件不存在”' {
+        $missing = Join-Path $TestDrive 'really-missing/RustDesk2.toml'
+        $summary = Get-VegaRustDeskConfigSummary -UserConfigPath $missing -ServiceConfigPath $missing
+
+        $summary.UserExists | Should -BeFalse
+        $summary.UserError | Should -Be ''
+    }
+
+    It '路径是目录时按读取失败上报' {
+        $directoryPath = Join-Path $TestDrive 'config-as-dir'
+        $null = New-Item -ItemType Directory -Path $directoryPath -Force
+
+        $summary = Get-VegaRustDeskConfigSummary -UserConfigPath $directoryPath -ServiceConfigPath (Join-Path $TestDrive 'none.toml')
+        $summary.UserExists | Should -BeTrue
+        $summary.UserError | Should -Match '读取失败'
+    }
+
+    It '探测用 -ErrorAction Stop，并显式识别 ItemNotFound' {
+        $moduleText = Get-Content -LiteralPath (Join-Path (Join-Path $PSScriptRoot '..') 'host/lib/Vega.Common.psm1') -Raw -Encoding UTF8
+        $moduleText | Should -Match ([regex]::Escape('Get-Item -LiteralPath $ConfigPath -Force -ErrorAction Stop'))
+        $moduleText | Should -Match 'ItemNotFound'
+        $moduleText | Should -Not -Match ([regex]::Escape('$exists = Test-Path -LiteralPath $ConfigPath -PathType Leaf'))
+    }
 }
