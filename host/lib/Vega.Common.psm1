@@ -1180,9 +1180,9 @@ function Add-VegaStateService {
     $existing = Get-VegaStateService -State $State -Name $Name
     if ($null -ne $existing) {
         if ($null -ne $existing.PSObject.Properties['Restored'] -and [bool]$existing.Restored) {
-            $existing.OriginalStartType = $StartType
-            $existing.OriginalStatus = $Status
-            $existing.Restored = $false
+            $existing | Add-Member -NotePropertyName OriginalStartType -NotePropertyValue $StartType -Force
+            $existing | Add-Member -NotePropertyName OriginalStatus -NotePropertyValue $Status -Force
+            $existing | Add-Member -NotePropertyName Restored -NotePropertyValue $false -Force
         }
         return $State
     }
