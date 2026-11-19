@@ -229,6 +229,116 @@ Describe 'Invoke-VegaHostInstall（mock）' {
         $removed.ExitCode | Should -Be 0
         Should -Invoke -ModuleName $script:ModuleName -CommandName Uninstall-VegaPackage -Times 0 -Exactly
     }
+
+    It '安装前阻断规则强制包含 47990，安装完成后再按实际端口计算' {
+        Mock -ModuleName $script:ModuleName Get-VegaSunshineInstall { $script:sunshine }
+        Mock -ModuleName $script:ModuleName Install-VegaPackage {
+            param($PackageId, $DisplayName, [switch]$Force)
+            $null = $PackageId
+            $null = $DisplayName
+            $null = $Force
+            [pscustomobject]@{ PackageId = 'LizardByte.Sunshine'; Installed = $true; PreExisting = $false }
+        }
+        $env:VEGA_TEST_BLOCK_LOG = Join-Path $TestDrive 'block.log'
+        Mock -ModuleName $script:ModuleName Get-VegaAdminBlockPortList {
+            param($ManagementPorts, $BasePort, [switch]$IncludeDefaultManagementPort)
+            $null = $ManagementPorts
+            $null = $BasePort
+            if ($IncludeDefaultManagementPort) { Add-Content -LiteralPath $env:VEGA_TEST_BLOCK_LOG -Value 'pre' }
+            else { Add-Content -LiteralPath $env:VEGA_TEST_BLOCK_LOG -Value 'final' }
+            @(47990)
+        }
+
+        try {
+            $null = Invoke-VegaHostInstall -StatePath $script:statePath -TemplatePath $script:TemplatePath -SkipTailscale
+            $log = @(Get-Content -LiteralPath $env:VEGA_TEST_BLOCK_LOG)
+            $log | Should -Be @('pre', 'final')
+        }
+        finally {
+            Remove-Item Env:VEGA_TEST_BLOCK_LOG -ErrorAction SilentlyContinue
+        }
+    }
+
+    It '串流放行规则创建失败时中止，不禁用安装器规则' {
+        Mock -ModuleName $script:ModuleName Get-VegaSunshineInstall { $script:sunshine }
+        Mock -ModuleName $script:ModuleName Install-VegaPackage {
+            param($PackageId, $DisplayName, [switch]$Force)
+            $null = $PackageId
+            $null = $DisplayName
+            $null = $Force
+            [pscustomobject]@{ PackageId = 'LizardByte.Sunshine'; Installed = $true; PreExisting = $false }
+        }
+        Mock -ModuleName $script:ModuleName Set-VegaFirewallRule { throw '回读发现端口不全' }
+
+        $result = Invoke-VegaHostInstall -StatePath $script:statePath -TemplatePath $script:TemplatePath -SkipTailscale
+
+        $result.ExitCode | Should -Be 1
+        ($result.Failures -join "`n") | Should -Match '回读发现端口不全'
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Protect-VegaSunshineManagementPort -Times 0 -Exactly
+    }
+
+    It '先确认 Vega 放行规则，再禁用安装器规则' {
+        Mock -ModuleName $script:ModuleName Get-VegaSunshineInstall { $script:sunshine }
+        Mock -ModuleName $script:ModuleName Install-VegaPackage {
+            param($PackageId, $DisplayName, [switch]$Force)
+            $null = $PackageId
+            $null = $DisplayName
+            $null = $Force
+            [pscustomobject]@{ PackageId = 'LizardByte.Sunshine'; Installed = $true; PreExisting = $false }
+        }
+        $env:VEGA_TEST_ORDER_LOG = Join-Path $TestDrive 'order.log'
+        Mock -ModuleName $script:ModuleName Set-VegaFirewallRule {
+            param($Program, $BasePort, $OnRuleCreated)
+            $null = $Program
+            $null = $BasePort
+            Add-Content -LiteralPath $env:VEGA_TEST_ORDER_LOG -Value 'allow'
+            if ($null -ne $OnRuleCreated) {
+                & $OnRuleCreated 'Vega-Sunshine-TCP'
+                & $OnRuleCreated 'Vega-Sunshine-UDP'
+            }
+            return @('Vega-Sunshine-TCP', 'Vega-Sunshine-UDP')
+        }
+        Mock -ModuleName $script:ModuleName Protect-VegaSunshineManagementPort {
+            param($State)
+            Add-Content -LiteralPath $env:VEGA_TEST_ORDER_LOG -Value 'protect'
+            $State
+        }
+
+        try {
+            $result = Invoke-VegaHostInstall -StatePath $script:statePath -TemplatePath $script:TemplatePath -SkipTailscale
+            $result.ExitCode | Should -Be 0
+            $log = @(Get-Content -LiteralPath $env:VEGA_TEST_ORDER_LOG)
+            $log | Should -Be @('allow', 'protect')
+        }
+        finally {
+            Remove-Item Env:VEGA_TEST_ORDER_LOG -ErrorAction SilentlyContinue
+        }
+    }
+
+    It '已标记 Restored 的服务条目在新一轮安装时重采基线并改回待恢复' {
+        Mock -ModuleName $script:ModuleName Get-VegaSunshineInstall { $script:sunshine }
+        Mock -ModuleName $script:ModuleName Install-VegaPackage {
+            param($PackageId, $DisplayName, [switch]$Force)
+            $null = $PackageId
+            $null = $DisplayName
+            $null = $Force
+            [pscustomobject]@{ PackageId = 'LizardByte.Sunshine'; Installed = $true; PreExisting = $false }
+        }
+
+        $state = Get-VegaEmptyState
+        $state = Add-VegaStateService -State $state -Name 'SunshineService' -StartType 'Disabled' -Status 'Stopped'
+        $state = Set-VegaStateServiceRestored -State $state -Name 'SunshineService' -Confirm:$false
+        $null = Write-VegaState -State $state -Path $script:statePath -Confirm:$false
+
+        $result = Invoke-VegaHostInstall -StatePath $script:statePath -TemplatePath $script:TemplatePath -SkipTailscale
+        $result.ExitCode | Should -Be 0
+
+        $saved = Read-VegaState -Path $script:statePath
+        $entry = @($saved.Services | Where-Object { $_.Name -eq 'SunshineService' })[0]
+        $entry.OriginalStartType | Should -Be 'Manual'
+        $entry.OriginalStatus | Should -Be 'Stopped'
+        [bool]$entry.Restored | Should -BeFalse
+    }
 }
 
 Describe 'Invoke-VegaHostUninstall（mock）' {

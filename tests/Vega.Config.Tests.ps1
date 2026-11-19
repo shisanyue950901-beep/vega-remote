@@ -39,6 +39,21 @@ Describe 'ConvertFrom-VegaSunshineConfigText' {
         $values.Count | Should -Be 0
     }
 
+    It '只认小写键：PORT / Port 不等同于 port' {
+        $text = @(
+            'PORT = 48000',
+            'Port = 48001',
+            'port = 48002'
+        ) -join "`n"
+
+        $values = ConvertFrom-VegaSunshineConfigText -Text $text
+
+        $values.Count | Should -Be 1
+        $values['port'] | Should -Be '48002'
+        $values.Contains('PORT') | Should -BeFalse
+        $values.Contains('Port') | Should -BeFalse
+    }
+
     It '仓库模板里包含必须由 Vega 管理的键，且不写 encoder' {
         $values = ConvertFrom-VegaSunshineConfigText -Text $script:TemplateText
 
@@ -106,6 +121,36 @@ Describe 'Merge-VegaSunshineConfigText' {
         # 受管键前面会有一行注释，^ 需要多行模式才匹配得到
         $result | Should -Match '(?m)^sunshine_name = Vega$'
         ([regex]::Matches($result, '(?m)^sunshine_name\s*=')).Count | Should -Be 1
+    }
+}
+
+Describe 'Merge-VegaSunshineConfigText 大小写敏感' {
+    It '大写键原样保留，另写一条小写受管键' {
+        $existing = "PORT = 48000`nsunshine_name = Old" + "`n"
+        $values = [ordered]@{ sunshine_name = 'Vega' }
+
+        $result = Merge-VegaSunshineConfigText -ExistingText $existing -Values $values
+        $lines = @($result -split "`n" | Where-Object { $_ -ne '' })
+
+        $lines | Should -Contain 'PORT = 48000'
+        $lines | Should -Contain 'sunshine_name = Vega'
+    }
+
+    It '只有小写键算作已存在，不会重复追加' {
+        $existing = "port = 48000`n"
+        $values = [ordered]@{ port = '48000' }
+
+        $result = Merge-VegaSunshineConfigText -ExistingText $existing -Values $values
+        @($result -split "`n" | Where-Object { $_ -match '^port\s*=' }).Count | Should -Be 1
+    }
+
+    It 'RemoveKeys 不删同名大写键' {
+        $existing = "PORT = 48000`nport = 48000`n"
+        $result = Merge-VegaSunshineConfigText -ExistingText $existing -Values ([ordered]@{}) -RemoveKeys @('port')
+        $lines = @($result -split "`n" | Where-Object { $_ -ne '' })
+
+        $lines | Should -Contain 'PORT = 48000'
+        $lines | Should -Not -Contain 'port = 48000'
     }
 }
 

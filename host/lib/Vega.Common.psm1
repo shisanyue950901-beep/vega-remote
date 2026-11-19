@@ -1160,6 +1160,8 @@ function Get-VegaStateService {
 function Add-VegaStateService {
     <#
       只在第一次记录服务的原始启动类型与运行状态；重跑不覆盖基线。
+      例外：条目已经被标记 Restored（卸载恢复过），说明旧基线已经消费掉，
+      新一轮安装要重新采集基线并改回待恢复，否则这次安装的改动卸载时没人管。
     #>
     [CmdletBinding()]
     param(
@@ -1175,7 +1177,15 @@ function Add-VegaStateService {
         [string]$Status = ''
     )
 
-    if ($null -ne (Get-VegaStateService -State $State -Name $Name)) { return $State }
+    $existing = Get-VegaStateService -State $State -Name $Name
+    if ($null -ne $existing) {
+        if ($null -ne $existing.PSObject.Properties['Restored'] -and [bool]$existing.Restored) {
+            $existing.OriginalStartType = $StartType
+            $existing.OriginalStatus = $Status
+            $existing.Restored = $false
+        }
+        return $State
+    }
 
     $State.Services = @(@($State.Services) + [pscustomobject]@{
             Name              = $Name
@@ -1493,6 +1503,8 @@ function ConvertFrom-VegaSunshineConfigText {
     <#
       纯函数：把配置文本解析成 键 -> 值 的有序字典。
       忽略注释与空行；同名键以第一次出现的为准。
+      只认小写键名：Sunshine 的配置键大小写敏感，PORT / Port 这类键
+      对 Sunshine 无效，Vega 也就不能把它们当成 port 来读。
     #>
     [CmdletBinding()]
     param(
@@ -1506,7 +1518,7 @@ function ConvertFrom-VegaSunshineConfigText {
 
     foreach ($line in ($Text -split "\r?\n")) {
         if ($line -match '^\s*#') { continue }
-        if ($line -match '^\s*(?<key>[A-Za-z0-9_]+)\s*=\s*(?<value>.*)$') {
+        if ($line -match '^\s*(?<key>[a-z0-9_]+)\s*=\s*(?<value>.*)$') {
             $key = $Matches['key']
             if (-not $values.Contains($key)) {
                 $values[$key] = ([string]$Matches['value']).Trim()
@@ -1521,6 +1533,7 @@ function Merge-VegaSunshineConfigText {
     <#
       纯函数：只更新 $Values 里给出的键，其余行（用户自己加的键、注释、空行）
       原样保留。重复的受管键只保留第一条。缺失的受管键追加到文件末尾。
+      键名大小写敏感，只匹配小写键（与 Sunshine 一致）。
       $RemoveKeys 里的键整行删除（按键回滚时“原文里本来没有”的键）。
       返回以单个换行结尾的文本。
     #>
@@ -1538,7 +1551,7 @@ function Merge-VegaSunshineConfigText {
         [string[]]$RemoveKeys = @()
     )
 
-    $remove = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $remove = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
     foreach ($removeKey in @($RemoveKeys)) {
         if ([string]::IsNullOrWhiteSpace($removeKey)) { continue }
         $null = $remove.Add([string]$removeKey)
@@ -1552,12 +1565,12 @@ function Merge-VegaSunshineConfigText {
         }
     }
 
-    $written = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $written = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
     $output = New-Object System.Collections.Generic.List[string]
 
     foreach ($line in $existingLines) {
         $key = $null
-        if ($line -match '^\s*(?<key>[A-Za-z0-9_]+)\s*=') { $key = $Matches['key'] }
+        if ($line -match '^\s*(?<key>[a-z0-9_]+)\s*=') { $key = $Matches['key'] }
 
         if ($null -ne $key -and $remove.Contains($key)) { continue }
 
@@ -2437,8 +2450,31 @@ function Set-VegaFirewallRule {
             throw "创建防火墙规则 $($spec.Name) 失败：$($_.Exception.Message)"
         }
 
-        if (-not (Test-VegaFirewallRule -Name $spec.Name)) {
+        # 回读确认：规则已生效（Allow）、端口覆盖完整。确认之前不往下走，
+        # 调用方要等这一步成功才去禁用 Sunshine 安装器的放行规则。
+        $check = Get-NetFirewallRule -Name $spec.Name -PolicyStore ActiveStore -ErrorAction SilentlyContinue
+        if ($null -eq $check) {
             throw "创建后未找到防火墙规则 $($spec.Name)"
+        }
+        if ([string]$check.Enabled -ne 'True' -or [string]$check.Action -ne 'Allow') {
+            throw "防火墙规则 $($spec.Name) 状态异常（Enabled=$($check.Enabled)，Action=$($check.Action)）。"
+        }
+        $filter = Get-NetFirewallPortFilter -AssociatedNetFirewallRule $check -ErrorAction SilentlyContinue
+        if ($null -eq $filter) {
+            throw "无法读取防火墙规则 $($spec.Name) 的端口过滤器。"
+        }
+        $actualPorts = @($filter.LocalPort | ForEach-Object { [string]$_ })
+        foreach ($portSpec in @($spec.LocalPort)) {
+            if ($portSpec -match '^(?<start>[0-9]+)-(?<end>[0-9]+)$') {
+                if (-not (Test-VegaPortInRange -Ports $actualPorts -Port ([int]$Matches['start'])) -or
+                    -not (Test-VegaPortInRange -Ports $actualPorts -Port ([int]$Matches['end']))) {
+                    throw "防火墙规则 $($spec.Name) 未覆盖端口段 $portSpec（实际：$($actualPorts -join ',')）。"
+                }
+                continue
+            }
+            if (-not (Test-VegaPortInRange -Ports $actualPorts -Port ([int]$portSpec))) {
+                throw "防火墙规则 $($spec.Name) 未覆盖端口 $portSpec（实际：$($actualPorts -join ',')）。"
+            }
         }
         $created.Add($spec.Name)
         if ($null -ne $OnRuleCreated) { & $OnRuleCreated $spec.Name }
@@ -2513,14 +2549,51 @@ function Remove-VegaLegacyFirewallRule {
     return $removed.ToArray()
 }
 
+function Get-VegaAdminBlockPortList {
+    <#
+      纯函数：算出 Vega-Block-Admin 要阻断的端口。
+      - 始终包含按生效配置算出的管理端口。
+      - -IncludeDefaultManagementPort：安装前使用，无条件再加 47990
+        （安装器可能按默认端口启动，首次设密前必须挡住）。
+      - 不带该开关：安装完成后使用，只有 47990 不在串流放行端口里时才加，
+        避免把串流端口一起阻断。
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [int[]]$ManagementPorts,
+
+        [int]$BasePort = 47989,
+
+        [switch]$IncludeDefaultManagementPort
+    )
+
+    $result = New-Object System.Collections.Generic.List[int]
+    foreach ($port in @($ManagementPorts)) {
+        if ($port -lt 1 -or $port -gt 65535) { continue }
+        if (-not $result.Contains([int]$port)) { $result.Add([int]$port) }
+    }
+
+    $includeDefault = [bool]$IncludeDefaultManagementPort
+    if (-not $includeDefault -and -not (Test-VegaPortInRange -Ports @((Get-VegaFirewallRuleSpec -BasePort $BasePort) |
+                    ForEach-Object { $_.LocalPort }) -Port 47990)) {
+        $includeDefault = $true
+    }
+
+    if ($includeDefault -and -not $result.Contains(47990)) { $result.Add(47990) }
+
+    return @($result | Sort-Object)
+}
+
 function Set-VegaAdminBlockRule {
     <#
       建立/刷新管理端口阻断规则（Vega-Block-Admin，入站 TCP，Action = Block）。
       必须在 winget 安装 Sunshine 之前调用：安装器会先放行并启动服务，
       先阻断才能保证首次设密前管理页不暴露在网络上。
-      规则已存在时原地更新端口（Set-NetFirewallRule / Set-NetFirewallPortFilter），
+      规则已存在时用一次 Set-NetFirewallRule 原地更新协议/端口/动作，
       绝不先删后建：删除到重建之间管理页会重新暴露，而且安装失败也不能撤掉已有阻断。
-      创建或更新后回读确认，失败抛异常（已有阻断保持原样）。规则保留到卸载。
+      创建或更新后从 ActiveStore 回读确认，失败抛异常（已有阻断保持原样）。规则保留到卸载。
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -2558,17 +2631,16 @@ function Set-VegaAdminBlockRule {
         }
     }
     else {
-        # 原地更新：不删除已有规则，端口变了也只是一次 Set
+        # 原地更新：协议、端口、动作一次 Set 完成，不删除已有规则
         try {
-            $null = Set-NetFirewallRule -Name $name -Enabled True -Action Block -ErrorAction Stop
-            $null = Set-NetFirewallPortFilter -AssociatedNetFirewallRule $existing -Protocol TCP -LocalPort $ports -ErrorAction Stop
+            $null = Set-NetFirewallRule -Name $name -Protocol TCP -LocalPort $ports -Action Block -Enabled True -ErrorAction Stop
         }
         catch {
             throw "更新管理端口阻断规则 $name 失败（已有阻断保持原样，未删除）：$($_.Exception.Message)"
         }
     }
 
-    $check = Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue
+    $check = Get-NetFirewallRule -Name $name -PolicyStore ActiveStore -ErrorAction SilentlyContinue
     if ($null -eq $check) { throw "管理端口阻断规则创建/更新后未找到：$name" }
     if ([string]$check.Enabled -ne 'True' -or [string]$check.Action -ne 'Block') {
         throw "管理端口阻断规则状态异常（Enabled=$($check.Enabled)，Action=$($check.Action)）。"
@@ -2881,7 +2953,7 @@ function Invoke-VegaHostInstallCore {
     <#
       被控端安装流程：
       清单 -> 隔离管理端口 -> 装组件 -> 按键记录配置基线并写入 -> 只放行串流端口
-      -> 关睡眠 -> 服务自启。每一步变更立即写清单。
+      -> 确认放行后再禁用安装器规则 -> 关睡眠 -> 服务自启。每一步变更立即写清单。
       返回 { ExitCode, Failures }；任何失败都让退出码非零。
     #>
     [CmdletBinding(SupportsShouldProcess)]
@@ -2922,8 +2994,10 @@ function Invoke-VegaHostInstallCore {
     if ($null -ne $existingSunshine) {
         $basePort = Get-VegaSunshineBasePort -ConfigPath $existingSunshine.Config
     }
-    # 阻断规则只包含按生效配置算出的管理端口
-    $managementPorts = @((Get-VegaSunshinePortMap -BasePort $basePort).ManagementPort)
+    # 安装前的阻断规则：计算出的管理端口 + 默认 47990，去重。
+    # 安装器启动那一刻可能还按默认端口监听，不能漏掉 47990。
+    $managementPorts = @(Get-VegaAdminBlockPortList -ManagementPorts @((Get-VegaSunshinePortMap -BasePort $basePort).ManagementPort) `
+            -BasePort $basePort -IncludeDefaultManagementPort)
 
     # 管理端口落进串流放行端口时同端口既放行又阻断：让用户改 port，不要猜
     $portConflicts = @(Test-VegaManagementPortConflict -ManagementPorts $managementPorts -BasePort $basePort)
@@ -2951,12 +3025,6 @@ function Invoke-VegaHostInstallCore {
             ExitCode = 1
             Failures = $failures.ToArray()
         }
-    }
-
-    # 已经装过 Sunshine 的机器：隔离安装器自带的对管理端口放行规则
-    if ($null -ne $existingSunshine) {
-        $state = Protect-VegaSunshineManagementPort -State $state -SunshineExe $existingSunshine.Exe `
-            -ManagementPort (Get-VegaSunshinePortMap -BasePort $basePort).ManagementPort -StatePath $StatePath -Confirm:$false
     }
 
     # 服务基线必须在 winget 安装/重装之前采集：重装会把服务重置成安装器的默认值，
@@ -3017,8 +3085,9 @@ function Invoke-VegaHostInstallCore {
     $basePort = Get-VegaSunshineBasePort -ConfigPath $sunshine.Config
     $ports = Get-VegaSunshinePortMap -BasePort $basePort
 
-    # 安装器可能改过配置端口：按生效配置原地更新阻断规则的端口（规则保留，不删）
-    $actualManagementPorts = @($ports.ManagementPort)
+    # 安装器可能改过配置端口：按生效配置原地更新阻断规则的端口（规则保留，不删）。
+    # 安装完成后串流放行规则已经按实际端口建好，只有 47990 不是串流端口时才继续阻断它。
+    $actualManagementPorts = @(Get-VegaAdminBlockPortList -ManagementPorts @($ports.ManagementPort) -BasePort $basePort)
     $portConflicts = @(Test-VegaManagementPortConflict -ManagementPorts $actualManagementPorts -BasePort $basePort)
     if ($portConflicts.Count -gt 0) {
         $failures.Add("管理端口 $($portConflicts -join '/') 与串流放行端口重叠，请先修改 sunshine.conf 里的 port 再重试。")
@@ -3042,9 +3111,6 @@ function Invoke-VegaHostInstallCore {
             Failures = $failures.ToArray()
         }
     }
-
-    $state = Protect-VegaSunshineManagementPort -State $state -SunshineExe $sunshine.Exe `
-        -ManagementPort $ports.ManagementPort -StatePath $StatePath -Confirm:$false
 
     Write-VegaStatus '检测显卡'
     $gpuNames = @()
@@ -3115,8 +3181,27 @@ function Invoke-VegaHostInstallCore {
         Write-VegaStatus ("Vega 防火墙规则已就绪（TCP {0}；UDP {1}）" -f ($ports.TcpPorts -join '/'), ($ports.UdpPorts -join '/')) -Level Ok
     }
     catch {
-        $failures.Add("防火墙规则创建失败：$($_.Exception.Message)")
+        # 放行规则没确认成功就不禁用安装器规则：否则两条都没了
+        $failures.Add("防火墙规则创建失败，中止安装（未禁用安装器规则）：$($_.Exception.Message)")
         Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
+        return [pscustomobject]@{
+            ExitCode = 1
+            Failures = $failures.ToArray()
+        }
+    }
+
+    # 串流放行规则已回读确认，再隔离 Sunshine 安装器自带的对管理端口放行规则
+    try {
+        $state = Protect-VegaSunshineManagementPort -State $state -SunshineExe $sunshine.Exe `
+            -ManagementPort $ports.ManagementPort -StatePath $StatePath -Confirm:$false
+    }
+    catch {
+        $failures.Add("隔离 Sunshine 安装器放行规则失败，中止安装：$($_.Exception.Message)")
+        Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
+        return [pscustomobject]@{
+            ExitCode = 1
+            Failures = $failures.ToArray()
+        }
     }
 
     Write-VegaStatus '关闭插电睡眠'
@@ -3687,6 +3772,7 @@ Export-ModuleMember -Function @(
     'Get-VegaSunshinePortMap',
     'Get-VegaSunshineBasePort',
     'Get-VegaFirewallRuleSpec',
+    'Get-VegaAdminBlockPortList',
     'Test-VegaFirewallSpecSafe',
     'Test-VegaManagementPortConflict',
     'Test-VegaPortInRange',
