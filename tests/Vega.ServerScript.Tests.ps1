@@ -50,6 +50,11 @@ Describe 'RustDesk 部署脚本：端口与失败清理' {
         $script:ServerScript | Should -Match 'compose down'
     }
 
+    It 'ss 预检只解析本地地址列（第 5 列）末尾的端口' {
+        $script:ServerScript | Should -Match 'split\(\$5, parts, ":"\)'
+        $script:ServerScript | Should -Not -Match '\$0 ~ \(":" p'
+    }
+
     It '就绪检查按 up 后的容器 ID 采样，RestartCount 必须为 0' {
         $script:ServerScript | Should -Match 'EXPECTED_ID'
         $script:ServerScript | Should -Match 'RestartCount'
@@ -57,15 +62,26 @@ Describe 'RustDesk 部署脚本：端口与失败清理' {
     }
 }
 
-Describe 'RustDesk 部署脚本：UFW' {
-    It '已有涉及 21115-21119 的规则时不再追加，提示自查' {
-        $script:ServerScript | Should -Match 'ufw_status_has_port_rules'
-        $script:ServerScript | Should -Match '本次不追加'
+Describe 'RustDesk 部署脚本：防火墙只提示不修改' {
+    It '不执行任何 ufw allow/deny/delete，也不回滚规则' {
+        $script:ServerScript | Should -Not -Match '(?m)^\s*ufw (allow|deny|delete)\b'
+        $script:ServerScript | Should -Not -Match 'ADDED_RULES'
+        $script:ServerScript | Should -Not -Match 'rollback_rules'
+        $script:ServerScript | Should -Not -Match 'ufw_status_has_port_rules'
     }
 
-    It '未启用 WebSocket 且默认 deny 时额外阻断 21118:21119/tcp' {
-        $script:ServerScript | Should -Match 'ufw deny 21118:21119/tcp'
-        $script:ServerScript | Should -Match 'ADDED_RULES\+=\("deny 21118:21119/tcp"\)'
+    It '完成后打印端口清单、ufw 示例与云安全组建议' {
+        $script:ServerScript | Should -Match 'print_port_guidance'
+        $script:ServerScript | Should -Match 'sudo ufw allow 21115:21117/tcp'
+        $script:ServerScript | Should -Match 'sudo ufw allow 21116/udp'
+        $script:ServerScript | Should -Match '云安全组建议'
+        $script:ServerScript | Should -Match '只放行 TCP \$tcp_list、UDP 21116'
+    }
+
+    It '--websocket 只影响提示文字，额外列出 TCP 21118-21119' {
+        $script:ServerScript | Should -Match 'sudo ufw allow 21118:21119/tcp'
+        $script:ServerScript | Should -Match 'tcp_list="21115-21119"'
+        $script:ServerScript | Should -Match '已含 WebSocket'
     }
 
     It '默认 allow 或 UFW 未启用时警告 WebSocket 暴露并给出安全组最小放行范围' {
