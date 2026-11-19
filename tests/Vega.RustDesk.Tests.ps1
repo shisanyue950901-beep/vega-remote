@@ -636,6 +636,39 @@ Describe 'P2-4 TOML 保留缩进与逐行换行，引号结构写前中止' {
                 -UserConfigPath $path -Confirm:$false } | Should -Throw '*引号键*'
         (Get-Content -LiteralPath $path -Raw -Encoding UTF8) | Should -Be $original
     }
+
+    It '根级带引号段的点分键写前中止' {
+        $lines = @(
+            '"options".key = "x"',
+            "'options'.key = 'x'",
+            'options."key" = "x"',
+            "options.'key' = 'x'"
+        )
+        foreach ($line in $lines) {
+            { Merge-VegaRustDeskConfigText -ExistingText ($line + "`n") -Values ([System.Collections.Specialized.OrderedDictionary]::new([System.StringComparer]::Ordinal)) } |
+                Should -Throw '*引号点分键*'
+        }
+        { Merge-VegaRustDeskConfigText -ExistingText ('[relay]' + "`n" + 'options."key" = "x"' + "`n") -Values ([System.Collections.Specialized.OrderedDictionary]::new([System.StringComparer]::Ordinal)) } |
+            Should -Throw '*引号点分键*'
+    }
+
+    It '普通点分键与非 options 的引号点分键不误判' {
+        Test-VegaRustDeskConfigUnsupported -Text ('options.key = "x"' + "`n") | Should -Be ''
+        Test-VegaRustDeskConfigUnsupported -Text ('other."key" = "x"' + "`n") | Should -Be ''
+        Test-VegaRustDeskConfigUnsupported -Text ('"other".key = "x"' + "`n") | Should -Be ''
+    }
+
+    It 'Set 遇到引号点分键时不改文件' {
+        $path = Join-Path $TestDrive 'quoted-dotted/RustDesk/config/RustDesk2.toml'
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force
+        $original = '"options".custom-rendezvous-server = "old"' + "`n"
+        Set-Content -LiteralPath $path -Value $original -Encoding UTF8 -NoNewline
+
+        { Set-VegaRustDeskConfig -Server 'relay.example.com' -Key ('C' * 43 + '=') `
+                -State (Get-VegaEmptyState) -StatePath (Join-Path $TestDrive 'quoted-dotted-state.json') `
+                -UserConfigPath $path -Confirm:$false } | Should -Throw '*引号点分键*'
+        (Get-Content -LiteralPath $path -Raw -Encoding UTF8) | Should -Be $original
+    }
 }
 
 Describe 'P2-5 回滚按 Ordinal 比较文本' {
