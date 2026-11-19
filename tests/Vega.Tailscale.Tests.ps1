@@ -64,7 +64,7 @@ Describe 'ConvertFrom-VegaTailscalePing' {
 
     It '没有 pong 时 Succeded 为假，并保留最后一行' {
         $output = @(
-            'pong from vega-host (100.64.0.2) via DERP(hkg) in 40ms',
+            'magicsock: disco: timeout waiting for a relay connection',
             'timeout waiting for a relay connection'
         )
         $result = ConvertFrom-VegaTailscalePing -Output $output
