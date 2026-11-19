@@ -653,9 +653,13 @@ Describe 'P2-4 TOML 保留缩进与逐行换行，引号结构写前中止' {
     }
 
     It '普通点分键与非 options 的引号点分键不误判' {
-        Test-VegaRustDeskConfigUnsupported -Text ('options.key = "x"' + "`n") | Should -Be ''
-        Test-VegaRustDeskConfigUnsupported -Text ('other."key" = "x"' + "`n") | Should -Be ''
-        Test-VegaRustDeskConfigUnsupported -Text ('"other".key = "x"' + "`n") | Should -Be ''
+        # Test-VegaRustDeskConfigUnsupported 是模块内部辅助函数（未导出），
+        # 必须在模块作用域里调用，否则命令名解析不到。
+        InModuleScope Vega.Common {
+            Test-VegaRustDeskConfigUnsupported -Text ('options.key = "x"' + "`n") | Should -Be ''
+            Test-VegaRustDeskConfigUnsupported -Text ('other."key" = "x"' + "`n") | Should -Be ''
+            Test-VegaRustDeskConfigUnsupported -Text ('"other".key = "x"' + "`n") | Should -Be ''
+        }
     }
 
     It 'Set 遇到引号点分键时不改文件' {
