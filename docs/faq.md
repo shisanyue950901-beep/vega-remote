@@ -22,13 +22,13 @@ Moonlight 不支持。用 RustDesk 或 Tailscale 的 Taildrop。
 Moonlight 首次连接要 PIN 配对；Tailscale 端到端加密。管理页用 `origin_web_ui_allowed = pc` 限制为本机访问，Vega 防火墙只放行串流端口，不放行 47990；如果 Sunshine 安装器自带对 47990 的入站规则，安装脚本会禁用它（卸载时恢复）。所以不要在路由器上把 47990 映射出去。
 
 **安装脚本可以重复运行吗？**
-可以。已安装的组件会跳过，Vega 防火墙规则先删后建。`sunshine.conf` 只更新 Vega 管理的键（`sunshine_name`、`adapter_name`、`dd_*`、`origin_web_ui_allowed`、`address_family`），其余内容原样保留，写入用临时文件 + 原子替换；第一次修改前会备份成 `sunshine.conf.bak`，之后不覆盖最初备份。想强制重装组件加 `-Force`。
+可以。已安装的组件会跳过，Vega 防火墙规则先删后建。`sunshine.conf` 只更新 Vega 管理的键（`sunshine_name`、`adapter_name`、`dd_*`、`origin_web_ui_allowed`、`address_family`），其余内容原样保留，写入用临时文件 + 原子替换，不生成 `.bak`；首次安装只把受管键的原值记进状态清单，卸载按键回滚。想强制重装组件加 `-Force`（重装前仍会查询，已存在的组件登记为 PreExisting，不会被 `-RemoveApps` 卸载）。
 
 **脚本支持 Windows PowerShell 5.1 吗？**
 支持。Windows 10/11 自带的 Windows PowerShell 5.1 和 PowerShell 7 都能跑，文件是 UTF-8 with BOM。Win7 不在支持范围。
 
 **怎么卸载？**
-安装时会写 `%ProgramData%\Vega\state.json` 状态清单。被控端运行 `.\host\install-host.ps1 -Uninstall`：按清单删除 Vega 防火墙规则、恢复安装器规则、恢复 `sunshine.conf` 与服务的原始启动类型。配置文件在安装后被改过时只报告冲突、不覆盖。再加 `-RemoveApps` 只卸载清单里由 Vega 安装的 Sunshine / Tailscale（加 `-WithRustDesk` 时也卸 RustDesk），你原本就有的应用不会被删。主控端用 `.\client\install-client.ps1 -Uninstall -RemoveApps`。卸载不恢复电源/睡眠设置。
+安装时会写状态清单：被控端在 `%ProgramData%\Vega\host-state.json`（Administrators + SYSTEM 专用 ACL），主控端在 `%LOCALAPPDATA%\Vega\client-state.json`。被控端运行 `.\host\install-host.ps1 -Uninstall`：按清单删除 Vega 防火墙规则、恢复安装器规则、把 `sunshine.conf` 的受管键恢复为原始值、把服务恢复为记录的启动类型与运行状态。再加 `-RemoveApps` 只卸载清单里由 Vega 安装的 Sunshine / Tailscale（加 `-WithRustDesk` 时也卸 RustDesk），你原本就有的应用不会被删。主控端用 `.\client\install-client.ps1 -Uninstall -RemoveApps`。卸载不恢复电源/睡眠设置。
 
 **连不上或卡顿，先看哪里？**
 先跑只读诊断：`powershell -File .\tools\vega-doctor.ps1`。怀疑线路问题时加 `-Peer <被控端机器名>`，脚本会执行 `tailscale ping -c 3`，直接告诉你走的是直连还是 DERP 中继，并给出中文建议。它不会修改任何系统设置。

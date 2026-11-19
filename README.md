@@ -76,7 +76,8 @@ powershell -File .\tools\vega-doctor.ps1 -Peer vega-host
 
 两个安装脚本都可以反复执行：已安装的组件跳过，防火墙规则先删后建，`sunshine.conf` 只更新 Vega 管理的键（`sunshine_name`、`adapter_name`、`dd_*`、`origin_web_ui_allowed`、`address_family`），你后来加的端口、凭据、配对路径等键原样保留。
 
-安装时会写一份状态清单 `%ProgramData%\Vega\state.json`，记录 Vega 实际安装的包、创建的备份、禁用的安装器防火墙规则、服务的原始启动类型。卸载只按清单回滚：
+安装时会写一份状态清单，记录 Vega 实际安装的包、Vega 防火墙规则、被禁用的安装器防火墙规则、服务原始的启动类型与运行状态，以及 `sunshine.conf` 里受管键的原始值。
+被控端（管理员）用 `%ProgramData%\Vega\host-state.json`：目录只给 Administrators + SYSTEM 完全控制并禁用继承，读取前还会校验所有者不是低权限账号、不是重解析点；主控端（普通用户）用 `%LOCALAPPDATA%\Vega\client-state.json`。回滚前每条记录都会按白名单核对（规则名、服务名、配置路径、包 ID），每一步变更立即写回，全部回滚成功后才删除清单。卸载只按清单回滚：
 
 ```powershell
 # 被控端：删除 Vega 防火墙规则、恢复安装器规则、恢复配置与服务启动类型
@@ -90,7 +91,7 @@ Set-ExecutionPolicy -Scope Process Bypass -Force
 .\client\install-client.ps1 -Uninstall -RemoveApps
 ```
 
-如果 `sunshine.conf` 在安装后被手动改过，卸载会报告冲突并保留现状（备份文件仍在），不会覆盖你的修改。`-Uninstall` 不会改动睡眠/电源设置，也不会删除 Sunshine 安装目录。
+卸载只把受管键恢复为首次安装前的原值（原来没有的键就删掉），你后来加的键、注释、端口、凭据路径都不会被动。`-Uninstall` 不会改动睡眠/电源设置，也不会删除 Sunshine 安装目录。
 
 旧版本装的机器没有状态清单：此时卸载只清理 Vega 自己命名的防火墙规则，其余保持现状，避免误伤。
 

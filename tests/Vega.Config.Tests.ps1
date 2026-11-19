@@ -109,14 +109,39 @@ Describe 'Merge-VegaSunshineConfigText' {
     }
 }
 
-Describe 'Set-VegaSunshineConfig' {
-    It '首次写入不备份（原文件不存在），内容为 UTF-8 无 BOM' {
-        $path = Join-Path $TestDrive 'sunshine.conf'
-        $result = Set-VegaSunshineConfig -Path $path -Content 'adapter_name = test' -Confirm:$false
+Describe 'Merge-VegaSunshineConfigText -RemoveKeys' {
+    It '把指定键整行删除，其他键与注释保留' {
+        $existing = @(
+            '# 注释',
+            'sunshine_name = Vega',
+            'address_family = both',
+            'port = 48000'
+        ) -join "`n"
 
-        $result.BackupCreated | Should -BeFalse
-        $result.OriginalExisted | Should -BeFalse
+        $result = Merge-VegaSunshineConfigText -ExistingText $existing -Values ([ordered]@{}) -RemoveKeys @('address_family')
+        $lines = $result -split "`n"
+
+        $lines | Should -Contain 'sunshine_name = Vega'
+        $lines | Should -Contain 'port = 48000'
+        $lines | Should -Contain '# 注释'
+        $result | Should -Not -Match 'address_family'
+    }
+
+    It '重复出现的待删键全部删除' {
+        $existing = "sunshine_name = Vega`naddress_family = both`naddress_family = ipv4"
+        $result = Merge-VegaSunshineConfigText -ExistingText $existing -Values ([ordered]@{}) -RemoveKeys @('address_family')
+        $result | Should -Not -Match 'address_family'
+        $result | Should -Match 'sunshine_name = Vega'
+    }
+}
+
+Describe 'Set-VegaSunshineConfig' {
+    It '写入 UTF-8 无 BOM 内容，不生成 .bak' {
+        $path = Join-Path $TestDrive 'sunshine.conf'
+        $null = Set-VegaSunshineConfig -Path $path -Content 'adapter_name = test' -Confirm:$false
+
         (Get-Content -LiteralPath $path -Raw) | Should -Be 'adapter_name = test'
+        Test-Path -LiteralPath "$path.bak" | Should -BeFalse
 
         $bytes = [System.IO.File]::ReadAllBytes($path)
         $bytes.Length | Should -BeGreaterThan 3
@@ -124,23 +149,7 @@ Describe 'Set-VegaSunshineConfig' {
         $bytes[0] | Should -Not -Be 0xEF
     }
 
-    It '原配置存在时备份一次，重复执行不覆盖最初的备份' {
-        $path = Join-Path $TestDrive 'sunshine.conf'
-        Set-Content -LiteralPath $path -Value 'original' -NoNewline
-
-        $first = Set-VegaSunshineConfig -Path $path -Content 'new' -Confirm:$false
-        $first.BackupCreated | Should -BeTrue
-        $first.OriginalExisted | Should -BeTrue
-        (Get-Content -LiteralPath "$path.bak" -Raw) | Should -Be 'original'
-        (Get-Content -LiteralPath $path -Raw) | Should -Be 'new'
-
-        $second = Set-VegaSunshineConfig -Path $path -Content 'newer' -Confirm:$false
-        $second.BackupCreated | Should -BeFalse
-        (Get-Content -LiteralPath "$path.bak" -Raw) | Should -Be 'original'
-        (Get-Content -LiteralPath $path -Raw) | Should -Be 'newer'
-    }
-
-    It '写入后不留临时文件' {
+    It '重复写入不覆盖，也不留临时文件' {
         $directory = Join-Path $TestDrive 'atomic'
         $null = New-Item -ItemType Directory -Path $directory
         $path = Join-Path $directory 'sunshine.conf'
@@ -148,17 +157,8 @@ Describe 'Set-VegaSunshineConfig' {
         $null = Set-VegaSunshineConfig -Path $path -Content 'a = 1' -Confirm:$false
         $null = Set-VegaSunshineConfig -Path $path -Content 'a = 2' -Confirm:$false
 
+        (Get-Content -LiteralPath $path -Raw) | Should -Be 'a = 2'
         @(Get-ChildItem -LiteralPath $directory -Filter '.vega-tmp-*').Count | Should -Be 0
-    }
-
-    It '-NoBackup 时不生成备份' {
-        $path = Join-Path $TestDrive 'nobackup.conf'
-        Set-Content -LiteralPath $path -Value 'original' -NoNewline
-
-        $result = Set-VegaSunshineConfig -Path $path -Content 'new' -NoBackup -Confirm:$false
-
-        $result.BackupCreated | Should -BeFalse
-        Test-Path -LiteralPath "$path.bak" | Should -BeFalse
     }
 
     It '配置目录不存在时自动创建' {
@@ -169,50 +169,73 @@ Describe 'Set-VegaSunshineConfig' {
     }
 }
 
-Describe 'Restore-VegaSunshineConfig' {
-    It '哈希一致时从备份恢复原配置' {
-        $path = Join-Path $TestDrive 'restore.conf'
-        Set-Content -LiteralPath $path -Value 'original' -NoNewline
-        $written = Set-VegaSunshineConfig -Path $path -Content 'modified' -Confirm:$false
+Describe 'Get-VegaConfigKeySnapshot' {
+    It '记录受管键原值，缺失的键标记为不存在' {
+        $snapshot = Get-VegaConfigKeySnapshot -Text "sunshine_name = OldName`nport = 48000" -Keys @('sunshine_name', 'port', 'address_family')
 
-        $result = Restore-VegaSunshineConfig -Path $path -ExpectedSha256 $written.Sha256 -Confirm:$false
+        $snapshot['sunshine_name'].Existed | Should -BeTrue
+        $snapshot['sunshine_name'].Value | Should -Be 'OldName'
+        $snapshot['port'].Value | Should -Be '48000'
+        $snapshot['address_family'].Existed | Should -BeFalse
+        $snapshot['address_family'].Value | Should -Be ''
+    }
+
+    It '空配置时所有键都不存在' {
+        $snapshot = Get-VegaConfigKeySnapshot -Text '' -Keys @('sunshine_name')
+        $snapshot['sunshine_name'].Existed | Should -BeFalse
+    }
+}
+
+Describe 'Restore-VegaManagedConfig' {
+    It '只把受管键恢复为原值，用户后来加的键保留' {
+        $path = Join-Path $TestDrive 'keyrestore.conf'
+        $original = @(
+            '# 用户注释',
+            'sunshine_name = OldName',
+            'pairing_file = D:\Sunshine\pairs.dat'
+        ) -join "`n"
+        Set-Content -LiteralPath $path -Value $original -NoNewline
+
+        $snapshot = Get-VegaConfigKeySnapshot -Text $original -Keys @('sunshine_name', 'address_family')
+        $installed = Merge-VegaSunshineConfigText -ExistingText $original -Values ([ordered]@{
+                sunshine_name  = 'Vega'
+                address_family = 'both'
+            })
+        Set-Content -LiteralPath $path -Value $installed -NoNewline
+
+        # 安装后用户又自己加了一个键
+        $userText = $installed + "custom_key = 1`n"
+        Set-Content -LiteralPath $path -Value $userText -NoNewline
+
+        $result = Restore-VegaManagedConfig -Path $path -Records @($snapshot['sunshine_name'], $snapshot['address_family']) -Confirm:$false
 
         $result.Restored | Should -BeTrue
-        $result.Conflict | Should -BeFalse
-        (Get-Content -LiteralPath $path -Raw) | Should -Be 'original'
+        $result.Changed | Should -BeTrue
+
+        $text = Get-Content -LiteralPath $path -Raw
+        $text | Should -Match '(?m)^sunshine_name = OldName$'
+        $text | Should -Not -Match 'address_family'
+        $text | Should -Match '(?m)^pairing_file = D:\\Sunshine\\pairs\.dat$'
+        $text | Should -Match '(?m)^custom_key = 1$'
+        $text | Should -Match '(?m)^# 用户注释$'
+        Test-Path -LiteralPath "$path.bak" | Should -BeFalse
     }
 
-    It '配置被用户改过时报告冲突且不覆盖' {
-        $path = Join-Path $TestDrive 'conflict.conf'
-        Set-Content -LiteralPath $path -Value 'original' -NoNewline
-        $written = Set-VegaSunshineConfig -Path $path -Content 'managed' -Confirm:$false
-        Set-Content -LiteralPath $path -Value 'user changed this' -NoNewline
+    It '受管键本来就是原值时报告未变更' {
+        $path = Join-Path $TestDrive 'nochange.conf'
+        Set-Content -LiteralPath $path -Value "sunshine_name = OldName`n" -NoNewline
 
-        $result = Restore-VegaSunshineConfig -Path $path -ExpectedSha256 $written.Sha256 -Confirm:$false
-
-        $result.Restored | Should -BeFalse
-        $result.Conflict | Should -BeTrue
-        (Get-Content -LiteralPath $path -Raw) | Should -Be 'user changed this'
-        Test-Path -LiteralPath "$path.bak" | Should -BeTrue
-    }
-
-    It '原配置本来不存在时，删除 Vega 新建的配置文件' {
-        $path = Join-Path $TestDrive 'created.conf'
-        $written = Set-VegaSunshineConfig -Path $path -Content 'managed' -Confirm:$false
-
-        $result = Restore-VegaSunshineConfig -Path $path -ExpectedSha256 $written.Sha256 -DeleteIfCreated -Confirm:$false
+        $snapshot = Get-VegaConfigKeySnapshot -Text "sunshine_name = OldName`n" -Keys @('sunshine_name')
+        $result = Restore-VegaManagedConfig -Path $path -Records @($snapshot['sunshine_name']) -Confirm:$false
 
         $result.Restored | Should -BeTrue
-        Test-Path -LiteralPath $path | Should -BeFalse
+        $result.Changed | Should -BeFalse
+        (Get-Content -LiteralPath $path -Raw) | Should -Be "sunshine_name = OldName`n"
     }
 
-    It '没有备份时返回未恢复且不冲突' {
-        $path = Join-Path $TestDrive 'norestore.conf'
-        Set-Content -LiteralPath $path -Value 'whatever' -NoNewline
-
-        $result = Restore-VegaSunshineConfig -Path $path -Confirm:$false
-
+    It '配置不存在时返回未回滚' {
+        $path = Join-Path $TestDrive 'missing.conf'
+        $result = Restore-VegaManagedConfig -Path $path -Records @() -Confirm:$false
         $result.Restored | Should -BeFalse
-        $result.Conflict | Should -BeFalse
     }
 }

@@ -5,7 +5,7 @@
 
 .DESCRIPTION
   安装：Moonlight + Tailscale（可选 RustDesk）。
-  卸载：按 %ProgramData%\Vega\state.json 清单，用 -RemoveApps 卸载 Vega 装过的组件。
+  卸载：按 %LOCALAPPDATA%\Vega\client-state.json 清单，用 -RemoveApps 卸载 Vega 装过的组件。
   已安装的组件自动跳过，可重复执行。
   兼容 Windows PowerShell 5.1 与 PowerShell 7。
 

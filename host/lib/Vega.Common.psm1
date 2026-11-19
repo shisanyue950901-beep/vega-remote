@@ -9,7 +9,9 @@
     Invoke-VegaCommand / Invoke-VegaWinget，测试里用 Mock 替换即可，
     不会真的调用 winget 或任何系统命令。
   - 管理员权限下启动的外部程序一律使用绝对路径，不依赖 PATH 搜索。
-  - 安装动作写进状态清单（%ProgramData%\Vega\state.json），卸载只按清单回滚。
+  - 被控端状态清单落在 %ProgramData%\Vega\host-state.json（管理员专用 ACL），
+    主控端落在 %LOCALAPPDATA%\Vega\client-state.json；卸载只按清单回滚，
+    回滚前逐条过白名单。
   - 不在这里做任何“加载即执行”的动作，模块可安全反复导入。
 #>
 
@@ -280,22 +282,6 @@ function Write-VegaTextFileAtomic {
     return $Path
 }
 
-function Get-VegaFileSha256 {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$Path
-    )
-
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return '' }
-    try {
-        return (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
-    }
-    catch {
-        return ''
-    }
-}
-
 # ---------------------------------------------------------------------------
 # winget 组件安装 / 卸载
 # ---------------------------------------------------------------------------
@@ -521,16 +507,217 @@ function Uninstall-VegaPackage {
 }
 
 # ---------------------------------------------------------------------------
-# 状态清单：%ProgramData%\Vega\state.json
+# 状态清单
 # ---------------------------------------------------------------------------
+# 两种清单，互不相通：
+#   被控端（管理员）：%ProgramData%\Vega\host-state.json
+#     目录创建时禁用继承，只给 Administrators + SYSTEM 完全控制；
+#     读取前校验目录与文件所有者、拒绝重解析点，不满足直接拒绝。
+#   主控端（非管理员）：%LOCALAPPDATA%\Vega\client-state.json（天然按用户隔离）。
+# 清单里的每条记录在执行回滚前都要过白名单（Test-VegaStateRecordAllowed），
+# 只认 Vega 自己创建的对象；每一步变更立即写回，回滚结果也写回。
 
-function Get-VegaStatePath {
+function Test-VegaWindowsPlatform {
+    <#
+      当前宿主是不是 Windows。非 Windows 只用于本地跑 Pester，
+      没有 ACL/防火墙/服务，因此所有权校验在此平台上不适用。
+    #>
+    [CmdletBinding()]
+    param()
+
+    return ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)
+}
+
+function Get-VegaHostStatePath {
+    <#
+      被控端（管理员）状态清单：%ProgramData%\Vega\host-state.json
+    #>
     [CmdletBinding()]
     param()
 
     $root = $env:ProgramData
     if ([string]::IsNullOrWhiteSpace($root)) { $root = [System.IO.Path]::GetTempPath() }
-    return (Join-Path (Join-Path $root 'Vega') 'state.json')
+    return (Join-Path (Join-Path $root 'Vega') 'host-state.json')
+}
+
+function Get-VegaClientStatePath {
+    <#
+      主控端（非管理员）状态清单：%LOCALAPPDATA%\Vega\client-state.json
+    #>
+    [CmdletBinding()]
+    param()
+
+    $root = $env:LOCALAPPDATA
+    if ([string]::IsNullOrWhiteSpace($root)) { $root = [System.IO.Path]::GetTempPath() }
+    return (Join-Path (Join-Path $root 'Vega') 'client-state.json')
+}
+
+function Get-VegaStatePath {
+    <#
+      兼容旧调用：等价于被控端清单路径。
+    #>
+    [CmdletBinding()]
+    param()
+
+    return (Get-VegaHostStatePath)
+}
+
+function Test-VegaManagedHostStatePath {
+    <#
+      是否是被控端机器级清单（%ProgramData%\Vega\host-state.json）。
+      只有这个路径才强制所有权校验；测试/诊断用的临时路径不校验所有者。
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()]
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $expected = Get-VegaHostStatePath
+    try {
+        return ([System.IO.Path]::GetFullPath($Path) -eq [System.IO.Path]::GetFullPath($expected))
+    }
+    catch {
+        return ($Path -eq $expected)
+    }
+}
+
+function Test-VegaReparsePoint {
+    <#
+      路径是否是重解析点/符号链接。读不到元数据时按“可疑”处理。
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()]
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    }
+    catch {
+        return $true
+    }
+
+    if ($null -eq $item) { return $true }
+    if ([bool]($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { return $true }
+    if ($null -ne $item.PSObject.Properties['LinkType'] -and -not [string]::IsNullOrEmpty([string]$item.LinkType)) { return $true }
+
+    return $false
+}
+
+function Get-VegaPathOwnerSid {
+    <#
+      返回路径所有者的 SID 字符串；取不到返回空串。
+      用 SID 而不是名字比较，避免本地化系统里 "Administrators" 名字不同。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    if (-not (Test-VegaWindowsPlatform)) { return '' }
+
+    try {
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    }
+    catch {
+        return ''
+    }
+
+    $owner = [string]$acl.Owner
+    if ([string]::IsNullOrWhiteSpace($owner)) { return '' }
+    if ($owner -match '^S-1-') { return $owner }
+
+    try {
+        $account = New-Object System.Security.Principal.NTAccount($owner)
+        return $account.Translate([System.Security.Principal.SecurityIdentifier]).Value
+    }
+    catch {
+        return ''
+    }
+}
+
+function Test-VegaStatePathTrusted {
+    <#
+      目录与清单文件必须是 Administrators（S-1-5-32-544）或 SYSTEM（S-1-5-18）
+      所有，且都不是重解析点，否则拒绝使用。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $allowedOwnerSids = @('S-1-5-32-544', 'S-1-5-18')
+
+    if (Test-VegaReparsePoint -Path $Path) { return $false }
+
+    $directory = Split-Path -Path $Path -Parent
+    if ([string]::IsNullOrWhiteSpace($directory)) { return $false }
+    # 目录还不存在：由 Initialize-VegaStateDirectory 创建并设 ACL
+    if (-not (Test-Path -LiteralPath $directory)) { return $true }
+    if (Test-VegaReparsePoint -Path $directory) { return $false }
+
+    if (-not (Test-VegaWindowsPlatform)) { return $true }
+
+    foreach ($target in @($directory, $Path)) {
+        if (-not (Test-Path -LiteralPath $target)) { continue }
+        $sid = Get-VegaPathOwnerSid -Path $target
+        if ($allowedOwnerSids -notcontains $sid) { return $false }
+    }
+
+    return $true
+}
+
+function Initialize-VegaStateDirectory {
+    <#
+      建立清单目录并收紧 ACL：禁用继承，只留 Administrators + SYSTEM 完全控制，
+      所有者设为 Administrators。任何一步失败都抛异常（调用方据此中止）。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $directory = Split-Path -Path $Path -Parent
+    if ([string]::IsNullOrWhiteSpace($directory)) { throw "状态清单路径无效：$Path" }
+
+    if (Test-Path -LiteralPath $directory) {
+        if (Test-VegaReparsePoint -Path $directory) { throw "状态目录是重解析点，拒绝使用：$directory" }
+    }
+    else {
+        $null = New-Item -ItemType Directory -Path $directory -Force
+    }
+
+    if (-not (Test-VegaWindowsPlatform)) { return $directory }
+
+    try {
+        $administrators = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+        $system = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+
+        $acl = Get-Acl -LiteralPath $directory -ErrorAction Stop
+        $acl.SetAccessRuleProtection($true, $false)
+        foreach ($rule in @($acl.Access)) { $null = $acl.RemoveAccessRule($rule) }
+        foreach ($sid in @($system, $administrators)) {
+            $accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $sid, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')
+            $null = $acl.AddAccessRule($accessRule)
+        }
+        $acl.SetOwner($administrators)
+        Set-Acl -LiteralPath $directory -AclObject $acl -ErrorAction Stop
+    }
+    catch {
+        throw "无法为状态目录设置 Administrators/SYSTEM 专用 ACL：$directory（$($_.Exception.Message)）"
+    }
+
+    return $directory
 }
 
 function Get-VegaEmptyState {
@@ -541,10 +728,9 @@ function Get-VegaEmptyState {
     param()
 
     return [pscustomobject]@{
-        SchemaVersion         = 1
+        SchemaVersion         = 2
         UpdatedAt             = ''
         Packages              = @()
-        Backups               = @()
         FirewallRules         = @()
         DisabledFirewallRules = @()
         Services              = @()
@@ -554,7 +740,10 @@ function Get-VegaEmptyState {
 
 function Read-VegaState {
     <#
-      读取清单；文件不存在或损坏时返回空清单（不抛异常）。
+      读取清单；文件不存在返回空清单。
+      机器级清单（%ProgramData%\Vega\host-state.json）先校验目录/文件所有者与
+      重解析点，不满足直接抛异常——管理员绝不信任低权限侧能写的路径。
+      文件损坏按空清单处理（不回滚任何东西，比乱删安全）。
     #>
     [CmdletBinding()]
     param(
@@ -563,6 +752,16 @@ function Read-VegaState {
     )
 
     $state = Get-VegaEmptyState
+
+    if (Test-VegaManagedHostStatePath -Path $Path) {
+        if (-not (Test-VegaStatePathTrusted -Path $Path)) {
+            throw "状态清单不可信（目录/文件所有者不是 Administrators/SYSTEM 或是重解析点），拒绝读取：$Path"
+        }
+    }
+    elseif (Test-VegaReparsePoint -Path $Path) {
+        throw "状态清单是重解析点，拒绝读取：$Path"
+    }
+
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $state }
 
     $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
@@ -580,7 +779,7 @@ function Read-VegaState {
 
     $properties = @($data.PSObject.Properties.Name)
     if ($properties -contains 'SchemaVersion') { $state.SchemaVersion = [int]$data.SchemaVersion }
-    foreach ($name in @('Packages', 'Backups', 'FirewallRules', 'DisabledFirewallRules', 'Services', 'ManagedConfigKeys')) {
+    foreach ($name in @('Packages', 'FirewallRules', 'DisabledFirewallRules', 'Services', 'ManagedConfigKeys')) {
         if ($properties -contains $name) { $state.$name = @($data.$name) }
     }
 
@@ -589,7 +788,7 @@ function Read-VegaState {
 
 function Write-VegaState {
     <#
-      原子写出清单（UTF-8 无 BOM）。目录不存在时创建。
+      原子写出清单（UTF-8 无 BOM）。机器级清单先建受信目录。
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -605,9 +804,109 @@ function Write-VegaState {
 
     if (-not $PSCmdlet.ShouldProcess($Path, '写入状态清单')) { return $Path }
 
+    if (Test-VegaManagedHostStatePath -Path $Path) {
+        $null = Initialize-VegaStateDirectory -Path $Path
+    }
+
     $null = Write-VegaTextFileAtomic -Path $Path -Text $json
     return $Path
 }
+
+function Save-VegaState {
+    <#
+      逐项持久化：每次改动清单后立刻调用，测试里只 mock 这一个点。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $State,
+
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    return (Write-VegaState -State $State -Path $Path -Confirm:$false)
+}
+
+# ---------------------------------------------------------------------------
+# 白名单：清单记录只能指向 Vega 自己创建的对象
+# ---------------------------------------------------------------------------
+
+function Get-VegaAllowedFirewallRuleName {
+    [CmdletBinding()]
+    param()
+
+    return @('Vega-Sunshine-TCP', 'Vega-Sunshine-UDP', 'Vega-Block-Admin')
+}
+
+function Get-VegaAllowedServiceName {
+    [CmdletBinding()]
+    param()
+
+    return @('SunshineService', 'sunshinesvc')
+}
+
+function Get-VegaAllowedPackageId {
+    [CmdletBinding()]
+    param()
+
+    return @(
+        'LizardByte.Sunshine',
+        'Tailscale.Tailscale',
+        'RustDesk.RustDesk',
+        'MoonlightGameStreamingProject.Moonlight'
+    )
+}
+
+function Test-VegaStateRecordAllowed {
+    <#
+      纯函数：回滚前逐条校验。
+        FirewallRule - 只能是 Vega 建的那几条规则名
+        Service      - 只能是 SunshineService / sunshinesvc
+        ConfigPath   - 只能指向 Sunshine 安装目录下的 config\sunshine.conf
+        Package      - 只能是已知 4 个包 ID
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('FirewallRule', 'Service', 'ConfigPath', 'Package')]
+        [string]$Kind,
+
+        [AllowEmptyString()]
+        [string]$Value,
+
+        [AllowEmptyString()]
+        [string]$SunshineDirectory = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+
+    switch ($Kind) {
+        'FirewallRule' { return ((Get-VegaAllowedFirewallRuleName) -contains $Value) }
+        'Service' { return ((Get-VegaAllowedServiceName) -contains $Value) }
+        'Package' { return ((Get-VegaAllowedPackageId) -contains $Value) }
+        'ConfigPath' {
+            try {
+                $leaf = [System.IO.Path]::GetFileName($Value)
+                $parent = [System.IO.Path]::GetDirectoryName($Value)
+                if ($leaf -ne 'sunshine.conf') { return $false }
+                if ([System.IO.Path]::GetFileName($parent) -ne 'config') { return $false }
+                if ([string]::IsNullOrWhiteSpace($SunshineDirectory)) { return $true }
+                $expected = [System.IO.Path]::GetFullPath((Join-Path (Join-Path $SunshineDirectory 'config') 'sunshine.conf'))
+                $actual = [System.IO.Path]::GetFullPath($Value)
+                return ($expected -eq $actual)
+            }
+            catch {
+                return $false
+            }
+        }
+        default { return $false }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 清单编辑 + 互斥
+# ---------------------------------------------------------------------------
 
 function Test-VegaStatePackage {
     [CmdletBinding()]
@@ -679,44 +978,40 @@ function Remove-VegaStatePackage {
     return $State
 }
 
-function Add-VegaStateBackup {
-    <#
-      记录一次配置备份。同一路径只保留一条（重跑时更新写入内容的哈希）。
-    #>
+function Add-VegaStateFirewallRule {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
         $State,
 
         [Parameter(Mandatory)]
-        [string]$Path,
-
-        [string]$BackupPath = '',
-
-        [bool]$OriginalExisted = $false,
-
-        [string]$WrittenSha256 = '',
-
-        [bool]$BackupCreated = $false
+        [string]$Name
     )
 
-    $entry = [pscustomobject]@{
-        Path            = $Path
-        BackupPath      = $BackupPath
-        OriginalExisted = $OriginalExisted
-        WrittenSha256   = $WrittenSha256
-        BackupCreated   = $BackupCreated
-        RecordedAt      = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    foreach ($item in @($State.FirewallRules)) {
+        if ($null -ne $item -and [string]$item.Name -eq $Name) { return $State }
     }
+    $State.FirewallRules = @(@($State.FirewallRules) + [pscustomobject]@{ Name = $Name })
+    return $State
+}
+
+function Remove-VegaStateFirewallRule {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $State,
+
+        [Parameter(Mandatory)]
+        [string]$Name
+    )
 
     $kept = New-Object System.Collections.Generic.List[object]
-    foreach ($item in @($State.Backups)) {
+    foreach ($item in @($State.FirewallRules)) {
         if ($null -eq $item) { continue }
-        if ([string]$item.Path -eq $Path) { continue }
+        if ([string]$item.Name -eq $Name) { continue }
         $kept.Add($item)
     }
-    $kept.Add($entry)
-    $State.Backups = $kept.ToArray()
+    $State.FirewallRules = $kept.ToArray()
     return $State
 }
 
@@ -737,7 +1032,7 @@ function Add-VegaStateDisabledFirewallRule {
     return $State
 }
 
-function Add-VegaStateFirewallRule {
+function Remove-VegaStateDisabledFirewallRule {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -747,16 +1042,19 @@ function Add-VegaStateFirewallRule {
         [string]$Name
     )
 
-    foreach ($item in @($State.FirewallRules)) {
-        if ($null -ne $item -and [string]$item.Name -eq $Name) { return $State }
+    $kept = New-Object System.Collections.Generic.List[object]
+    foreach ($item in @($State.DisabledFirewallRules)) {
+        if ($null -eq $item) { continue }
+        if ([string]$item.Name -eq $Name) { continue }
+        $kept.Add($item)
     }
-    $State.FirewallRules = @(@($State.FirewallRules) + [pscustomobject]@{ Name = $Name })
+    $State.DisabledFirewallRules = $kept.ToArray()
     return $State
 }
 
-function Get-VegaStateServiceStartType {
+function Get-VegaStateService {
     <#
-      返回记录的原始启动类型；没有记录返回 $null。
+      返回记录的服务条目；没有记录返回 $null。
     #>
     [CmdletBinding()]
     param(
@@ -769,16 +1067,16 @@ function Get-VegaStateServiceStartType {
 
     foreach ($entry in @($State.Services)) {
         if ($null -eq $entry) { continue }
-        if ([string]$entry.Name -eq $Name) { return [string]$entry.OriginalStartType }
+        if ([string]$entry.Name -eq $Name) { return $entry }
     }
     return $null
 }
 
-function Set-VegaStateServiceStartType {
+function Add-VegaStateService {
     <#
-      只在第一次记录服务的原始启动类型；重复执行不会用当前值覆盖原值。
+      只在第一次记录服务的原始启动类型与运行状态；重跑不覆盖基线。
     #>
-    [CmdletBinding(SupportsShouldProcess)]
+    [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
         $State,
@@ -787,17 +1085,190 @@ function Set-VegaStateServiceStartType {
         [string]$Name,
 
         [Parameter(Mandatory)]
-        [string]$StartType
+        [string]$StartType,
+
+        [string]$Status = ''
     )
 
-    if ($null -ne (Get-VegaStateServiceStartType -State $State -Name $Name)) { return $State }
-    if (-not $PSCmdlet.ShouldProcess($Name, '记录服务原始启动类型')) { return $State }
+    if ($null -ne (Get-VegaStateService -State $State -Name $Name)) { return $State }
 
     $State.Services = @(@($State.Services) + [pscustomobject]@{
             Name              = $Name
             OriginalStartType = $StartType
+            OriginalStatus    = $Status
+            Restored          = $false
         })
     return $State
+}
+
+function Set-VegaStateServiceRestored {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $State,
+
+        [Parameter(Mandatory)]
+        [string]$Name,
+
+        [bool]$Restored = $true
+    )
+
+    foreach ($entry in @($State.Services)) {
+        if ($null -eq $entry) { continue }
+        if ([string]$entry.Name -ne $Name) { continue }
+        if ($null -eq $entry.PSObject.Properties['Restored']) {
+            $entry | Add-Member -NotePropertyName Restored -NotePropertyValue $Restored -Force
+        }
+        else {
+            $entry.Restored = $Restored
+        }
+        break
+    }
+    return $State
+}
+
+function Add-VegaStateManagedKeys {
+    <#
+      首次安装时记录受管键的原值（不存在则记 Existed = $false）。
+      同一个路径+键只记第一次，重跑不会覆盖基线。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $State,
+
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary]$Snapshot
+    )
+
+    $known = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in @($State.ManagedConfigKeys)) {
+        if ($null -eq $entry) { continue }
+        if ([string]$entry.Path -eq $Path) { $null = $known.Add([string]$entry.Key) }
+    }
+
+    foreach ($key in $Snapshot.Keys) {
+        $keyText = [string]$key
+        if ($known.Contains($keyText)) { continue }
+        $item = $Snapshot[$key]
+        $State.ManagedConfigKeys = @(@($State.ManagedConfigKeys) + [pscustomobject]@{
+                Path          = $Path
+                Key           = $keyText
+                Existed       = [bool]$item.Existed
+                OriginalValue = [string]$item.Value
+                Restored      = $false
+            })
+    }
+
+    return $State
+}
+
+function Get-VegaStateManagedKey {
+    <#
+      返回某个配置路径下的受管键记录（含尚未成功回滚的）。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $State,
+
+        [AllowEmptyString()]
+        [string]$Path = ''
+    )
+
+    $result = New-Object System.Collections.Generic.List[object]
+    foreach ($entry in @($State.ManagedConfigKeys)) {
+        if ($null -eq $entry) { continue }
+        if (-not [string]::IsNullOrWhiteSpace($Path) -and [string]$entry.Path -ne $Path) { continue }
+        $result.Add($entry)
+    }
+    return $result.ToArray()
+}
+
+function Set-VegaStateManagedKeyRestored {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $State,
+
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$Key,
+
+        [bool]$Restored = $true
+    )
+
+    foreach ($entry in @($State.ManagedConfigKeys)) {
+        if ($null -eq $entry) { continue }
+        if ([string]$entry.Path -ne $Path -or [string]$entry.Key -ne $Key) { continue }
+        if ($null -eq $entry.PSObject.Properties['Restored']) {
+            $entry | Add-Member -NotePropertyName Restored -NotePropertyValue $Restored -Force
+        }
+        else {
+            $entry.Restored = $Restored
+        }
+        break
+    }
+    return $State
+}
+
+function Enter-VegaSetupLock {
+    <#
+      安装与卸载共用同一把命名互斥体，避免两个进程同时改系统。
+      拿不到锁抛异常；当前平台不支持命名互斥体时返回 $null（不阻塞）。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name
+    )
+
+    $mutex = $null
+    try {
+        $mutex = New-Object System.Threading.Mutex($false, $Name)
+    }
+    catch {
+        Write-Verbose "无法创建命名互斥体 ${Name}：$($_.Exception.Message)"
+        return $null
+    }
+
+    $acquired = $false
+    try {
+        $acquired = $mutex.WaitOne(0)
+    }
+    catch [System.Threading.AbandonedMutexException] {
+        $acquired = $true
+    }
+    catch {
+        $mutex.Dispose()
+        return $null
+    }
+
+    if (-not $acquired) {
+        $mutex.Dispose()
+        throw "另一个 Vega 安装/卸载进程正在运行（互斥体 $Name）。等它结束后重试。"
+    }
+
+    return $mutex
+}
+
+function Exit-VegaSetupLock {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        $Lock
+    )
+
+    if ($null -eq $Lock) { return }
+    try { $Lock.ReleaseMutex() }
+    catch { $null = $_ }
+    try { $Lock.Dispose() }
+    catch { $null = $_ }
 }
 
 # ---------------------------------------------------------------------------
@@ -956,6 +1427,7 @@ function Merge-VegaSunshineConfigText {
     <#
       纯函数：只更新 $Values 里给出的键，其余行（用户自己加的键、注释、空行）
       原样保留。重复的受管键只保留第一条。缺失的受管键追加到文件末尾。
+      $RemoveKeys 里的键整行删除（按键回滚时“原文里本来没有”的键）。
       返回以单个换行结尾的文本。
     #>
     [CmdletBinding()]
@@ -965,8 +1437,18 @@ function Merge-VegaSunshineConfigText {
         [string]$ExistingText,
 
         [Parameter(Mandatory)]
-        [System.Collections.IDictionary]$Values
+        [System.Collections.IDictionary]$Values,
+
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [string[]]$RemoveKeys = @()
     )
+
+    $remove = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($removeKey in @($RemoveKeys)) {
+        if ([string]::IsNullOrWhiteSpace($removeKey)) { continue }
+        $null = $remove.Add([string]$removeKey)
+    }
 
     $existingLines = New-Object System.Collections.Generic.List[string]
     if (-not [string]::IsNullOrEmpty($ExistingText)) {
@@ -982,6 +1464,8 @@ function Merge-VegaSunshineConfigText {
     foreach ($line in $existingLines) {
         $key = $null
         if ($line -match '^\s*(?<key>[A-Za-z0-9_]+)\s*=') { $key = $Matches['key'] }
+
+        if ($null -ne $key -and $remove.Contains($key)) { continue }
 
         if ($null -ne $key -and $Values.Contains($key)) {
             if ($written.Contains($key)) { continue }
@@ -1014,8 +1498,8 @@ function Merge-VegaSunshineConfigText {
 function Set-VegaSunshineConfig {
     <#
       写 sunshine.conf（UTF-8 无 BOM；Sunshine 不认 BOM）。
-      同目录临时文件 + 原子替换；只在备份不存在时备份一次原配置。
-      返回 { Path, BackupPath, BackupCreated, OriginalExisted, Sha256 }。
+      同目录临时文件 + 原子替换；不生成任何 .bak——回滚靠清单里按键记录的原值。
+      返回写入路径。
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -1024,101 +1508,104 @@ function Set-VegaSunshineConfig {
 
         [Parameter(Mandatory)]
         [AllowEmptyString()]
-        [string]$Content,
-
-        [switch]$NoBackup
+        [string]$Content
     )
-
-    $backupPath = "$Path.bak"
-    $backupCreated = $false
-    $originalExisted = Test-Path -LiteralPath $Path -PathType Leaf
-
-    if (-not $NoBackup -and $originalExisted -and -not (Test-Path -LiteralPath $backupPath)) {
-        if ($PSCmdlet.ShouldProcess($backupPath, '备份原配置')) {
-            Copy-Item -LiteralPath $Path -Destination $backupPath -Force
-            $backupCreated = $true
-        }
-    }
 
     if ($PSCmdlet.ShouldProcess($Path, '写入 Sunshine 配置')) {
         $null = Write-VegaTextFileAtomic -Path $Path -Text $Content
     }
 
-    return [pscustomobject]@{
-        Path            = $Path
-        BackupPath      = $backupPath
-        BackupCreated   = $backupCreated
-        OriginalExisted = $originalExisted
-        Sha256          = (Get-VegaFileSha256 -Path $Path)
-    }
+    return $Path
 }
 
-function Restore-VegaSunshineConfig {
+function Get-VegaConfigKeySnapshot {
     <#
-      卸载用：按备份恢复 sunshine.conf。
-      -ExpectedSha256 非空时先校验当前文件；被用户改过就报告冲突、不覆盖。
-      -DeleteIfCreated 表示原配置本来不存在（Vega 新建的），校验通过后删除。
-      返回 { Restored, Conflict, Message, BackupPath }。
+      纯函数：从原始配置文本读出受管键的基线。
+      键存在记 Existed = $true 与原值；不存在记 Existed = $false。
+      卸载时按这份基线按键回滚，用户改过的其他键不会被牵连。
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Text,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]]$Keys
+    )
+
+    $values = ConvertFrom-VegaSunshineConfigText -Text $Text
+    $snapshot = [ordered]@{}
+
+    foreach ($key in @($Keys)) {
+        $keyText = [string]$key
+        if ([string]::IsNullOrWhiteSpace($keyText)) { continue }
+        if ($values.Contains($keyText)) {
+            $snapshot[$keyText] = [pscustomobject]@{
+                Key     = $keyText
+                Existed = $true
+                Value   = [string]$values[$keyText]
+            }
+        }
+        else {
+            $snapshot[$keyText] = [pscustomobject]@{
+                Key     = $keyText
+                Existed = $false
+                Value   = ''
+            }
+        }
+    }
+
+    return $snapshot
+}
+
+function Restore-VegaManagedConfig {
+    <#
+      卸载用：只把清单记录的受管键恢复为首次安装前的原值；当时不存在的键整行删除。
+      其他键、注释、用户后来加的内容原样保留，不再整文件替换、也不读任何 .bak。
+      返回 { Restored, Changed, Message }。
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
         [string]$Path,
 
-        [string]$BackupPath = '',
-
-        [string]$ExpectedSha256 = '',
-
-        [switch]$DeleteIfCreated
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Records
     )
 
-    if ([string]::IsNullOrWhiteSpace($BackupPath)) { $BackupPath = "$Path.bak" }
-
-    $current = Get-VegaFileSha256 -Path $Path
-    if (-not [string]::IsNullOrWhiteSpace($ExpectedSha256) -and $current -ne $ExpectedSha256) {
-        return [pscustomobject]@{
-            Restored   = $false
-            Conflict   = $true
-            Message    = "配置在安装后被修改过，保留现状不覆盖：$Path（备份仍在 $BackupPath）"
-            BackupPath = $BackupPath
-        }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return [pscustomobject]@{ Restored = $false; Changed = $false; Message = "配置不存在，跳过按键回滚：$Path" }
     }
 
-    if ($DeleteIfCreated) {
-        if (Test-Path -LiteralPath $Path -PathType Leaf) {
-            if (-not $PSCmdlet.ShouldProcess($Path, '删除 Vega 新建的配置')) {
-                return [pscustomobject]@{ Restored = $false; Conflict = $false; Message = '跳过删除配置'; BackupPath = $BackupPath }
-            }
-            Remove-Item -LiteralPath $Path -Force
-        }
-        return [pscustomobject]@{
-            Restored   = $true
-            Conflict   = $false
-            Message    = "已删除 Vega 新建的配置：$Path"
-            BackupPath = $BackupPath
-        }
+    $values = [ordered]@{}
+    $remove = New-Object System.Collections.Generic.List[string]
+    foreach ($record in @($Records)) {
+        if ($null -eq $record) { continue }
+        $key = [string]$record.Key
+        if ([string]::IsNullOrWhiteSpace($key)) { continue }
+        if ([bool]$record.Existed) { $values[$key] = [string]$record.OriginalValue }
+        else { $remove.Add($key) }
     }
 
-    if (-not (Test-Path -LiteralPath $BackupPath -PathType Leaf)) {
-        return [pscustomobject]@{
-            Restored   = $false
-            Conflict   = $false
-            Message    = "没有备份可恢复：$BackupPath"
-            BackupPath = $BackupPath
-        }
+    if ($values.Count -eq 0 -and $remove.Count -eq 0) {
+        return [pscustomobject]@{ Restored = $true; Changed = $false; Message = "没有受管键需要回滚：$Path" }
     }
 
-    if (-not $PSCmdlet.ShouldProcess($Path, '从备份恢复')) {
-        return [pscustomobject]@{ Restored = $false; Conflict = $false; Message = '跳过恢复配置'; BackupPath = $BackupPath }
+    $current = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+    $merged = Merge-VegaSunshineConfigText -ExistingText $current -Values $values -RemoveKeys $remove.ToArray()
+    if ($merged -eq $current) {
+        return [pscustomobject]@{ Restored = $true; Changed = $false; Message = "受管键已是原始值：$Path" }
     }
 
-    Copy-Item -LiteralPath $BackupPath -Destination $Path -Force
-    return [pscustomobject]@{
-        Restored   = $true
-        Conflict   = $false
-        Message    = "已用 $BackupPath 恢复 $Path"
-        BackupPath = $BackupPath
+    if (-not $PSCmdlet.ShouldProcess($Path, '按键回滚 Sunshine 配置')) {
+        return [pscustomobject]@{ Restored = $false; Changed = $false; Message = "跳过按键回滚：$Path" }
     }
+
+    $null = Write-VegaTextFileAtomic -Path $Path -Text $merged
+    return [pscustomobject]@{ Restored = $true; Changed = $true; Message = "已把受管键恢复为原始值：$Path" }
 }
 
 # ---------------------------------------------------------------------------
@@ -1508,17 +1995,48 @@ function Disable-VegaSunshineInstallerFirewallRule {
 function Enable-VegaSunshineInstallerFirewallRule {
     <#
       卸载用：重新启用记录过的安装器规则，返回成功的规则名。
+      不盲信清单里的名字：Vega-* 永不恢复，规则必须现在还存在，
+      且（给了安装目录时）程序路径必须是 Sunshine 目录下的 sunshine.exe。
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [AllowNull()]
         [AllowEmptyCollection()]
-        [string[]]$Name
+        [string[]]$Name,
+
+        [AllowEmptyString()]
+        [string]$SunshineExe = ''
     )
 
     $enabled = New-Object System.Collections.Generic.List[string]
     foreach ($ruleName in @($Name)) {
         if ([string]::IsNullOrWhiteSpace($ruleName)) { continue }
+        if ($ruleName -like 'Vega-*') {
+            Write-Warning "拒绝恢复 Vega 自己的规则：$ruleName"
+            continue
+        }
+
+        $rule = Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
+        if ($null -eq $rule) {
+            Write-Warning "规则不存在，跳过：$ruleName"
+            continue
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($SunshineExe)) {
+            $program = ''
+            try {
+                $application = $rule | Get-NetFirewallApplicationFilter -ErrorAction Stop
+                if ($null -ne $application) { $program = [string]$application.Program }
+            }
+            catch {
+                $program = ''
+            }
+            if ([string]::IsNullOrWhiteSpace($program) -or $program -notmatch '(?i)\\sunshine\.exe$') {
+                Write-Warning "规则 $ruleName 的程序不是 sunshine.exe，跳过"
+                continue
+            }
+        }
+
         if (-not $PSCmdlet.ShouldProcess($ruleName, '恢复安装器防火墙规则')) { continue }
 
         try {
@@ -1562,10 +2080,39 @@ function Get-VegaFirewallRuleMissing {
     return $missing.ToArray()
 }
 
+function Remove-VegaFirewallRuleByName {
+    <#
+      按内部 Name 删除单条规则并回读确认。
+      返回 $true 表示规则已不存在（删除成功或本来就没有）；删不掉返回 $false 并写警告。
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name
+    )
+
+    if (-not (Test-VegaFirewallRule -Name $Name)) { return $true }
+    if (-not $PSCmdlet.ShouldProcess($Name, '删除防火墙规则')) { return $false }
+
+    try {
+        Remove-NetFirewallRule -Name $Name -ErrorAction Stop
+    }
+    catch {
+        Write-Warning "删除防火墙规则 $Name 失败：$($_.Exception.Message)"
+        return $false
+    }
+
+    if (Test-VegaFirewallRule -Name $Name) {
+        Write-Warning "删除后规则仍存在：$Name"
+        return $false
+    }
+
+    return $true
+}
+
 function Remove-VegaFirewallRule {
     <#
-      按内部 Name 删除规则，删除后回读确认；返回确认删除的条数。
-      删不掉会写警告，不会假装成功。
+      批量删除，返回确认删除的条数（诊断/兼容用）。
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -1580,21 +2127,7 @@ function Remove-VegaFirewallRule {
     foreach ($ruleName in $Name) {
         if ([string]::IsNullOrWhiteSpace($ruleName)) { continue }
         if (-not (Test-VegaFirewallRule -Name $ruleName)) { continue }
-        if (-not $PSCmdlet.ShouldProcess($ruleName, '删除防火墙规则')) { continue }
-
-        try {
-            Remove-NetFirewallRule -Name $ruleName -ErrorAction Stop
-        }
-        catch {
-            Write-Warning "删除防火墙规则 $ruleName 失败：$($_.Exception.Message)"
-            continue
-        }
-
-        if (Test-VegaFirewallRule -Name $ruleName) {
-            Write-Warning "删除后规则仍存在：$ruleName"
-            continue
-        }
-        $removed++
+        if (Remove-VegaFirewallRuleByName -Name $ruleName -Confirm:$false) { $removed++ }
     }
 
     return $removed
@@ -1692,7 +2225,10 @@ function Protect-VegaSunshineManagementPort {
         [Parameter(Mandatory)]
         [string]$SunshineExe,
 
-        [int]$ManagementPort = 47990
+        [int]$ManagementPort = 47990,
+
+        [AllowEmptyString()]
+        [string]$StatePath = ''
     )
 
     if (-not (Test-Path -LiteralPath $SunshineExe -PathType Leaf)) { return $State }
@@ -1703,6 +2239,10 @@ function Protect-VegaSunshineManagementPort {
     $disabled = @(Disable-VegaSunshineInstallerFirewallRule -Rules $rules -Confirm:$false)
     foreach ($ruleName in $disabled) {
         $State = Add-VegaStateDisabledFirewallRule -State $State -Name $ruleName
+        # 逐项持久化：禁用到一条就记一条
+        if (-not [string]::IsNullOrWhiteSpace($StatePath)) {
+            $null = Save-VegaState -State $State -Path $StatePath
+        }
     }
 
     if ($disabled.Count -gt 0) {
@@ -1940,8 +2480,33 @@ function Get-VegaDoctorAdvice {
 
 function Invoke-VegaHostInstall {
     <#
-      被控端安装流程（脚本只是薄包装，逻辑在这里便于 mock 测试）：
-      装组件 -> 隔离管理端口 -> 合并配置 -> 只放行串流端口 -> 关睡眠 -> 服务自启。
+      被控端安装/卸载的公共外壳：装与卸争同一把命名互斥体。
+      真正的流程在 *Core 函数里，便于 mock 测试。
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [switch]$SkipTailscale,
+        [switch]$WithRustDesk,
+        [switch]$Force,
+        [string]$StatePath = (Get-VegaHostStatePath),
+        [string]$TemplatePath = (Join-Path (Split-Path -Parent $PSScriptRoot) 'sunshine.conf')
+    )
+
+    $lock = Enter-VegaSetupLock -Name 'Global\Vega-Host-Setup'
+    try {
+        return (Invoke-VegaHostInstallCore -SkipTailscale:$SkipTailscale -WithRustDesk:$WithRustDesk `
+                -Force:$Force -StatePath $StatePath -TemplatePath $TemplatePath -Confirm:$false)
+    }
+    finally {
+        Exit-VegaSetupLock -Lock $lock
+    }
+}
+
+function Invoke-VegaHostInstallCore {
+    <#
+      被控端安装流程：
+      清单 -> 隔离管理端口 -> 装组件 -> 按键记录配置基线并写入 -> 只放行串流端口
+      -> 关睡眠 -> 服务自启。每一步变更立即写清单。
       返回 { ExitCode, Failures }；任何失败都让退出码非零。
     #>
     [CmdletBinding(SupportsShouldProcess)]
@@ -1949,7 +2514,7 @@ function Invoke-VegaHostInstall {
         [switch]$SkipTailscale,
         [switch]$WithRustDesk,
         [switch]$Force,
-        [string]$StatePath = (Get-VegaStatePath),
+        [string]$StatePath = (Get-VegaHostStatePath),
         [string]$TemplatePath = (Join-Path (Split-Path -Parent $PSScriptRoot) 'sunshine.conf')
     )
 
@@ -1959,14 +2524,15 @@ function Invoke-VegaHostInstall {
         throw '未找到 winget（App Installer）。请按官方文档安装「应用安装程序」后重试。'
     }
 
+    # 读清单：机器级清单会先校验所有者/重解析点，不可信直接抛异常
     $state = Read-VegaState -Path $StatePath
 
     # 已经装过 Sunshine 的机器：先隔离管理端口，再动配置
     $existingSunshine = Get-VegaSunshineInstall
     if ($null -ne $existingSunshine) {
         $existingPort = Get-VegaSunshineBasePort -ConfigPath $existingSunshine.Config
-        $state = Protect-VegaSunshineManagementPort -State $state -SunshineExe $existingSunshine.Exe -ManagementPort (Get-VegaSunshinePorts -BasePort $existingPort).ManagementPort -Confirm:$false
-        $null = Write-VegaState -State $state -Path $StatePath -Confirm:$false
+        $state = Protect-VegaSunshineManagementPort -State $state -SunshineExe $existingSunshine.Exe `
+            -ManagementPort (Get-VegaSunshinePorts -BasePort $existingPort).ManagementPort -StatePath $StatePath -Confirm:$false
     }
 
     $componentNames = New-Object System.Collections.Generic.List[string]
@@ -1996,7 +2562,7 @@ function Invoke-VegaHostInstall {
         else {
             $state = Add-VegaStatePackage -State $state -PackageId $component.PackageId -Name $component.Name -PreExisting
         }
-        $null = Write-VegaState -State $state -Path $StatePath -Confirm:$false
+        $null = Save-VegaState -State $state -Path $StatePath
     }
 
     $sunshine = Get-VegaSunshineInstall
@@ -2011,8 +2577,8 @@ function Invoke-VegaHostInstall {
 
     $basePort = Get-VegaSunshineBasePort -ConfigPath $sunshine.Config
     $ports = Get-VegaSunshinePorts -BasePort $basePort
-    $state = Protect-VegaSunshineManagementPort -State $state -SunshineExe $sunshine.Exe -ManagementPort $ports.ManagementPort -Confirm:$false
-    $null = Write-VegaState -State $state -Path $StatePath -Confirm:$false
+    $state = Protect-VegaSunshineManagementPort -State $state -SunshineExe $sunshine.Exe `
+        -ManagementPort $ports.ManagementPort -StatePath $StatePath -Confirm:$false
 
     Write-VegaStatus '检测显卡'
     $gpuNames = @()
@@ -2061,28 +2627,22 @@ function Invoke-VegaHostInstall {
         $existingText = Get-Content -LiteralPath $sunshine.Config -Raw -Encoding UTF8
     }
 
+    # 首次安装只记录受管键的原值；重跑不覆盖已有基线
+    $snapshot = Get-VegaConfigKeySnapshot -Text $existingText -Keys @($values.Keys | ForEach-Object { [string]$_ })
+    $state = Add-VegaStateManagedKeys -State $state -Path $sunshine.Config -Snapshot $snapshot
+    $null = Save-VegaState -State $state -Path $StatePath
+
     $merged = Merge-VegaSunshineConfigText -ExistingText $existingText -Values $values
-    $configResult = Set-VegaSunshineConfig -Path $sunshine.Config -Content $merged -Confirm:$false
-
-    $state = Add-VegaStateBackup -State $state -Path $sunshine.Config `
-        -BackupPath $configResult.BackupPath `
-        -OriginalExisted $configResult.OriginalExisted `
-        -WrittenSha256 $configResult.Sha256 `
-        -BackupCreated $configResult.BackupCreated
-    $null = Write-VegaState -State $state -Path $StatePath -Confirm:$false
-
-    if ($configResult.BackupCreated) {
-        Write-VegaStatus "已备份原配置到 $($configResult.BackupPath)" -Level Ok
-    }
-    Write-VegaStatus "配置已写入 $($configResult.Path)"
+    $null = Set-VegaSunshineConfig -Path $sunshine.Config -Content $merged -Confirm:$false
+    Write-VegaStatus "配置已写入 $($sunshine.Config)"
 
     Write-VegaStatus "放行串流端口（仅 sunshine.exe，不含管理端口 $($ports.ManagementPort)）"
     try {
         $createdRules = @(Set-VegaFirewallRule -Program $sunshine.Exe -BasePort $basePort -Confirm:$false)
         foreach ($ruleName in $createdRules) {
             $state = Add-VegaStateFirewallRule -State $state -Name $ruleName
+            $null = Save-VegaState -State $state -Path $StatePath
         }
-        $null = Write-VegaState -State $state -Path $StatePath -Confirm:$false
         Write-VegaStatus ("Vega 防火墙规则已就绪（TCP {0}；UDP {1}）" -f ($ports.TcpPorts -join '/'), ($ports.UdpPorts -join '/')) -Level Ok
     }
     catch {
@@ -2115,10 +2675,11 @@ function Invoke-VegaHostInstall {
     }
     else {
         $service = $services[0]
-        $recorded = Get-VegaStateServiceStartType -State $state -Name $service.Name
+        $recorded = Get-VegaStateService -State $state -Name $service.Name
         if ($null -eq $recorded) {
-            $state = Set-VegaStateServiceStartType -State $state -Name $service.Name -StartType ([string]$service.StartType)
-            $null = Write-VegaState -State $state -Path $StatePath -Confirm:$false
+            $state = Add-VegaStateService -State $state -Name $service.Name `
+                -StartType ([string]$service.StartType) -Status ([string]$service.Status)
+            $null = Save-VegaState -State $state -Path $StatePath
         }
 
         $restart = Restart-VegaSunshineService -Name $service.Name -Confirm:$false
@@ -2155,19 +2716,42 @@ function Invoke-VegaHostInstall {
 
 function Invoke-VegaHostUninstall {
     <#
-      被控端卸载：只按状态清单回滚。
-      - 删除记录过的 Vega 防火墙规则
-      - 恢复记录过的安装器防火墙规则
-      - 配置被用户改过时报告冲突、不覆盖
-      - 服务启动类型恢复为安装前的值
-      - -RemoveApps 只卸载 Vega 装的组件
+      被控端卸载外壳：与安装共用同一把互斥体。
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [switch]$SkipTailscale,
         [switch]$WithRustDesk,
         [switch]$RemoveApps,
-        [string]$StatePath = (Get-VegaStatePath)
+        [string]$StatePath = (Get-VegaHostStatePath)
+    )
+
+    $lock = Enter-VegaSetupLock -Name 'Global\Vega-Host-Setup'
+    try {
+        return (Invoke-VegaHostUninstallCore -SkipTailscale:$SkipTailscale -WithRustDesk:$WithRustDesk `
+                -RemoveApps:$RemoveApps -StatePath $StatePath -Confirm:$false)
+    }
+    finally {
+        Exit-VegaSetupLock -Lock $lock
+    }
+}
+
+function Invoke-VegaHostUninstallCore {
+    <#
+      被控端卸载：只按状态清单回滚，且每条记录先过白名单。
+      - 删除清单记录的 Vega 防火墙规则（逐项写回）
+      - 恢复记录过的安装器防火墙规则
+      - 受管配置键恢复为首次安装前的原值（其他键原样保留）
+      - 服务只恢复清单记录的值
+      - -RemoveApps 只卸载 Vega 新装的组件
+      所有记录都成功回滚后才删除清单。
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [switch]$SkipTailscale,
+        [switch]$WithRustDesk,
+        [switch]$RemoveApps,
+        [string]$StatePath = (Get-VegaHostStatePath)
     )
 
     $failures = New-Object System.Collections.Generic.List[string]
@@ -2175,51 +2759,74 @@ function Invoke-VegaHostUninstall {
     $state = Read-VegaState -Path $StatePath
 
     if (-not $hasState) {
-        Write-VegaStatus '没有找到状态清单（%ProgramData%\Vega\state.json）：按旧安装清理 Vega 自己的防火墙规则，其余保持现状。' -Level Warn
+        Write-VegaStatus '没有找到状态清单：只清理 Vega 固定名称的防火墙规则，其余保持现状。' -Level Warn
     }
+
+    $sunshine = Get-VegaSunshineInstall
+    $sunshineDirectory = ''
+    if ($null -ne $sunshine) { $sunshineDirectory = [string]$sunshine.Directory }
 
     Write-VegaStatus '删除 Vega 防火墙规则'
-    $ruleNames = @()
     foreach ($item in @($state.FirewallRules)) {
         if ($null -eq $item) { continue }
-        if (-not [string]::IsNullOrWhiteSpace([string]$item.Name)) { $ruleNames += [string]$item.Name }
-    }
-    if ($ruleNames.Count -eq 0) {
-        $ruleNames = @((Get-VegaFirewallRuleSpec) | ForEach-Object { $_.Name })
-    }
-    $removed = Remove-VegaFirewallRule -Name $ruleNames -Confirm:$false
-    Write-VegaStatus "已删除 $removed 条 Vega 防火墙规则"
+        $ruleName = [string]$item.Name
+        if (-not (Test-VegaStateRecordAllowed -Kind 'FirewallRule' -Value $ruleName)) {
+            $failures.Add("清单里的防火墙规则名不在白名单，拒绝删除：$ruleName")
+            Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
+            continue
+        }
 
-    $disabledNames = @()
+        if (Remove-VegaFirewallRuleByName -Name $ruleName -Confirm:$false) {
+            $state = Remove-VegaStateFirewallRule -State $state -Name $ruleName
+            $null = Save-VegaState -State $state -Path $StatePath
+            Write-VegaStatus "已删除防火墙规则 $ruleName"
+        }
+        else {
+            $failures.Add("未能删除防火墙规则：$ruleName")
+            Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
+        }
+    }
+
+    $disabledNames = New-Object System.Collections.Generic.List[string]
     foreach ($item in @($state.DisabledFirewallRules)) {
         if ($null -eq $item) { continue }
-        if (-not [string]::IsNullOrWhiteSpace([string]$item.Name)) { $disabledNames += [string]$item.Name }
+        $ruleName = [string]$item.Name
+        if (-not [string]::IsNullOrWhiteSpace($ruleName)) { $disabledNames.Add($ruleName) }
     }
     if ($disabledNames.Count -gt 0) {
-        $enabled = @(Enable-VegaSunshineInstallerFirewallRule -Name $disabledNames -Confirm:$false)
+        $enabled = @(Enable-VegaSunshineInstallerFirewallRule -Name $disabledNames.ToArray() -SunshineExe $sunshineDirectory -Confirm:$false)
         foreach ($ruleName in $disabledNames) {
             if ($enabled -notcontains $ruleName) {
                 $failures.Add("未能恢复安装器防火墙规则：$ruleName")
                 Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
+                continue
             }
+            $state = Remove-VegaStateDisabledFirewallRule -State $state -Name $ruleName
+            $null = Save-VegaState -State $state -Path $StatePath
         }
     }
 
-    Write-VegaStatus '恢复 Sunshine 配置'
-    foreach ($backup in @($state.Backups)) {
-        if ($null -eq $backup) { continue }
-        $configPath = [string]$backup.Path
-        if ([string]::IsNullOrWhiteSpace($configPath)) { continue }
+    Write-VegaStatus '按原始值回滚 Sunshine 配置（只动受管键）'
+    $configPaths = @($state.ManagedConfigKeys | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Path } | Select-Object -Unique)
+    foreach ($configPath in $configPaths) {
+        if (-not (Test-VegaStateRecordAllowed -Kind 'ConfigPath' -Value $configPath -SunshineDirectory $sunshineDirectory)) {
+            $failures.Add("清单里的配置路径不在白名单，拒绝回滚：$configPath")
+            Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
+            continue
+        }
 
-        $restore = Restore-VegaSunshineConfig -Path $configPath `
-            -BackupPath ([string]$backup.BackupPath) `
-            -ExpectedSha256 ([string]$backup.WrittenSha256) `
-            -DeleteIfCreated:(-not [bool]$backup.OriginalExisted) `
-            -Confirm:$false
-
+        $records = @(Get-VegaStateManagedKey -State $state -Path $configPath | Where-Object { -not [bool]$_.Restored })
+        $restore = Restore-VegaManagedConfig -Path $configPath -Records $records -Confirm:$false
         Write-VegaStatus $restore.Message
-        if ($restore.Conflict) {
-            Write-VegaStatus "配置冲突：$configPath 在安装后被修改过，未覆盖（备份保留在 $($restore.BackupPath)）。" -Level Warn
+        if ($restore.Restored) {
+            foreach ($record in $records) {
+                $state = Set-VegaStateManagedKeyRestored -State $state -Path $configPath -Key ([string]$record.Key)
+            }
+            $null = Save-VegaState -State $state -Path $StatePath
+        }
+        else {
+            $failures.Add("配置回滚未完成：$configPath")
+            Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
         }
     }
 
@@ -2227,25 +2834,28 @@ function Invoke-VegaHostUninstall {
     foreach ($entry in @($state.Services)) {
         if ($null -eq $entry) { continue }
         $serviceName = [string]$entry.Name
-        if ([string]::IsNullOrWhiteSpace($serviceName)) { continue }
+        if (-not (Test-VegaStateRecordAllowed -Kind 'Service' -Value $serviceName)) {
+            $failures.Add("清单里的服务名不在白名单，拒绝操作：$serviceName")
+            Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
+            continue
+        }
 
         $startType = [string]$entry.OriginalStartType
-        if ($startType -notin @('Automatic', 'Manual', 'Disabled')) { $startType = 'Manual' }
-
-        try {
-            Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
-        }
-        catch {
-            $null = $_
+        if ($startType -notin @('Automatic', 'Manual', 'Disabled')) {
+            $failures.Add("服务启动类型记录无效：$serviceName → $startType")
+            Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
+            continue
         }
 
         if (-not (Set-VegaSunshineServiceStartType -Name $serviceName -StartupType $startType -Confirm:$false)) {
             $failures.Add("恢复服务启动类型失败：$serviceName → $startType")
             Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
+            continue
         }
-        else {
-            Write-VegaStatus "服务 $serviceName 已恢复启动类型 $startType 并停止" -Level Ok
-        }
+
+        $state = Set-VegaStateServiceRestored -State $state -Name $serviceName
+        $null = Save-VegaState -State $state -Path $StatePath
+        Write-VegaStatus "服务 $serviceName 已恢复启动类型 $startType"
     }
 
     if ($RemoveApps) {
@@ -2254,6 +2864,12 @@ function Invoke-VegaHostUninstall {
         foreach ($package in @($state.Packages)) {
             if ($null -eq $package) { continue }
             if (-not [bool]$package.InstalledByVega) { continue }
+            $packageId = [string]$package.PackageId
+            if (-not (Test-VegaStateRecordAllowed -Kind 'Package' -Value $packageId)) {
+                $failures.Add("清单里的包 ID 不在白名单，拒绝卸载：$packageId")
+                Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
+                continue
+            }
             $packageName = [string]$package.Name
             if ($SkipTailscale -and $packageName -eq 'Tailscale') { continue }
             if (-not $WithRustDesk -and $packageName -eq 'RustDesk') { continue }
@@ -2277,7 +2893,7 @@ function Invoke-VegaHostUninstall {
                     else { Write-VegaStatus "$packageName 未安装，跳过" }
 
                     $state = Remove-VegaStatePackage -State $state -PackageId $packageId
-                    $null = Write-VegaState -State $state -Path $StatePath -Confirm:$false
+                    $null = Save-VegaState -State $state -Path $StatePath
                 }
                 catch {
                     $failures.Add("卸载 $packageName 失败：$($_.Exception.Message)")
@@ -2287,9 +2903,11 @@ function Invoke-VegaHostUninstall {
         }
     }
 
+    # 所有记录都成功回滚后才删清单；有失败就留着下次继续
     if ($hasState) {
         if ($failures.Count -eq 0) {
             Remove-Item -LiteralPath $StatePath -Force -ErrorAction SilentlyContinue
+            Write-VegaStatus '清单里的事项已全部回滚，删除状态清单。'
         }
         else {
             Write-VegaStatus "仍有失败项，保留状态清单便于再次回滚：$StatePath" -Level Warn
@@ -2310,12 +2928,34 @@ function Invoke-VegaHostUninstall {
 # ---------------------------------------------------------------------------
 
 function Invoke-VegaClientInstall {
+    <#
+      主控端安装。状态清单落在 %LOCALAPPDATA%\Vega\client-state.json。
+    #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [switch]$SkipTailscale,
         [switch]$WithRustDesk,
         [switch]$Force,
-        [string]$StatePath = (Get-VegaStatePath)
+        [string]$StatePath = (Get-VegaClientStatePath)
+    )
+
+    $lock = Enter-VegaSetupLock -Name 'Local\Vega-Client-Setup'
+    try {
+        return (Invoke-VegaClientInstallCore -SkipTailscale:$SkipTailscale -WithRustDesk:$WithRustDesk `
+                -Force:$Force -StatePath $StatePath -Confirm:$false)
+    }
+    finally {
+        Exit-VegaSetupLock -Lock $lock
+    }
+}
+
+function Invoke-VegaClientInstallCore {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [switch]$SkipTailscale,
+        [switch]$WithRustDesk,
+        [switch]$Force,
+        [string]$StatePath = (Get-VegaClientStatePath)
     )
 
     $failures = New-Object System.Collections.Generic.List[string]
@@ -2353,7 +2993,7 @@ function Invoke-VegaClientInstall {
         else {
             $state = Add-VegaStatePackage -State $state -PackageId $component.PackageId -Name $component.Name -PreExisting
         }
-        $null = Write-VegaState -State $state -Path $StatePath -Confirm:$false
+        $null = Save-VegaState -State $state -Path $StatePath
     }
 
     Write-VegaStatus '完成' -Level Ok
@@ -2376,7 +3016,26 @@ function Invoke-VegaClientUninstall {
         [switch]$SkipTailscale,
         [switch]$WithRustDesk,
         [switch]$RemoveApps,
-        [string]$StatePath = (Get-VegaStatePath)
+        [string]$StatePath = (Get-VegaClientStatePath)
+    )
+
+    $lock = Enter-VegaSetupLock -Name 'Local\Vega-Client-Setup'
+    try {
+        return (Invoke-VegaClientUninstallCore -SkipTailscale:$SkipTailscale -WithRustDesk:$WithRustDesk `
+                -RemoveApps:$RemoveApps -StatePath $StatePath -Confirm:$false)
+    }
+    finally {
+        Exit-VegaSetupLock -Lock $lock
+    }
+}
+
+function Invoke-VegaClientUninstallCore {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [switch]$SkipTailscale,
+        [switch]$WithRustDesk,
+        [switch]$RemoveApps,
+        [string]$StatePath = (Get-VegaClientStatePath)
     )
 
     $failures = New-Object System.Collections.Generic.List[string]
@@ -2397,6 +3056,12 @@ function Invoke-VegaClientUninstall {
     foreach ($package in @($state.Packages)) {
         if ($null -eq $package) { continue }
         if (-not [bool]$package.InstalledByVega) { continue }
+        $packageId = [string]$package.PackageId
+        if (-not (Test-VegaStateRecordAllowed -Kind 'Package' -Value $packageId)) {
+            $failures.Add("清单里的包 ID 不在白名单，拒绝卸载：$packageId")
+            Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
+            continue
+        }
         $packageName = [string]$package.Name
         if ($SkipTailscale -and $packageName -eq 'Tailscale') { continue }
         if (-not $WithRustDesk -and $packageName -eq 'RustDesk') { continue }
@@ -2420,7 +3085,7 @@ function Invoke-VegaClientUninstall {
                 else { Write-VegaStatus "$packageName 未安装，跳过" }
 
                 $state = Remove-VegaStatePackage -State $state -PackageId $packageId
-                $null = Write-VegaState -State $state -Path $StatePath -Confirm:$false
+                $null = Save-VegaState -State $state -Path $StatePath
             }
             catch {
                 $failures.Add("卸载 $packageName 失败：$($_.Exception.Message)")
@@ -2451,7 +3116,6 @@ Export-ModuleMember -Function @(
     'Get-VegaPowerCfgPath',
     'Write-VegaStatus',
     'Write-VegaTextFileAtomic',
-    'Get-VegaFileSha256',
     'Get-VegaComponent',
     'Resolve-VegaWingetPath',
     'Test-VegaWingetAvailable',
@@ -2459,18 +3123,38 @@ Export-ModuleMember -Function @(
     'Get-VegaWingetPackageStatus',
     'Install-VegaPackage',
     'Uninstall-VegaPackage',
+    'Test-VegaWindowsPlatform',
+    'Get-VegaHostStatePath',
+    'Get-VegaClientStatePath',
     'Get-VegaStatePath',
+    'Test-VegaManagedHostStatePath',
+    'Test-VegaReparsePoint',
+    'Get-VegaPathOwnerSid',
+    'Test-VegaStatePathTrusted',
+    'Initialize-VegaStateDirectory',
     'Get-VegaEmptyState',
     'Read-VegaState',
     'Write-VegaState',
+    'Save-VegaState',
+    'Get-VegaAllowedFirewallRuleName',
+    'Get-VegaAllowedServiceName',
+    'Get-VegaAllowedPackageId',
+    'Test-VegaStateRecordAllowed',
     'Test-VegaStatePackage',
     'Add-VegaStatePackage',
     'Remove-VegaStatePackage',
-    'Add-VegaStateBackup',
-    'Add-VegaStateDisabledFirewallRule',
     'Add-VegaStateFirewallRule',
-    'Get-VegaStateServiceStartType',
-    'Set-VegaStateServiceStartType',
+    'Remove-VegaStateFirewallRule',
+    'Add-VegaStateDisabledFirewallRule',
+    'Remove-VegaStateDisabledFirewallRule',
+    'Get-VegaStateService',
+    'Add-VegaStateService',
+    'Set-VegaStateServiceRestored',
+    'Add-VegaStateManagedKeys',
+    'Get-VegaStateManagedKey',
+    'Set-VegaStateManagedKeyRestored',
+    'Enter-VegaSetupLock',
+    'Exit-VegaSetupLock',
     'Test-VegaVirtualAdapter',
     'Select-VegaAdapter',
     'Get-VegaEncoderName',
@@ -2478,7 +3162,8 @@ Export-ModuleMember -Function @(
     'ConvertFrom-VegaSunshineConfigText',
     'Merge-VegaSunshineConfigText',
     'Set-VegaSunshineConfig',
-    'Restore-VegaSunshineConfig',
+    'Get-VegaConfigKeySnapshot',
+    'Restore-VegaManagedConfig',
     'Get-VegaSunshineService',
     'Set-VegaSunshineServiceStartType',
     'Restart-VegaSunshineService',
@@ -2495,6 +3180,7 @@ Export-ModuleMember -Function @(
     'Test-VegaFirewallRule',
     'Get-VegaFirewallRuleMissing',
     'Remove-VegaFirewallRule',
+    'Remove-VegaFirewallRuleByName',
     'Set-VegaFirewallRule',
     'Get-VegaPublicIPv6',
     'ConvertFrom-VegaTailscalePing',

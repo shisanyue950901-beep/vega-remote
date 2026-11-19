@@ -9,7 +9,7 @@
   管理密码不在脚本里设置：装完后在本机浏览器打开 https://localhost:47990，由 Sunshine
   页面引导首次设密。脚本会把管理页限制为本机访问（origin_web_ui_allowed = pc），
   不放行 47990，并禁用 Sunshine 安装器自带的对 47990 的放行规则。
-  卸载：只按 %ProgramData%\Vega\state.json 清单回滚。
+  卸载：只按 %ProgramData%\Vega\host-state.json 清单回滚（回滚前逐条过白名单）。
   可重复执行：已安装的组件跳过，配置只更新 Vega 管理的键，防火墙规则先删后建。
   兼容 Windows PowerShell 5.1 与 PowerShell 7。
 
