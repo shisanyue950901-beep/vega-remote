@@ -180,8 +180,8 @@ Describe 'Set-VegaRustDeskConfig / Restore-VegaRustDeskConfig' {
 
         $result.Applied.Count | Should -Be 1
         $text = Get-Content -LiteralPath $path -Encoding UTF8 -Raw
-        $text | Should -Match '(?m)^custom-rendezvous-server = "relay\.example\.com:21116"$'
-        $text | Should -Match '(?m)^relay-server = "relay\.example\.com:21117"$'
+        $text | Should -Match '(?m)^custom-rendezvous-server = "relay\.example\.com:21116"\r?$'
+        $text | Should -Match '(?m)^relay-server = "relay\.example\.com:21117"\r?$'
         $text | Should -Match '(?m)^key = "C+=?"' # 公钥被写进 key，不写密码
         $text | Should -Not -Match 'password'
 
@@ -215,10 +215,10 @@ Describe 'Set-VegaRustDeskConfig / Restore-VegaRustDeskConfig' {
         $restore.Restored | Should -BeTrue
 
         $text = Get-Content -LiteralPath $path -Encoding UTF8 -Raw
-        $text | Should -Match '(?m)^custom-rendezvous-server = "old\.example\.com"$'
+        $text | Should -Match '(?m)^custom-rendezvous-server = "old\.example\.com"\r?$'
         $text | Should -Not -Match 'relay-server'
         $text | Should -Not -Match 'newer\.example\.com'
-        $text | Should -Match '(?m)^other = "keep"$'
+        $text | Should -Match '(?m)^other = "keep"\r?$'
     }
 
     It '卸载白名单只认 config\RustDesk2.toml' {
@@ -420,17 +420,17 @@ Describe 'Merge-VegaRustDeskConfigText 大小写、注释与换行保真' {
         $values.Add('key', 'new')
         $result = Merge-VegaRustDeskConfigText -ExistingText $existing -Values $values
 
-        $result | Should -Match '(?m)^\[Options\]$'
-        $result | Should -Match '(?m)^Key = "keep"$'
-        $result | Should -Match '(?m)^key = "new"$'
+        $result | Should -Match '(?m)^\[Options\]\r?$'
+        $result | Should -Match '(?m)^Key = "keep"\r?$'
+        $result | Should -Match '(?m)^key = "new"\r?$'
         # 找不到精确的 [options] 时不会把 [Options] 当受管段，但仍会识别真正的 [options]
-        ([regex]::Matches($result, '(?m)^\[options\]$')).Count | Should -Be 1
+        ([regex]::Matches($result, '(?m)^\[options\]\r?$')).Count | Should -Be 1
     }
 
     It '没有 [options] 段时在文件末尾追加' {
         $existing = "[other]`nx = 1"
         $result = Merge-VegaRustDeskConfigText -ExistingText $existing -Values ([ordered]@{ key = 'abc' })
-        $result | Should -Match '(?m)^\[other\]\r?\nx = 1\r?\n\r?\n\[options\]\r?\nkey = "abc"$'
+        $result | Should -Match '(?m)^\[other\]\r?\nx = 1\r?\n\r?\n\[options\]\r?\nkey = "abc"\r?$'
     }
 
     It '读取键值时不把行尾注释读进值' {
@@ -478,8 +478,8 @@ password = "should-not-touch"
         ($result.Messages -join "`n") | Should -Match '忽略清单里的非受管 RustDesk 键：password'
 
         $text = Get-Content -LiteralPath $path -Raw -Encoding UTF8
-        $text | Should -Match '(?m)^custom-rendezvous-server = "old\.example\.com"$'
-        $text | Should -Match '(?m)^password = "should-not-touch"$'
+        $text | Should -Match '(?m)^custom-rendezvous-server = "old\.example\.com"\r?$'
+        $text | Should -Match '(?m)^password = "should-not-touch"\r?$'
         $text | Should -Not -Match 'attacker-value'
     }
 
@@ -684,7 +684,7 @@ Describe 'P2-5 回滚按 Ordinal 比较文本' {
         $records = @([pscustomobject]@{ Key = 'key'; Existed = $true; OriginalValue = 'ABC'; Restored = $false })
         $result = Restore-VegaRustDeskConfig -Path $path -Records $records -Confirm:$false
         $result.Changed | Should -BeTrue
-        (Get-Content -LiteralPath $path -Raw -Encoding UTF8) | Should -Match '(?m)^key = "ABC"$'
+        (Get-Content -LiteralPath $path -Raw -Encoding UTF8) | Should -Match '(?m)^key = "ABC"\r?$'
     }
 }
 
