@@ -390,7 +390,7 @@ function New-VegaBootstrapAclDirectory {
       .NET Core / PowerShell 7 分支：FileSystemAclExtensions.CreateDirectory(DirectorySecurity, string)。
       注意参数顺序是 (security, path)，与 5.1 的重载相反。
     #>
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
         [string]$Path,
@@ -398,6 +398,8 @@ function New-VegaBootstrapAclDirectory {
         [Parameter(Mandatory)]
         $Security
     )
+
+    if (-not $PSCmdlet.ShouldProcess($Path, '按 ACL 创建引导目录（FileSystemAclExtensions）')) { return $null }
 
     $directory = [System.IO.FileSystemAclExtensions]::CreateDirectory($Security, $Path)
     return $directory
@@ -407,7 +409,7 @@ function New-VegaBootstrapLegacyDirectory {
     <#
       Windows PowerShell 5.1 分支：Directory.CreateDirectory(string, DirectorySecurity)。
     #>
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
         [string]$Path,
@@ -415,6 +417,8 @@ function New-VegaBootstrapLegacyDirectory {
         [Parameter(Mandatory)]
         $security
     )
+
+    if (-not $PSCmdlet.ShouldProcess($Path, '按 ACL 创建引导目录（Directory.CreateDirectory）')) { return $null }
 
     $directory = [System.IO.Directory]::CreateDirectory($Path, $security)
     return $directory
@@ -425,7 +429,7 @@ function New-VegaBootstrapDirectoryWithAcl {
       带 ACL 建目录的唯一入口：按运行时能力选分支，调用方不需要知道版本差异。
       分支选择只依赖可 mock 的类型探测，测试可分别覆盖两条路径。
     #>
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
         [string]$Path,
@@ -433,6 +437,8 @@ function New-VegaBootstrapDirectoryWithAcl {
         [Parameter(Mandatory)]
         $Security
     )
+
+    if (-not $PSCmdlet.ShouldProcess($Path, '按运行时分支创建带 ACL 的引导目录')) { return '' }
 
     if (Test-VegaBootstrapAclExtensionsAvailable) {
         $null = New-VegaBootstrapAclDirectory -Path $Path -Security $Security
