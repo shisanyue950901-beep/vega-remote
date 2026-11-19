@@ -103,7 +103,9 @@ Describe 'Merge-VegaSunshineConfigText' {
 
     It '空配置只写受管键' {
         $result = Merge-VegaSunshineConfigText -ExistingText '' -Values ([ordered]@{ sunshine_name = 'Vega' })
-        $result | Should -Match '^sunshine_name = Vega'
+        # 受管键前面会有一行注释，^ 需要多行模式才匹配得到
+        $result | Should -Match '(?m)^sunshine_name = Vega$'
+        ([regex]::Matches($result, '(?m)^sunshine_name\s*=')).Count | Should -Be 1
     }
 }
 
