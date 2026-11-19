@@ -1042,7 +1042,7 @@ function Add-VegaStateFirewallRule {
 }
 
 function Remove-VegaStateFirewallRule {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
         $State,
@@ -1050,6 +1050,8 @@ function Remove-VegaStateFirewallRule {
         [Parameter(Mandatory)]
         [string]$Name
     )
+
+    if (-not $PSCmdlet.ShouldProcess($Name, '从状态清单移除防火墙规则')) { return $State }
 
     $kept = New-Object System.Collections.Generic.List[object]
     foreach ($item in @($State.FirewallRules)) {
@@ -1079,7 +1081,7 @@ function Add-VegaStateDisabledFirewallRule {
 }
 
 function Remove-VegaStateDisabledFirewallRule {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
         $State,
@@ -1087,6 +1089,8 @@ function Remove-VegaStateDisabledFirewallRule {
         [Parameter(Mandatory)]
         [string]$Name
     )
+
+    if (-not $PSCmdlet.ShouldProcess($Name, '从状态清单移除已禁用防火墙规则')) { return $State }
 
     $kept = New-Object System.Collections.Generic.List[object]
     foreach ($item in @($State.DisabledFirewallRules)) {
@@ -1148,7 +1152,7 @@ function Add-VegaStateService {
 }
 
 function Set-VegaStateServiceRestored {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
         $State,
@@ -1158,6 +1162,8 @@ function Set-VegaStateServiceRestored {
 
         [bool]$Restored = $true
     )
+
+    if (-not $PSCmdlet.ShouldProcess($Name, '标记服务已恢复')) { return $State }
 
     foreach ($entry in @($State.Services)) {
         if ($null -eq $entry) { continue }
@@ -1173,7 +1179,7 @@ function Set-VegaStateServiceRestored {
     return $State
 }
 
-function Add-VegaStateManagedKeys {
+function Add-VegaStateManagedKey {
     <#
       首次安装时记录受管键的原值（不存在则记 Existed = $false）。
       同一个路径+键只记第一次，重跑不会覆盖基线。
@@ -1200,11 +1206,16 @@ function Add-VegaStateManagedKeys {
         $keyText = [string]$key
         if ($known.Contains($keyText)) { continue }
         $item = $Snapshot[$key]
+        # 快照可以来自 Get-VegaConfigKeySnapshot（带 OriginalValue）或旧调用方（只有 Value）
+        $originalValue = [string]$item.Value
+        if ($null -ne $item.PSObject.Properties['OriginalValue']) {
+            $originalValue = [string]$item.OriginalValue
+        }
         $State.ManagedConfigKeys = @(@($State.ManagedConfigKeys) + [pscustomobject]@{
                 Path          = $Path
                 Key           = $keyText
                 Existed       = [bool]$item.Existed
-                OriginalValue = [string]$item.Value
+                OriginalValue = $originalValue
                 Restored      = $false
             })
     }
@@ -1235,7 +1246,7 @@ function Get-VegaStateManagedKey {
 }
 
 function Set-VegaStateManagedKeyRestored {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
         $State,
@@ -1248,6 +1259,8 @@ function Set-VegaStateManagedKeyRestored {
 
         [bool]$Restored = $true
     )
+
+    if (-not $PSCmdlet.ShouldProcess("$Path :: $Key", '标记受管配置键已回滚')) { return $State }
 
     foreach ($entry in @($State.ManagedConfigKeys)) {
         if ($null -eq $entry) { continue }
@@ -1589,16 +1602,18 @@ function Get-VegaConfigKeySnapshot {
         if ([string]::IsNullOrWhiteSpace($keyText)) { continue }
         if ($values.Contains($keyText)) {
             $snapshot[$keyText] = [pscustomobject]@{
-                Key     = $keyText
-                Existed = $true
-                Value   = [string]$values[$keyText]
+                Key           = $keyText
+                Existed       = $true
+                Value         = [string]$values[$keyText]
+                OriginalValue = [string]$values[$keyText]
             }
         }
         else {
             $snapshot[$keyText] = [pscustomobject]@{
-                Key     = $keyText
-                Existed = $false
-                Value   = ''
+                Key           = $keyText
+                Existed       = $false
+                Value         = ''
+                OriginalValue = ''
             }
         }
     }
@@ -1632,7 +1647,18 @@ function Restore-VegaManagedConfig {
         if ($null -eq $record) { continue }
         $key = [string]$record.Key
         if ([string]::IsNullOrWhiteSpace($key)) { continue }
-        if ([bool]$record.Existed) { $values[$key] = [string]$record.OriginalValue }
+        if ([bool]$record.Existed) {
+            # 清单记录用 OriginalValue；Get-VegaConfigKeySnapshot 的快照记录用 Value。
+            # 只认 OriginalValue 会让快照回滚把键值写成空串。
+            $originalValue = ''
+            if ($null -ne $record.PSObject.Properties['OriginalValue']) {
+                $originalValue = [string]$record.OriginalValue
+            }
+            elseif ($null -ne $record.PSObject.Properties['Value']) {
+                $originalValue = [string]$record.Value
+            }
+            $values[$key] = $originalValue
+        }
         else { $remove.Add($key) }
     }
 
@@ -1839,7 +1865,7 @@ function Restart-VegaSunshineService {
 # 防火墙（Vega 自己创建的规则，固定内部 Name，限定 Program）
 # ---------------------------------------------------------------------------
 
-function Get-VegaSunshinePorts {
+function Get-VegaSunshinePortMap {
     <#
       纯函数：按 Sunshine 的端口偏移规则，从生效配置里的 port（默认 47989）
       算出全部端口。偏移相对默认 HTTP 端口 47989：
@@ -1915,7 +1941,7 @@ function Get-VegaFirewallRuleSpec {
         [int]$BasePort = 47989
     )
 
-    $ports = Get-VegaSunshinePorts -BasePort $BasePort
+    $ports = Get-VegaSunshinePortMap -BasePort $BasePort
     return @(
         [pscustomobject]@{
             Name      = 'Vega-Sunshine-TCP'
@@ -2283,7 +2309,7 @@ function Set-VegaFirewallRule {
         throw "防火墙规则需要 sunshine.exe 的绝对路径，收到：$Program"
     }
 
-    $ports = Get-VegaSunshinePorts -BasePort $BasePort
+    $ports = Get-VegaSunshinePortMap -BasePort $BasePort
     $specs = @(Get-VegaFirewallRuleSpec -BasePort $BasePort)
     if (-not (Test-VegaFirewallSpecSafe -Specs $specs -ManagementPort $ports.ManagementPort)) {
         throw "放行规则覆盖了管理端口 $($ports.ManagementPort)，拒绝创建。"
@@ -2782,7 +2808,7 @@ function Invoke-VegaHostInstallCore {
     if ($null -ne $existingSunshine) {
         $basePort = Get-VegaSunshineBasePort -ConfigPath $existingSunshine.Config
     }
-    $managementPorts = @(47990, (Get-VegaSunshinePorts -BasePort $basePort).ManagementPort) | Sort-Object -Unique
+    $managementPorts = @(47990, (Get-VegaSunshinePortMap -BasePort $basePort).ManagementPort) | Sort-Object -Unique
 
     # 管理端口隔离必须早于 winget 安装：安装器会先放行并启动服务。
     # 隔离失败直接中止，退出码非零。
@@ -2804,7 +2830,7 @@ function Invoke-VegaHostInstallCore {
     # 已经装过 Sunshine 的机器：隔离安装器自带的对管理端口放行规则
     if ($null -ne $existingSunshine) {
         $state = Protect-VegaSunshineManagementPort -State $state -SunshineExe $existingSunshine.Exe `
-            -ManagementPort (Get-VegaSunshinePorts -BasePort $basePort).ManagementPort -StatePath $StatePath -Confirm:$false
+            -ManagementPort (Get-VegaSunshinePortMap -BasePort $basePort).ManagementPort -StatePath $StatePath -Confirm:$false
     }
 
     $componentNames = New-Object System.Collections.Generic.List[string]
@@ -2854,7 +2880,7 @@ function Invoke-VegaHostInstallCore {
     }
 
     $basePort = Get-VegaSunshineBasePort -ConfigPath $sunshine.Config
-    $ports = Get-VegaSunshinePorts -BasePort $basePort
+    $ports = Get-VegaSunshinePortMap -BasePort $basePort
 
     # 安装器可能改过配置端口：按生效配置把管理端口补齐（规则保留，不删）
     try {
@@ -2924,7 +2950,7 @@ function Invoke-VegaHostInstallCore {
 
     # 首次安装只记录受管键的原值；重跑不覆盖已有基线
     $snapshot = Get-VegaConfigKeySnapshot -Text $existingText -Keys @($values.Keys | ForEach-Object { [string]$_ })
-    $state = Add-VegaStateManagedKeys -State $state -Path $sunshine.Config -Snapshot $snapshot
+    $state = Add-VegaStateManagedKey -State $state -Path $sunshine.Config -Snapshot $snapshot
     $null = Save-VegaState -State $state -Path $StatePath
 
     $merged = Merge-VegaSunshineConfigText -ExistingText $existingText -Values $values
@@ -3481,7 +3507,7 @@ Export-ModuleMember -Function @(
     'Get-VegaStateService',
     'Add-VegaStateService',
     'Set-VegaStateServiceRestored',
-    'Add-VegaStateManagedKeys',
+    'Add-VegaStateManagedKey',
     'Get-VegaStateManagedKey',
     'Set-VegaStateManagedKeyRestored',
     'Enter-VegaSetupLock',
@@ -3499,7 +3525,7 @@ Export-ModuleMember -Function @(
     'Set-VegaSunshineServiceStartType',
     'Restore-VegaSunshineServiceState',
     'Restart-VegaSunshineService',
-    'Get-VegaSunshinePorts',
+    'Get-VegaSunshinePortMap',
     'Get-VegaSunshineBasePort',
     'Get-VegaFirewallRuleSpec',
     'Test-VegaFirewallSpecSafe',
