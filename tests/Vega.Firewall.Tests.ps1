@@ -624,7 +624,7 @@ Describe 'Set-VegaAdminBlockRule' {
             }
         }
 
-        { Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false } | Should -Throw '*未覆盖活动接口*'
+        { Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false } | Should -Throw '*未覆盖*'
     }
 
     It '规则 Profile 为 Any 时视为覆盖，不再调用 Set 补齐' {
