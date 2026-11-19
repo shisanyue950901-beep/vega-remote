@@ -652,6 +652,7 @@ function Write-VegaLegacyStateWarning {
     }
     catch {
         # 解析失败按旧清单处理：只警告，不读取内容回滚。
+        Write-Verbose "读取状态清单 $Path 失败，按旧版清单处理：$($_.Exception.Message)"
     }
 
     Write-VegaStatus ("检测到旧版状态清单：{0}。旧版记录不会自动迁移；卸载时请手动检查 Sunshine 配置。" -f $Path) -Level Warn
