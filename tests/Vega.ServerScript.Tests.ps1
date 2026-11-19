@@ -90,6 +90,13 @@ Describe 'RustDesk 部署脚本：防火墙只提示不修改' {
         $script:ServerScript | Should -Match 'warn_ufw_not_enabled'
         $script:ServerScript | Should -Match 'warn_websocket_reachable'
     }
+
+    It '完成提示直接列出可选 WebSocket 端口，不要求用 --websocket 重跑' {
+        $script:ServerScript | Should -Match '可选放行 WebSocket 端口 TCP 21118-21119'
+        $script:ServerScript | Should -Match '启用时核对旧拒绝规则和云安全组'
+        $script:ServerScript | Should -Match '--reinstall --websocket'
+        $script:ServerScript | Should -Not -Match '用 --websocket 重跑'
+    }
 }
 
 Describe 'docker-compose.yml：host 网络且不发布端口' {
