@@ -220,10 +220,187 @@ function Set-VegaBootstrapDirectoryAcl {
     }
 }
 
+function Get-VegaBootstrapSid {
+    <#
+      把 ACL 里的 IdentityReference 转成 SID 字符串；取不到返回空串（按可疑处理）。
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        $IdentityReference
+    )
+
+    if ($null -eq $IdentityReference) { return '' }
+    if ($IdentityReference -is [System.Security.Principal.SecurityIdentifier]) { return $IdentityReference.Value }
+
+    $text = [string]$IdentityReference
+    if ([string]::IsNullOrWhiteSpace($text)) { return '' }
+    if ($text -match '^S-1-') { return $text }
+
+    try {
+        $account = New-Object System.Security.Principal.NTAccount($text)
+        return $account.Translate([System.Security.Principal.SecurityIdentifier]).Value
+    }
+    catch {
+        return ''
+    }
+}
+
+function Test-VegaBootstrapWriteRights {
+    <#
+      纯函数：判断一组文件系统权限里是否含写/删除/改权限/取得所有权等写类权限。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $Rights
+    )
+
+    # Write(278) Delete(65536) ChangePermissions(262144) TakeOwnership(524288)
+    # FullControl(2032127) WriteData(2) AppendData(4) WriteExtendedAttributes(16)
+    # WriteAttributes(256) DeleteSubdirectoriesAndFiles(64)
+    $writeMask = 2 -bor 4 -bor 16 -bor 64 -bor 256 -bor 278 -bor 65536 -bor 262144 -bor 524288 -bor 2032127
+    return ((([int]$Rights) -band $writeMask) -ne 0)
+}
+
+function Test-VegaBootstrapDirectoryAclTrusted {
+    <#
+      目录是否满足：不是重解析点、所有者是 SYSTEM 或 Administrators、
+      没有任何非管理员 SID 持有写类权限。非 Windows 只用于跑 Pester，直接返回 $true。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    if (-not (Test-VegaBootstrapWindows)) { return $true }
+    if (Test-VegaBootstrapReparsePoint -Path $Path) { return $false }
+
+    try {
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    }
+    catch {
+        return $false
+    }
+    if ($null -eq $acl) { return $false }
+
+    $allowedOwnerSids = @('S-1-5-32-544', 'S-1-5-18')
+    $ownerSid = Get-VegaBootstrapSid -IdentityReference $acl.Owner
+    if ($allowedOwnerSids -notcontains $ownerSid) { return $false }
+
+    foreach ($rule in @($acl.Access)) {
+        if ($null -eq $rule) { continue }
+        if ([string]$rule.AccessControlType -ne 'Allow') { continue }
+
+        $sid = Get-VegaBootstrapSid -IdentityReference $rule.IdentityReference
+        if ($allowedOwnerSids -contains $sid) { continue }
+        if (Test-VegaBootstrapWriteRights -Rights $rule.FileSystemRights) { return $false }
+    }
+
+    return $true
+}
+
+function New-VegaBootstrapProtectedDirectory {
+    <#
+      创建目录时就用 DirectorySecurity 应用 ACL：禁用继承，只留 SYSTEM 与
+      Administrators 完全控制，所有者设为 Administrators。已存在则拒绝。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    if (Test-Path -LiteralPath $Path) { throw "目录已存在，拒绝覆盖：$Path" }
+
+    if (-not (Test-VegaBootstrapWindows)) {
+        $null = New-Item -ItemType Directory -Path $Path -Force
+        return $Path
+    }
+
+    try {
+        $administrators = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+        $system = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+
+        $security = New-Object System.Security.AccessControl.DirectorySecurity
+        $security.SetAccessRuleProtection($true, $false)
+        foreach ($sid in @($system, $administrators)) {
+            $accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $sid, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')
+            $security.AddAccessRule($accessRule)
+        }
+        $security.SetOwner($administrators)
+
+        $null = [System.IO.Directory]::CreateDirectory($Path, $security)
+    }
+    catch {
+        throw "创建受保护目录失败：$Path（$($_.Exception.Message)）"
+    }
+
+    if (Test-VegaBootstrapReparsePoint -Path $Path) { throw "新建目录是重解析点，拒绝使用：$Path" }
+    return $Path
+}
+
+function Initialize-VegaBootstrapProtectedRoot {
+    <#
+      建立或复用受保护目录：父目录不得是重解析点；
+      新建时在 CreateDirectory 阶段应用 ACL；已存在时必须通过 ACL 可信校验，
+      否则中止并提示用户以管理员身份删除或修复后重试。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $parent = Split-Path -Path $Path -Parent
+    if (-not [string]::IsNullOrWhiteSpace($parent) -and (Test-Path -LiteralPath $parent)) {
+        if (Test-VegaBootstrapReparsePoint -Path $parent) { throw "受保护目录的父目录是重解析点，拒绝使用：$parent" }
+    }
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return (New-VegaBootstrapProtectedDirectory -Path $Path)
+    }
+
+    if (Test-VegaBootstrapReparsePoint -Path $Path) {
+        throw "目录是重解析点，拒绝使用：$Path。请以管理员身份删除或修复该目录后重试。"
+    }
+    if (-not (Test-VegaBootstrapDirectoryAclTrusted -Path $Path)) {
+        throw ((("目录的权限不安全（所有者不是 SYSTEM/Administrators，或存在非管理员可写/可删除的权限）：{0}。" -f $Path)) +
+            '请以管理员身份删除或修复该目录后重试。')
+    }
+
+    return $Path
+}
+
+function Initialize-VegaBootstrapVegaRoot {
+    <#
+      默认工作根 %ProgramData%\Vega：先确认 %ProgramData% 不是重解析点，
+      再按受保护目录规则创建或校验 Vega 目录。
+    #>
+    [CmdletBinding()]
+    param()
+
+    $programData = $env:ProgramData
+    if ([string]::IsNullOrWhiteSpace($programData)) {
+        throw '环境变量 %ProgramData% 为空，无法建立受保护的引导工作目录。'
+    }
+    if (Test-Path -LiteralPath $programData) {
+        if (Test-VegaBootstrapReparsePoint -Path $programData) {
+            throw "%ProgramData% 是重解析点，拒绝使用：$programData"
+        }
+    }
+
+    $vegaRoot = Join-Path $programData 'Vega'
+    return (Initialize-VegaBootstrapProtectedRoot -Path $vegaRoot)
+}
+
 function Initialize-VegaBootstrapDirectory {
     <#
       建立（或复用）一个目录并收紧 ACL。
-      父目录与目标目录都不得是重解析点，否则中止。
+      父目录与目标目录都不得是重解析点；已存在的目录必须通过 ACL 可信校验。
     #>
     [CmdletBinding()]
     param(
@@ -237,18 +414,20 @@ function Initialize-VegaBootstrapDirectory {
     }
 
     if (-not (Test-Path -LiteralPath $Path)) {
-        $null = New-Item -ItemType Directory -Path $Path -Force
+        $null = New-VegaBootstrapProtectedDirectory -Path $Path
+    }
+    else {
+        if (Test-VegaBootstrapReparsePoint -Path $Path) { throw "工作目录是重解析点，拒绝使用：$Path" }
+        Set-VegaBootstrapDirectoryAcl -Path $Path
     }
 
-    if (Test-VegaBootstrapReparsePoint -Path $Path) { throw "工作目录是重解析点，拒绝使用：$Path" }
-
-    Set-VegaBootstrapDirectoryAcl -Path $Path
     return $Path
 }
 
 function Get-VegaBootstrapWorkRoot {
     <#
       受保护工作目录的根：默认 %ProgramData%\Vega\bootstrap。
+      默认根建立在已验证的 %ProgramData%\Vega 下；自定义根同样要求父目录可信。
     #>
     [CmdletBinding()]
     param(
@@ -258,16 +437,14 @@ function Get-VegaBootstrapWorkRoot {
 
     if (-not [string]::IsNullOrWhiteSpace($Root)) { return $Root }
 
-    $programData = $env:ProgramData
-    if ([string]::IsNullOrWhiteSpace($programData)) {
-        throw '环境变量 %ProgramData% 为空，无法建立受保护的引导工作目录。'
-    }
-    return (Join-Path (Join-Path $programData 'Vega') 'bootstrap')
+    $vegaRoot = Initialize-VegaBootstrapVegaRoot
+    return (Join-Path $vegaRoot 'bootstrap')
 }
 
 function New-VegaBootstrapWorkDirectory {
     <#
-      在工作根下建一个带新 GUID 的工作目录，建完立刻设 ACL。
+      在工作根下建一个带新 GUID 的工作目录，创建时即应用 ACL；
+      父目录与工作目录都不得是重解析点。
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -283,11 +460,7 @@ function New-VegaBootstrapWorkDirectory {
 
     if (-not $PSCmdlet.ShouldProcess($workDirectory, '创建受保护的引导工作目录')) { return '' }
 
-    $null = New-Item -ItemType Directory -Path $workDirectory -Force
-    if (Test-VegaBootstrapReparsePoint -Path $workDirectory) {
-        throw "新建的工作目录是重解析点，拒绝使用：$workDirectory"
-    }
-    Set-VegaBootstrapDirectoryAcl -Path $workDirectory
+    $null = New-VegaBootstrapProtectedDirectory -Path $workDirectory
     return $workDirectory
 }
 
@@ -303,6 +476,10 @@ function Remove-VegaBootstrapWorkDirectory {
 
     if ([string]::IsNullOrWhiteSpace($Path)) { return }
     if (-not (Test-Path -LiteralPath $Path)) { return }
+    if (Test-VegaBootstrapReparsePoint -Path $Path) {
+        Write-Warning "工作目录是重解析点，跳过清理，请手动检查：$Path"
+        return
+    }
     if (-not $PSCmdlet.ShouldProcess($Path, '删除引导工作目录')) { return }
     try {
         Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
@@ -335,10 +512,72 @@ function Resolve-VegaBootstrapRole {
     }
 }
 
+function Get-VegaBootstrapAssetName {
+    <#
+      从 URL 的 AbsolutePath 末段取资产文件名（查询串不参与），URL 解码后只允许
+      [A-Za-z0-9._-]。错误信息只显示脱敏后的 URL。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Uri
+    )
+
+    $shown = Hide-VegaBootstrapUri -Uri $Uri
+    try {
+        $parsed = [System.Uri]$Uri
+    }
+    catch {
+        throw "下载地址无效：$shown"
+    }
+
+    $path = $parsed.AbsolutePath
+    $leaf = $path.Substring($path.LastIndexOf('/') + 1)
+    try {
+        $leaf = [System.Uri]::UnescapeDataString($leaf)
+    }
+    catch {
+        throw "下载地址里的资产文件名无法解码：$shown"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($leaf) -or $leaf -notmatch '^[A-Za-z0-9._-]+$') {
+        throw "下载地址里的资产文件名无效（只允许字母、数字、点、下划线和连字符）：$shown"
+    }
+    return $leaf
+}
+
+function Get-VegaBootstrapAssetBaseUri {
+    <#
+      取 URL 的目录部分（保留 scheme/host/port，去掉文件名、查询串与片段），
+      用于推导同目录的 SHA256SUMS.txt。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Uri
+    )
+
+    $shown = Hide-VegaBootstrapUri -Uri $Uri
+    try {
+        $parsed = [System.Uri]$Uri
+        $path = $parsed.AbsolutePath
+        $basePath = $path.Substring(0, $path.LastIndexOf('/') + 1)
+        $builder = New-Object System.UriBuilder($parsed)
+        $builder.Path = $basePath
+        $builder.Query = ''
+        $builder.Fragment = ''
+        return $builder.Uri.AbsoluteUri
+    }
+    catch {
+        throw "下载地址无效：$shown"
+    }
+}
+
 function Get-VegaBootstrapRelease {
     <#
       查询 latest Release，返回 { Version, Tag, ZipUrl, ChecksumUrl, AssetName }。
       -ZipUrl 给定时只推导同目录的 SHA256SUMS.txt，不查询 API。
+      资产名一律从 Uri 的 AbsolutePath 末段提取，带令牌的查询串不进入文件名与错误信息。
     #>
     [CmdletBinding()]
     param(
@@ -348,8 +587,8 @@ function Get-VegaBootstrapRelease {
     )
 
     if (-not [string]::IsNullOrWhiteSpace($ZipUrl)) {
-        $base = $ZipUrl.Substring(0, $ZipUrl.LastIndexOf('/') + 1)
-        $assetName = $ZipUrl.Substring($ZipUrl.LastIndexOf('/') + 1)
+        $assetName = Get-VegaBootstrapAssetName -Uri $ZipUrl
+        $base = Get-VegaBootstrapAssetBaseUri -Uri $ZipUrl
         $version = $assetName
         if ($version -match '^vega-remote-(?<ver>.+)\.zip$') { $version = $Matches['ver'] }
         return [pscustomobject]@{
@@ -389,18 +628,22 @@ function Get-VegaBootstrapRelease {
     $version = $tag.TrimStart('v')
     if ([string]::IsNullOrWhiteSpace($version)) { $version = [string]$zipAsset[0].name }
 
+    $zipUrl = [string]$zipAsset[0].browser_download_url
+    $assetName = Get-VegaBootstrapAssetName -Uri $zipUrl
+
     return [pscustomobject]@{
         Version     = $version
         Tag         = $tag
-        ZipUrl      = [string]$zipAsset[0].browser_download_url
+        ZipUrl      = $zipUrl
         ChecksumUrl = [string]$sumAsset[0].browser_download_url
-        AssetName   = [string]$zipAsset[0].name
+        AssetName   = $assetName
     }
 }
 
 function Get-VegaBootstrapByteArray {
     <#
-      下载到内存字节数组（不落盘）。失败时附带镜像提示，URL 去掉 userinfo 与查询参数。
+      下载到内存字节数组（不落盘）。手动跟随重定向，并检查最终响应 URI 仍是 https；
+      失败时附带镜像提示，URL 去掉 userinfo 与查询参数。
     #>
     [CmdletBinding()]
     param(
@@ -409,17 +652,37 @@ function Get-VegaBootstrapByteArray {
     )
 
     $shown = Hide-VegaBootstrapUri -Uri $Uri
+    $client = $null
     try {
-        $client = New-Object System.Net.WebClient
-        try {
-            return , $client.DownloadData($Uri)
+        Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+
+        $handler = New-Object System.Net.Http.HttpClientHandler
+        $handler.AllowAutoRedirect = $true
+        $handler.MaxAutomaticRedirections = 5
+
+        $client = New-Object System.Net.Http.HttpClient($handler)
+        $client.Timeout = [TimeSpan]::FromSeconds(60)
+
+        $response = $client.GetAsync($Uri).GetAwaiter().GetResult()
+        if (-not $response.IsSuccessStatusCode) {
+            throw ("HTTP {0}" -f [int]$response.StatusCode)
         }
-        finally {
-            $client.Dispose()
+
+        $finalUri = ''
+        if ($null -ne $response.RequestMessage -and $null -ne $response.RequestMessage.RequestUri) {
+            $finalUri = $response.RequestMessage.RequestUri.AbsoluteUri
         }
+        if (-not (Test-VegaBootstrapSecureUrl -Uri $finalUri)) {
+            throw "下载被重定向到非 https 地址：$(Hide-VegaBootstrapUri -Uri $finalUri)"
+        }
+
+        return , $response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
     }
     catch {
         throw ("下载失败：{0}（{1}）。只使用可信镜像，镜像同时控制 zip 和校验文件；也可先手动下载后解压运行安装脚本。" -f $shown, $_.Exception.Message)
+    }
+    finally {
+        if ($null -ne $client) { $client.Dispose() }
     }
 }
 
@@ -534,6 +797,9 @@ function Write-VegaBootstrapFile {
 
     $parent = Split-Path -Path $Path -Parent
     if (Test-VegaBootstrapReparsePoint -Path $parent) { throw "写入目录是重解析点，拒绝写入：$parent" }
+    if (-not (Test-VegaBootstrapDirectoryAclTrusted -Path $parent)) {
+        throw "写入目录的权限不安全（存在非管理员可写权限），拒绝写入：$parent"
+    }
 
     try {
         [System.IO.File]::WriteAllBytes($Path, $Bytes)
@@ -572,6 +838,13 @@ function Expand-VegaBootstrapArchive {
     }
 
     Expand-Archive -LiteralPath $ArchivePath -DestinationPath $DestinationPath -Force -ErrorAction Stop
+
+    # 解压后再检查子目录：压缩包里的目录联接/符号链接不能被当作可信内容执行。
+    $reparseItems = @(Get-ChildItem -LiteralPath $DestinationPath -Recurse -Force -ErrorAction SilentlyContinue |
+        Where-Object { [bool]($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) })
+    if ($reparseItems.Count -gt 0) {
+        throw "解压目录里包含重解析点，拒绝使用：$($reparseItems[0].FullName)"
+    }
 
     $leaf = $(if ($Role -eq 'host') { 'install-host.ps1' } else { 'install-client.ps1' })
     $found = @(Get-ChildItem -LiteralPath $DestinationPath -Recurse -Filter $leaf -File -ErrorAction SilentlyContinue |
@@ -683,6 +956,14 @@ function Invoke-VegaBootstrap {
         throw '服务器地址格式无效：-ZipUrl 只接受 https 链接。只使用可信镜像，镜像同时控制 zip 和校验文件。'
     }
 
+    # 显式传入空白 -Sha256 是调用错误：不能悄悄退回同源校验文件。
+    if ($PSBoundParameters.ContainsKey('Sha256') -and [string]::IsNullOrWhiteSpace($Sha256)) {
+        throw '-Sha256 不能为空：请提供 64 位十六进制摘要，或不传 -Sha256 使用 SHA256SUMS.txt。'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ApiUrl) -and -not (Test-VegaBootstrapSecureUrl -Uri $ApiUrl)) {
+        throw '服务器地址格式无效：-ApiUrl 只接受 https 链接。'
+    }
+
     $resolvedRole = Resolve-VegaBootstrapRole -Role $Role
     $installerArgs = Get-VegaBootstrapInstallerArgument -SkipTailscale:$SkipTailscale -WithRustDesk:$WithRustDesk `
         -Force:$Force -Uninstall:$Uninstall -RemoveApps:$RemoveApps `
@@ -740,11 +1021,24 @@ function Invoke-VegaBootstrap {
 # 点源（测试）时只加载函数，不执行主流程。
 if ($MyInvocation.InvocationName -ne '.') {
     try {
-        Invoke-VegaBootstrap -Role $Role -ZipUrl $ZipUrl -Sha256 $Sha256 -Repo $Repo -ApiUrl $ApiUrl `
-            -WorkRoot $WorkRoot -InstallerScript $InstallerScript `
-            -SkipAdminCheck:$SkipAdminCheck -SkipTls12:$SkipTls12 `
-            -SkipTailscale:$SkipTailscale -WithRustDesk:$WithRustDesk -Force:$Force -Uninstall:$Uninstall `
-            -RemoveApps:$RemoveApps -RustDeskServer $RustDeskServer -RustDeskKey $RustDeskKey -Confirm:$false
+        # 只透传用户实际给出的参数：否则空的 -Sha256 会被当成“显式传入空白”。
+        $bootstrapArgs = @{ Role = $Role; Repo = $Repo }
+        if ($PSBoundParameters.ContainsKey('ZipUrl') -and -not [string]::IsNullOrWhiteSpace($ZipUrl)) { $bootstrapArgs['ZipUrl'] = $ZipUrl }
+        if ($PSBoundParameters.ContainsKey('Sha256')) { $bootstrapArgs['Sha256'] = $Sha256 }
+        if ($PSBoundParameters.ContainsKey('ApiUrl') -and -not [string]::IsNullOrWhiteSpace($ApiUrl)) { $bootstrapArgs['ApiUrl'] = $ApiUrl }
+        if ($PSBoundParameters.ContainsKey('WorkRoot') -and -not [string]::IsNullOrWhiteSpace($WorkRoot)) { $bootstrapArgs['WorkRoot'] = $WorkRoot }
+        if ($PSBoundParameters.ContainsKey('InstallerScript') -and -not [string]::IsNullOrWhiteSpace($InstallerScript)) { $bootstrapArgs['InstallerScript'] = $InstallerScript }
+        if ($SkipAdminCheck) { $bootstrapArgs['SkipAdminCheck'] = $true }
+        if ($SkipTls12) { $bootstrapArgs['SkipTls12'] = $true }
+        if ($SkipTailscale) { $bootstrapArgs['SkipTailscale'] = $true }
+        if ($WithRustDesk) { $bootstrapArgs['WithRustDesk'] = $true }
+        if ($Force) { $bootstrapArgs['Force'] = $true }
+        if ($Uninstall) { $bootstrapArgs['Uninstall'] = $true }
+        if ($RemoveApps) { $bootstrapArgs['RemoveApps'] = $true }
+        if (-not [string]::IsNullOrWhiteSpace($RustDeskServer)) { $bootstrapArgs['RustDeskServer'] = $RustDeskServer }
+        if (-not [string]::IsNullOrWhiteSpace($RustDeskKey)) { $bootstrapArgs['RustDeskKey'] = $RustDeskKey }
+
+        Invoke-VegaBootstrap @bootstrapArgs -Confirm:$false
     }
     catch {
         Write-Host $_.Exception.Message -ForegroundColor Red
