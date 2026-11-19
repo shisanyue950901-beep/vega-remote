@@ -89,19 +89,44 @@ jobs:
         uses: actions/checkout@v4
 
       - name: shellcheck
-        run: shellcheck server/setup-rustdesk-server.sh
+        run: |
+          shellcheck server/setup-rustdesk-server.sh
+          shellcheck tests/setup-rustdesk-static.sh
 
-      - name: docker compose config
+      - name: 部署脚本静态检查（不实跑 docker）
+        run: bash tests/setup-rustdesk-static.sh
+
+      - name: docker compose config（逐服务断言）
         run: |
           # 只用 server/docker-compose.yml 一份文件（WebSocket 覆盖文件已删除）
           docker compose -f server/docker-compose.yml config > compose.rendered.yml
           cat compose.rendered.yml
           # host 网络 + 不发布端口：Docker 端口发布走 DNAT，会绕过 UFW 入站规则
-          grep -q 'network_mode: host' compose.rendered.yml
-          if grep -q 'published:' compose.rendered.yml; then
-            echo 'compose 里不应出现 ports 发布（host 网络）'
-            exit 1
-          fi
+          for service in hbbs hbbr; do
+            block=$(awk -v svc="  $service:" '
+              $0 == svc { inblock = 1; next }
+              /^  [a-z]/ { inblock = 0 }
+              inblock
+            ' compose.rendered.yml)
+            if [ -z "$block" ]; then
+              echo "compose 里找不到服务 $service"
+              exit 1
+            fi
+            echo "---- $service ----"
+            echo "$block"
+            echo "$block" | grep -qE '^[[:space:]]+network_mode:[[:space:]]+host[[:space:]]*$' || {
+              echo "服务 $service 必须是 network_mode: host"
+              exit 1
+            }
+            if echo "$block" | grep -qE '^[[:space:]]+ports:'; then
+              echo "服务 $service 不应发布端口"
+              exit 1
+            fi
+            if echo "$block" | grep -qE '^[[:space:]]+published:'; then
+              echo "服务 $service 不应发布端口（published）"
+              exit 1
+            fi
+          done
 
       - name: 部署脚本失败路径（非 root 应拒绝且无副作用）
         run: |

@@ -43,7 +43,7 @@ Moonlight 首次连接要 PIN 配对；Tailscale 端到端加密。管理页用 
 安装只使用 `--source winget` 源，并关掉了交互提示。没有匹配（例如源里确实没有该包）和查询失败（源故障、超时）是两种情况：前者跳过安装，后者会让脚本以非零退出码结束，不会假装成功。先更新「应用安装程序」(App Installer)，再执行 `winget source update`；仍失败可手动安装官方发行版。
 
 **服务器上 `docker compose` 不存在？**
-`server/setup-rustdesk-server.sh` 会优先用 `docker compose`，回退到独立的 `docker-compose` 命令；两者都没有时会提示先安装 Docker Compose 插件。脚本不会用 `curl | sh` 安装 Docker，没装 Docker 时会提示按官方文档用软件源安装后重新运行。没有 ufw 的系统（如部分云镜像）会跳过防火墙步骤，并打印醒目警告：「未检测到启用的 UFW，21115-21119 将直接暴露，请在云厂商安全组只放行 TCP 21115-21117、UDP 21116」。此时安全组是唯一防线，务必按提示收紧。
+`server/setup-rustdesk-server.sh` 会优先用 `docker compose`，回退到独立的 `docker-compose` 命令；两者都没有时会提示先安装 Docker Compose 插件。脚本不会用 `curl | sh` 安装 Docker，没装 Docker 时会提示按官方文档用软件源安装后重新运行。没有 ufw 的系统（如部分云镜像）或 ufw 未启用时会打印醒目警告：「未检测到启用的 UFW，21115-21119 将直接对外暴露，其中 21118/21119（WebSocket）也会对外可达，请用云厂商安全组只放行 TCP 21115-21117、UDP 21116」。ufw 已启用但默认入站为 allow 时同样警告。未启用 WebSocket 且默认入站为 deny 时，脚本会额外 `ufw deny 21118:21119/tcp`；`ufw status` 里已有涉及 21115-21119 的规则时不再追加，只提示自查。另外脚本只支持全新部署，已有容器时需加 `--reinstall`（先 `compose down`，数据目录和密钥保留）。
 
 **RustDesk 中继要开哪些端口？**
 默认只放行桌面客户端需要的 TCP 21115-21117 与 UDP 21116。需要 WebSocket（`--websocket`）时才额外放行 TCP 21118-21119。私钥文件落盘后会被收紧到 0600，数据目录要求在 0700 且属于 root。

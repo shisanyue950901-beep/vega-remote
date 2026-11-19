@@ -52,9 +52,11 @@ cd server && sudo bash setup-rustdesk-server.sh
 
 脚本输出服务器地址和 Key，填到两端 RustDesk 的「ID/中继服务器」里即可。
 
+脚本只支持全新部署：启动前发现项目里已有容器会直接拒绝，避免误删正在用的中继。需要重装时加 `--reinstall`，脚本会先 `compose down`（数据目录和密钥保留）再按全新流程部署。启动前还会用 `ss -lntup` 检查 TCP/UDP 21115-21119，被占用就停下。
+
 镜像固定为 `rustdesk/rustdesk-server:1.1.16`，部署与 CI 使用同一份 `server/docker-compose.yml`。容器用 `network_mode: host`，不发布端口：Docker 的端口发布走 DNAT，不经过 UFW 的 INPUT 规则，等于绕过入站限制；host 网络下端口由服务自己监听，ufw 规则才真正生效。默认只放行桌面客户端需要的 TCP 21115-21117 与 UDP 21116；需要 WebSocket 时用 `sudo bash setup-rustdesk-server.sh --websocket` 额外放行 21118/21119。脚本不会用 `curl | sh` 安装 Docker：没装时会提示按官方文档用软件源安装后重新运行。
 
-未安装或未启用 UFW 时，脚本会打印醒目警告：**「未检测到启用的 UFW，21115-21119 将直接暴露，请在云厂商安全组只放行 TCP 21115-21117、UDP 21116」**。这种情况下安全组就是唯一防线，务必按提示收紧。
+未安装或未启用 UFW 时，脚本会打印醒目警告：**「未检测到启用的 UFW，21115-21119 将直接对外暴露，其中 21118/21119（WebSocket）也会对外可达，请用云厂商安全组只放行 TCP 21115-21117、UDP 21116」**。UFW 已启用但默认入站是 allow 时同样会警告；未启用 WebSocket 且默认入站为 deny 时，脚本会额外执行 `ufw deny 21118:21119/tcp`。如果 `ufw status` 里已经有涉及 21115-21119 的规则，脚本不再追加，只提示你自行核对放行范围。
 
 ## 诊断
 
