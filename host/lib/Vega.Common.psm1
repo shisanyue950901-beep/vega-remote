@@ -425,9 +425,10 @@ function Get-VegaWingetPackageStatus {
 
 function Install-VegaPackage {
     <#
-      用 winget 安装组件；已安装则跳过（可重复执行）。
-      返回 $true 表示本次真的装了。查询失败或安装失败都抛异常，
-      由入口函数记入失败列表并反映到退出码。
+      用 winget 安装组件；可重复执行。
+      -Force 只是让 winget 重装，前置查询照做：安装前就存在的包一律算 PreExisting，
+      永不被 -RemoveApps 卸载（用户原有的 Tailscale / Sunshine 不能算 Vega 的）。
+      返回 { PackageId, Installed, PreExisting }；查询或安装失败抛异常。
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -441,18 +442,23 @@ function Install-VegaPackage {
 
     if ([string]::IsNullOrWhiteSpace($DisplayName)) { $DisplayName = $PackageId }
 
-    if (-not $Force) {
-        $status = Get-VegaWingetPackageStatus -PackageId $PackageId
-        if ($status.Status -eq 'Failed') {
-            throw "查询 $DisplayName 安装状态失败：$($status.Error)"
-        }
-        if ($status.Installed) {
-            Write-Verbose "已安装，跳过：$PackageId"
-            return $false
-        }
+    $status = Get-VegaWingetPackageStatus -PackageId $PackageId
+    if ($status.Status -eq 'Failed') {
+        throw "查询 $DisplayName 安装状态失败：$($status.Error)"
     }
 
-    if (-not $PSCmdlet.ShouldProcess($DisplayName, 'winget install')) { return $false }
+    $outcome = [pscustomobject]@{
+        PackageId   = $PackageId
+        Installed   = $false
+        PreExisting = [bool]$status.Installed
+    }
+
+    if ($outcome.PreExisting -and -not $Force) {
+        Write-Verbose "已安装（Vega 之外的实例），跳过：$PackageId"
+        return $outcome
+    }
+
+    if (-not $PSCmdlet.ShouldProcess($DisplayName, 'winget install')) { return $outcome }
 
     $arguments = @(
         'install', '--id', $PackageId, '-e', '--source', 'winget', '--silent',
@@ -465,7 +471,8 @@ function Install-VegaPackage {
         throw "安装 $DisplayName 失败（winget 退出码 $($result.ExitCode)）。可手动执行：winget install --id $PackageId -e --source winget"
     }
 
-    return $true
+    $outcome.Installed = $true
+    return $outcome
 }
 
 function Uninstall-VegaPackage {
@@ -2703,9 +2710,9 @@ function Invoke-VegaHostInstallCore {
         $component = Get-VegaComponent -Name $name
         Write-VegaStatus "安装 $($component.Name)"
 
-        $installed = $false
+        $outcome = $null
         try {
-            $installed = Install-VegaPackage -PackageId $component.PackageId -DisplayName $component.Name -Force:$Force -Confirm:$false
+            $outcome = Install-VegaPackage -PackageId $component.PackageId -DisplayName $component.Name -Force:$Force -Confirm:$false
         }
         catch {
             $failures.Add("安装 $($component.Name) 失败：$($_.Exception.Message)")
@@ -2714,14 +2721,20 @@ function Invoke-VegaHostInstallCore {
         }
 
         if (Test-VegaStatePackage -State $state -PackageId $component.PackageId) { continue }
+        if ($null -eq $outcome) { continue }
 
-        if ($installed) {
-            $state = Add-VegaStatePackage -State $state -PackageId $component.PackageId -Name $component.Name
-        }
-        else {
+        # 安装前就存在的实例永远算 PreExisting，-Force 重装也不改归属
+        if ($outcome.PreExisting) {
             $state = Add-VegaStatePackage -State $state -PackageId $component.PackageId -Name $component.Name -PreExisting
+            $null = Save-VegaState -State $state -Path $StatePath
+            Write-VegaStatus "$($component.Name) 安装前已存在，登记为 PreExisting（不会被 -RemoveApps 卸载）"
+            continue
         }
-        $null = Save-VegaState -State $state -Path $StatePath
+
+        if ($outcome.Installed) {
+            $state = Add-VegaStatePackage -State $state -PackageId $component.PackageId -Name $component.Name
+            $null = Save-VegaState -State $state -Path $StatePath
+        }
     }
 
     $sunshine = Get-VegaSunshineInstall
@@ -3171,9 +3184,9 @@ function Invoke-VegaClientInstallCore {
         $component = Get-VegaComponent -Name $name
         Write-VegaStatus "安装 $($component.Name)"
 
-        $installed = $false
+        $outcome = $null
         try {
-            $installed = Install-VegaPackage -PackageId $component.PackageId -DisplayName $component.Name -Force:$Force -Confirm:$false
+            $outcome = Install-VegaPackage -PackageId $component.PackageId -DisplayName $component.Name -Force:$Force -Confirm:$false
         }
         catch {
             $failures.Add("安装 $($component.Name) 失败：$($_.Exception.Message)")
@@ -3182,14 +3195,20 @@ function Invoke-VegaClientInstallCore {
         }
 
         if (Test-VegaStatePackage -State $state -PackageId $component.PackageId) { continue }
+        if ($null -eq $outcome) { continue }
 
-        if ($installed) {
-            $state = Add-VegaStatePackage -State $state -PackageId $component.PackageId -Name $component.Name
-        }
-        else {
+        # 安装前就存在的实例永远算 PreExisting，-Force 重装也不改归属
+        if ($outcome.PreExisting) {
             $state = Add-VegaStatePackage -State $state -PackageId $component.PackageId -Name $component.Name -PreExisting
+            $null = Save-VegaState -State $state -Path $StatePath
+            Write-VegaStatus "$($component.Name) 安装前已存在，登记为 PreExisting（不会被 -RemoveApps 卸载）"
+            continue
         }
-        $null = Save-VegaState -State $state -Path $StatePath
+
+        if ($outcome.Installed) {
+            $state = Add-VegaStatePackage -State $state -PackageId $component.PackageId -Name $component.Name
+            $null = Save-VegaState -State $state -Path $StatePath
+        }
     }
 
     Write-VegaStatus '完成' -Level Ok
