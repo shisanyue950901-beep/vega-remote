@@ -608,6 +608,41 @@ function Get-VegaStatePath {
     return (Get-VegaHostStatePath)
 }
 
+function Get-VegaLegacyStatePath {
+    <#
+      旧版（v0.1）清单路径：%ProgramData%\Vega\state.json。只用于检测，不读取内容。
+    #>
+    [CmdletBinding()]
+    param()
+
+    $root = $env:ProgramData
+    if ([string]::IsNullOrWhiteSpace($root)) { $root = [System.IO.Path]::GetTempPath() }
+    return (Join-Path (Join-Path $root 'Vega') 'state.json')
+}
+
+function Write-VegaLegacyStateWarning {
+    <#
+      检测到旧清单时打印警告，返回 $true。
+      不读取旧文件内容：旧版记录没有新的归属/白名单字段，不能拿来回滚。
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()]
+        [string]$Path = (Get-VegaLegacyStatePath)
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    try {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    }
+    catch {
+        return $false
+    }
+
+    Write-VegaStatus ("检测到旧版状态清单：{0}。旧版记录不会自动迁移；卸载时请手动检查 Sunshine 配置。" -f $Path) -Level Warn
+    return $true
+}
+
 function Test-VegaManagedHostStatePath {
     <#
       是否是被控端机器级清单（%ProgramData%\Vega\host-state.json）。
@@ -1700,6 +1735,37 @@ function Get-VegaSunshineService {
     return $result.ToArray()
 }
 
+function Get-VegaSunshineServiceSnapshot {
+    <#
+      安装/重装前采集 Sunshine 服务的启动类型与运行状态。
+      服务不存在也记一条 StartType = 'NotPresent'：卸载时据此什么都不做，
+      不会去恢复一个本来就不存在的服务。
+    #>
+    [CmdletBinding()]
+    param()
+
+    $snapshot = New-Object System.Collections.Generic.List[object]
+    foreach ($name in (Get-VegaAllowedServiceName)) {
+        $service = Get-Service -Name $name -ErrorAction SilentlyContinue
+        if ($null -eq $service) {
+            $snapshot.Add([pscustomobject]@{
+                    Name      = $name
+                    StartType = 'NotPresent'
+                    Status    = 'NotPresent'
+                })
+            continue
+        }
+
+        $snapshot.Add([pscustomobject]@{
+                Name      = $name
+                StartType = [string]$service.StartType
+                Status    = [string]$service.Status
+            })
+    }
+
+    return $snapshot.ToArray()
+}
+
 function Set-VegaSunshineServiceStartType {
     <#
       设置服务启动类型并回读验证。成功返回 $true。
@@ -2288,6 +2354,36 @@ function Test-VegaFirewallSpecSafe {
     return $true
 }
 
+function Test-VegaManagementPortConflict {
+    <#
+      纯函数：返回与串流放行端口相交的管理端口。
+      相交意味着同一端口既放行又阻断，配置自相矛盾，调用方应中止并提示改 port。
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [int[]]$ManagementPorts,
+
+        [int]$BasePort = 47989
+    )
+
+    $conflicts = New-Object System.Collections.Generic.List[int]
+    if ($null -eq $ManagementPorts -or $ManagementPorts.Count -eq 0) { return $conflicts.ToArray() }
+
+    $specs = @(Get-VegaFirewallRuleSpec -BasePort $BasePort)
+    foreach ($port in $ManagementPorts) {
+        foreach ($spec in $specs) {
+            if (Test-VegaPortInRange -Ports @($spec.LocalPort) -Port $port) {
+                $conflicts.Add([int]$port)
+                break
+            }
+        }
+    }
+
+    return $conflicts.ToArray()
+}
+
 function Set-VegaFirewallRule {
     <#
       先删后建，规则限定 Program 为 sunshine.exe 绝对路径、只开按生效配置算出的串流端口。
@@ -2421,7 +2517,10 @@ function Set-VegaAdminBlockRule {
     <#
       建立/刷新管理端口阻断规则（Vega-Block-Admin，入站 TCP，Action = Block）。
       必须在 winget 安装 Sunshine 之前调用：安装器会先放行并启动服务，
-      先阻断才能保证首次设密前管理页不暴露在网络上。建完回读确认，失败抛异常。
+      先阻断才能保证首次设密前管理页不暴露在网络上。
+      规则已存在时原地更新端口（Set-NetFirewallRule / Set-NetFirewallPortFilter），
+      绝不先删后建：删除到重建之间管理页会重新暴露，而且安装失败也不能撤掉已有阻断。
+      创建或更新后回读确认，失败抛异常（已有阻断保持原样）。规则保留到卸载。
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -2434,42 +2533,54 @@ function Set-VegaAdminBlockRule {
     $ports = @($ManagementPorts | Sort-Object -Unique | ForEach-Object { [string]$_ })
     if ($ports.Count -eq 0) { throw '管理端口阻断规则需要至少一个端口。' }
 
+    $existing = Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue
+
     if (-not $PSCmdlet.ShouldProcess($name, "阻断入站 TCP $($ports -join '/')")) { return $name }
 
-    $null = Remove-VegaFirewallRuleByName -Name $name -Confirm:$false
+    if ($null -eq $existing) {
+        $params = @{
+            Name        = $name
+            DisplayName = $name
+            Direction   = 'Inbound'
+            Action      = 'Block'
+            Protocol    = 'TCP'
+            LocalPort   = $ports
+            Profile     = 'Any'
+            Enabled     = 'True'
+            Description = 'Vega Remote：阻止入站访问 Sunshine 管理页（本机浏览器仍可访问）'
+        }
 
-    $params = @{
-        Name        = $name
-        DisplayName = $name
-        Direction   = 'Inbound'
-        Action      = 'Block'
-        Protocol    = 'TCP'
-        LocalPort   = $ports
-        Profile     = 'Any'
-        Enabled     = 'True'
-        Description = 'Vega Remote：阻止入站访问 Sunshine 管理页（本机浏览器仍可访问）'
+        try {
+            $null = New-NetFirewallRule @params -ErrorAction Stop
+        }
+        catch {
+            throw "创建管理端口阻断规则 $name 失败：$($_.Exception.Message)"
+        }
     }
-
-    try {
-        $null = New-NetFirewallRule @params -ErrorAction Stop
-    }
-    catch {
-        throw "创建管理端口阻断规则 $name 失败：$($_.Exception.Message)"
+    else {
+        # 原地更新：不删除已有规则，端口变了也只是一次 Set
+        try {
+            $null = Set-NetFirewallRule -Name $name -Enabled True -Action Block -ErrorAction Stop
+            $null = Set-NetFirewallPortFilter -AssociatedNetFirewallRule $existing -Protocol TCP -LocalPort $ports -ErrorAction Stop
+        }
+        catch {
+            throw "更新管理端口阻断规则 $name 失败（已有阻断保持原样，未删除）：$($_.Exception.Message)"
+        }
     }
 
     $check = Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue
-    if ($null -eq $check) { throw "管理端口阻断规则创建后未找到：$name" }
+    if ($null -eq $check) { throw "管理端口阻断规则创建/更新后未找到：$name" }
     if ([string]$check.Enabled -ne 'True' -or [string]$check.Action -ne 'Block') {
         throw "管理端口阻断规则状态异常（Enabled=$($check.Enabled)，Action=$($check.Action)）。"
     }
 
     $filter = Get-NetFirewallPortFilter -AssociatedNetFirewallRule $check -ErrorAction SilentlyContinue
-    if ($null -ne $filter) {
-        $actualPorts = @($filter.LocalPort | ForEach-Object { [string]$_ })
-        foreach ($port in $ports) {
-            if (-not (Test-VegaPortInRange -Ports $actualPorts -Port ([int]$port))) {
-                throw "管理端口阻断规则未覆盖端口 $port（实际：$($actualPorts -join ',')）。"
-            }
+    if ($null -eq $filter) { throw "无法读取管理端口阻断规则 $name 的端口过滤器，拒绝继续。" }
+
+    $actualPorts = @($filter.LocalPort | ForEach-Object { [string]$_ })
+    foreach ($port in $ports) {
+        if (-not (Test-VegaPortInRange -Ports $actualPorts -Port ([int]$port))) {
+            throw "管理端口阻断规则未覆盖端口 $port（实际：$($actualPorts -join ',')）。"
         }
     }
 
@@ -2791,6 +2902,9 @@ function Invoke-VegaHostInstallCore {
     # 读清单：机器级清单会先校验所有者/重解析点，不可信直接抛异常
     $state = Read-VegaState -Path $StatePath
 
+    # 旧版清单只警告、不读取：旧记录没有白名单字段，不能拿来回滚
+    $null = Write-VegaLegacyStateWarning
+
     # 旧版规则迁移：v0.1 只设了 DisplayName，内部 Name 是 Windows 生成的
     try {
         $legacyRules = @(Remove-VegaLegacyFirewallRule -Confirm:$false)
@@ -2808,7 +2922,19 @@ function Invoke-VegaHostInstallCore {
     if ($null -ne $existingSunshine) {
         $basePort = Get-VegaSunshineBasePort -ConfigPath $existingSunshine.Config
     }
-    $managementPorts = @(47990, (Get-VegaSunshinePortMap -BasePort $basePort).ManagementPort) | Sort-Object -Unique
+    # 阻断规则只包含按生效配置算出的管理端口
+    $managementPorts = @((Get-VegaSunshinePortMap -BasePort $basePort).ManagementPort)
+
+    # 管理端口落进串流放行端口时同端口既放行又阻断：让用户改 port，不要猜
+    $portConflicts = @(Test-VegaManagementPortConflict -ManagementPorts $managementPorts -BasePort $basePort)
+    if ($portConflicts.Count -gt 0) {
+        $failures.Add("管理端口 $($portConflicts -join '/') 与串流放行端口重叠，请先修改 sunshine.conf 里的 port 再重试。")
+        Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
+        return [pscustomobject]@{
+            ExitCode = 1
+            Failures = $failures.ToArray()
+        }
+    }
 
     # 管理端口隔离必须早于 winget 安装：安装器会先放行并启动服务。
     # 隔离失败直接中止，退出码非零。
@@ -2832,6 +2958,15 @@ function Invoke-VegaHostInstallCore {
         $state = Protect-VegaSunshineManagementPort -State $state -SunshineExe $existingSunshine.Exe `
             -ManagementPort (Get-VegaSunshinePortMap -BasePort $basePort).ManagementPort -StatePath $StatePath -Confirm:$false
     }
+
+    # 服务基线必须在 winget 安装/重装之前采集：重装会把服务重置成安装器的默认值，
+    # 装完再采集就把安装器的状态当成了用户原来的状态。
+    Write-VegaStatus '记录 Sunshine 服务基线（安装/重装前）'
+    foreach ($snapshot in @(Get-VegaSunshineServiceSnapshot)) {
+        $state = Add-VegaStateService -State $state -Name $snapshot.Name `
+            -StartType $snapshot.StartType -Status $snapshot.Status
+    }
+    $null = Save-VegaState -State $state -Path $StatePath
 
     $componentNames = New-Object System.Collections.Generic.List[string]
     $componentNames.Add('Sunshine')
@@ -2882,9 +3017,19 @@ function Invoke-VegaHostInstallCore {
     $basePort = Get-VegaSunshineBasePort -ConfigPath $sunshine.Config
     $ports = Get-VegaSunshinePortMap -BasePort $basePort
 
-    # 安装器可能改过配置端口：按生效配置把管理端口补齐（规则保留，不删）
+    # 安装器可能改过配置端口：按生效配置原地更新阻断规则的端口（规则保留，不删）
+    $actualManagementPorts = @($ports.ManagementPort)
+    $portConflicts = @(Test-VegaManagementPortConflict -ManagementPorts $actualManagementPorts -BasePort $basePort)
+    if ($portConflicts.Count -gt 0) {
+        $failures.Add("管理端口 $($portConflicts -join '/') 与串流放行端口重叠，请先修改 sunshine.conf 里的 port 再重试。")
+        Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
+        return [pscustomobject]@{
+            ExitCode = 1
+            Failures = $failures.ToArray()
+        }
+    }
+
     try {
-        $actualManagementPorts = @(47990, $ports.ManagementPort) | Sort-Object -Unique
         $null = Set-VegaAdminBlockRule -ManagementPorts $actualManagementPorts -Confirm:$false
         $state = Add-VegaStateFirewallRule -State $state -Name 'Vega-Block-Admin'
         $null = Save-VegaState -State $state -Path $StatePath
@@ -2998,13 +3143,8 @@ function Invoke-VegaHostInstallCore {
         Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
     }
     else {
+        # 基线已在 winget 之前记过，这里不再采集（否则记的是安装器写的状态）
         $service = $services[0]
-        $recorded = Get-VegaStateService -State $state -Name $service.Name
-        if ($null -eq $recorded) {
-            $state = Add-VegaStateService -State $state -Name $service.Name `
-                -StartType ([string]$service.StartType) -Status ([string]$service.Status)
-            $null = Save-VegaState -State $state -Path $StatePath
-        }
 
         $restart = Restart-VegaSunshineService -Name $service.Name -Confirm:$false
         if (-not $restart.Success) {
@@ -3085,6 +3225,9 @@ function Invoke-VegaHostUninstallCore {
     if (-not $hasState) {
         Write-VegaStatus '没有找到状态清单：只清理 Vega 固定名称的防火墙规则，其余保持现状。' -Level Warn
     }
+
+    # 旧版清单只警告、不读取：旧记录没有白名单字段，不能拿来回滚
+    $null = Write-VegaLegacyStateWarning
 
     $sunshine = Get-VegaSunshineInstall
     $sunshineDirectory = ''
@@ -3184,7 +3327,20 @@ function Invoke-VegaHostUninstallCore {
             continue
         }
 
+        # 已经恢复过的服务不再重复恢复：重跑卸载不能把用户后来改的设置改回去
+        if ($null -ne $entry.PSObject.Properties['Restored'] -and [bool]$entry.Restored) {
+            Write-VegaStatus "服务已恢复过，跳过：$serviceName"
+            continue
+        }
+
         $startType = [string]$entry.OriginalStartType
+        if ($startType -eq 'NotPresent') {
+            # 安装前就没有这个服务：什么都不做，只标记已处理
+            $state = Set-VegaStateServiceRestored -State $state -Name $serviceName
+            $null = Save-VegaState -State $state -Path $StatePath
+            Write-VegaStatus "安装前没有服务 $serviceName，跳过恢复"
+            continue
+        }
         if ($startType -notin @('Automatic', 'Manual', 'Disabled')) {
             $failures.Add("服务启动类型记录无效：$serviceName → $startType")
             Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
@@ -3484,6 +3640,8 @@ Export-ModuleMember -Function @(
     'Get-VegaHostStatePath',
     'Get-VegaClientStatePath',
     'Get-VegaStatePath',
+    'Get-VegaLegacyStatePath',
+    'Write-VegaLegacyStateWarning',
     'Test-VegaManagedHostStatePath',
     'Test-VegaReparsePoint',
     'Get-VegaPathOwnerSid',
@@ -3522,6 +3680,7 @@ Export-ModuleMember -Function @(
     'Get-VegaConfigKeySnapshot',
     'Restore-VegaManagedConfig',
     'Get-VegaSunshineService',
+    'Get-VegaSunshineServiceSnapshot',
     'Set-VegaSunshineServiceStartType',
     'Restore-VegaSunshineServiceState',
     'Restart-VegaSunshineService',
@@ -3529,6 +3688,7 @@ Export-ModuleMember -Function @(
     'Get-VegaSunshineBasePort',
     'Get-VegaFirewallRuleSpec',
     'Test-VegaFirewallSpecSafe',
+    'Test-VegaManagementPortConflict',
     'Test-VegaPortInRange',
     'Select-VegaSunshineInstallerFirewallRule',
     'Get-VegaSunshineInstallerFirewallRule',
