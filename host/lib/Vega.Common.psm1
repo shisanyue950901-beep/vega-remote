@@ -3098,7 +3098,17 @@ function Invoke-VegaHostInstallCore {
     $existingSunshine = Get-VegaSunshineInstall
     $basePort = 47989
     if ($null -ne $existingSunshine) {
-        $basePort = Get-VegaSunshineBasePort -ConfigPath $existingSunshine.Config
+        try {
+            $basePort = Get-VegaSunshineBasePort -ConfigPath $existingSunshine.Config
+        }
+        catch {
+            $failures.Add("读取 sunshine.conf 的 port 失败，中止安装：$($_.Exception.Message)")
+            Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
+            return [pscustomobject]@{
+                ExitCode = 1
+                Failures = $failures.ToArray()
+            }
+        }
     }
     # 安装前的阻断规则：计算出的管理端口 + 默认 47990，去重。
     # 安装器启动那一刻可能还按默认端口监听，不能漏掉 47990。
@@ -3209,7 +3219,17 @@ function Invoke-VegaHostInstallCore {
         }
     }
 
-    $basePort = Get-VegaSunshineBasePort -ConfigPath $sunshine.Config
+    try {
+        $basePort = Get-VegaSunshineBasePort -ConfigPath $sunshine.Config
+    }
+    catch {
+        $failures.Add("读取 sunshine.conf 的 port 失败，中止安装：$($_.Exception.Message)")
+        Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
+        return [pscustomobject]@{
+            ExitCode = 1
+            Failures = $failures.ToArray()
+        }
+    }
     $ports = Get-VegaSunshinePortMap -BasePort $basePort
 
     # 安装器可能改过配置端口：按生效配置原地更新阻断规则的端口（规则保留，不删）。
