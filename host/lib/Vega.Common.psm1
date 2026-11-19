@@ -1513,7 +1513,9 @@ function ConvertFrom-VegaSunshineConfigText {
         [string]$Text
     )
 
-    $values = [ordered]@{}
+    # 显式用 Ordinal 比较器：PowerShell 的 [ordered]@{} 默认大小写不敏感，
+    # 会让 PORT 被当成 port，和 Sunshine 的行为不一致。
+    $values = [System.Collections.Specialized.OrderedDictionary]::new([System.StringComparer]::Ordinal)
     if ([string]::IsNullOrEmpty($Text)) { return $values }
 
     foreach ($line in ($Text -split "\r?\n")) {
