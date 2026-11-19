@@ -3086,7 +3086,7 @@ function Invoke-VegaHostInstallCore {
     $ports = Get-VegaSunshinePortMap -BasePort $basePort
 
     # 安装器可能改过配置端口：按生效配置原地更新阻断规则的端口（规则保留，不删）。
-    # 安装完成后串流放行规则已经按实际端口建好，只有 47990 不是串流端口时才继续阻断它。
+    # 安装完成后的最终规则：只有 47990 不是串流端口时才继续阻断它。
     $actualManagementPorts = @(Get-VegaAdminBlockPortList -ManagementPorts @($ports.ManagementPort) -BasePort $basePort)
     $portConflicts = @(Test-VegaManagementPortConflict -ManagementPorts $actualManagementPorts -BasePort $basePort)
     if ($portConflicts.Count -gt 0) {
