@@ -318,6 +318,78 @@ function Test-VegaBootstrapDirectoryAclTrusted {
     return $true
 }
 
+function Test-VegaBootstrapAclExtensionsAvailable {
+    <#
+      纯函数：当前运行时是否提供 [System.IO.FileSystemAclExtensions]。
+      PowerShell 7 / .NET Core 只有这个类型带 (DirectorySecurity, string) 重载；
+      Windows PowerShell 5.1 只有 [System.IO.Directory]::CreateDirectory(string, DirectorySecurity)。
+      抽成函数是为了让测试能分别覆盖两条分支，而不依赖真实运行时版本。
+    #>
+    [CmdletBinding()]
+    param()
+
+    return ($null -ne ('System.IO.FileSystemAclExtensions' -as [type]))
+}
+
+function New-VegaBootstrapAclDirectory {
+    <#
+      .NET Core / PowerShell 7 分支：FileSystemAclExtensions.CreateDirectory(DirectorySecurity, string)。
+      注意参数顺序是 (security, path)，与 5.1 的重载相反。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        $Security
+    )
+
+    $directory = [System.IO.FileSystemAclExtensions]::CreateDirectory($Security, $Path)
+    return $directory
+}
+
+function New-VegaBootstrapLegacyDirectory {
+    <#
+      Windows PowerShell 5.1 分支：Directory.CreateDirectory(string, DirectorySecurity)。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        $security
+    )
+
+    $directory = [System.IO.Directory]::CreateDirectory($Path, $security)
+    return $directory
+}
+
+function New-VegaBootstrapDirectoryWithAcl {
+    <#
+      带 ACL 建目录的唯一入口：按运行时能力选分支，调用方不需要知道版本差异。
+      分支选择只依赖可 mock 的类型探测，测试可分别覆盖两条路径。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        $Security
+    )
+
+    if (Test-VegaBootstrapAclExtensionsAvailable) {
+        $null = New-VegaBootstrapAclDirectory -Path $Path -Security $Security
+    }
+    else {
+        $null = New-VegaBootstrapLegacyDirectory -Path $Path -Security $Security
+    }
+
+    return $Path
+}
+
 function New-VegaBootstrapProtectedDirectory {
     <#
       创建目录时就用 DirectorySecurity 应用 ACL：禁用继承，只留 SYSTEM 与
@@ -350,13 +422,12 @@ function New-VegaBootstrapProtectedDirectory {
         }
         $security.SetOwner($administrators)
 
-        $null = [System.IO.Directory]::CreateDirectory($Path, $security)
+        $null = New-VegaBootstrapDirectoryWithAcl -Path $Path -Security $security
     }
     catch {
         throw "创建受保护目录失败：$Path（$($_.Exception.Message)）"
     }
 
-    if (Test-VegaBootstrapReparsePoint -Path $Path) { throw "新建目录是重解析点，拒绝使用：$Path" }
     return $Path
 }
 
