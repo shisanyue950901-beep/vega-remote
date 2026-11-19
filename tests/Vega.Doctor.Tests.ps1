@@ -374,7 +374,7 @@ Describe 'P3-1 doctor 分别比较 ID 与 relay，区分不存在与读取失败
         $scriptText | Should -Match '配置读取失败'
     }
 
-    It '探测本身失败时报“读取失败”及原因，不误判为文件不存在' {
+    It '探测本身失败时上报原因，不误判为文件不存在' {
         $unreadable = Join-Path $TestDrive 'unreadable/RustDesk2.toml'
         $null = New-Item -ItemType Directory -Path (Split-Path -Parent $unreadable) -Force
         Set-Content -LiteralPath $unreadable -Encoding UTF8 -Value '[options]'
@@ -382,8 +382,10 @@ Describe 'P3-1 doctor 分别比较 ID 与 relay，区分不存在与读取失败
 
         $summary = Get-VegaRustDeskConfigSummary -UserConfigPath $unreadable -ServiceConfigPath (Join-Path $TestDrive 'none.toml')
         $summary.UserExists | Should -BeTrue
-        $summary.UserError | Should -Match '读取失败'
         $summary.UserError | Should -Match '拒绝访问'
+        # “读取失败”这一层由 doctor 输出负责，Error 里只放原因，避免出现“读取失败：读取失败：…”
+        $doctorText = Get-Content -LiteralPath (Join-Path (Join-Path $PSScriptRoot '..') 'tools/vega-doctor.ps1') -Raw -Encoding UTF8
+        $doctorText | Should -Match '用户配置读取失败'
     }
 
     It '只有明确的 ItemNotFound 才判“文件不存在”' {
@@ -394,13 +396,13 @@ Describe 'P3-1 doctor 分别比较 ID 与 relay，区分不存在与读取失败
         $summary.UserError | Should -Be ''
     }
 
-    It '路径是目录时按读取失败上报' {
+    It '路径是目录时上报原因，不当成配置文件' {
         $directoryPath = Join-Path $TestDrive 'config-as-dir'
         $null = New-Item -ItemType Directory -Path $directoryPath -Force
 
         $summary = Get-VegaRustDeskConfigSummary -UserConfigPath $directoryPath -ServiceConfigPath (Join-Path $TestDrive 'none.toml')
         $summary.UserExists | Should -BeTrue
-        $summary.UserError | Should -Match '读取失败'
+        $summary.UserError | Should -Match '不是配置文件'
     }
 
     It '探测用 -ErrorAction Stop，并显式识别 ItemNotFound' {
