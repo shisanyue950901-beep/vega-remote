@@ -167,6 +167,8 @@ Describe 'Invoke-VegaHostInstall（mock）' {
         ($result.Failures -join "`n") | Should -Match 'port'
         Should -Invoke -ModuleName $script:ModuleName -CommandName Set-VegaAdminBlockRule -Times 0 -Exactly
         Should -Invoke -ModuleName $script:ModuleName -CommandName Install-VegaPackage -Times 0 -Exactly
+        # 端口预检失败时不能先动旧版规则
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Remove-VegaLegacyFirewallRule -Times 0 -Exactly
     }
 
     It '当前网络防火墙关闭时中止安装，不建阻断规则也不调用 winget' {
@@ -180,6 +182,39 @@ Describe 'Invoke-VegaHostInstall（mock）' {
         ($result.Failures -join "`n") | Should -Match 'Windows 防火墙在当前网络已关闭'
         Should -Invoke -ModuleName $script:ModuleName -CommandName Set-VegaAdminBlockRule -Times 0 -Exactly
         Should -Invoke -ModuleName $script:ModuleName -CommandName Install-VegaPackage -Times 0 -Exactly
+        # 防火墙预检在旧版规则清理之前：中止时旧规则原样保留
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Remove-VegaLegacyFirewallRule -Times 0 -Exactly
+    }
+
+    It 'port = 47981 时安装后的最终阻断规则仍含 47990' {
+        # 47990 只是 UDP 视频端口，TCP 管理端口 47982 与串流放行端口不冲突
+        Set-Content -LiteralPath $script:sunshineConfig -Value 'port = 47981' -Encoding UTF8
+        Mock -ModuleName $script:ModuleName Get-VegaSunshineInstall { $script:sunshine }
+        Mock -ModuleName $script:ModuleName Install-VegaPackage {
+            param($PackageId, $DisplayName, [switch]$Force)
+            $null = $DisplayName
+            $null = $Force
+            [pscustomobject]@{ PackageId = $PackageId; Installed = $true; PreExisting = $false }
+        }
+        $env:VEGA_TEST_BLOCK_PORTS = ''
+        Mock -ModuleName $script:ModuleName Set-VegaAdminBlockRule {
+            param($ManagementPorts)
+            $env:VEGA_TEST_BLOCK_PORTS = ($ManagementPorts -join ',')
+            'Vega-Block-Admin'
+        }
+
+        try {
+            $result = Invoke-VegaHostInstall -StatePath $script:statePath -TemplatePath $script:TemplatePath -SkipTailscale
+            $result.ExitCode | Should -Be 0
+
+            # 最后一次调用是安装完成后的最终规则
+            $finalPorts = @($env:VEGA_TEST_BLOCK_PORTS -split ',')
+            $finalPorts | Should -Contain '47982'
+            $finalPorts | Should -Contain '47990'
+        }
+        finally {
+            Remove-Item Env:VEGA_TEST_BLOCK_PORTS -ErrorAction SilentlyContinue
+        }
     }
 
     It '服务基线在 winget 安装之前采集' {
