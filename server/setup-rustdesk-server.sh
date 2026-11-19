@@ -435,6 +435,7 @@ else
 fi
 echo "Key: $KEY"
 if [[ "$ALLOW_WEBSOCKET" != true ]]; then
-  echo "提示: 需要 WebSocket 时用 --websocket 重跑，提示会额外列出 TCP 21118-21119。"
+  echo "提示: 可选放行 WebSocket 端口 TCP 21118-21119；启用时核对旧拒绝规则和云安全组。"
+  echo "      已有部署不会因为重跑而更新；需要重装时用 --reinstall --websocket。"
 fi
 print_port_guidance
