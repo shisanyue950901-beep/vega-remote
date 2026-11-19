@@ -163,4 +163,57 @@ Describe 'Get-VegaDoctorAdvice' {
         $advice.Count | Should -BeGreaterThan 0
         ($advice -join "`n") | Should -Match 'install-host\.ps1'
     }
+
+    It 'RustDesk2.toml 与配置的服务器不一致时提示重跑安装' {
+        $advice = @(Get-VegaDoctorAdvice -Facts @{
+                SunshineInstalled    = $true
+                SunshineRunning      = $true
+                Encoder              = 'NVENC'
+                MissingFirewallRules = @()
+                Ipv6                 = @('2001:db8::1')
+                TailscaleInstalled   = $true
+                RustDeskExpectedServer = 'relay.example.com:21116'
+                RustDeskTomlServer     = 'old.example.com'
+                RustDeskDeviceId       = '123456789'
+            })
+
+        $text = $advice -join "`n"
+        $text | Should -Match '不一致'
+        $text | Should -Match 'old\.example\.com'
+        $text | Should -Match 'relay\.example\.com:21116'
+    }
+
+    It 'RustDesk 指向正确且能读设备码时不做警告' {
+        $advice = @(Get-VegaDoctorAdvice -Facts @{
+                SunshineInstalled      = $true
+                SunshineRunning        = $true
+                Encoder                = 'NVENC'
+                MissingFirewallRules   = @()
+                Ipv6                   = @('2001:db8::1')
+                TailscaleInstalled     = $true
+                RustDeskExpectedServer = 'relay.example.com'
+                RustDeskTomlServer     = 'relay.example.com'
+                RustDeskDeviceId       = '123456789'
+            })
+
+        $text = $advice -join "`n"
+        $text | Should -Match 'RustDesk 中继配置正确'
+        $text | Should -Not -Match '读取不到 RustDesk 设备码'
+    }
+
+    It '配置了中继但读不到设备码时给出提示' {
+        $advice = @(Get-VegaDoctorAdvice -Facts @{
+                SunshineInstalled      = $true
+                SunshineRunning        = $true
+                Encoder                = 'NVENC'
+                MissingFirewallRules   = @()
+                Ipv6                   = @('2001:db8::1')
+                TailscaleInstalled     = $true
+                RustDeskExpectedServer = 'relay.example.com'
+                RustDeskTomlServer     = 'relay.example.com'
+                RustDeskDeviceId       = ''
+            })
+
+        ($advice -join "`n") | Should -Match '读取不到 RustDesk 设备码'
+    }
 }

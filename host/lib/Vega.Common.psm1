@@ -3152,6 +3152,39 @@ function Get-VegaDoctorAdvice {
         $advice.Add('想看是否直连：加 -Peer <被控端机器名> 再跑一次（例：-Peer vega-host）。')
     }
 
+    # RustDesk 中继配置（只有 doctor 采集到相关事实时才提示）
+    $rustDeskExpected = ''
+    if ($Facts.ContainsKey('RustDeskExpectedServer') -and $null -ne $Facts['RustDeskExpectedServer']) {
+        $rustDeskExpected = [string]$Facts['RustDeskExpectedServer']
+    }
+    $rustDeskActual = ''
+    if ($Facts.ContainsKey('RustDeskTomlServer') -and $null -ne $Facts['RustDeskTomlServer']) {
+        $rustDeskActual = [string]$Facts['RustDeskTomlServer']
+    }
+    $rustDeskDevice = ''
+    if ($Facts.ContainsKey('RustDeskDeviceId') -and $null -ne $Facts['RustDeskDeviceId']) {
+        $rustDeskDevice = [string]$Facts['RustDeskDeviceId']
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($rustDeskExpected)) {
+        if ([string]::IsNullOrWhiteSpace($rustDeskActual)) {
+            $advice.Add(("RustDesk2.toml 没有配置 custom-rendezvous-server（期望 {0}）：重新运行安装脚本并带 -RustDeskServer / -RustDeskKey。" -f $rustDeskExpected))
+        }
+        elseif ($rustDeskActual -ne $rustDeskExpected) {
+            $advice.Add(("RustDesk2.toml 指向 {0}，与配置的 {1} 不一致：重新运行安装脚本写入正确的中继地址。" -f $rustDeskActual, $rustDeskExpected))
+        }
+        else {
+            $advice.Add(("RustDesk 中继配置正确：{0}。" -f $rustDeskActual))
+        }
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($rustDeskActual)) {
+        $advice.Add(("RustDesk 当前中继：{0}（没有在 vega.config.json 里配置期望值，跳过一致性检查）。" -f $rustDeskActual))
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($rustDeskExpected) -and [string]::IsNullOrWhiteSpace($rustDeskDevice)) {
+        $advice.Add('读取不到 RustDesk 设备码：确认 RustDesk 已安装并启动，或在 RustDesk 主界面查看设备码。')
+    }
+
     if ($advice.Count -eq 0) {
         $advice.Add('整体状态良好：打开 Moonlight 添加被控端地址即可连接。')
     }

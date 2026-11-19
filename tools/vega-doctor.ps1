@@ -153,6 +153,66 @@ else {
 }
 
 # ---------------------------------------------------------------------------
+# RustDesk
+# ---------------------------------------------------------------------------
+
+Write-Section 'RustDesk'
+$rustDeskExpected = $null
+$repoConfigPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'vega.config.json'
+try {
+    $rustDeskExpected = Resolve-VegaRustDeskSettings -ConfigPath $repoConfigPath
+}
+catch {
+    Write-Host "读取 vega.config.json 失败：$($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+$rustDeskToml = Get-VegaRustDeskConfigPath
+$rustDeskActual = ''
+if (Test-Path -LiteralPath $rustDeskToml -PathType Leaf) {
+    $tomlText = Get-Content -LiteralPath $rustDeskToml -Raw -Encoding UTF8
+    $tomlOptions = ConvertFrom-VegaRustDeskConfigText -Text $tomlText
+    if ($tomlOptions.Contains('custom-rendezvous-server')) {
+        $rustDeskActual = [string]$tomlOptions['custom-rendezvous-server']
+    }
+    Write-Host "配置: $rustDeskToml"
+    if ([string]::IsNullOrWhiteSpace($rustDeskActual)) {
+        Write-Host '中继服务器: 未配置（custom-rendezvous-server 为空）' -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "中继服务器: $rustDeskActual" -ForegroundColor Green
+    }
+}
+else {
+    Write-Host "未找到 RustDesk2.toml：$rustDeskToml（RustDesk 未安装或还没登录过）" -ForegroundColor Yellow
+}
+
+if ($null -ne $rustDeskExpected) {
+    if ($rustDeskActual -eq $rustDeskExpected.Server) {
+        Write-Host "与 vega.config.json 一致: $($rustDeskExpected.Server)" -ForegroundColor Green
+    }
+    else {
+        Write-Host "与 vega.config.json 不一致：期望 $($rustDeskExpected.Server)，实际 $(if ($rustDeskActual) { $rustDeskActual } else { '未配置' })" -ForegroundColor Yellow
+    }
+}
+
+$rustDeskDeviceId = ''
+$rustDeskExe = Get-VegaRustDeskInstall
+if ([string]::IsNullOrWhiteSpace($rustDeskExe)) {
+    Write-Host '未检测到 rustdesk.exe（Program Files / LOCALAPPDATA\Programs 下都没有）' -ForegroundColor Yellow
+}
+else {
+    Write-Host "已安装: $rustDeskExe"
+    $device = Get-VegaRustDeskDeviceId -Exe $rustDeskExe
+    if ($device.Success) {
+        $rustDeskDeviceId = $device.DeviceId
+        Write-Host ("设备码: {0}" -f (Format-VegaRustDeskId -DeviceId $device.DeviceId)) -ForegroundColor Green
+    }
+    else {
+        Write-Host "设备码: 读取失败（$($device.Error)）" -ForegroundColor Yellow
+    }
+}
+
+# ---------------------------------------------------------------------------
 # IPv6
 # ---------------------------------------------------------------------------
 
@@ -255,7 +315,11 @@ $facts = @{
     Ipv6                 = $ipv6
     TailscaleInstalled   = $tailscaleInstalled
     Peer                 = $Peer
+    RustDeskTomlServer   = $rustDeskActual
+    RustDeskDeviceId     = $rustDeskDeviceId
 }
+
+if ($null -ne $rustDeskExpected) { $facts['RustDeskExpectedServer'] = $rustDeskExpected.Server }
 
 if ($null -ne $pingResult) { $facts['Ping'] = $pingResult }
 
