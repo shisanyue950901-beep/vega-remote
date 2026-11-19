@@ -1989,9 +1989,10 @@ function Get-VegaSunshinePortMap {
 
 function ConvertFrom-VegaSunshinePortValue {
     <#
-      纯函数：按 Sunshine 的解析方式读取 port 值。
-      去掉首尾空白与成对引号（单/双引号都接受），支持十进制与 0x 十六进制；
-      解析失败或超出 Sunshine 允许范围时返回 $null，由调用方中止。
+      纯函数：按 Sunshine v2026.914 的解析方式读取 port 值。
+      先去行尾 # 注释、去首尾空白，只剥离成对双引号（单引号不剥离，交给调用方中止）；
+      十进制允许前导零，支持 0x 十六进制；范围 1-65535。
+      解析失败或超出范围时返回 $null，由调用方中止。
     #>
     [CmdletBinding()]
     param(
@@ -2002,11 +2003,15 @@ function ConvertFrom-VegaSunshinePortValue {
 
     if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
 
-    $text = $Value.Trim()
+    $text = $Value
+    $commentIndex = $text.IndexOf('#')
+    if ($commentIndex -ge 0) { $text = $text.Substring(0, $commentIndex) }
+    $text = $text.Trim()
+
     if ($text.Length -ge 2) {
         $first = $text[0]
         $last = $text[$text.Length - 1]
-        if (($first -eq '"' -and $last -eq '"') -or ($first -eq "'" -and $last -eq "'")) {
+        if ($first -eq '"' -and $last -eq '"') {
             $text = $text.Substring(1, $text.Length - 2).Trim()
         }
     }
@@ -2016,14 +2021,14 @@ function ConvertFrom-VegaSunshinePortValue {
         try { $port = [Convert]::ToInt32($Matches['hex'], 16) }
         catch { return $null }
     }
-    elseif ($text -match '^[0-9]{1,5}$') {
-        $port = [int]$text
+    elseif ($text -match '^[0-9]+$') {
+        if (-not [int]::TryParse($text, [ref]$port)) { return $null }
     }
     else {
         return $null
     }
 
-    if ($port -lt 1030 -or $port -gt 65514) { return $null }
+    if ($port -lt 1 -or $port -gt 65535) { return $null }
     return $port
 }
 
@@ -2048,7 +2053,7 @@ function Get-VegaSunshineBasePort {
 
     $port = ConvertFrom-VegaSunshinePortValue -Value ([string]$values['port'])
     if ($null -eq $port) {
-        throw "sunshine.conf 里的 port 无效（$($values['port'])），无法确定管理端口；请改成 1030-65514 的十进制或 0x 十六进制值后重试。"
+        throw "sunshine.conf 里的 port 无效（$($values['port'])），无法确定管理端口；请改成 1-65535 的十进制或 0x 十六进制值（单引号不会被剥离，请用双引号或不加引号）后重试。"
     }
 
     return [int]$port
@@ -2616,9 +2621,10 @@ function Get-VegaFirewallProfileName {
 
 function Test-VegaHostFirewallEnabled {
     <#
-      当前活动网络对应的防火墙配置必须全部为 Enabled。
-      WinGet 安装 Sunshine 后会立即启动服务；防火墙在该网络关闭时，
-      Vega-Block-Admin 不会生效，首次设密页面会暴露。任一活动配置关闭即返回 $false。
+      逐个核对活动接口：其网络类别对应的防火墙配置必须 Enabled=True，
+      且接口不在该配置的 DisabledInterfaceAliases 里。
+      WinGet 安装 Sunshine 后会立即启动服务；防火墙在该接口上关闭或接口被排除时，
+      Vega-Block-Admin 不会生效，首次设密页面会暴露。任一接口不满足即返回 $false。
     #>
     [CmdletBinding()]
     param()
@@ -2627,16 +2633,28 @@ function Test-VegaHostFirewallEnabled {
     if ($connections.Count -eq 0) { return $false }
 
     $profiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop)
-    $categories = @($connections | ForEach-Object { [string]$_.NetworkCategory } | Sort-Object -Unique)
 
-    foreach ($category in $categories) {
-        $profileName = Get-VegaFirewallProfileName -NetworkCategory $category
+    foreach ($connection in $connections) {
+        $profileName = Get-VegaFirewallProfileName -NetworkCategory ([string]$connection.NetworkCategory)
         if ([string]::IsNullOrWhiteSpace($profileName)) { return $false }
 
         $active = @($profiles | Where-Object { [string]$_.Name -eq $profileName })
         if ($active.Count -eq 0) { return $false }
+
+        $alias = [string]$connection.InterfaceAlias
         foreach ($firewallProfile in $active) {
             if ([string]$firewallProfile.Enabled -ne 'True') { return $false }
+
+            # 旧系统没有该属性时跳过接口排除检查
+            $disabledProperty = $firewallProfile.PSObject.Properties['DisabledInterfaceAliases']
+            if ($null -eq $disabledProperty) { continue }
+            if ([string]::IsNullOrWhiteSpace($alias)) { continue }
+            foreach ($disabledAlias in @($disabledProperty.Value)) {
+                if ([string]::IsNullOrWhiteSpace([string]$disabledAlias)) { continue }
+                if ([string]::Equals([string]$disabledAlias, $alias, [StringComparison]::OrdinalIgnoreCase)) {
+                    return $false
+                }
+            }
         }
     }
 
@@ -2649,8 +2667,8 @@ function Get-VegaAdminBlockPortList {
       - 始终包含按生效配置算出的管理端口。
       - -IncludeDefaultManagementPort：安装前使用，无条件再加 47990
         （安装器可能按默认端口启动，首次设密前必须挡住）。
-      - 不带该开关：安装完成后使用，只有 47990 不在串流放行端口里时才加，
-        避免把串流端口一起阻断。
+      - 不带该开关：安装完成后使用，只有 47990 不在 TCP 串流放行端口里时才加，
+        避免把串流端口一起阻断。只比较 TCP：阻断规则是 TCP，同号 UDP 端口不冲突。
     #>
     [CmdletBinding()]
     param(
@@ -2670,9 +2688,13 @@ function Get-VegaAdminBlockPortList {
     }
 
     $includeDefault = [bool]$IncludeDefaultManagementPort
-    if (-not $includeDefault -and -not (Test-VegaPortInRange -Ports @((Get-VegaFirewallRuleSpec -BasePort $BasePort) |
-                    ForEach-Object { $_.LocalPort }) -Port 47990)) {
-        $includeDefault = $true
+    if (-not $includeDefault) {
+        $tcpPorts = @(Get-VegaFirewallRuleSpec -BasePort $BasePort |
+            Where-Object { $_.Protocol -eq 'TCP' } |
+            ForEach-Object { $_.LocalPort })
+        if (-not (Test-VegaPortInRange -Ports $tcpPorts -Port 47990)) {
+            $includeDefault = $true
+        }
     }
 
     if ($includeDefault -and -not $result.Contains(47990)) { $result.Add(47990) }
@@ -2739,6 +2761,20 @@ function Set-VegaAdminBlockRule {
     if ([string]$check.Enabled -ne 'True' -or [string]$check.Action -ne 'Block' -or
         [string]$check.Direction -ne 'Inbound') {
         throw "管理端口阻断规则状态异常（Enabled=$($check.Enabled)，Action=$($check.Action)，Direction=$($check.Direction)）。"
+    }
+
+    # 组策略/特殊策略可能让本地规则不生效：核对生效存储里的执行状态。
+    # 旧系统没有这些属性时跳过，保持兼容。
+    $primaryProperty = $check.PSObject.Properties['PrimaryStatus']
+    if ($null -ne $primaryProperty -and [string]$primaryProperty.Value -ne 'OK') {
+        throw "管理端口阻断规则未生效（PrimaryStatus=$($primaryProperty.Value)），拒绝继续。"
+    }
+    $enforcementProperty = $check.PSObject.Properties['EnforcementStatus']
+    if ($null -ne $enforcementProperty) {
+        $enforcement = (@($enforcementProperty.Value) | ForEach-Object { [string]$_ }) -join ','
+        if ($enforcement -notmatch 'Enforced') {
+            throw "管理端口阻断规则未被强制执行（EnforcementStatus=$enforcement），拒绝继续。"
+        }
     }
 
     $filter = Get-NetFirewallPortFilter -AssociatedNetFirewallRule $check -ErrorAction SilentlyContinue
@@ -3083,18 +3119,6 @@ function Invoke-VegaHostInstallCore {
     # 旧版清单只警告、不读取：旧记录没有白名单字段，不能拿来回滚
     $null = Write-VegaLegacyStateWarning
 
-    # 旧版规则迁移：v0.1 只设了 DisplayName，内部 Name 是 Windows 生成的
-    try {
-        $legacyRules = @(Remove-VegaLegacyFirewallRule -Confirm:$false)
-        if ($legacyRules.Count -gt 0) {
-            Write-VegaStatus ("已清理旧版 Vega 防火墙规则：{0}" -f ($legacyRules -join '、')) -Level Ok
-        }
-    }
-    catch {
-        $failures.Add("清理旧版防火墙规则失败：$($_.Exception.Message)")
-        Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
-    }
-
     $existingSunshine = Get-VegaSunshineInstall
     $basePort = 47989
     if ($null -ne $existingSunshine) {
@@ -3145,6 +3169,19 @@ function Invoke-VegaHostInstallCore {
             ExitCode = 1
             Failures = $failures.ToArray()
         }
+    }
+
+    # 旧版规则迁移放在防火墙/端口预检之后：预检中止时不能先删掉旧版规则。
+    # v0.1 只设了 DisplayName，内部 Name 是 Windows 生成的。
+    try {
+        $legacyRules = @(Remove-VegaLegacyFirewallRule -Confirm:$false)
+        if ($legacyRules.Count -gt 0) {
+            Write-VegaStatus ("已清理旧版 Vega 防火墙规则：{0}" -f ($legacyRules -join '、')) -Level Ok
+        }
+    }
+    catch {
+        $failures.Add("清理旧版防火墙规则失败：$($_.Exception.Message)")
+        Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
     }
 
     # 管理端口隔离必须早于 winget 安装：安装器会先放行并启动服务。
