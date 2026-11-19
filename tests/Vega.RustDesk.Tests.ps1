@@ -281,11 +281,14 @@ Describe 'Get-VegaRustDeskInstall -RequireSigned' {
         $script:OriginalProgramFilesX86 = ${env:ProgramFiles(x86)}
         $script:OriginalLocalAppData = $env:LOCALAPPDATA
 
-        $env:ProgramFiles = Join-Path $TestDrive 'PF'
-        ${env:ProgramFiles(x86)} = Join-Path $TestDrive 'PF86'
-        $env:LOCALAPPDATA = Join-Path $TestDrive 'LAD'
+        $script:PfRoot = Join-Path $TestDrive 'PF'
+        $script:Pf86Root = Join-Path $TestDrive 'PF86'
+        $script:LadRoot = Join-Path $TestDrive 'LAD'
+        $env:ProgramFiles = $script:PfRoot
+        ${env:ProgramFiles(x86)} = $script:Pf86Root
+        $env:LOCALAPPDATA = $script:LadRoot
 
-        foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, (Join-Path $env:LOCALAPPDATA 'Programs'))) {
+        foreach ($root in @($script:PfRoot, $script:Pf86Root, (Join-Path $script:LadRoot 'Programs'))) {
             $dir = Join-Path $root 'RustDesk'
             $null = New-Item -ItemType Directory -Path $dir -Force
             Set-Content -LiteralPath (Join-Path $dir 'rustdesk.exe') -Value 'stub' -Encoding UTF8
@@ -299,21 +302,32 @@ Describe 'Get-VegaRustDeskInstall -RequireSigned' {
     }
 
     It '签名有效时返回 Program Files 下的副本' {
-        Mock Test-VegaRustDeskSignatureValid { $true }
-        $exe = Get-VegaRustDeskInstall -RequireSigned
+        # 模块内部调用 Test-VegaRustDeskSignatureValid，mock 必须带上 -ModuleName 才能生效；
+        # 搜索根用可注入的 -SearchRoot 提供，不依赖运行平台上的 Program Files 环境变量。
+        Mock -ModuleName $script:ModuleName Test-VegaRustDeskSignatureValid { $true }
+        $exe = Get-VegaRustDeskInstall -RequireSigned -SearchRoot $script:PfRoot, $script:Pf86Root
+        $exe | Should -Not -BeNullOrEmpty
         (Split-Path -Leaf (Split-Path -Parent $exe)) | Should -Be 'RustDesk'
         (Split-Path -Leaf (Split-Path -Parent (Split-Path -Parent $exe))) | Should -Be 'PF'
     }
 
     It '签名无效时返回 null，且不回退到 LOCALAPPDATA' {
-        Mock Test-VegaRustDeskSignatureValid { $false }
+        Mock -ModuleName $script:ModuleName Test-VegaRustDeskSignatureValid { $false }
+        Get-VegaRustDeskInstall -RequireSigned -SearchRoot $script:PfRoot, $script:Pf86Root | Should -BeNullOrEmpty
+    }
+
+    It '两个 Program Files 环境变量都为空时安全跳过，不抛异常' {
+        $env:ProgramFiles = ''
+        ${env:ProgramFiles(x86)} = ''
+        Mock -ModuleName $script:ModuleName Test-VegaRustDeskSignatureValid { $true }
+        { Get-VegaRustDeskInstall -RequireSigned } | Should -Not -Throw
         Get-VegaRustDeskInstall -RequireSigned | Should -BeNullOrEmpty
     }
 
     It '不提权时仍可使用 LOCALAPPDATA 下的副本' {
-        Mock Test-VegaRustDeskSignatureValid { $false }
-        Remove-Item -LiteralPath (Join-Path (Join-Path $env:ProgramFiles 'RustDesk') 'rustdesk.exe') -Force
-        Remove-Item -LiteralPath (Join-Path (Join-Path ${env:ProgramFiles(x86)} 'RustDesk') 'rustdesk.exe') -Force
+        Mock -ModuleName $script:ModuleName Test-VegaRustDeskSignatureValid { $false }
+        Remove-Item -LiteralPath (Join-Path (Join-Path $script:PfRoot 'RustDesk') 'rustdesk.exe') -Force
+        Remove-Item -LiteralPath (Join-Path (Join-Path $script:Pf86Root 'RustDesk') 'rustdesk.exe') -Force
 
         $exe = Get-VegaRustDeskInstall
         $exe | Should -Match 'LAD'
@@ -322,19 +336,23 @@ Describe 'Get-VegaRustDeskInstall -RequireSigned' {
 
 Describe 'Invoke-VegaRustDeskSetup 提权设备码' {
     BeforeEach {
-        Mock Set-VegaRustDeskConfig {
+        # Invoke-VegaRustDeskSetup 在模块内部调用这些函数，mock 必须带 -ModuleName，
+        # 否则真实实现会跑（配置写入/服务查询失败就会在读取设备码前抛错或返回）。
+        Mock -ModuleName $script:ModuleName Set-VegaRustDeskConfig {
             [pscustomobject]@{ Applied = @(); Warnings = @(); ServicePresent = $false; Values = @{}; State = $null }
         }
-        Mock Restart-VegaRustDeskService {
+        Mock -ModuleName $script:ModuleName Restart-VegaRustDeskService {
             [pscustomobject]@{ Found = $false; Restarted = $false; Status = ''; Message = '未找到 RustDesk 服务，跳过重启' }
         }
-        Mock Write-VegaStatus { }
+        Mock -ModuleName $script:ModuleName Write-VegaStatus { }
     }
 
     It '提权时只启动签名有效的 Program Files 副本' {
-        Mock Test-VegaProcessElevated { $true }
-        Mock Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
-        Mock Get-VegaRustDeskDeviceId { [pscustomobject]@{ Success = $true; DeviceId = '123456789'; RawOutput = @(); Error = '' } }
+        Mock -ModuleName $script:ModuleName Test-VegaProcessElevated { $true }
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskDeviceId {
+            [pscustomobject]@{ Success = $true; DeviceId = '123456789'; RawOutput = @(); Error = '' }
+        }
 
         $result = Invoke-VegaRustDeskSetup -Settings ([pscustomobject]@{ Server = 'relay.example.com'; RelayServer = 'relay.example.com:21117'; Key = ('A' * 43 + '=') })
 
@@ -346,9 +364,9 @@ Describe 'Invoke-VegaRustDeskSetup 提权设备码' {
     }
 
     It '提权但没有签名有效的副本时不启动，提示打开 RustDesk 查看设备码' {
-        Mock Test-VegaProcessElevated { $true }
-        Mock Get-VegaRustDeskInstall { $null }
-        Mock Get-VegaRustDeskDeviceId { throw '不应调用' }
+        Mock -ModuleName $script:ModuleName Test-VegaProcessElevated { $true }
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { $null }
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskDeviceId { throw '不应调用' }
 
         $result = Invoke-VegaRustDeskSetup -Settings ([pscustomobject]@{ Server = 'relay.example.com'; RelayServer = 'relay.example.com:21117'; Key = ('A' * 43 + '=') })
 
@@ -357,8 +375,10 @@ Describe 'Invoke-VegaRustDeskSetup 提权设备码' {
     }
 
     It '未提权时仍按普通查找读取设备码' {
-        Mock Test-VegaProcessElevated { $false }
-        Mock Get-VegaRustDeskDeviceId { [pscustomobject]@{ Success = $true; DeviceId = '987654321'; RawOutput = @(); Error = '' } }
+        Mock -ModuleName $script:ModuleName Test-VegaProcessElevated { $false }
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskDeviceId {
+            [pscustomobject]@{ Success = $true; DeviceId = '987654321'; RawOutput = @(); Error = '' }
+        }
 
         $result = Invoke-VegaRustDeskSetup -Settings ([pscustomobject]@{ Server = 'relay.example.com'; RelayServer = 'relay.example.com:21117'; Key = ('A' * 43 + '=') })
 
@@ -374,12 +394,17 @@ Describe 'Merge-VegaRustDeskConfigText 大小写、注释与换行保真' {
                 'custom-rendezvous-server' = 'new.example.com'
             })
 
-        $result | Should -Match '(?m)^\[options\]  # 默认段$'
-        $result | Should -Match '(?m)^custom-rendezvous-server = "new\.example\.com"  # 中继地址$'
-        $result | Should -Match '(?m)^key = "oldkey"$'
+        # .NET 的 (?m)$ 只匹配 \n 前的位置，CRLF 文本里行尾还剩一个 \r，所以用 \r?$ 兼容两种换行。
+        $result | Should -Match '(?m)^\[options\]  # 默认段\r?$'
+        $result | Should -Match '(?m)^custom-rendezvous-server = "new\.example\.com"  # 中继地址\r?$'
+        $result | Should -Match '(?m)^key = "oldkey"\r?$'
+        # 按行断言，确认表头就是带注释的第一行
+        $lines = $result -split "`r`n"
+        $lines[0] | Should -Be '[options]  # 默认段'
+        # CRLF 必须被保留：原文件是 CRLF，输出不能变成裸 LF
         $result | Should -Match "`r`n`r`n$"
-        $result.Contains("`n`n") | Should -BeTrue
         $result.Contains("`r`n") | Should -BeTrue
+        ([regex]::Matches($result, "(?<!`r)`n")).Count | Should -Be 0
     }
 
     It '表头与键名按精确大小写匹配：[Options]/Key 不受管' {
