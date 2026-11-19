@@ -4513,20 +4513,37 @@ function Get-VegaRustDeskInstall {
       找 rustdesk.exe；找不到返回 $null。
       -RequireSigned：只返回 Program Files / Program Files (x86) 下且 Authenticode 状态为
       Valid 的副本，并完全不考虑 %LOCALAPPDATA%——提权运行时不能启动低权限目录里的可执行文件。
+      -SearchRoot：可注入的安装根目录列表（测试用）；不传时取两个 Program Files
+      环境变量中非空的值。Windows 上其中一项为空、或非 Windows 上两者都为空时安全跳过。
     #>
     [CmdletBinding()]
     param(
-        [switch]$RequireSigned
+        [switch]$RequireSigned,
+
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [string[]]$SearchRoot = @()
     )
 
+    $explicitRoots = $false
+    $roots = New-Object System.Collections.Generic.List[string]
+    foreach ($root in @($SearchRoot)) {
+        if ([string]::IsNullOrWhiteSpace($root)) { continue }
+        $roots.Add([string]$root)
+        $explicitRoots = $true
+    }
+    if (-not $explicitRoots) {
+        foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+            if ([string]::IsNullOrWhiteSpace($root)) { continue }
+            $roots.Add([string]$root)
+        }
+    }
+
     $candidates = New-Object System.Collections.Generic.List[string]
-    if (-not [string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
-        $candidates.Add((Join-Path (Join-Path $env:ProgramFiles 'RustDesk') 'rustdesk.exe'))
+    foreach ($root in $roots) {
+        $candidates.Add((Join-Path (Join-Path $root 'RustDesk') 'rustdesk.exe'))
     }
-    if (-not [string]::IsNullOrWhiteSpace(${env:ProgramFiles(x86)})) {
-        $candidates.Add((Join-Path (Join-Path ${env:ProgramFiles(x86)} 'RustDesk') 'rustdesk.exe'))
-    }
-    if (-not $RequireSigned -and -not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+    if (-not $RequireSigned -and -not $explicitRoots -and -not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
         $candidates.Add((Join-Path (Join-Path (Join-Path $env:LOCALAPPDATA 'Programs') 'RustDesk') 'rustdesk.exe'))
     }
 
