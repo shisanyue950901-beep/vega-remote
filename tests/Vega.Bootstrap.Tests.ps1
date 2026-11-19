@@ -85,9 +85,9 @@ Describe 'Test-VegaBootstrapChecksum' {
     }
 }
 
-Describe 'Get-VegaBootstrapInstallerArguments' {
+Describe 'Get-VegaBootstrapInstallerArgument' {
     It '只透传给出的参数，空字符串不传' {
-        $installerArgs = Get-VegaBootstrapInstallerArguments -SkipTailscale -WithRustDesk `
+        $installerArgs = Get-VegaBootstrapInstallerArgument -SkipTailscale -WithRustDesk `
             -RustDeskServer 'relay.example.com' -RustDeskKey ('A' * 43 + '=')
         $installerArgs['SkipTailscale'] | Should -BeTrue
         $installerArgs['WithRustDesk'] | Should -BeTrue
@@ -96,7 +96,7 @@ Describe 'Get-VegaBootstrapInstallerArguments' {
     }
 
     It '没有任何密码参数' {
-        $installerArgs = Get-VegaBootstrapInstallerArguments -RustDeskServer 'relay.example.com' -RustDeskKey ('A' * 43 + '=')
+        $installerArgs = Get-VegaBootstrapInstallerArgument -RustDeskServer 'relay.example.com' -RustDeskKey ('A' * 43 + '=')
         @($installerArgs.Keys | Where-Object { $_ -match '(?i)password|passwd|pwd|secret' }).Count | Should -Be 0
     }
 }

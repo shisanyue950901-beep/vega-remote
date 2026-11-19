@@ -275,7 +275,7 @@ function Expand-VegaBootstrapArchive {
     }
 }
 
-function Get-VegaBootstrapInstallerArguments {
+function Get-VegaBootstrapInstallerArgument {
     <#
       纯函数：把引导脚本收到的安装参数整理成安装脚本的参数表。
       密码永远不在其中：这里没有任何密码参数。
@@ -370,7 +370,7 @@ function Invoke-VegaBootstrap {
     }
 
     $resolvedRole = Resolve-VegaBootstrapRole -Role $Role
-    $installerArgs = Get-VegaBootstrapInstallerArguments -SkipTailscale:$SkipTailscale -WithRustDesk:$WithRustDesk `
+    $installerArgs = Get-VegaBootstrapInstallerArgument -SkipTailscale:$SkipTailscale -WithRustDesk:$WithRustDesk `
         -Force:$Force -Uninstall:$Uninstall -RemoveApps:$RemoveApps `
         -RustDeskServer $RustDeskServer -RustDeskKey $RustDeskKey `
         -RemainingArguments $RemainingArguments

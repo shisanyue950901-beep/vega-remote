@@ -2609,7 +2609,7 @@ function Set-VegaFirewallRule {
         }
 
         # Profile 必须覆盖所有活动接口的配置文件（Any 视为覆盖），否则补齐后回读。
-        $requiredProfiles = @(Get-VegaActiveFirewallProfiles)
+        $requiredProfiles = @(Get-VegaActiveFirewallProfile)
         $check = Repair-VegaFirewallRuleProfile -Name $spec.Name -Rule $check -RequiredProfiles $requiredProfiles -Confirm:$false
 
         $filter = Get-NetFirewallPortFilter -AssociatedNetFirewallRule $check -ErrorAction SilentlyContinue
@@ -2787,7 +2787,7 @@ function Test-VegaFirewallProfileCovered {
     return $true
 }
 
-function Get-VegaActiveFirewallProfiles {
+function Get-VegaActiveFirewallProfile {
     <#
       返回所有活动网络接口对应的防火墙配置名（Domain / Private / Public），去重。
       用于回读时确认规则 Profile 覆盖了每个活动接口；无法映射的分类直接抛异常，
@@ -3090,7 +3090,7 @@ function Set-VegaAdminBlockRule {
 
     # 规则 Profile 必须覆盖所有活动接口的配置文件；Any 视为覆盖。
     # 不覆盖就用 Set-NetFirewallRule -Profile 补齐，再回读确认。
-    $requiredProfiles = @(Get-VegaActiveFirewallProfiles)
+    $requiredProfiles = @(Get-VegaActiveFirewallProfile)
     $check = Repair-VegaFirewallRuleProfile -Name $name -Rule $check -RequiredProfiles $requiredProfiles -Confirm:$false
 
     # 组策略/特殊策略可能让本地规则不生效：核对生效存储里的执行状态。
@@ -5233,7 +5233,7 @@ Export-ModuleMember -Function @(
     'Get-VegaFirewallProfileName',
     'ConvertTo-VegaFirewallProfileNames',
     'Test-VegaFirewallProfileCovered',
-    'Get-VegaActiveFirewallProfiles',
+    'Get-VegaActiveFirewallProfile',
     'Repair-VegaFirewallRuleProfile',
     'Test-VegaEnforcementStatus',
     'Get-VegaFirewallRuleSpec',
