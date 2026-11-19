@@ -37,14 +37,34 @@ require 'compose ps -a -q' '启动前必须检查项目已有容器'
 require 'ss -lntup' '启动前必须检查端口占用'
 require '21115 21116 21117 21118 21119' '端口占用检查必须覆盖 21115-21119'
 require 'ATTEMPTED=true' 'compose up 之前必须置 ATTEMPTED=true'
-require 'ufw deny 21118:21119/tcp' '未启用 WebSocket 且默认 deny 时必须阻断 21118/21119'
+require 'print_port_guidance' '部署完成后必须打印端口放行清单与 ufw 示例'
+require 'sudo ufw allow 21115:21117/tcp' 'ufw 示例必须包含 TCP 21115-21117'
+require 'sudo ufw allow 21116/udp' 'ufw 示例必须包含 UDP 21116'
+require '云安全组建议' '必须给出云安全组建议'
 require '21118/21119（WebSocket）也会对外可达' '默认 allow / UFW 未启用时必须警告 WebSocket 暴露'
 require '请用云厂商安全组只放行 TCP 21115-21117、UDP 21116' '警告必须给出安全组最小放行范围'
+
+echo "==> ss 端口预检只解析本地地址列"
+# shellcheck disable=SC2016  # 正则里的 $ 是 awk 字段
+require 'split\(\$5, parts, ":"\)' 'ss 预检必须只解析第 5 列（本地地址）'
+# shellcheck disable=SC2016  # 正则里的 $ 是 awk 行
+forbid '\$0 ~ \(":" p' 'ss 预检不能匹配整行（会把进程名里的端口算进来）'
+ss_sample='Netid State Recv-Q Send-Q Local Address:Port Peer Address:Port Process
+udp   UNCONN 0      0      0.0.0.0:5353       0.0.0.0:*    users:(("worker:21119",pid=1,fd=3))
+tcp   LISTEN 0      0      0.0.0.0:21115      0.0.0.0:*    users:(("hbbs",pid=2,fd=4))'
+ss_ports=$(awk 'NR > 1 { n = split($5, parts, ":"); print parts[n] }' <<<"$ss_sample" | sort -u | tr '\n' ' ')
+if [[ "$ss_ports" != "21115 5353 " ]]; then
+  fail "ss 第 5 列解析结果不对：$ss_ports"
+fi
 
 echo "==> 禁止的旧逻辑"
 forbid 'HAS_PRE_EXISTING' '必须删除 HAS_PRE_EXISTING 分支'
 forbid 'RESTART_BASELINE' '必须删除跨容器重启计数基线'
 forbid 'record_container_baseline' '必须删除旧基线采集函数'
+forbid '^[[:space:]]*ufw (allow|deny|delete)' '脚本不得修改 UFW 规则'
+forbid 'ADDED_RULES' '必须删除 UFW 规则记账'
+forbid 'rollback_rules' '必须删除 UFW 回滚逻辑'
+forbid 'ufw_status_has_port_rules' '必须删除 UFW 规则识别逻辑'
 
 echo "==> 顺序：先 ATTEMPTED，再 compose up"
 attempted_line=$(grep -n 'ATTEMPTED=true' "$SCRIPT" | head -1 | cut -d: -f1)
