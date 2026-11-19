@@ -1,6 +1,24 @@
 # Vega Remote
 
 > 免费、开源、无广告、无弹窗的远程办公方案。2K / 1080p 自适应，独显、集显通用。
+>
+> **零广告、零付费、无需登录**：脚本只下载官方发行版并写配置，不插入任何推广或付费墙，也不需要注册 Vega 账号。中继用你自己的 VPS，或直接走 Tailscale / IPv6 直连。
+
+## 一行安装（Windows，管理员 PowerShell）
+
+```powershell
+irm https://raw.githubusercontent.com/shisanyue950901-beep/vega-remote/main/bootstrap.ps1 | iex
+```
+
+按提示选 **1 = 被控主机** 或 **2 = 控制端**。带参数静默安装（例如同时配置 RustDesk 自建中继）：
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/shisanyue950901-beep/vega-remote/main/bootstrap.ps1))) -Role host -RustDeskServer relay.example.com -RustDeskKey <公钥>
+```
+
+引导脚本会下载最新 Release 的 `vega-remote-<版本>.zip`，用同 Release 的 `SHA256SUMS.txt` 校验后解压，再调用对应安装脚本。GitHub 直连受限时可用 `-ZipUrl` 指定镜像。需要管理员 PowerShell；脚本不接收、不保存任何密码。
+
+> 不想用一行安装也可以按下面的步骤手动下载仓库后运行脚本。
 
 国内常用的远程软件越来越多地限速、收费、弹窗。Vega Remote 不重新造轮子，而是把最好的开源组件组合起来，用一键脚本帮你配好：
 
@@ -50,7 +68,16 @@ Set-ExecutionPolicy -Scope Process Bypass -Force
 cd server && sudo bash setup-rustdesk-server.sh
 ```
 
-脚本输出服务器地址和 Key，填到两端 RustDesk 的「ID/中继服务器」里即可。
+脚本输出服务器地址和 Key。部署后有两种方式配置两端 RustDesk：
+
+- 安装脚本参数：`-RustDeskServer relay.example.com -RustDeskKey <公钥>`（必须同时给）
+- 仓库根目录可选文件 `vega.config.json`：
+
+```json
+{ "rustdesk": { "server": "relay.example.com", "key": "<公钥>" } }
+```
+
+安装脚本会写 `RustDesk2.toml` 的 `custom-rendezvous-server`、`relay-server`、`key`（只动这三个键，卸载按键回滚），并打印 3-3-3 分组后的本机设备码。固定密码请在 RustDesk 界面「设置 → 安全 → 密码」自行设置，脚本不接收、不保存任何密码。
 
 脚本只支持全新部署：启动前发现项目里已有容器会直接拒绝，避免误删正在用的中继。需要重装时加 `--reinstall`，脚本会先 `compose down`（数据目录和密钥保留）再按全新流程部署。启动前还会用 `ss -lntup` 检查 TCP/UDP 21115-21119，被占用就停下。
 

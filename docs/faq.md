@@ -1,5 +1,20 @@
 # 常见问题
 
+**是不是免费的？有广告或强制登录吗？**
+零广告、零付费、无需注册 Vega 账号。脚本只调用各组件官方发行版，不打包、不修改、不插入推广。中继服务器可以用你自己的 VPS，也可以只走 Tailscale / IPv6 直连。
+
+**怎么最省事地安装？**
+管理员 PowerShell 执行：
+
+```powershell
+irm https://raw.githubusercontent.com/shisanyue950901-beep/vega-remote/main/bootstrap.ps1 | iex
+```
+
+按提示选 1（被控主机）或 2（控制端）。引导脚本下载最新 Release 的 zip，用同 Release 的 `SHA256SUMS.txt` 校验后解压，再调用对应安装脚本。带参数时用 `& ([scriptblock]::Create((irm <url>))) -Role host -RustDeskServer ... -RustDeskKey ...`。
+
+**引导脚本下载失败怎么办？**
+GitHub 直连可能被限速或阻断。用 `-ZipUrl https://镜像地址/vega-remote-<版本>.zip` 指定镜像（脚本会从同一目录取 `SHA256SUMS.txt`），或手动下载 zip、校验后解压运行 `host/install-host.ps1` / `client/install-client.ps1`。脚本不会跳过校验，校验失败直接停止。
+
 **集显能用吗？**
 能。Intel 用 QuickSync，AMD 用 AMF。八代以后的 Intel 跑 2K 60 帧很稳。
 
@@ -44,6 +59,9 @@ Moonlight 首次连接要 PIN 配对；Tailscale 端到端加密。管理页用 
 
 **服务器上 `docker compose` 不存在？**
 `server/setup-rustdesk-server.sh` 会优先用 `docker compose`，回退到独立的 `docker-compose` 命令；两者都没有时会提示先安装 Docker Compose 插件。脚本不会用 `curl | sh` 安装 Docker，没装 Docker 时会提示按官方文档用软件源安装后重新运行。脚本不修改防火墙：没有 ufw 的系统（如部分云镜像）或 ufw 未启用时会打印醒目警告：「未检测到启用的 UFW，21115-21119 将直接对外暴露，其中 21118/21119（WebSocket）也会对外可达，请用云厂商安全组只放行 TCP 21115-21117、UDP 21116」。ufw 已启用但默认入站为 allow 时同样警告。部署完成后只打印端口清单、`ufw` 示例命令和云安全组建议，实际放行需要你自行执行。另外脚本只支持全新部署，已有容器时需加 `--reinstall`（先 `compose down`，数据目录和密钥保留）。
+
+**RustDesk 中继怎么自动配置？**
+安装时加 `-RustDeskServer <host[:port]> -RustDeskKey <公钥>`（两个必须同时给），或在仓库根目录放 `vega.config.json`（`{"rustdesk":{"server":"","key":""}}`）。脚本会写当前用户和（存在服务时）LocalService 服务模式的 `RustDesk2.toml`，只改 `custom-rendezvous-server`、`relay-server`、`key` 三个键，写前把原值记进状态清单，卸载只恢复 Vega 改过的键。若 RustDesk 服务在运行，写入后会重启服务，并用 `rustdesk --get-id` 读取设备码（超时 15 秒只警告），按 3-3-3 分组显示。都没有配置时跳过并提示如何配置。**脚本不接收、不保存密码**：固定密码请在 RustDesk「设置 → 安全 → 密码」自行设置，或使用一次性密码。诊断里会让 `vega-doctor` 核对 `RustDesk2.toml` 是否指向配置的服务器、设备码能否读取。
 
 **RustDesk 中继要开哪些端口？**
 默认需要放行 TCP 21115-21117 与 UDP 21116。需要 WebSocket（`--websocket`）时提示里会额外列出 TCP 21118-21119。脚本只给出清单和示例，不会代跑 `ufw`。私钥文件落盘后会被收紧到 0600，数据目录要求在 0700 且属于 root。
