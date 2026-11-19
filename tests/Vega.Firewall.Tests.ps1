@@ -223,7 +223,8 @@ Describe 'Test-VegaHostFirewallEnabled' {
             }
         }
         foreach ($stubName in $stubs.Keys) {
-            if (Get-Command -Name $stubName -ErrorAction SilentlyContinue) { continue }
+            # 过滤器 cmdlet 在 Windows PowerShell 5.1 的动态参数会强转 CimInstance，始终用 stub 覆盖。
+            if ($stubName -notlike "*Filter" -and (Get-Command -Name $stubName -ErrorAction SilentlyContinue)) { continue }
             $stubBody = $stubs[$stubName]
             & $module {
                 param($name, $body)
@@ -314,7 +315,8 @@ Describe 'Set-VegaAdminBlockRule' {
             }
         }
         foreach ($stubName in $stubs.Keys) {
-            if (Get-Command -Name $stubName -ErrorAction SilentlyContinue) { continue }
+            # 过滤器 cmdlet 在 Windows PowerShell 5.1 的动态参数会强转 CimInstance，始终用 stub 覆盖。
+            if ($stubName -notlike "*Filter" -and (Get-Command -Name $stubName -ErrorAction SilentlyContinue)) { continue }
             $stubBody = $stubs[$stubName]
             & $module {
                 param($name, $body)
@@ -518,7 +520,8 @@ Describe 'Set-VegaFirewallRule 回读' {
             }
         }
         foreach ($stubName in $stubs.Keys) {
-            if (Get-Command -Name $stubName -ErrorAction SilentlyContinue) { continue }
+            # 过滤器 cmdlet 在 Windows PowerShell 5.1 的动态参数会强转 CimInstance，始终用 stub 覆盖。
+            if ($stubName -notlike "*Filter" -and (Get-Command -Name $stubName -ErrorAction SilentlyContinue)) { continue }
             $stubBody = $stubs[$stubName]
             & $module {
                 param($name, $body)
