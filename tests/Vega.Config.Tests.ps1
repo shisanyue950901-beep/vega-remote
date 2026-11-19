@@ -148,8 +148,8 @@ Describe 'Merge-VegaSunshineConfigText 大小写敏感' {
         $result = Merge-VegaSunshineConfigText -ExistingText $existing -Values ([ordered]@{}) -RemoveKeys @('port')
         $lines = @($result -split "`n" | Where-Object { $_ -ne '' })
 
-        $lines | Should -Contain 'PORT = 48000'
-        $lines | Should -Not -Contain 'port = 48000'
+        ($lines -ccontains 'PORT = 48000') | Should -BeTrue
+        ($lines -ccontains 'port = 48000') | Should -BeFalse
     }
 }
 

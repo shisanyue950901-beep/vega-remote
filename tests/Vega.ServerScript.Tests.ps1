@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
   RustDesk 部署脚本与 compose 的静态检查（Pester 5）。
   只读仓库里的文件，不执行 docker / ufw / ss。

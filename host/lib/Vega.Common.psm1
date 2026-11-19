@@ -1520,7 +1520,7 @@ function ConvertFrom-VegaSunshineConfigText {
 
     foreach ($line in ($Text -split "\r?\n")) {
         if ($line -match '^\s*#') { continue }
-        if ($line -match '^\s*(?<key>[a-z0-9_]+)\s*=\s*(?<value>.*)$') {
+        if ($line -cmatch '^\s*(?<key>[a-z0-9_]+)\s*=\s*(?<value>.*)$') {
             $key = $Matches['key']
             if (-not $values.Contains($key)) {
                 $values[$key] = ([string]$Matches['value']).Trim()
@@ -1572,7 +1572,7 @@ function Merge-VegaSunshineConfigText {
 
     foreach ($line in $existingLines) {
         $key = $null
-        if ($line -match '^\s*(?<key>[a-z0-9_]+)\s*=') { $key = $Matches['key'] }
+        if ($line -cmatch '^\s*(?<key>[a-z0-9_]+)\s*=') { $key = $Matches['key'] }
 
         if ($null -ne $key -and $remove.Contains($key)) { continue }
 
