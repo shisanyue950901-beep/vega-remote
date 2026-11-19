@@ -140,9 +140,9 @@ Describe 'Set-VegaAdminBlockRule' {
             'New-NetFirewallRule'       = {
                 [CmdletBinding()]
                 param($Name, $DisplayName, $Direction, $Action, $Protocol, $LocalPort,
-                    $Profile, $Program, $Enabled, $Description)
+                    [Alias('Profile')]$FwProfile, $Program, $Enabled, $Description)
                 $null = $Name, $DisplayName, $Direction, $Action, $Protocol, $LocalPort,
-                $Profile, $Program, $Enabled, $Description
+                $FwProfile, $Program, $Enabled, $Description
             }
             'Set-NetFirewallRule'       = {
                 [CmdletBinding()]
@@ -204,6 +204,13 @@ Describe 'Set-VegaAdminBlockRule' {
     }
 
     It '规则不存在时才创建，并回读校验端口' {
+        $script:BlockCreated = $false
+        Mock -ModuleName $script:ModuleName New-NetFirewallRule { $script:BlockCreated = $true }
+        Mock -ModuleName $script:ModuleName Get-NetFirewallRule {
+            param($Name)
+            if ($Name -ne 'Vega-Block-Admin' -or -not $script:BlockCreated) { return }
+            [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block' }
+        }
         $name = Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false
 
         $name | Should -Be 'Vega-Block-Admin'
