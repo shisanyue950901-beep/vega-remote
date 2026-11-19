@@ -247,9 +247,11 @@ function Get-VegaBootstrapSid {
     }
 }
 
-function Test-VegaBootstrapWriteRights {
+function Test-VegaBootstrapWriteRight {
     <#
       纯函数：判断一组文件系统权限里是否含写/删除/改权限/取得所有权等写类权限。
+      只按写类位判断，不能用 FullControl 这类复合值当掩码：它含读位，
+      会把 Read/ReadAndExecute 也误判成写；Synchronize 只是等待位，不算写。
     #>
     [CmdletBinding()]
     param(
@@ -257,11 +259,25 @@ function Test-VegaBootstrapWriteRights {
         $Rights
     )
 
-    # Write(278) Delete(65536) ChangePermissions(262144) TakeOwnership(524288)
-    # FullControl(2032127) WriteData(2) AppendData(4) WriteExtendedAttributes(16)
-    # WriteAttributes(256) DeleteSubdirectoriesAndFiles(64)
-    $writeMask = 2 -bor 4 -bor 16 -bor 64 -bor 256 -bor 278 -bor 65536 -bor 262144 -bor 524288 -bor 2032127
+    # WriteData(2) AppendData(4) WriteExtendedAttributes(16) DeleteSubdirectoriesAndFiles(64)
+    # WriteAttributes(256) Delete(65536) ChangePermissions(262144) TakeOwnership(524288)
+    # FullControl/Modify 等复合值本身含这些位，不需要单独加进掩码。
+    $writeMask = 2 -bor 4 -bor 16 -bor 64 -bor 256 -bor 65536 -bor 262144 -bor 524288
     return ((([int]$Rights) -band $writeMask) -ne 0)
+}
+
+function Get-VegaBootstrapDirectoryAcl {
+    <#
+      读取目录 ACL 的唯一入口：Windows 上走 Get-Acl，非 Windows 不调用。
+      抽成函数是为了让测试能 Mock，而不是依赖 Linux 上不存在的 Get-Acl。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    return (Get-Acl -LiteralPath $Path -ErrorAction Stop)
 }
 
 function Test-VegaBootstrapDirectoryAclTrusted {
@@ -279,7 +295,7 @@ function Test-VegaBootstrapDirectoryAclTrusted {
     if (Test-VegaBootstrapReparsePoint -Path $Path) { return $false }
 
     try {
-        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        $acl = Get-VegaBootstrapDirectoryAcl -Path $Path
     }
     catch {
         return $false
@@ -296,7 +312,7 @@ function Test-VegaBootstrapDirectoryAclTrusted {
 
         $sid = Get-VegaBootstrapSid -IdentityReference $rule.IdentityReference
         if ($allowedOwnerSids -contains $sid) { continue }
-        if (Test-VegaBootstrapWriteRights -Rights $rule.FileSystemRights) { return $false }
+        if (Test-VegaBootstrapWriteRight -Rights $rule.FileSystemRights) { return $false }
     }
 
     return $true
@@ -307,13 +323,14 @@ function New-VegaBootstrapProtectedDirectory {
       创建目录时就用 DirectorySecurity 应用 ACL：禁用继承，只留 SYSTEM 与
       Administrators 完全控制，所有者设为 Administrators。已存在则拒绝。
     #>
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
         [string]$Path
     )
 
     if (Test-Path -LiteralPath $Path) { throw "目录已存在，拒绝覆盖：$Path" }
+    if (-not $PSCmdlet.ShouldProcess($Path, '创建受保护的引导目录')) { return '' }
 
     if (-not (Test-VegaBootstrapWindows)) {
         $null = New-Item -ItemType Directory -Path $Path -Force
