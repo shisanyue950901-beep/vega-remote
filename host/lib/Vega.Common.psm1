@@ -2087,8 +2087,10 @@ function Get-VegaSunshinePortMap {
 function ConvertFrom-VegaSunshinePortValue {
     <#
       纯函数：按 Sunshine v2026.914 的解析方式读取 port 值。
-      先去行尾 # 注释、去首尾空白，只剥离成对双引号（单引号不剥离，交给调用方中止）；
-      十进制允许前导零，支持 0x 十六进制；范围 1-65535。
+      先去掉行尾 # 注释，但保留注释前的空格——上游的十进制转换会因为这段空格失败，
+      Vega 不再替它 Trim，按“无法可靠确定端口”中止。
+      只剥离成对双引号（单引号不剥离，交给调用方中止）；
+      十进制允许前导零，支持 0x 十六进制；有效范围 1019-65514。
       解析失败或超出范围时返回 $null，由调用方中止。
     #>
     [CmdletBinding()]
@@ -2103,7 +2105,7 @@ function ConvertFrom-VegaSunshinePortValue {
     $text = $Value
     $commentIndex = $text.IndexOf('#')
     if ($commentIndex -ge 0) { $text = $text.Substring(0, $commentIndex) }
-    $text = $text.Trim()
+    # 不 Trim：注释前的空格会保留下来，十进制转换失败 → 无法可靠确定端口。
 
     if ($text.Length -ge 2) {
         $first = $text[0]
@@ -2125,7 +2127,7 @@ function ConvertFrom-VegaSunshinePortValue {
         return $null
     }
 
-    if ($port -lt 1 -or $port -gt 65535) { return $null }
+    if ($port -lt 1019 -or $port -gt 65514) { return $null }
     return $port
 }
 
@@ -2150,7 +2152,7 @@ function Get-VegaSunshineBasePort {
 
     $port = ConvertFrom-VegaSunshinePortValue -Value ([string]$values['port'])
     if ($null -eq $port) {
-        throw "sunshine.conf 里的 port 无效（$($values['port'])），无法确定管理端口；请改成 1-65535 的十进制或 0x 十六进制值（单引号不会被剥离，请用双引号或不加引号）后重试。"
+        throw "sunshine.conf 里的 port 无效（$($values['port'])），无法可靠确定端口；请改成 1019-65514 的十进制或 0x 十六进制值（不加行尾注释；单引号不会被剥离，请用双引号或不加引号）后重试。"
     }
 
     return [int]$port
@@ -2716,46 +2718,194 @@ function Get-VegaFirewallProfileName {
     }
 }
 
-function Test-VegaHostFirewallEnabled {
+function ConvertTo-VegaFirewallProfileNames {
     <#
-      逐个核对活动接口：其网络类别对应的防火墙配置必须 Enabled=True，
-      且接口不在该配置的 DisabledInterfaceAliases 里。
-      WinGet 安装 Sunshine 后会立即启动服务；防火墙在该接口上关闭或接口被排除时，
-      Vega-Block-Admin 不会生效，首次设密页面会暴露。任一接口不满足即返回 $false。
+      纯函数：把规则/配置的 Profile 值归一化成名字列表。
+      支持 "Any"、"Private, Public"、数组，以及数字位掩码（1=Domain 2=Private 4=Public，0=Any）。
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        $Profile
+    )
+
+    $names = New-Object System.Collections.Generic.List[string]
+    foreach ($item in @($Profile)) {
+        if ($null -eq $item) { continue }
+        $text = ([string]$item).Trim()
+        if ($text.Length -eq 0) { continue }
+
+        if ($text -match '^[0-9]+$') {
+            $mask = 0
+            if (-not [int]::TryParse($text, [ref]$mask)) { continue }
+            if ($mask -eq 0) { $names.Add('Any'); continue }
+            if (($mask -band 1) -ne 0) { $names.Add('Domain') }
+            if (($mask -band 2) -ne 0) { $names.Add('Private') }
+            if (($mask -band 4) -ne 0) { $names.Add('Public') }
+            continue
+        }
+
+        foreach ($part in ($text -split ',')) {
+            $name = $part.Trim()
+            if ($name.Length -gt 0) { $names.Add($name) }
+        }
+    }
+
+    return $names.ToArray()
+}
+
+function Test-VegaFirewallProfileCovered {
+    <#
+      纯函数：规则 Profile 是否覆盖所有要求的配置（Any 视为覆盖全部）。
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        $Profile,
+
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [string[]]$RequiredProfiles
+    )
+
+    $required = @($RequiredProfiles | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    if ($required.Count -eq 0) { return $true }
+
+    $covered = @(ConvertTo-VegaFirewallProfileNames -Profile $Profile)
+    if ($covered -contains 'Any') { return $true }
+
+    foreach ($name in $required) {
+        if ($covered -notcontains $name) { return $false }
+    }
+    return $true
+}
+
+function Test-VegaEnforcementStatus {
+    <#
+      纯函数：归一化 EnforcementStatus。
+      字符串或数字都接受；Enforced / Full / 1 视为成功，数组必须全部成功才通过。
+      属性不存在或值为空时调用方跳过检查，这里空集合按通过处理。
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        $Value
+    )
+
+    $values = New-Object System.Collections.Generic.List[string]
+    foreach ($item in @($Value)) {
+        if ($null -eq $item) { continue }
+        $text = ([string]$item).Trim()
+        if ($text.Length -eq 0) { continue }
+        $values.Add($text)
+    }
+
+    if ($values.Count -eq 0) { return $true }
+
+    foreach ($text in $values) {
+        if ($text -notin @('Enforced', 'Full', '1')) { return $false }
+    }
+    return $true
+}
+
+function Get-VegaHostFirewallStatus {
+    <#
+      逐个核对活动接口，返回 { Enabled, Reason, InterfaceAlias, Profile, Message }。
+      Reason 用于安装脚本区分“防火墙关闭”和“接口被排除”，提示不再混为一谈。
     #>
     [CmdletBinding()]
     param()
 
-    $connections = @(Get-NetConnectionProfile -ErrorAction Stop)
-    if ($connections.Count -eq 0) { return $false }
+    try {
+        $connections = @(Get-NetConnectionProfile -ErrorAction Stop)
+    }
+    catch {
+        return [pscustomobject]@{
+            Enabled = $false; Reason = 'Error'; InterfaceAlias = ''; Profile = ''
+            Message = "无法读取网络连接配置：$($_.Exception.Message)"
+        }
+    }
 
-    $profiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop)
+    if ($connections.Count -eq 0) {
+        return [pscustomobject]@{
+            Enabled = $false; Reason = 'NoConnection'; InterfaceAlias = ''; Profile = ''
+            Message = '没有检测到活动的网络连接，无法确认防火墙状态'
+        }
+    }
+
+    try {
+        $profiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop)
+    }
+    catch {
+        return [pscustomobject]@{
+            Enabled = $false; Reason = 'Error'; InterfaceAlias = ''; Profile = ''
+            Message = "无法读取防火墙配置：$($_.Exception.Message)"
+        }
+    }
 
     foreach ($connection in $connections) {
         $profileName = Get-VegaFirewallProfileName -NetworkCategory ([string]$connection.NetworkCategory)
-        if ([string]::IsNullOrWhiteSpace($profileName)) { return $false }
+        $alias = [string]$connection.InterfaceAlias
+
+        if ([string]::IsNullOrWhiteSpace($profileName)) {
+            return [pscustomobject]@{
+                Enabled = $false; Reason = 'UnknownCategory'; InterfaceAlias = $alias; Profile = [string]$connection.NetworkCategory
+                Message = "接口 $alias 的网络类别 $($connection.NetworkCategory) 无法映射到防火墙配置，无法确认阻断规则是否生效"
+            }
+        }
 
         $active = @($profiles | Where-Object { [string]$_.Name -eq $profileName })
-        if ($active.Count -eq 0) { return $false }
+        if ($active.Count -eq 0) {
+            return [pscustomobject]@{
+                Enabled = $false; Reason = 'ProfileMissing'; InterfaceAlias = $alias; Profile = $profileName
+                Message = "找不到防火墙配置 $profileName（接口 $alias），无法确认阻断规则是否生效"
+            }
+        }
 
-        $alias = [string]$connection.InterfaceAlias
         foreach ($firewallProfile in $active) {
-            if ([string]$firewallProfile.Enabled -ne 'True') { return $false }
+            if ([string]$firewallProfile.Enabled -ne 'True') {
+                return [pscustomobject]@{
+                    Enabled = $false; Reason = 'Disabled'; InterfaceAlias = $alias; Profile = $profileName
+                    Message = "Windows 防火墙在当前网络已关闭：接口 $alias（配置 $profileName），Vega 无法保护首次设密页面，请开启防火墙后重试"
+                }
+            }
 
-            # 旧系统没有该属性时跳过接口排除检查
             $disabledProperty = $firewallProfile.PSObject.Properties['DisabledInterfaceAliases']
             if ($null -eq $disabledProperty) { continue }
             if ([string]::IsNullOrWhiteSpace($alias)) { continue }
             foreach ($disabledAlias in @($disabledProperty.Value)) {
                 if ([string]::IsNullOrWhiteSpace([string]$disabledAlias)) { continue }
                 if ([string]::Equals([string]$disabledAlias, $alias, [StringComparison]::OrdinalIgnoreCase)) {
-                    return $false
+                    return [pscustomobject]@{
+                        Enabled = $false; Reason = 'InterfaceExcluded'; InterfaceAlias = $alias; Profile = $profileName
+                        Message = "接口 $alias 被防火墙配置 $profileName 的 DisabledInterfaceAliases 排除，Vega-Block-Admin 不会生效；请在该配置下取消排除该接口后重试"
+                    }
                 }
             }
         }
     }
 
-    return $true
+    return [pscustomobject]@{
+        Enabled = $true; Reason = 'Enabled'; InterfaceAlias = ''; Profile = ''
+        Message = 'Windows 防火墙已在所有活动接口上启用'
+    }
+}
+
+function Test-VegaHostFirewallEnabled {
+    <#
+      逐个核对活动接口：其网络类别对应的防火墙配置必须 Enabled=True，
+      且接口不在该配置的 DisabledInterfaceAliases 里。
+      WinGet 安装 Sunshine 后会立即启动服务；防火墙在该接口上关闭或接口被排除时，
+      Vega-Block-Admin 不会生效，首次设密页面会暴露。任一接口不满足即返回 $false。
+      需要具体原因时调用 Get-VegaHostFirewallStatus。
+    #>
+    [CmdletBinding()]
+    param()
+
+    return [bool](Get-VegaHostFirewallStatus).Enabled
 }
 
 function Get-VegaAdminBlockPortList {
@@ -4075,7 +4225,18 @@ function Invoke-VegaHostInstallCore {
     # 首次设密页面会暴露。必须在调用 WinGet 之前确认，不能只信规则 Enabled=True。
     try {
         if (-not (Test-VegaHostFirewallEnabled)) {
-            $failures.Add('Windows 防火墙在当前网络已关闭，Vega 无法保护首次设密页面，请开启防火墙后重试')
+            $status = Get-VegaHostFirewallStatus
+            if ([string]$status.Reason -eq 'InterfaceExcluded') {
+                # 接口被排除不是“防火墙关闭”，提示必须写出接口别名与配置文件
+                $message = [string]$status.Message
+            }
+            else {
+                $message = 'Windows 防火墙在当前网络已关闭，Vega 无法保护首次设密页面，请开启防火墙后重试'
+                if (-not [string]::IsNullOrWhiteSpace([string]$status.Message)) {
+                    $message = "$message（$($status.Message)）"
+                }
+            }
+            $failures.Add($message)
             Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
             return [pscustomobject]@{
                 ExitCode = 1
