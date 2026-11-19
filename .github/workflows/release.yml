@@ -19,20 +19,31 @@ jobs:
       - name: 计算版本
         id: version
         shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
-          $tag = '${{ github.ref_name }}'
-          if ($tag -notmatch '^v(?<ver>.+)$') {
-            throw "tag 必须以 v 开头：$tag"
+          $tag = [string]$env:TAG
+          if ($tag -notmatch '^v(?<ver>\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?)$') {
+            throw "tag 必须是 v<主>.<次>.<补丁>（可带 -预发布后缀）：$tag"
           }
-          "version=$($Matches['ver'])" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          $version = $Matches['ver']
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: 打包 zip（排除 tests/、.github/、work/）
+        id: package
         shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          $version = '${{ steps.version.outputs.version }}'
+          $version = [string]$env:VERSION
+          if ($version -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$') {
+            throw "版本格式无效：$version"
+          }
+
+          $archiveName = "vega-remote-$version.zip"
           $staging = Join-Path $env:RUNNER_TEMP 'vega-remote-stage'
-          $archive = Join-Path $env:RUNNER_TEMP ("vega-remote-{0}.zip" -f $version)
+          $archive = Join-Path $env:RUNNER_TEMP $archiveName
           $exclude = @('tests', '.github', 'work', '.git')
 
           if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force }
@@ -44,31 +55,53 @@ jobs:
 
           Compress-Archive -Path (Join-Path $staging '*') -DestinationPath $archive -CompressionLevel Optimal
           "archive=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "archive_name=vega-remote-{0}.zip" -f $version | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "archive_name=$archiveName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: 生成 SHA256SUMS.txt
         shell: pwsh
+        env:
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+          ARCHIVE_NAME: ${{ steps.package.outputs.archive_name }}
         run: |
-          $archive = '${{ steps.version.outputs.archive }}'
-          $name = '${{ steps.version.outputs.archive_name }}'
+          $archive = [string]$env:ARCHIVE
+          $name = [string]$env:ARCHIVE_NAME
+          if ([string]::IsNullOrWhiteSpace($archive) -or -not (Test-Path -LiteralPath $archive -PathType Leaf)) {
+            throw "打包产物不存在：$archive"
+          }
+          if ($name -notmatch '^vega-remote-\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?\.zip$') {
+            throw "打包产物名无效：$name"
+          }
+
           $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
           $sums = Join-Path $env:RUNNER_TEMP 'SHA256SUMS.txt'
           Set-Content -LiteralPath $sums -Value ("{0}  {1}" -f $hash, $name) -Encoding UTF8
           Get-Content -LiteralPath $sums
+
           # 发布前自检：用 bootstrap 的校验规则再算一遍
           $bootstrap = Join-Path $PWD 'bootstrap.ps1'
           . $bootstrap
-          $checked = Test-VegaBootstrapChecksum -ArchivePath $archive -ChecksumPath $sums
+          $bytes = [System.IO.File]::ReadAllBytes($archive)
+          $checked = Test-VegaBootstrapChecksum -Bytes $bytes -ChecksumText (Get-Content -LiteralPath $sums -Raw) -AssetName $name
           if (-not $checked) { throw 'SHA256SUMS.txt 自检失败' }
 
       - name: 创建 GitHub Release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+          REPOSITORY: ${{ github.repository }}
         run: |
-          $tag = '${{ steps.version.outputs.tag }}'
-          $archive = '${{ steps.version.outputs.archive }}'
+          $tag = [string]$env:TAG
+          if ($tag -notmatch '^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$') {
+            throw "tag 格式无效：$tag"
+          }
+          $archive = [string]$env:ARCHIVE
+          if ([string]::IsNullOrWhiteSpace($archive) -or -not (Test-Path -LiteralPath $archive -PathType Leaf)) {
+            throw "打包产物不存在：$archive"
+          }
+
           $sums = Join-Path $env:RUNNER_TEMP 'SHA256SUMS.txt'
-          $url = "https://raw.githubusercontent.com/${{ github.repository }}/main/bootstrap.ps1"
+          $url = "https://raw.githubusercontent.com/$($env:REPOSITORY)/main/bootstrap.ps1"
           $notes = "Vega Remote $tag`n`n一行安装：`nirm $url | iex`n`n下载后可用 SHA256SUMS.txt 校验 zip。"
           gh release create $tag $archive $sums --title "Vega Remote $tag" --notes $notes
