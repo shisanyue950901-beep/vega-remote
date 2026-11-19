@@ -26,7 +26,7 @@ tailscale ping <被控端机器名>
 | RustDesk 服务器（默认） | 21115-21117 | 21116 |
 | RustDesk 服务器（`--websocket`） | 21118-21119 | — |
 
-RustDesk 服务器容器用 `network_mode: host`，不发布端口；放行由 ufw 控制（`--websocket` 只决定是否额外 `ufw allow` 21118/21119）。**未安装或未启用 UFW 时脚本会打印醒目警告：「未检测到启用的 UFW，21115-21119 将直接暴露，请在云厂商安全组只放行 TCP 21115-21117、UDP 21116」**，这时安全组是唯一防线。
+RustDesk 服务器容器用 `network_mode: host`，不发布端口；放行由 ufw 控制（`--websocket` 只决定是否额外 `ufw allow` 21118/21119，未启用 WebSocket 且默认入站为 deny 时脚本会 `ufw deny 21118:21119/tcp`）。`ufw status` 里已有涉及 21115-21119 的规则时不再追加，只提示自查。**未安装或未启用 UFW 时脚本会打印醒目警告：「未检测到启用的 UFW，21115-21119 将直接对外暴露，其中 21118/21119（WebSocket）也会对外可达，请用云厂商安全组只放行 TCP 21115-21117、UDP 21116」**，默认入站为 allow 时同样警告，这时安全组是唯一防线。脚本只支持全新部署，已有容器时需加 `--reinstall`（先 `compose down`，数据目录和密钥保留）。
 
 Sunshine 管理端口 **47990 不放行**：`origin_web_ui_allowed = pc` 只允许本机访问管理页，首次设密和改配置都在被控端本机做。
 
