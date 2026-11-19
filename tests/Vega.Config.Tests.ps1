@@ -49,9 +49,8 @@ Describe 'ConvertFrom-VegaSunshineConfigText' {
         $values = ConvertFrom-VegaSunshineConfigText -Text $text
 
         $values.Count | Should -Be 1
+        @($values.Keys) | Should -Be @('port')
         $values['port'] | Should -Be '48002'
-        $values.Contains('PORT') | Should -BeFalse
-        $values.Contains('Port') | Should -BeFalse
     }
 
     It '仓库模板里包含必须由 Vega 管理的键，且不写 encoder' {
