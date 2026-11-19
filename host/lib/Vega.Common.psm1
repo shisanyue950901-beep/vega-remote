@@ -408,8 +408,9 @@ function Get-VegaWingetPackageStatus {
                 return $status
             }
         }
-        # 退出码 0 但列表里没有：按“未安装”处理（列表输出格式变化时不误报失败）
-        $status.Status = 'NotInstalled'
+        # 退出码 0 却解析不到包 ID：不能当成“未安装”，否则查询输出变化会让
+        # -RemoveApps 静默跳过、或者把已存在的包登记成 Vega 装的。
+        $status.Error = "winget list 退出码 0，但输出里没有包 ID $PackageId（输出可能被截断或格式变化）"
         return $status
     }
 
@@ -2227,13 +2228,17 @@ function Set-VegaFirewallRule {
     <#
       先删后建，规则限定 Program 为 sunshine.exe 绝对路径、只开按生效配置算出的串流端口。
       创建后逐条核对，失败抛异常。返回创建成功的规则名。
+      OnRuleCreated 在每条规则确认存在后立即调用，供调用方逐项写入状态清单——
+      第二条创建失败时，第一条也不会漏记。
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
         [string]$Program,
 
-        [int]$BasePort = 47989
+        [int]$BasePort = 47989,
+
+        [scriptblock]$OnRuleCreated = $null
     )
 
     if (-not (Test-VegaAbsolutePath -Path $Program)) {
@@ -2276,6 +2281,7 @@ function Set-VegaFirewallRule {
             throw "创建后未找到防火墙规则 $($spec.Name)"
         }
         $created.Add($spec.Name)
+        if ($null -ne $OnRuleCreated) { & $OnRuleCreated $spec.Name }
     }
 
     return $created.ToArray()
@@ -2889,11 +2895,14 @@ function Invoke-VegaHostInstallCore {
 
     Write-VegaStatus "放行串流端口（仅 sunshine.exe，不含管理端口 $($ports.ManagementPort)）"
     try {
-        $createdRules = @(Set-VegaFirewallRule -Program $sunshine.Exe -BasePort $basePort -Confirm:$false)
-        foreach ($ruleName in $createdRules) {
-            $state = Add-VegaStateFirewallRule -State $state -Name $ruleName
+        # 每建成一条就写回清单：第二条失败时第一条仍然可回滚。
+        $persistRule = {
+            param([string]$RuleName)
+            $state = Add-VegaStateFirewallRule -State $state -Name $RuleName
             $null = Save-VegaState -State $state -Path $StatePath
-        }
+        }.GetNewClosure()
+
+        $null = @(Set-VegaFirewallRule -Program $sunshine.Exe -BasePort $basePort -OnRuleCreated $persistRule -Confirm:$false)
         Write-VegaStatus ("Vega 防火墙规则已就绪（TCP {0}；UDP {1}）" -f ($ports.TcpPorts -join '/'), ($ports.UdpPorts -join '/')) -Level Ok
     }
     catch {
@@ -3176,11 +3185,16 @@ function Invoke-VegaHostUninstallCore {
         }
     }
 
-    # 所有记录都成功回滚后才删清单；有失败就留着下次继续
+    # 所有记录都成功回滚后才删清单；未指定 -RemoveApps、或按参数跳过 Tailscale/RustDesk 时，
+    # 仍有 InstalledByVega 的包没回滚，必须保留清单，不能把待办一起删掉。
+    $pendingPackages = @($state.Packages | Where-Object { $null -ne $_ -and [bool]$_.InstalledByVega })
     if ($hasState) {
-        if ($failures.Count -eq 0) {
+        if ($failures.Count -eq 0 -and $pendingPackages.Count -eq 0) {
             Remove-Item -LiteralPath $StatePath -Force -ErrorAction SilentlyContinue
             Write-VegaStatus '清单里的事项已全部回滚，删除状态清单。'
+        }
+        elseif ($pendingPackages.Count -gt 0) {
+            Write-VegaStatus "仍有未卸载的 Vega 组件，保留状态清单：$StatePath（需要卸载时加 -RemoveApps）" -Level Warn
         }
         else {
             Write-VegaStatus "仍有失败项，保留状态清单便于再次回滚：$StatePath" -Level Warn
