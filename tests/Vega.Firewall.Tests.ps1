@@ -133,18 +133,36 @@ Describe 'Test-VegaManagementPortConflict' {
 }
 
 Describe 'Get-VegaSunshineBasePort' {
-    It '接受带成对引号的端口值' {
+    It '只剥离成对双引号' {
         $path = Join-Path $TestDrive 'quoted.conf'
         Set-Content -LiteralPath $path -Value 'port = "50000"' -Encoding UTF8
         Get-VegaSunshineBasePort -ConfigPath $path | Should -Be 50000
+    }
 
+    It '单引号不剥离，按 Sunshine 的行为解析失败并中止' {
+        $path = Join-Path $TestDrive 'single-quoted.conf'
         Set-Content -LiteralPath $path -Value "port = '50000'" -Encoding UTF8
-        Get-VegaSunshineBasePort -ConfigPath $path | Should -Be 50000
+        { Get-VegaSunshineBasePort -ConfigPath $path } | Should -Throw '*port 无效*'
     }
 
     It '接受 0x 十六进制端口值' {
         $path = Join-Path $TestDrive 'hex.conf'
         Set-Content -LiteralPath $path -Value 'port = 0xC350' -Encoding UTF8
+        Get-VegaSunshineBasePort -ConfigPath $path | Should -Be 50000
+
+        Set-Content -LiteralPath $path -Value 'port = 0xBB80' -Encoding UTF8
+        Get-VegaSunshineBasePort -ConfigPath $path | Should -Be 48000
+    }
+
+    It '十进制允许前导零，与 Sunshine 的十进制转换一致' {
+        $path = Join-Path $TestDrive 'leading-zero.conf'
+        Set-Content -LiteralPath $path -Value 'port = 047989' -Encoding UTF8
+        Get-VegaSunshineBasePort -ConfigPath $path | Should -Be 47989
+    }
+
+    It '去掉行尾 # 注释后再解析' {
+        $path = Join-Path $TestDrive 'comment.conf'
+        Set-Content -LiteralPath $path -Value 'port = 50000 # 自定义端口' -Encoding UTF8
         Get-VegaSunshineBasePort -ConfigPath $path | Should -Be 50000
     }
 
@@ -179,6 +197,89 @@ Describe 'Get-VegaAdminBlockPortList' {
 
         # port = 47990 时 47990 是 HTTP 串流端口，不能再阻断它
         @(Get-VegaAdminBlockPortList -ManagementPorts @(47991) -BasePort 47990) | Should -Be @(47991)
+    }
+
+    It '最终列表复用 TCP-only 冲突判定：port = 47981 时仍阻断 47990' {
+        # 47981 + 9 = 47990 只是 UDP 视频端口，不占用 TCP 47990
+        @(Get-VegaAdminBlockPortList -ManagementPorts @(47982) -BasePort 47981) |
+            Should -Be @(47982, 47990)
+    }
+}
+
+Describe 'Test-VegaHostFirewallEnabled' {
+    BeforeAll {
+        $script:ModuleName = 'Vega.Common'
+        $module = Get-Module $script:ModuleName
+        # Linux 上没有这些 Windows cmdlet，先塞同名 stub 再 Mock。
+        $stubs = @{
+            'Get-NetConnectionProfile' = {
+                [CmdletBinding()]
+                param()
+            }
+            'Get-NetFirewallProfile'   = {
+                [CmdletBinding()]
+                param([string]$PolicyStore)
+                $null = $PolicyStore
+            }
+        }
+        foreach ($stubName in $stubs.Keys) {
+            if (Get-Command -Name $stubName -ErrorAction SilentlyContinue) { continue }
+            $stubBody = $stubs[$stubName]
+            & $module {
+                param($name, $body)
+                New-Item -Path ("function:script:{0}" -f $name) -Value $body -Force | Out-Null
+            } $stubName $stubBody
+        }
+    }
+
+    It '所有活动接口对应的配置开启且未排除接口时通过' {
+        Mock -ModuleName $script:ModuleName Get-NetConnectionProfile {
+            [pscustomobject]@{ InterfaceAlias = 'Ethernet'; NetworkCategory = 'Private' }
+        }
+        Mock -ModuleName $script:ModuleName Get-NetFirewallProfile {
+            [pscustomobject]@{ Name = 'Private'; Enabled = 'True'; DisabledInterfaceAliases = @() }
+        }
+
+        Test-VegaHostFirewallEnabled | Should -BeTrue
+    }
+
+    It '活动接口被 DisabledInterfaceAliases 排除时返回 false' {
+        Mock -ModuleName $script:ModuleName Get-NetConnectionProfile {
+            [pscustomobject]@{ InterfaceAlias = 'Ethernet'; NetworkCategory = 'Private' }
+        }
+        Mock -ModuleName $script:ModuleName Get-NetFirewallProfile {
+            [pscustomobject]@{ Name = 'Private'; Enabled = 'True'; DisabledInterfaceAliases = @('Ethernet') }
+        }
+
+        Test-VegaHostFirewallEnabled | Should -BeFalse
+    }
+
+    It '逐个接口核对：任一接口的配置关闭就返回 false' {
+        Mock -ModuleName $script:ModuleName Get-NetConnectionProfile {
+            @(
+                [pscustomobject]@{ InterfaceAlias = 'Ethernet'; NetworkCategory = 'Private' }
+                [pscustomobject]@{ InterfaceAlias = 'Wi-Fi'; NetworkCategory = 'Public' }
+            )
+        }
+        Mock -ModuleName $script:ModuleName Get-NetFirewallProfile {
+            @(
+                [pscustomobject]@{ Name = 'Private'; Enabled = 'True'; DisabledInterfaceAliases = @() }
+                [pscustomobject]@{ Name = 'Public'; Enabled = 'False'; DisabledInterfaceAliases = @() }
+            )
+        }
+
+        Test-VegaHostFirewallEnabled | Should -BeFalse
+    }
+
+    It '旧系统没有 DisabledInterfaceAliases 属性时跳过接口排除检查' {
+        Mock -ModuleName $script:ModuleName Get-NetConnectionProfile {
+            [pscustomobject]@{ InterfaceAlias = 'Ethernet'; NetworkCategory = 'Private' }
+        }
+        Mock -ModuleName $script:ModuleName Get-NetFirewallProfile {
+            [pscustomobject]@{ Name = 'Private'; Enabled = 'True' }
+        }
+
+        Test-VegaHostFirewallEnabled | Should -BeTrue
     }
 }
 
@@ -315,6 +416,41 @@ Describe 'Set-VegaAdminBlockRule' {
             [pscustomobject]@{ LocalPort = @('47990'); Protocol = 'UDP' }
         }
         { Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false } | Should -Throw '*协议不是 TCP*'
+    }
+
+    It '回读核对 PrimaryStatus 与 EnforcementStatus' {
+        Mock -ModuleName $script:ModuleName Get-NetFirewallRule {
+            param($Name, $PolicyStore)
+            $null = $PolicyStore
+            if ($Name -ne 'Vega-Block-Admin') { return }
+            [pscustomobject]@{
+                Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound'
+                PrimaryStatus = 'Error'; EnforcementStatus = 'Enforced'
+            }
+        }
+        { Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false } | Should -Throw '*PrimaryStatus*'
+
+        Mock -ModuleName $script:ModuleName Get-NetFirewallRule {
+            param($Name, $PolicyStore)
+            $null = $PolicyStore
+            if ($Name -ne 'Vega-Block-Admin') { return }
+            [pscustomobject]@{
+                Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound'
+                PrimaryStatus = 'OK'; EnforcementStatus = 'NotEnforced'
+            }
+        }
+        { Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false } | Should -Throw '*未被强制执行*'
+    }
+
+    It '旧系统没有 PrimaryStatus/EnforcementStatus 属性时视为通过' {
+        Mock -ModuleName $script:ModuleName Get-NetFirewallRule {
+            param($Name, $PolicyStore)
+            $null = $PolicyStore
+            if ($Name -ne 'Vega-Block-Admin') { return }
+            [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound' }
+        }
+
+        { Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false } | Should -Not -Throw
     }
 
     It '回读发现端口没覆盖时抛异常' {
