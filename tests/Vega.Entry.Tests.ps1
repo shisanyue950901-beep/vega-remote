@@ -67,6 +67,10 @@ Describe 'Invoke-VegaHostInstall（mock）' {
     BeforeEach {
         $script:statePath = Join-Path $TestDrive 'host-state.json'
         $script:sunshineDir = Join-Path $TestDrive 'Sunshine'
+        # Pester 的 TestDrive 按 Describe/Context 清理，不按 It 清理：
+        # 上一个用例写下的清单和配置会留到下一个用例，这里显式清空，保证每个 It 从空状态开始。
+        if (Test-Path -LiteralPath $script:statePath) { Remove-Item -LiteralPath $script:statePath -Force }
+        if (Test-Path -LiteralPath $script:sunshineDir) { Remove-Item -LiteralPath $script:sunshineDir -Recurse -Force }
         $null = New-Item -ItemType Directory -Path (Join-Path $script:sunshineDir 'config') -Force
         $script:sunshineExe = Join-Path $script:sunshineDir 'sunshine.exe'
         $script:sunshineConfig = Join-Path (Join-Path $script:sunshineDir 'config') 'sunshine.conf'
@@ -170,6 +174,9 @@ Describe 'Invoke-VegaHostUninstall（mock）' {
     BeforeEach {
         $script:statePath = Join-Path $TestDrive 'uninstall-state.json'
         $script:sunshineDir = Join-Path $TestDrive 'Sunshine'
+        # 同上：TestDrive 只在 Describe 结束时清理，先手动清掉上个用例的清单与配置。
+        if (Test-Path -LiteralPath $script:statePath) { Remove-Item -LiteralPath $script:statePath -Force }
+        if (Test-Path -LiteralPath $script:sunshineDir) { Remove-Item -LiteralPath $script:sunshineDir -Recurse -Force }
         $script:configDir = Join-Path $script:sunshineDir 'config'
         $script:configPath = Join-Path $script:configDir 'sunshine.conf'
         $null = New-Item -ItemType Directory -Path $script:configDir -Force
@@ -214,7 +221,7 @@ Describe 'Invoke-VegaHostUninstall（mock）' {
         $state = Add-VegaStateDisabledFirewallRule -State $state -Name 'Sunshine'
         $state = Add-VegaStateService -State $state -Name 'SunshineService' -StartType 'Manual' -Status 'Running'
         $snapshot = Get-VegaConfigKeySnapshot -Text $original -Keys @('sunshine_name', 'address_family')
-        $state = Add-VegaStateManagedKeys -State $state -Path $script:configPath -Snapshot $snapshot
+        $state = Add-VegaStateManagedKey -State $state -Path $script:configPath -Snapshot $snapshot
         $null = Write-VegaState -State $state -Path $script:statePath -Confirm:$false
 
         $result = Invoke-VegaHostUninstall -StatePath $script:statePath -RemoveApps -Confirm:$false
@@ -287,12 +294,12 @@ Describe '受管键基线（重跑不覆盖，卸载按键回滚）' {
 
         $state = Get-VegaEmptyState
         $first = Get-VegaConfigKeySnapshot -Text $original -Keys @('sunshine_name', 'address_family')
-        $state = Add-VegaStateManagedKeys -State $state -Path $path -Snapshot $first
+        $state = Add-VegaStateManagedKey -State $state -Path $path -Snapshot $first
 
         # 模拟重跑：配置已经被 Vega 改过，重跑不能把基线刷新成 Vega 自己的值
         $changed = "sunshine_name = Vega`naddress_family = both"
         $second = Get-VegaConfigKeySnapshot -Text $changed -Keys @('sunshine_name', 'address_family')
-        $state = Add-VegaStateManagedKeys -State $state -Path $path -Snapshot $second
+        $state = Add-VegaStateManagedKey -State $state -Path $path -Snapshot $second
 
         $records = @(Get-VegaStateManagedKey -State $state -Path $path)
         $records.Count | Should -Be 2
