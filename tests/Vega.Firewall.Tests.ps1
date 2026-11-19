@@ -327,7 +327,7 @@ Describe 'Set-VegaAdminBlockRule' {
         Mock -ModuleName $script:ModuleName Get-NetFirewallRule { $null }
         Mock -ModuleName $script:ModuleName New-NetFirewallRule { }
         Mock -ModuleName $script:ModuleName Set-NetFirewallRule { }
-        Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter {
+        Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter -RemoveParameterType AssociatedNetFirewallRule {
             [pscustomobject]@{ LocalPort = @('47990'); Protocol = 'TCP' }
         }
         Mock -ModuleName $script:ModuleName Remove-VegaFirewallRuleByName { $true }
@@ -340,7 +340,7 @@ Describe 'Set-VegaAdminBlockRule' {
             if ($Name -ne 'Vega-Block-Admin') { return }
             [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound' }
         }
-        Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter {
+        Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter -RemoveParameterType AssociatedNetFirewallRule {
             [pscustomobject]@{ LocalPort = @('47991'); Protocol = 'TCP' }
         }
 
@@ -412,7 +412,7 @@ Describe 'Set-VegaAdminBlockRule' {
             if ($Name -ne 'Vega-Block-Admin') { return }
             [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound' }
         }
-        Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter {
+        Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter -RemoveParameterType AssociatedNetFirewallRule {
             [pscustomobject]@{ LocalPort = @('47990'); Protocol = 'UDP' }
         }
         { Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false } | Should -Throw '*协议不是 TCP*'
@@ -460,7 +460,7 @@ Describe 'Set-VegaAdminBlockRule' {
             if ($Name -ne 'Vega-Block-Admin') { return }
             [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound' }
         }
-        Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter {
+        Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter -RemoveParameterType AssociatedNetFirewallRule {
             [pscustomobject]@{ LocalPort = @('47990'); Protocol = 'TCP' }
         }
 
@@ -475,7 +475,7 @@ Describe 'Set-VegaAdminBlockRule' {
             if ($Name -ne 'Vega-Block-Admin') { return }
             [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block'; Direction = 'Inbound' }
         }
-        Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter { $null }
+        Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter -RemoveParameterType AssociatedNetFirewallRule { $null }
 
         { Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false } | Should -Throw '*端口过滤器*'
     }
@@ -538,7 +538,7 @@ Describe 'Set-VegaFirewallRule 回读' {
             $null = $PolicyStore
             [pscustomobject]@{ Name = $Name; Enabled = 'True'; Action = 'Allow' }
         }
-        Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter {
+        Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter -RemoveParameterType AssociatedNetFirewallRule {
             param($AssociatedNetFirewallRule)
             if ($AssociatedNetFirewallRule.Name -eq 'Vega-Sunshine-TCP') {
                 [pscustomobject]@{ LocalPort = @('47984', '47989', '48010') }
@@ -560,7 +560,7 @@ Describe 'Set-VegaFirewallRule 回读' {
             $null = $PolicyStore
             [pscustomobject]@{ Name = $Name; Enabled = 'True'; Action = 'Allow' }
         }
-        Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter {
+        Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter -RemoveParameterType AssociatedNetFirewallRule {
             [pscustomobject]@{ LocalPort = @('47984') }
         }
 
@@ -573,7 +573,7 @@ Describe 'Set-VegaFirewallRule 回读' {
             $null = $PolicyStore
             [pscustomobject]@{ Name = $Name; Enabled = 'False'; Action = 'Allow' }
         }
-        Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter {
+        Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter -RemoveParameterType AssociatedNetFirewallRule {
             [pscustomobject]@{ LocalPort = @('Any') }
         }
 

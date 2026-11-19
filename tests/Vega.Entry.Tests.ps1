@@ -302,14 +302,14 @@ Describe 'Invoke-VegaHostInstall（mock）' {
             param($ManagementPorts, $BasePort, [switch]$IncludeDefaultManagementPort)
             $null = $ManagementPorts
             $null = $BasePort
-            if ($IncludeDefaultManagementPort) { Add-Content -LiteralPath $env:VEGA_TEST_BLOCK_LOG -Value 'pre' }
-            else { Add-Content -LiteralPath $env:VEGA_TEST_BLOCK_LOG -Value 'final' }
+            if ($IncludeDefaultManagementPort) { Add-Content -LiteralPath $env:VEGA_TEST_BLOCK_LOG -Encoding UTF8 -Value 'pre' }
+            else { Add-Content -LiteralPath $env:VEGA_TEST_BLOCK_LOG -Encoding UTF8 -Value 'final' }
             @(47990)
         }
 
         try {
             $null = Invoke-VegaHostInstall -StatePath $script:statePath -TemplatePath $script:TemplatePath -SkipTailscale
-            $log = @(Get-Content -LiteralPath $env:VEGA_TEST_BLOCK_LOG)
+            $log = @(Get-Content -LiteralPath $env:VEGA_TEST_BLOCK_LOG -Encoding UTF8)
             $log | Should -Be @('pre', 'final')
         }
         finally {
@@ -349,7 +349,7 @@ Describe 'Invoke-VegaHostInstall（mock）' {
             param($Program, $BasePort, $OnRuleCreated)
             $null = $Program
             $null = $BasePort
-            Add-Content -LiteralPath $env:VEGA_TEST_ORDER_LOG -Value 'allow'
+            Add-Content -LiteralPath $env:VEGA_TEST_ORDER_LOG -Encoding UTF8 -Value 'allow'
             if ($null -ne $OnRuleCreated) {
                 & $OnRuleCreated 'Vega-Sunshine-TCP'
                 & $OnRuleCreated 'Vega-Sunshine-UDP'
@@ -358,14 +358,14 @@ Describe 'Invoke-VegaHostInstall（mock）' {
         }
         Mock -ModuleName $script:ModuleName Protect-VegaSunshineManagementPort {
             param($State)
-            Add-Content -LiteralPath $env:VEGA_TEST_ORDER_LOG -Value 'protect'
+            Add-Content -LiteralPath $env:VEGA_TEST_ORDER_LOG -Encoding UTF8 -Value 'protect'
             $State
         }
 
         try {
             $result = Invoke-VegaHostInstall -StatePath $script:statePath -TemplatePath $script:TemplatePath -SkipTailscale
             $result.ExitCode | Should -Be 0
-            $log = @(Get-Content -LiteralPath $env:VEGA_TEST_ORDER_LOG)
+            $log = @(Get-Content -LiteralPath $env:VEGA_TEST_ORDER_LOG -Encoding UTF8)
             $log | Should -Be @('allow', 'protect')
         }
         finally {
@@ -437,12 +437,12 @@ Describe 'Invoke-VegaHostUninstall（mock）' {
 
     It '只按清单回滚：按键恢复配置、删 Vega 规则、恢复安装器规则与服务' {
         $original = "sunshine_name = OldName`nuser_key = keep"
-        Set-Content -LiteralPath $script:configPath -Value $original -NoNewline
+        Set-Content -LiteralPath $script:configPath -Encoding UTF8 -Value $original -NoNewline
         $installed = Merge-VegaSunshineConfigText -ExistingText $original -Values ([ordered]@{
                 sunshine_name  = 'Vega'
                 address_family = 'both'
             })
-        Set-Content -LiteralPath $script:configPath -Value $installed -NoNewline
+        Set-Content -LiteralPath $script:configPath -Encoding UTF8 -Value $installed -NoNewline
 
         $state = Get-VegaEmptyState
         $state = Add-VegaStatePackage -State $state -PackageId 'LizardByte.Sunshine' -Name 'Sunshine'
@@ -457,7 +457,7 @@ Describe 'Invoke-VegaHostUninstall（mock）' {
         $result = Invoke-VegaHostUninstall -StatePath $script:statePath -RemoveApps -Confirm:$false
 
         $result.ExitCode | Should -Be 0
-        $text = Get-Content -LiteralPath $script:configPath -Raw
+        $text = Get-Content -LiteralPath $script:configPath -Encoding UTF8 -Raw
         $text | Should -Match '(?m)^sunshine_name = OldName$'
         $text | Should -Not -Match 'address_family'
         $text | Should -Match '(?m)^user_key = keep$'
@@ -471,7 +471,7 @@ Describe 'Invoke-VegaHostUninstall（mock）' {
     }
 
     It '没加 -RemoveApps 时保留组件待办清单，不删除整个清单' {
-        Set-Content -LiteralPath $script:configPath -Value 'sunshine_name = Vega' -NoNewline
+        Set-Content -LiteralPath $script:configPath -Encoding UTF8 -Value 'sunshine_name = Vega' -NoNewline
 
         $state = Get-VegaEmptyState
         $state = Add-VegaStatePackage -State $state -PackageId 'LizardByte.Sunshine' -Name 'Sunshine'
@@ -551,12 +551,12 @@ Describe 'Invoke-VegaHostUninstall（mock）' {
 Describe 'Write-VegaLegacyStateWarning' {
     It '检测到旧清单时返回 true，且不读取内容' {
         $path = Join-Path $TestDrive 'legacy-state.json'
-        Set-Content -LiteralPath $path -Value '{ 这不是合法 JSON' -NoNewline
+        Set-Content -LiteralPath $path -Encoding UTF8 -Value '{ 这不是合法 JSON' -NoNewline
 
         Write-VegaLegacyStateWarning -Path $path | Should -BeTrue
 
         # 只判断存在，不解析、不改写
-        (Get-Content -LiteralPath $path -Raw) | Should -Be '{ 这不是合法 JSON'
+        (Get-Content -LiteralPath $path -Encoding UTF8 -Raw) | Should -Be '{ 这不是合法 JSON'
     }
 
     It '没有旧清单时返回 false' {
@@ -568,7 +568,7 @@ Describe '受管键基线（重跑不覆盖，卸载按键回滚）' {
     It '重跑只保留第一次的值，回滚时只动受管键' {
         $path = Join-Path $TestDrive 'managed.conf'
         $original = "sunshine_name = OldName`nport = 48000"
-        Set-Content -LiteralPath $path -Value $original -NoNewline
+        Set-Content -LiteralPath $path -Encoding UTF8 -Value $original -NoNewline
 
         $state = Get-VegaEmptyState
         $first = Get-VegaConfigKeySnapshot -Text $original -Keys @('sunshine_name', 'address_family')
@@ -585,12 +585,12 @@ Describe '受管键基线（重跑不覆盖，卸载按键回滚）' {
         ($records | Where-Object { $_.Key -eq 'address_family' }).Existed | Should -BeFalse
 
         $installed = "sunshine_name = Vega`naddress_family = both`nuser_key = keep"
-        Set-Content -LiteralPath $path -Value $installed -NoNewline
+        Set-Content -LiteralPath $path -Encoding UTF8 -Value $installed -NoNewline
 
         $restore = Restore-VegaManagedConfig -Path $path -Records $records -Confirm:$false
         $restore.Restored | Should -BeTrue
 
-        $text = Get-Content -LiteralPath $path -Raw
+        $text = Get-Content -LiteralPath $path -Encoding UTF8 -Raw
         $text | Should -Match '(?m)^sunshine_name = OldName$'
         $text | Should -Not -Match 'address_family'
         $text | Should -Match '(?m)^user_key = keep$'

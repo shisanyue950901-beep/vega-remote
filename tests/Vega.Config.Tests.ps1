@@ -184,7 +184,7 @@ Describe 'Set-VegaSunshineConfig' {
         $path = Join-Path $TestDrive 'sunshine.conf'
         $null = Set-VegaSunshineConfig -Path $path -Content 'adapter_name = test' -Confirm:$false
 
-        (Get-Content -LiteralPath $path -Raw) | Should -Be 'adapter_name = test'
+        (Get-Content -LiteralPath $path -Encoding UTF8 -Raw) | Should -Be 'adapter_name = test'
         Test-Path -LiteralPath "$path.bak" | Should -BeFalse
 
         $bytes = [System.IO.File]::ReadAllBytes($path)
@@ -201,7 +201,7 @@ Describe 'Set-VegaSunshineConfig' {
         $null = Set-VegaSunshineConfig -Path $path -Content 'a = 1' -Confirm:$false
         $null = Set-VegaSunshineConfig -Path $path -Content 'a = 2' -Confirm:$false
 
-        (Get-Content -LiteralPath $path -Raw) | Should -Be 'a = 2'
+        (Get-Content -LiteralPath $path -Encoding UTF8 -Raw) | Should -Be 'a = 2'
         @(Get-ChildItem -LiteralPath $directory -Filter '.vega-tmp-*').Count | Should -Be 0
     }
 
@@ -238,25 +238,25 @@ Describe 'Restore-VegaManagedConfig' {
             'sunshine_name = OldName',
             'pairing_file = D:\Sunshine\pairs.dat'
         ) -join "`n"
-        Set-Content -LiteralPath $path -Value $original -NoNewline
+        Set-Content -LiteralPath $path -Encoding UTF8 -Value $original -NoNewline
 
         $snapshot = Get-VegaConfigKeySnapshot -Text $original -Keys @('sunshine_name', 'address_family')
         $installed = Merge-VegaSunshineConfigText -ExistingText $original -Values ([ordered]@{
                 sunshine_name  = 'Vega'
                 address_family = 'both'
             })
-        Set-Content -LiteralPath $path -Value $installed -NoNewline
+        Set-Content -LiteralPath $path -Encoding UTF8 -Value $installed -NoNewline
 
         # 安装后用户又自己加了一个键
         $userText = $installed + "custom_key = 1`n"
-        Set-Content -LiteralPath $path -Value $userText -NoNewline
+        Set-Content -LiteralPath $path -Encoding UTF8 -Value $userText -NoNewline
 
         $result = Restore-VegaManagedConfig -Path $path -Records @($snapshot['sunshine_name'], $snapshot['address_family']) -Confirm:$false
 
         $result.Restored | Should -BeTrue
         $result.Changed | Should -BeTrue
 
-        $text = Get-Content -LiteralPath $path -Raw
+        $text = Get-Content -LiteralPath $path -Encoding UTF8 -Raw
         $text | Should -Match '(?m)^sunshine_name = OldName$'
         $text | Should -Not -Match 'address_family'
         $text | Should -Match '(?m)^pairing_file = D:\\Sunshine\\pairs\.dat$'
@@ -267,14 +267,14 @@ Describe 'Restore-VegaManagedConfig' {
 
     It '受管键本来就是原值时报告未变更' {
         $path = Join-Path $TestDrive 'nochange.conf'
-        Set-Content -LiteralPath $path -Value "sunshine_name = OldName`n" -NoNewline
+        Set-Content -LiteralPath $path -Encoding UTF8 -Value "sunshine_name = OldName`n" -NoNewline
 
         $snapshot = Get-VegaConfigKeySnapshot -Text "sunshine_name = OldName`n" -Keys @('sunshine_name')
         $result = Restore-VegaManagedConfig -Path $path -Records @($snapshot['sunshine_name']) -Confirm:$false
 
         $result.Restored | Should -BeTrue
         $result.Changed | Should -BeFalse
-        (Get-Content -LiteralPath $path -Raw) | Should -Be "sunshine_name = OldName`n"
+        (Get-Content -LiteralPath $path -Encoding UTF8 -Raw) | Should -Be "sunshine_name = OldName`n"
     }
 
     It '配置不存在时返回未回滚' {

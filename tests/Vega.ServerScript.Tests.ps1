@@ -8,8 +8,8 @@ BeforeAll {
     $root = Join-Path (Join-Path $PSScriptRoot '..') 'server'
     $script:ServerScriptPath = Join-Path $root 'setup-rustdesk-server.sh'
     $script:ComposePath = Join-Path $root 'docker-compose.yml'
-    $script:ServerScript = Get-Content -LiteralPath $script:ServerScriptPath -Raw
-    $script:Compose = Get-Content -LiteralPath $script:ComposePath -Raw
+    $script:ServerScript = Get-Content -LiteralPath $script:ServerScriptPath -Encoding UTF8 -Raw
+    $script:Compose = Get-Content -LiteralPath $script:ComposePath -Encoding UTF8 -Raw
 }
 
 Describe 'RustDesk 部署脚本：只支持全新部署' {
