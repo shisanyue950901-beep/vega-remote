@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  powershell:
+    name: PSScriptAnalyzer + Pester (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 PSScriptAnalyzer 与 Pester 5
+        shell: pwsh
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -MinimumVersion 1.21.0
+          Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.5.0 -SkipPublisherCheck
+
+      - name: PSScriptAnalyzer（Error / Warning）
+        shell: pwsh
+        run: |
+          $results = @(Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1)
+          if ($results.Count -gt 0) {
+            $results | Sort-Object ScriptName, Line | Format-Table RuleName, Severity, ScriptName, Line, Message -AutoSize | Out-String -Width 200 | Write-Host
+            throw "PSScriptAnalyzer 发现 $($results.Count) 个问题"
+          }
+          Write-Host 'PSScriptAnalyzer 通过'
+
+      - name: Pester（PowerShell 7）
+        shell: pwsh
+        run: |
+          $config = New-PesterConfiguration
+          $config.Run.Path = './tests'
+          $config.Run.Exit = $true
+          $config.Output.Verbosity = 'Detailed'
+          Invoke-Pester -Configuration $config
+
+      - name: Pester（Windows PowerShell 5.1 兼容性）
+        shell: powershell
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          if (-not (Get-Module -ListAvailable Pester | Where-Object { $_.Version -ge [version]'5.5.0' })) {
+            Install-Module Pester -Force -Scope CurrentUser -MinimumVersion 5.5.0 -SkipPublisherCheck
+          }
+          $config = New-PesterConfiguration
+          $config.Run.Path = './tests'
+          $config.Run.Exit = $true
+          $config.Output.Verbosity = 'Normal'
+          Invoke-Pester -Configuration $config
+
+  shell:
+    name: shellcheck + compose config (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: shellcheck server/setup-rustdesk-server.sh
+
+      - name: docker compose config
+        run: docker compose -f server/docker-compose.yml config
