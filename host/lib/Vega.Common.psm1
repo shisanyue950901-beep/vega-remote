@@ -4163,10 +4163,42 @@ function Get-VegaTomlLineEnding {
     return ''
 }
 
+function Test-VegaTomlQuotedDottedKey {
+    <#
+      内部辅助：这一行是否是“带引号段的点分键”且涉及受管表 options。
+      例子："options".key = 1、'options'.key = 1、options."key" = 1、options.'key' = 1。
+      这类写法当前按键定位文本区间时无法安全定位（引号里的点、引号段的边界都会错位），
+      写前必须中止。纯点分键（options.key）没有引号段，不在此列。
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Line
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Line)) { return $false }
+
+    # 键 = 一到多个“引号段或裸段”，段之间用点连接；段内部允许包含点（引号内）。
+    $pattern = '^[ \t]*(?<key>(?:"(?:[^"\\]|\\.)*"|''[^'']*''|[A-Za-z0-9_-]+)(?:[ \t]*\.[ \t]*(?:"(?:[^"\\]|\\.)*"|''[^'']*''|[A-Za-z0-9_-]+))+)[ \t]*='
+    if ($Line -cnotmatch $pattern) { return $false }
+
+    $key = [string]$Matches['key']
+    if ($key -cnotmatch '["'']') { return $false }
+
+    foreach ($match in [regex]::Matches($key, '"(?:[^"\\]|\\.)*"|''[^'']*''|[A-Za-z0-9_-]+')) {
+        $name = ConvertFrom-VegaTomlString -Value $match.Value
+        if ($name -ceq 'options') { return $true }
+    }
+
+    return $false
+}
+
 function Test-VegaRustDeskConfigUnsupported {
     <#
       内部辅助：写前检测当前解析器不支持的 TOML 结构。
-      引号键（"key" / 'key'）或引号表头（["options"]）返回原因文本，否则返回空串。
+      引号键（"key" / 'key'）、引号表头（["options"]）、
+      涉及 options 的引号点分键（"options".key / options."key"）返回原因文本，否则返回空串。
     #>
     [CmdletBinding()]
     param(
@@ -4181,6 +4213,8 @@ function Test-VegaRustDeskConfigUnsupported {
     foreach ($rawLine in @(Split-VegaTomlLine -Text $Text)) {
         $line = Get-VegaTomlLineContent -Line $rawLine
         if ($line -match '^[ \t]*\[[ \t]*["'']') { return '引号表头' }
+        # 根级或任意段里出现带引号段的点分键：可能就是在改受管表 options，定位不可靠。
+        if (Test-VegaTomlQuotedDottedKey -Line $line) { return '引号点分键' }
         if ($line -cmatch '^[ \t]*\[(?<name>[^\]]+)\][ \t]*(?:#.*)?$') {
             $section = ([string]$Matches['name']).Trim()
             continue
@@ -4440,11 +4474,39 @@ function Get-VegaRustDeskConfigSummary {
 
     $read = {
         param([string]$ConfigPath)
-        $exists = Test-Path -LiteralPath $ConfigPath -PathType Leaf
+        $exists = $false
         $server = ''
         $relay = ''
         $errorText = ''
-        if ($exists) {
+
+        # 探测本身也会失败（权限、路径不可达、句柄被占用）：用 -ErrorAction Stop 包住，
+        # 只有明确的 ItemNotFound 才算“文件不存在”，其他错误一律按读取失败上报原因。
+        try {
+            $probe = Get-Item -LiteralPath $ConfigPath -Force -ErrorAction Stop
+            if ($null -eq $probe) {
+                $errorText = "读取失败：$ConfigPath 探测结果为空"
+            }
+            elseif ([bool]$probe.PSIsContainer) {
+                $errorText = "读取失败：$ConfigPath 是目录，不是配置文件"
+            }
+            else {
+                $exists = $true
+            }
+        }
+        catch {
+            $notFound = ($_.Exception -is [System.Management.Automation.ItemNotFoundException]) -or
+                ([string]$_.FullyQualifiedErrorId -match 'ItemNotFound') -or
+                ($_.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::ObjectNotFound)
+            if ($notFound) {
+                $exists = $false
+            }
+            else {
+                $exists = $true
+                $errorText = "读取失败：$($_.Exception.Message)"
+            }
+        }
+
+        if ($exists -and [string]::IsNullOrEmpty($errorText)) {
             try {
                 $text = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 -ErrorAction Stop
                 $values = ConvertFrom-VegaRustDeskConfigText -Text $text
@@ -4456,7 +4518,7 @@ function Get-VegaRustDeskConfigSummary {
                 }
             }
             catch {
-                $errorText = $_.Exception.Message
+                $errorText = "读取失败：$($_.Exception.Message)"
             }
         }
         return [pscustomobject]@{ Exists = $exists; Server = $server; Relay = $relay; Error = $errorText }
