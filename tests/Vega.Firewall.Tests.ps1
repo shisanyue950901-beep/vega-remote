@@ -109,3 +109,158 @@ Describe 'Select-VegaSunshineInstallerFirewallRule' {
         @(Select-VegaSunshineInstallerFirewallRule -Rules $null).Count | Should -Be 0
     }
 }
+
+Describe 'Test-VegaManagementPortConflict' {
+    It '默认端口算出的管理端口不与串流放行端口相交' {
+        @(Test-VegaManagementPortConflict -ManagementPorts @(47990)).Count | Should -Be 0
+    }
+
+    It '管理端口落进串流放行端口时报告冲突' {
+        # port = 47995 时 TCP 放行 47990（HTTPS），再阻断 47990 就自相矛盾
+        @(Test-VegaManagementPortConflict -ManagementPorts @(47990) -BasePort 47995) | Should -Contain 47990
+    }
+
+    It '空输入返回空数组' {
+        @(Test-VegaManagementPortConflict -ManagementPorts @()).Count | Should -Be 0
+    }
+}
+
+Describe 'Set-VegaAdminBlockRule' {
+    BeforeAll {
+        $script:ModuleName = 'Vega.Common'
+        $module = Get-Module $script:ModuleName
+        # Windows 专有 cmdlet 在 Linux 上不存在，先塞同名 stub 再 Mock；
+        # Windows 上本来就有，跳过。
+        $stubs = @{
+            'Get-NetFirewallRule'       = {
+                [CmdletBinding()]
+                param([string]$Name, [string]$Direction, [string]$Action)
+                $null = $Name, $Direction, $Action
+            }
+            'New-NetFirewallRule'       = {
+                [CmdletBinding()]
+                param($Name, $DisplayName, $Direction, $Action, $Protocol, $LocalPort,
+                    $Profile, $Program, $Enabled, $Description)
+                $null = $Name, $DisplayName, $Direction, $Action, $Protocol, $LocalPort,
+                $Profile, $Program, $Enabled, $Description
+            }
+            'Set-NetFirewallRule'       = {
+                [CmdletBinding()]
+                param([string]$Name, $Enabled, $Action)
+                $null = $Name, $Enabled, $Action
+            }
+            'Set-NetFirewallPortFilter' = {
+                [CmdletBinding()]
+                param($AssociatedNetFirewallRule, [string]$Protocol, [string[]]$LocalPort)
+                $null = $AssociatedNetFirewallRule, $Protocol, $LocalPort
+            }
+            'Get-NetFirewallPortFilter' = {
+                [CmdletBinding()]
+                param($AssociatedNetFirewallRule)
+                $null = $AssociatedNetFirewallRule
+            }
+        }
+        foreach ($stubName in $stubs.Keys) {
+            if (Get-Command -Name $stubName -ErrorAction SilentlyContinue) { continue }
+            $stubBody = $stubs[$stubName]
+            & $module {
+                param($name, $body)
+                New-Item -Path ("function:script:{0}" -f $name) -Value $body -Force | Out-Null
+            } $stubName $stubBody
+        }
+    }
+
+    BeforeEach {
+        Mock -ModuleName $script:ModuleName Get-NetFirewallRule { $null }
+        Mock -ModuleName $script:ModuleName New-NetFirewallRule { }
+        Mock -ModuleName $script:ModuleName Set-NetFirewallRule { }
+        Mock -ModuleName $script:ModuleName Set-NetFirewallPortFilter { }
+        Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter {
+            [pscustomobject]@{ LocalPort = @('47990') }
+        }
+        Mock -ModuleName $script:ModuleName Remove-VegaFirewallRuleByName { $true }
+    }
+
+    It '规则已存在时原地更新端口，绝不删除也不重建' {
+        Mock -ModuleName $script:ModuleName Get-NetFirewallRule {
+            param($Name)
+            if ($Name -ne 'Vega-Block-Admin') { return }
+            [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block' }
+        }
+        # 更新生效后的端口过滤器
+        Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter {
+            [pscustomobject]@{ LocalPort = @('47991') }
+        }
+
+        $name = Set-VegaAdminBlockRule -ManagementPorts @(47991) -Confirm:$false
+
+        $name | Should -Be 'Vega-Block-Admin'
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Remove-VegaFirewallRuleByName -Times 0 -Exactly
+        Should -Invoke -ModuleName $script:ModuleName -CommandName New-NetFirewallRule -Times 0 -Exactly
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Set-NetFirewallRule -Times 1 -Exactly `
+            -ParameterFilter { $Action -eq 'Block' -and $Enabled -eq 'True' }
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Set-NetFirewallPortFilter -Times 1 -Exactly `
+            -ParameterFilter { $LocalPort -contains '47991' -and $Protocol -eq 'TCP' }
+    }
+
+    It '规则不存在时才创建，并回读校验端口' {
+        $name = Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false
+
+        $name | Should -Be 'Vega-Block-Admin'
+        Should -Invoke -ModuleName $script:ModuleName -CommandName New-NetFirewallRule -Times 1 -Exactly `
+            -ParameterFilter { $Action -eq 'Block' -and $Protocol -eq 'TCP' -and $Enabled -eq 'True' }
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Set-NetFirewallRule -Times 0 -Exactly
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Set-NetFirewallPortFilter -Times 0 -Exactly
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Remove-VegaFirewallRuleByName -Times 0 -Exactly
+    }
+
+    It '回读发现 Enabled/Action 不对时抛异常，且不删除已有阻断' {
+        Mock -ModuleName $script:ModuleName Get-NetFirewallRule {
+            param($Name)
+            if ($Name -ne 'Vega-Block-Admin') { return }
+            # 回读到一个被停用的规则
+            [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'False'; Action = 'Block' }
+        }
+
+        { Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false } | Should -Throw '*状态异常*'
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Remove-VegaFirewallRuleByName -Times 0 -Exactly
+    }
+
+    It '回读发现端口没覆盖时抛异常' {
+        Mock -ModuleName $script:ModuleName Get-NetFirewallRule {
+            param($Name)
+            if ($Name -ne 'Vega-Block-Admin') { return }
+            [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block' }
+        }
+        # 更新写成功了但过滤器没生效：回读必须发现端口缺失
+        Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter {
+            [pscustomobject]@{ LocalPort = @('47990') }
+        }
+
+        { Set-VegaAdminBlockRule -ManagementPorts @(47990, 47991) -Confirm:$false } | Should -Throw '*未覆盖端口 47991*'
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Remove-VegaFirewallRuleByName -Times 0 -Exactly
+    }
+
+    It '回读不到端口过滤器时抛异常' {
+        Mock -ModuleName $script:ModuleName Get-NetFirewallRule {
+            param($Name)
+            if ($Name -ne 'Vega-Block-Admin') { return }
+            [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block' }
+        }
+        Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter { $null }
+
+        { Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false } | Should -Throw '*端口过滤器*'
+    }
+
+    It '更新失败时不删除已有阻断，直接抛异常中止安装' {
+        Mock -ModuleName $script:ModuleName Get-NetFirewallRule {
+            param($Name)
+            if ($Name -ne 'Vega-Block-Admin') { return }
+            [pscustomobject]@{ Name = 'Vega-Block-Admin'; Enabled = 'True'; Action = 'Block' }
+        }
+        Mock -ModuleName $script:ModuleName Set-NetFirewallRule { throw '拒绝访问' }
+
+        { Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false } | Should -Throw '*更新管理端口阻断规则*'
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Remove-VegaFirewallRuleByName -Times 0 -Exactly
+    }
+}

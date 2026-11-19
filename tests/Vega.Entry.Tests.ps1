@@ -92,6 +92,11 @@ Describe 'Invoke-VegaHostInstall（mock）' {
         Mock -ModuleName $script:ModuleName Get-VegaSunshineService {
             [pscustomobject]@{ Name = 'SunshineService'; Status = 'Running'; StartType = 'Automatic' }
         }
+        # 安装前的服务基线（与安装后的状态不同，便于断言采集时机）
+        Mock -ModuleName $script:ModuleName Get-VegaSunshineServiceSnapshot {
+            @([pscustomobject]@{ Name = 'SunshineService'; StartType = 'Manual'; Status = 'Stopped' })
+        }
+        Mock -ModuleName $script:ModuleName Write-VegaLegacyStateWarning { $false }
         Mock -ModuleName $script:ModuleName Restart-VegaSunshineService {
             [pscustomobject]@{ Found = $true; Name = 'SunshineService'; Status = 'Running'; Success = $true; Error = '' }
         }
@@ -139,6 +144,62 @@ Describe 'Invoke-VegaHostInstall（mock）' {
         $names | Should -Contain 'Vega-Sunshine-TCP'
         $names | Should -Contain 'Vega-Sunshine-UDP'
         $names | Should -Contain 'Vega-Block-Admin'
+    }
+
+    It '管理端口与串流放行端口相交时中止安装，不建阻断规则' {
+        Mock -ModuleName $script:ModuleName Get-VegaSunshineInstall { $script:sunshine }
+        Mock -ModuleName $script:ModuleName Test-VegaManagementPortConflict { @(47990) }
+        Mock -ModuleName $script:ModuleName Install-VegaPackage { throw '不该被调用' }
+
+        $result = Invoke-VegaHostInstall -StatePath $script:statePath -TemplatePath $script:TemplatePath -SkipTailscale
+
+        $result.ExitCode | Should -Be 1
+        ($result.Failures -join "`n") | Should -Match 'port'
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Set-VegaAdminBlockRule -Times 0 -Exactly
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Install-VegaPackage -Times 0 -Exactly
+    }
+
+    It '服务基线在 winget 安装之前采集' {
+        Mock -ModuleName $script:ModuleName Get-VegaSunshineInstall { $script:sunshine }
+        # Mock 体在模块作用域执行，看不到测试变量；用环境变量把清单路径传进去，
+        # 安装那一刻回读清单：服务基线必须已经写好了。
+        $env:VEGA_TEST_STATE_PATH = $script:statePath
+        Mock -ModuleName $script:ModuleName Install-VegaPackage {
+            param($PackageId, $DisplayName, [switch]$Force)
+            $null = $DisplayName
+            $null = $Force
+            $duringInstall = Read-VegaState -Path $env:VEGA_TEST_STATE_PATH
+            if (@($duringInstall.Services).Count -eq 0) { throw '安装时还没有服务基线' }
+            [pscustomobject]@{ PackageId = $PackageId; Installed = $true; PreExisting = $false }
+        }
+
+        try {
+            $result = Invoke-VegaHostInstall -StatePath $script:statePath -TemplatePath $script:TemplatePath -SkipTailscale
+            $result.ExitCode | Should -Be 0
+        }
+        finally {
+            Remove-Item Env:VEGA_TEST_STATE_PATH -ErrorAction SilentlyContinue
+        }
+
+        # 记录的是安装前的 Manual/Stopped，而不是安装后服务自己的 Automatic/Running
+        $state = Read-VegaState -Path $script:statePath
+        $entry = @($state.Services | Where-Object { $_.Name -eq 'SunshineService' })[0]
+        $entry.OriginalStartType | Should -Be 'Manual'
+        $entry.OriginalStatus | Should -Be 'Stopped'
+    }
+
+    It '检测到旧版清单时打印警告' {
+        Mock -ModuleName $script:ModuleName Get-VegaSunshineInstall { $script:sunshine }
+        Mock -ModuleName $script:ModuleName Install-VegaPackage {
+            param($PackageId, $DisplayName, [switch]$Force)
+            $null = $DisplayName
+            $null = $Force
+            [pscustomobject]@{ PackageId = $PackageId; Installed = $true; PreExisting = $false }
+        }
+
+        $null = Invoke-VegaHostInstall -StatePath $script:statePath -TemplatePath $script:TemplatePath -SkipTailscale
+
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Write-VegaLegacyStateWarning -Times 1 -Exactly
     }
 
     It '-Force 重装已存在的包时仍登记为 PreExisting，-RemoveApps 不会卸载它' {
@@ -203,6 +264,7 @@ Describe 'Invoke-VegaHostUninstall（mock）' {
         }
         Mock -ModuleName $script:ModuleName Test-VegaWingetAvailable { $true }
         Mock -ModuleName $script:ModuleName Uninstall-VegaPackage { $true }
+        Mock -ModuleName $script:ModuleName Write-VegaLegacyStateWarning { $false }
     }
 
     It '只按清单回滚：按键恢复配置、删 Vega 规则、恢复安装器规则与服务' {
@@ -283,6 +345,54 @@ Describe 'Invoke-VegaHostUninstall（mock）' {
         Should -Invoke -ModuleName $script:ModuleName -CommandName Remove-VegaFirewallRuleByName -Times 0 -Exactly `
             -ParameterFilter { $Name -eq 'Evil-Rule' }
         Test-Path -LiteralPath $script:statePath | Should -BeTrue
+    }
+
+    It '已标记 Restored 的服务卸载时跳过' {
+        $state = Get-VegaEmptyState
+        $state = Add-VegaStateService -State $state -Name 'SunshineService' -StartType 'Manual' -Status 'Running'
+        $state = Set-VegaStateServiceRestored -State $state -Name 'SunshineService' -Confirm:$false
+        $null = Write-VegaState -State $state -Path $script:statePath -Confirm:$false
+
+        $result = Invoke-VegaHostUninstall -StatePath $script:statePath -Confirm:$false
+
+        $result.ExitCode | Should -Be 0
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Restore-VegaSunshineServiceState -Times 0 -Exactly
+    }
+
+    It '安装前不存在的服务卸载时不恢复' {
+        $state = Get-VegaEmptyState
+        $state = Add-VegaStateService -State $state -Name 'SunshineService' -StartType 'NotPresent' -Status 'NotPresent'
+        $null = Write-VegaState -State $state -Path $script:statePath -Confirm:$false
+
+        $result = Invoke-VegaHostUninstall -StatePath $script:statePath -Confirm:$false
+
+        $result.ExitCode | Should -Be 0
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Restore-VegaSunshineServiceState -Times 0 -Exactly
+    }
+
+    It '卸载时也检查旧版清单并警告' {
+        $state = Get-VegaEmptyState
+        $null = Write-VegaState -State $state -Path $script:statePath -Confirm:$false
+
+        $null = Invoke-VegaHostUninstall -StatePath $script:statePath -Confirm:$false
+
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Write-VegaLegacyStateWarning -Times 1 -Exactly
+    }
+}
+
+Describe 'Write-VegaLegacyStateWarning' {
+    It '检测到旧清单时返回 true，且不读取内容' {
+        $path = Join-Path $TestDrive 'legacy-state.json'
+        Set-Content -LiteralPath $path -Value '{ 这不是合法 JSON' -NoNewline
+
+        Write-VegaLegacyStateWarning -Path $path | Should -BeTrue
+
+        # 只判断存在，不解析、不改写
+        (Get-Content -LiteralPath $path -Raw) | Should -Be '{ 这不是合法 JSON'
+    }
+
+    It '没有旧清单时返回 false' {
+        Write-VegaLegacyStateWarning -Path (Join-Path $TestDrive 'no-legacy.json') | Should -BeFalse
     }
 }
 
