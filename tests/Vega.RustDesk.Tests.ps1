@@ -171,7 +171,7 @@ Describe 'Set-VegaRustDeskConfig / Restore-VegaRustDeskConfig' {
     }
 
     It '写入当前用户配置，并把三个键的基线记进清单' {
-        $path = Join-Path $TestDrive 'user/RustDesk2.toml'
+        $path = Join-Path $TestDrive 'user/RustDesk/config/RustDesk2.toml'
         $statePath = Join-Path $TestDrive 'rustdesk-state.json'
         $state = Get-VegaEmptyState
 
@@ -192,7 +192,7 @@ Describe 'Set-VegaRustDeskConfig / Restore-VegaRustDeskConfig' {
     }
 
     It '重跑不覆盖首次基线，卸载只恢复 Vega 改过的键' {
-        $path = Join-Path $TestDrive 'restore/RustDesk2.toml'
+        $path = Join-Path $TestDrive 'restore/RustDesk/config/RustDesk2.toml'
         $statePath = Join-Path $TestDrive 'restore-state.json'
         $null = New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force
         $original = "[options]`ncustom-rendezvous-server = `"old.example.com`"`nother = `"keep`"`n"
@@ -229,6 +229,10 @@ Describe 'Set-VegaRustDeskConfig / Restore-VegaRustDeskConfig' {
 }
 
 Describe 'Format-VegaRustDeskId / Get-VegaRustDeskDeviceId' {
+    BeforeEach {
+        Mock -ModuleName $script:ModuleName Test-VegaProcessElevated { $false }
+    }
+
     It '9 位设备码按 3-3-3 分组，其他格式原样' {
         Format-VegaRustDeskId -DeviceId '123456789' | Should -Be '123-456-789'
         Format-VegaRustDeskId -DeviceId '123-456-789' | Should -Be '123-456-789'
@@ -481,7 +485,7 @@ password = "should-not-touch"
 
     It '服务模式记录只写管理员清单，用户清单只保留当前用户路径' {
         $userPath = Join-Path $TestDrive 'svc/user/RustDesk/config/RustDesk2.toml'
-        $servicePath = Join-Path $TestDrive 'svc/service/RustDesk2.toml'
+        $servicePath = Join-Path $TestDrive 'svc/service/RustDesk/config/RustDesk2.toml'
         $clientStatePath = Join-Path $TestDrive 'svc/client-state.json'
         $serviceStatePath = Join-Path $TestDrive 'svc/admin/state.json'
         $null = New-Item -ItemType Directory -Path (Split-Path -Parent $userPath) -Force
@@ -561,5 +565,201 @@ custom-rendezvous-server = "current.example.com"
         $record = @($result.State.RustDeskConfigKeys | Where-Object { $_.Key -eq 'custom-rendezvous-server' })[0]
         $record.OriginalValue | Should -Be 'current.example.com'
         [bool]$record.Restored | Should -BeFalse
+    }
+}
+
+Describe 'P1-2 用户/服务配置路径逐级拒绝重解析点' {
+    BeforeEach {
+        Mock -ModuleName $script:ModuleName Get-Service { $null }
+    }
+
+    It '用户配置的 RustDesk 上级目录是重解析点时中止写入' {
+        $path = Join-Path $TestDrive 'join-user/RustDesk/config/RustDesk2.toml'
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force
+        Mock -ModuleName $script:ModuleName Test-VegaReparsePoint { param($Path) $Path -like '*join-user*' }
+
+        { Set-VegaRustDeskConfig -Server 'relay.example.com' -Key ('A' * 43 + '=') `
+                -State (Get-VegaEmptyState) -StatePath (Join-Path $TestDrive 'join-state.json') `
+                -UserConfigPath $path -Confirm:$false } | Should -Throw '*重解析点*'
+        Test-Path -LiteralPath $path | Should -BeFalse
+    }
+
+    It '服务配置路径含重解析点时只警告并跳过，不写服务配置' {
+        $userPath = Join-Path $TestDrive 'join-ok/RustDesk/config/RustDesk2.toml'
+        $servicePath = Join-Path $TestDrive 'join-service/RustDesk/config/RustDesk2.toml'
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $servicePath) -Force
+        Mock -ModuleName $script:ModuleName Get-Service { [pscustomobject]@{ Name = 'RustDesk'; Status = 'Running' } }
+        Mock -ModuleName $script:ModuleName Test-VegaReparsePoint { param($Path) $Path -like '*join-service*' }
+
+        $result = Set-VegaRustDeskConfig -Server 'relay.example.com' -Key ('B' * 43 + '=') `
+            -State (Get-VegaEmptyState) -StatePath (Join-Path $TestDrive 'join-ok-state.json') `
+            -UserConfigPath $userPath -ServiceConfigPath $servicePath `
+            -ServiceStatePath (Join-Path $TestDrive 'join-svc-state.json') -Confirm:$false
+
+        Test-Path -LiteralPath $userPath | Should -BeTrue
+        Test-Path -LiteralPath $servicePath | Should -BeFalse
+        ($result.Warnings -join "`n") | Should -Match '重解析点'
+    }
+}
+
+Describe 'P2-4 TOML 保留缩进与逐行换行，引号结构写前中止' {
+    It '保留行首缩进与每行原有换行符（允许混合）' {
+        $existing = "  custom-rendezvous-server = `"old`"  # 注释`r`nrelay-server = `"old:21117`"`n"
+        $result = Merge-VegaRustDeskConfigText -ExistingText $existing -Values ([ordered]@{
+                'custom-rendezvous-server' = 'new.example.com'
+            })
+
+        $result | Should -Match '(?m)^  custom-rendezvous-server = "new\.example\.com"  # 注释\r$'
+        $result.Contains("  custom-rendezvous-server = `"new.example.com`"  # 注释`r`n") | Should -BeTrue
+        $result.Contains("relay-server = `"old:21117`"`n") | Should -BeTrue
+        # 第一行仍是 CRLF，第二行仍是 LF，没有被统一
+        $result.Contains("old:21117`"`r`n") | Should -BeFalse
+    }
+
+    It '引号键与引号表头在写前中止' {
+        { Merge-VegaRustDeskConfigText -ExistingText "[options]`n`"key`" = `"x`"`n" -Values ([ordered]@{ key = 'y' }) } |
+            Should -Throw '*引号键*'
+        { Merge-VegaRustDeskConfigText -ExistingText "[\"options\"]`nkey = `"x`"`n" -Values ([ordered]@{ key = 'y' }) } |
+            Should -Throw '*引号表头*'
+        { Merge-VegaRustDeskConfigText -ExistingText "[options]`n'key' = `"x`"`n" -Values ([ordered]@{ key = 'y' }) } |
+            Should -Throw '*引号键*'
+    }
+
+    It 'Set 遇到引号键时不改文件' {
+        $path = Join-Path $TestDrive 'quoted/RustDesk/config/RustDesk2.toml'
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force
+        $original = "[options]`n`"custom-rendezvous-server`" = `"old`"`n"
+        Set-Content -LiteralPath $path -Value $original -Encoding UTF8 -NoNewline
+
+        { Set-VegaRustDeskConfig -Server 'relay.example.com' -Key ('C' * 43 + '=') `
+                -State (Get-VegaEmptyState) -StatePath (Join-Path $TestDrive 'quoted-state.json') `
+                -UserConfigPath $path -Confirm:$false } | Should -Throw '*引号键*'
+        (Get-Content -LiteralPath $path -Raw -Encoding UTF8) | Should -Be $original
+    }
+}
+
+Describe 'P2-5 回滚按 Ordinal 比较文本' {
+    It '仅大小写变化的公钥仍会被恢复' {
+        $path = Join-Path $TestDrive 'case/RustDesk/config/RustDesk2.toml'
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force
+        Set-Content -LiteralPath $path -Encoding UTF8 -NoNewline -Value "[options]`nkey = `"abc`"`n"
+
+        $records = @([pscustomobject]@{ Key = 'key'; Existed = $true; OriginalValue = 'ABC'; Restored = $false })
+        $result = Restore-VegaRustDeskConfig -Path $path -Records $records -Confirm:$false
+        $result.Changed | Should -BeTrue
+        (Get-Content -LiteralPath $path -Raw -Encoding UTF8) | Should -Match '(?m)^key = "ABC"$'
+    }
+}
+
+Describe 'P2-6 旧 schema 服务清单先归档' {
+    It '旧清单复制为 state.v0.1.bak.json，已存在时加时间戳' {
+        $path = Join-Path $TestDrive 'legacy/state.json'
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force
+        $legacy = '{"Packages":[{"Name":"Old"}],"FirewallRules":[]}'
+        Set-Content -LiteralPath $path -Value $legacy -Encoding UTF8 -NoNewline
+
+        Test-VegaLegacyStateFile -Path $path | Should -BeTrue
+        $first = Backup-VegaLegacyStateFile -Path $path
+        (Split-Path -Leaf $first) | Should -Be 'state.v0.1.bak.json'
+        (Get-Content -LiteralPath $first -Raw -Encoding UTF8) | Should -Be $legacy
+
+        $second = Backup-VegaLegacyStateFile -Path $path
+        $second | Should -Not -Be $first
+        (Split-Path -Leaf $second) | Should -Match '^state\.v0\.1\.bak\..+\.json$'
+        (Get-Content -LiteralPath $second -Raw -Encoding UTF8) | Should -Be $legacy
+    }
+
+    It 'Write-VegaState 写新清单前先归档同名 v0.1 文件' {
+        $path = Join-Path $TestDrive 'legacy-write/state.json'
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force
+        Set-Content -LiteralPath $path -Value '{"Packages":[]}' -Encoding UTF8 -NoNewline
+        Mock -ModuleName $script:ModuleName Test-VegaManagedServiceStatePath { $true }
+
+        $state = Get-VegaEmptyState
+        $state.Packages = @([pscustomobject]@{ Name = 'Vega'; InstalledByVega = $true })
+        Write-VegaState -State $state -Path $path -Confirm:$false
+
+        Test-Path -LiteralPath (Join-Path (Split-Path -Parent $path) 'state.v0.1.bak.json') | Should -BeTrue
+        (Read-VegaState -Path $path).SchemaVersion | Should -Be 2
+        @((Read-VegaState -Path $path).Packages).Count | Should -Be 1
+    }
+}
+
+Describe 'P1-3 / P3-2 提权设备码统一校验' {
+    BeforeEach {
+        $script:OriginalProgramFiles = $env:ProgramFiles
+        $script:OriginalProgramFilesX86 = ${env:ProgramFiles(x86)}
+        $script:PfRoot = Join-Path $TestDrive 'PFDevice'
+        $env:ProgramFiles = $script:PfRoot
+        ${env:ProgramFiles(x86)} = ''
+        $script:PfExe = Join-Path (Join-Path $script:PfRoot 'RustDesk') 'rustdesk.exe'
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $script:PfExe) -Force
+        Set-Content -LiteralPath $script:PfExe -Value 'stub' -Encoding UTF8
+        $script:UserExe = Join-Path $TestDrive 'user-device/rustdesk.exe'
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $script:UserExe) -Force
+        Set-Content -LiteralPath $script:UserExe -Value 'stub' -Encoding UTF8
+    }
+
+    AfterEach {
+        $env:ProgramFiles = $script:OriginalProgramFiles
+        ${env:ProgramFiles(x86)} = $script:OriginalProgramFilesX86
+    }
+
+    It '提权时拒绝显式传入的用户目录副本并说明原因' {
+        Mock -ModuleName $script:ModuleName Test-VegaProcessElevated { $true }
+        Mock -ModuleName $script:ModuleName Test-VegaRustDeskSignatureValid { $true }
+        Mock -ModuleName $script:ModuleName Invoke-VegaCommand { throw '不应执行' }
+
+        $result = Get-VegaRustDeskDeviceId -Exe $script:UserExe
+        $result.Success | Should -BeFalse
+        $result.Error | Should -Match 'Program Files 之外'
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Invoke-VegaCommand -Times 0 -Exactly
+    }
+
+    It '提权时拒绝签名无效的 Program Files 副本' {
+        Mock -ModuleName $script:ModuleName Test-VegaProcessElevated { $true }
+        Mock -ModuleName $script:ModuleName Test-VegaRustDeskSignatureValid { $false }
+
+        $result = Get-VegaRustDeskDeviceId -Exe $script:PfExe
+        $result.Success | Should -BeFalse
+        $result.Error | Should -Match '签名无效'
+    }
+
+    It '提权时未传路径只查找签名有效的 Program Files 副本' {
+        Mock -ModuleName $script:ModuleName Test-VegaProcessElevated { $true }
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { $script:PfExe }
+        Mock -ModuleName $script:ModuleName Test-VegaRustDeskSignatureValid { $true }
+        Mock -ModuleName $script:ModuleName Invoke-VegaCommand {
+            [pscustomobject]@{ FilePath = 'rustdesk.exe'; ExitCode = 0; Output = @('123 456 789'); StdOut = @('123 456 789'); StdErr = @(); TimedOut = $false }
+        }
+
+        $result = Get-VegaRustDeskDeviceId
+        $result.Success | Should -BeTrue
+        $result.DeviceId | Should -Be '123456789'
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Get-VegaRustDeskInstall -Times 1 -Exactly -ParameterFilter { $RequireSigned -eq $true }
+    }
+
+    It '提权已找到签名副本但 --get-id 失败时显示原因' {
+        Mock -ModuleName $script:ModuleName Set-VegaRustDeskConfig {
+            [pscustomobject]@{ Applied = @(); Warnings = @(); ServicePresent = $false; Values = @{}; State = $null }
+        }
+        Mock -ModuleName $script:ModuleName Restart-VegaRustDeskService {
+            [pscustomobject]@{ Found = $false; Restarted = $false; Status = ''; Message = '跳过重启' }
+        }
+        Mock -ModuleName $script:ModuleName Write-VegaStatus { }
+        Mock -ModuleName $script:ModuleName Test-VegaProcessElevated { $true }
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { $script:PfExe }
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskDeviceId {
+            [pscustomobject]@{ Success = $false; DeviceId = ''; RawOutput = @(); Error = 'rustdesk --get-id 退出码 1' }
+        }
+
+        $result = Invoke-VegaRustDeskSetup -Settings ([pscustomobject]@{ Server = 'relay.example.com'; RelayServer = 'relay.example.com:21117'; Key = ('A' * 43 + '=') })
+        ($result.Warnings -join "`n") | Should -Match '退出码 1'
+    }
+
+    It 'vega-doctor 提权时也走签名查找' {
+        $scriptText = Get-Content -LiteralPath (Join-Path (Join-Path $PSScriptRoot '..') 'tools/vega-doctor.ps1') -Raw -Encoding UTF8
+        $scriptText | Should -Match 'Test-VegaProcessElevated'
+        $scriptText | Should -Match 'Get-VegaRustDeskInstall -RequireSigned'
     }
 }

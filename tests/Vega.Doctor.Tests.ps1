@@ -296,3 +296,81 @@ Describe 'Get-VegaDoctorAdvice 服务模式优先' {
         $text | Should -Match 'RustDesk 中继配置正确'
     }
 }
+
+Describe 'P3-1 doctor 分别比较 ID 与 relay，区分不存在与读取失败' {
+    It 'Get-VegaRustDeskConfigSummary 返回 relay 字段' {
+        $userPath = Join-Path $TestDrive 'relay-user/RustDesk2.toml'
+        $servicePath = Join-Path $TestDrive 'relay-service/RustDesk2.toml'
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $userPath) -Force
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $servicePath) -Force
+        Set-Content -LiteralPath $userPath -Encoding UTF8 -Value "[options]`ncustom-rendezvous-server = `"user.example.com`"`nrelay-server = `"user.example.com:21117`""
+        Set-Content -LiteralPath $servicePath -Encoding UTF8 -Value "[options]`ncustom-rendezvous-server = `"svc.example.com`"`nrelay-server = `"svc.example.com:21117`""
+
+        $summary = Get-VegaRustDeskConfigSummary -UserConfigPath $userPath -ServiceConfigPath $servicePath -ServicePresent
+        $summary.UserRelay | Should -Be 'user.example.com:21117'
+        $summary.ServiceRelay | Should -Be 'svc.example.com:21117'
+        $summary.UserError | Should -Be ''
+        $summary.ServiceError | Should -Be ''
+    }
+
+    It '文件不存在时 Exists=false 且 Error 为空，读取失败时 Error 有原因' {
+        $missing = Join-Path $TestDrive 'no-such/RustDesk2.toml'
+        $broken = Join-Path $TestDrive 'broken/RustDesk2.toml'
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $broken) -Force
+        Set-Content -LiteralPath $broken -Encoding UTF8 -Value '[options]'
+        Mock -ModuleName 'Vega.Common' Get-Content { throw '拒绝访问' } -ParameterFilter { $LiteralPath -like '*broken*' }
+
+        $summary = Get-VegaRustDeskConfigSummary -UserConfigPath $missing -ServiceConfigPath $broken -ServicePresent
+        $summary.UserExists | Should -BeFalse
+        $summary.UserError | Should -Be ''
+        $summary.ServiceExists | Should -BeTrue
+        $summary.ServiceError | Should -Match '拒绝访问'
+    }
+
+    It 'relay 指向不一致时给出独立告警，而不是判定配置正确' {
+        $advice = @(Get-VegaDoctorAdvice -Facts @{
+                SunshineInstalled      = $true
+                SunshineRunning        = $true
+                Encoder                = 'NVENC'
+                MissingFirewallRules   = @()
+                Ipv6                   = @('2001:db8::1')
+                TailscaleInstalled     = $true
+                RustDeskExpectedServer = 'relay.example.com'
+                RustDeskExpectedRelay  = 'relay.example.com:21117'
+                RustDeskTomlServer     = 'relay.example.com'
+                RustDeskTomlRelay      = 'other.example.com:21117'
+                RustDeskDeviceId       = '123456789'
+            })
+
+        $text = $advice -join "`n"
+        $text | Should -Match 'relay-server'
+        $text | Should -Match 'other\.example\.com:21117'
+        $text | Should -Not -Match 'RustDesk 中继配置正确'
+    }
+
+    It 'ID 与 relay 都一致时才判定正确' {
+        $advice = @(Get-VegaDoctorAdvice -Facts @{
+                SunshineInstalled      = $true
+                SunshineRunning        = $true
+                Encoder                = 'NVENC'
+                MissingFirewallRules   = @()
+                Ipv6                   = @('2001:db8::1')
+                TailscaleInstalled     = $true
+                RustDeskExpectedServer = 'relay.example.com'
+                RustDeskExpectedRelay  = 'relay.example.com:21117'
+                RustDeskTomlServer     = 'relay.example.com'
+                RustDeskTomlRelay      = 'relay.example.com:21117'
+                RustDeskDeviceId       = '123456789'
+            })
+
+        ($advice -join "`n") | Should -Match 'RustDesk 中继配置正确'
+    }
+
+    It 'vega-doctor 脚本分别打印 ID 与 relay，并显示读取失败原因' {
+        $scriptText = Get-Content -LiteralPath (Join-Path (Join-Path $PSScriptRoot '..') 'tools/vega-doctor.ps1') -Raw -Encoding UTF8
+        $scriptText | Should -Match 'relay-server'
+        $scriptText | Should -Match 'UserError'
+        $scriptText | Should -Match 'ServiceError'
+        $scriptText | Should -Match '配置读取失败'
+    }
+}

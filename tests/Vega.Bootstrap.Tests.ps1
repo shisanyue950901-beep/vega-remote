@@ -87,7 +87,7 @@ Describe 'P2-2 资产文件名取 AbsolutePath 末段' {
     }
 
     It 'URL 解码后只允许安全字符，错误信息只用脱敏 URL' {
-        Get-VegaBootstrapAssetName -Uri 'https://example.com/a%20b.zip' | Should -Be 'a b.zip'
+        Get-VegaBootstrapAssetName -Uri 'https://example.com/a%2Db.zip' | Should -Be 'a-b.zip'
 
         $record = $null
         try { Get-VegaBootstrapAssetName -Uri 'https://example.com/..%2fevil.zip?token=SECRET' }
