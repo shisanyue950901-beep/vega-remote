@@ -392,8 +392,14 @@ Describe 'P2-1 带 ACL 建目录按运行时分支' {
     }
 
     It '两个重载各自按正确参数顺序调用' {
-        $script:ScriptText | Should -Match [regex]::Escape('[System.IO.FileSystemAclExtensions]::CreateDirectory($Security, $Path)')
-        $script:ScriptText | Should -Match [regex]::Escape('[System.IO.Directory]::CreateDirectory($Path, $security)')
+        # 参数顺序是这两个分支唯一的行为差异（mock 只能看到命名参数，看不到位置顺序），
+        # 所以对调用形式做字面量断言。用字符串包含而不是正则，避免
+        # [regex]::Escape(...) 在参数模式下被当成裸字符串、断言退化成匹配
+        # '[regex]::Escape' 这个字面量而必然失败。
+        $aclExtensionsCall = '[System.IO.FileSystemAclExtensions]::CreateDirectory($Security, $Path)'
+        $legacyCall = '[System.IO.Directory]::CreateDirectory($Path, $security)'
+        $script:ScriptText.Contains($aclExtensionsCall) | Should -BeTrue
+        $script:ScriptText.Contains($legacyCall) | Should -BeTrue
         $script:ScriptText | Should -Match 'Test-VegaBootstrapAclExtensionsAvailable'
     }
 }
