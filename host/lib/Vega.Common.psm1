@@ -299,6 +299,7 @@ function Select-VegaAdapter {
         [Parameter(Mandatory)]
         [AllowNull()]
         [AllowEmptyCollection()]
+        [AllowEmptyString()]
         [string[]]$GpuNames,
 
         [switch]$SkipVirtual
