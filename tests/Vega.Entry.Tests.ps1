@@ -1,9 +1,10 @@
 ﻿#Requires -Version 5.1
 <#
   入口级 mock 测试（Pester 5）：
-    - winget 安装失败反映到退出码、不写半截状态
-    - 卸载只按状态清单回滚，配置被用户改过时报冲突
-    - 安装时的配置合并保留用户自己加的键
+    - 被控端 / 主控端安装、卸载入口的退出码
+    - 状态清单白名单拒绝（不碰清单以外的对象）
+    - 受管键首次基线不被重跑覆盖，卸载按键回滚并保留用户键
+    - -Force 重装前仍查询，已存在的包登记为 PreExisting
   所有系统命令都被 Mock，不会真的调用 winget / 防火墙 / 服务。
 #>
 
@@ -20,20 +21,34 @@ BeforeAll {
     $stubs = @{
         'Get-CimInstance' = {
             [CmdletBinding()]
-            param(
-                [Parameter(Position = 0)]
-                [string]$ClassName
-            )
+            param([Parameter(Position = 0)][string]$ClassName)
             $null = $ClassName
+        }
+        'Get-Service'     = {
+            [CmdletBinding()]
+            param([Parameter(Position = 0)][string[]]$Name)
+            $null = $Name
+        }
+        'Set-Service'     = {
+            [CmdletBinding()]
+            param([string]$Name, [string]$StartupType)
+            $null = $Name
+            $null = $StartupType
+        }
+        'Start-Service'   = {
+            [CmdletBinding()]
+            param([string[]]$Name)
+            $null = $Name
         }
         'Stop-Service'    = {
             [CmdletBinding()]
-            param(
-                [Parameter(Position = 0)]
-                [string[]]$Name,
-
-                [switch]$Force
-            )
+            param([string[]]$Name, [switch]$Force)
+            $null = $Name
+            $null = $Force
+        }
+        'Restart-Service' = {
+            [CmdletBinding()]
+            param([string[]]$Name, [switch]$Force)
             $null = $Name
             $null = $Force
         }
@@ -50,47 +65,26 @@ BeforeAll {
 
 Describe 'Invoke-VegaHostInstall（mock）' {
     BeforeEach {
-        $script:statePath = Join-Path $TestDrive 'state.json'
+        $script:statePath = Join-Path $TestDrive 'host-state.json'
         $script:sunshineDir = Join-Path $TestDrive 'Sunshine'
         $null = New-Item -ItemType Directory -Path (Join-Path $script:sunshineDir 'config') -Force
-        $null = New-Item -ItemType File -Path (Join-Path $script:sunshineDir 'sunshine.exe') -Force
+        $script:sunshineExe = Join-Path $script:sunshineDir 'sunshine.exe'
+        $script:sunshineConfig = Join-Path (Join-Path $script:sunshineDir 'config') 'sunshine.conf'
+        $null = New-Item -ItemType File -Path $script:sunshineExe -Force
 
         $script:sunshine = [pscustomobject]@{
             Directory = $script:sunshineDir
-            Exe       = (Join-Path $script:sunshineDir 'sunshine.exe')
-            Config    = (Join-Path (Join-Path $script:sunshineDir 'config') 'sunshine.conf')
+            Exe       = $script:sunshineExe
+            Config    = $script:sunshineConfig
             Version   = '2026.1'
         }
-    }
 
-    It 'winget 安装 Sunshine 失败时退出码为 1，且不留下状态清单' {
         Mock -ModuleName $script:ModuleName Test-VegaWingetAvailable { $true }
-        Mock -ModuleName $script:ModuleName Get-VegaSunshineInstall { $null }
-        Mock -ModuleName $script:ModuleName Install-VegaPackage { throw '安装 Sunshine 失败（winget 退出码 1603）' }
-
-        $result = Invoke-VegaHostInstall -StatePath $script:statePath -TemplatePath $script:TemplatePath -SkipTailscale
-
-        $result.ExitCode | Should -Be 1
-        ($result.Failures -join "`n") | Should -Match '1603'
-        Test-Path -LiteralPath $script:statePath | Should -BeFalse
-    }
-
-    It 'Tailscale 安装失败时仍配置好 Sunshine，但退出码为 1' {
-        Mock -ModuleName $script:ModuleName Test-VegaWingetAvailable { $true }
-        Mock -ModuleName $script:ModuleName Get-VegaSunshineInstall { $script:sunshine }
-        Mock -ModuleName $script:ModuleName Install-VegaPackage {
-            param($PackageId, $DisplayName, [switch]$Force)
-            # -Force 只是为了让 mock 的签名和真实命令对上
-            $null = $Force
-            if ($PackageId -eq 'Tailscale.Tailscale') { throw "安装 $DisplayName 失败（winget 退出码 1603）" }
-            return $true
-        }
-        Mock -ModuleName $script:ModuleName Get-VegaSunshineInstallerFirewallRule { @() }
-        Mock -ModuleName $script:ModuleName Get-CimInstance {
-            [pscustomobject]@{ Name = 'NVIDIA GeForce RTX 4070' }
-        }
+        Mock -ModuleName $script:ModuleName Remove-VegaLegacyFirewallRule { @() }
+        Mock -ModuleName $script:ModuleName Set-VegaAdminBlockRule { 'Vega-Block-Admin' }
+        Mock -ModuleName $script:ModuleName Protect-VegaSunshineManagementPort { param($State) $State }
+        Mock -ModuleName $script:ModuleName Get-CimInstance { [pscustomobject]@{ Name = 'GPU' } }
         Mock -ModuleName $script:ModuleName Get-VegaPowerCfgPath { $null }
-        Mock -ModuleName $script:ModuleName Set-VegaFirewallRule { 2 }
         Mock -ModuleName $script:ModuleName Get-VegaSunshineService {
             [pscustomobject]@{ Name = 'SunshineService'; Status = 'Running'; StartType = 'Automatic' }
         }
@@ -98,100 +92,262 @@ Describe 'Invoke-VegaHostInstall（mock）' {
             [pscustomobject]@{ Found = $true; Name = 'SunshineService'; Status = 'Running'; Success = $true; Error = '' }
         }
         Mock -ModuleName $script:ModuleName Get-VegaPublicIPv6 { @() }
+        Mock -ModuleName $script:ModuleName Set-VegaFirewallRule {
+            param($Program, $BasePort, $OnRuleCreated)
+            $null = $Program
+            $null = $BasePort
+            if ($null -ne $OnRuleCreated) {
+                & $OnRuleCreated 'Vega-Sunshine-TCP'
+                & $OnRuleCreated 'Vega-Sunshine-UDP'
+            }
+            return @('Vega-Sunshine-TCP', 'Vega-Sunshine-UDP')
+        }
+    }
 
-        # 用户原来的配置：自定义端口与凭据路径必须保留
-        $existing = @(
-            'port = 48000',
-            'credentials_file = C:\secret\creds.json',
-            'sunshine_name = MyMachine'
-        ) -join "`n"
-        Set-Content -LiteralPath $script:sunshine.Config -Value $existing -NoNewline
+    It 'winget 安装失败时退出码为 1，并保留已记录的管理端口阻断规则' {
+        Mock -ModuleName $script:ModuleName Get-VegaSunshineInstall { $null }
+        Mock -ModuleName $script:ModuleName Install-VegaPackage { throw '安装 Sunshine 失败（winget 退出码 1603）' }
 
-        $result = Invoke-VegaHostInstall -StatePath $script:statePath -TemplatePath $script:TemplatePath
+        $result = Invoke-VegaHostInstall -StatePath $script:statePath -TemplatePath $script:TemplatePath -SkipTailscale
 
         $result.ExitCode | Should -Be 1
-        ($result.Failures -join "`n") | Should -Match 'Tailscale'
+        ($result.Failures -join "`n") | Should -Match '1603'
 
-        $merged = Get-Content -LiteralPath $script:sunshine.Config -Raw
-        $merged | Should -Match 'port = 48000'
-        $merged | Should -Match 'credentials_file = C:\\secret\\creds\.json'
-        $merged | Should -Match 'sunshine_name = Vega'
-        $merged | Should -Match 'adapter_name = NVIDIA GeForce RTX 4070'
-        $merged | Should -Match 'address_family = both'
-        $merged | Should -Match 'origin_web_ui_allowed = pc'
-
-        Test-Path -LiteralPath $script:statePath | Should -BeTrue
+        # 阻断规则是安装前建的，已经写进清单，必须留着供卸载清理
         $state = Read-VegaState -Path $script:statePath
-        (Test-VegaStatePackage -State $state -PackageId 'LizardByte.Sunshine') | Should -BeTrue
+        @($state.FirewallRules | ForEach-Object { $_.Name }) | Should -Contain 'Vega-Block-Admin'
+    }
+
+    It '安装成功后退出码为 0，防火墙规则逐条进清单' {
+        Mock -ModuleName $script:ModuleName Get-VegaSunshineInstall { $script:sunshine }
+        Mock -ModuleName $script:ModuleName Install-VegaPackage {
+            param($PackageId, $DisplayName, [switch]$Force)
+            $null = $DisplayName
+            $null = $Force
+            [pscustomobject]@{ PackageId = $PackageId; Installed = $true; PreExisting = $false }
+        }
+
+        $result = Invoke-VegaHostInstall -StatePath $script:statePath -TemplatePath $script:TemplatePath -SkipTailscale
+
+        $result.ExitCode | Should -Be 0
+        $state = Read-VegaState -Path $script:statePath
+        $names = @($state.FirewallRules | ForEach-Object { $_.Name })
+        $names | Should -Contain 'Vega-Sunshine-TCP'
+        $names | Should -Contain 'Vega-Sunshine-UDP'
+        $names | Should -Contain 'Vega-Block-Admin'
+    }
+
+    It '-Force 重装已存在的包时仍登记为 PreExisting，-RemoveApps 不会卸载它' {
+        Mock -ModuleName $script:ModuleName Get-VegaSunshineInstall { $script:sunshine }
+        Mock -ModuleName $script:ModuleName Install-VegaPackage {
+            param($PackageId, $DisplayName, [switch]$Force)
+            $null = $DisplayName
+            $null = $Force
+            [pscustomobject]@{ PackageId = $PackageId; Installed = $true; PreExisting = $true }
+        }
+
+        $installed = Invoke-VegaHostInstall -StatePath $script:statePath -TemplatePath $script:TemplatePath -SkipTailscale -Force
+        $installed.ExitCode | Should -Be 0
+
+        $state = Read-VegaState -Path $script:statePath
+        $package = @($state.Packages | Where-Object { $_.PackageId -eq 'LizardByte.Sunshine' })[0]
+        $package.InstalledByVega | Should -BeFalse
+
+        Mock -ModuleName $script:ModuleName Remove-VegaFirewallRuleByName { $true }
+        Mock -ModuleName $script:ModuleName Enable-VegaSunshineInstallerFirewallRule { @('Sunshine') }
+        Mock -ModuleName $script:ModuleName Restore-VegaSunshineServiceState {
+            [pscustomobject]@{ Success = $true; Message = 'ok' }
+        }
+        Mock -ModuleName $script:ModuleName Uninstall-VegaPackage { $true }
+
+        $removed = Invoke-VegaHostUninstall -StatePath $script:statePath -RemoveApps -Confirm:$false
+        $removed.ExitCode | Should -Be 0
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Uninstall-VegaPackage -Times 0 -Exactly
     }
 }
 
 Describe 'Invoke-VegaHostUninstall（mock）' {
     BeforeEach {
         $script:statePath = Join-Path $TestDrive 'uninstall-state.json'
-        $script:configPath = Join-Path $TestDrive 'config/sunshine.conf'
-        $null = New-Item -ItemType Directory -Path (Join-Path $TestDrive 'config') -Force
+        $script:sunshineDir = Join-Path $TestDrive 'Sunshine'
+        $script:configDir = Join-Path $script:sunshineDir 'config'
+        $script:configPath = Join-Path $script:configDir 'sunshine.conf'
+        $null = New-Item -ItemType Directory -Path $script:configDir -Force
+        $script:sunshineExe = Join-Path $script:sunshineDir 'sunshine.exe'
+        $null = New-Item -ItemType File -Path $script:sunshineExe -Force
 
-        Set-Content -LiteralPath $script:configPath -Value 'original config' -NoNewline
-        $written = Set-VegaSunshineConfig -Path $script:configPath -Content 'managed config' -Confirm:$false
+        $script:sunshine = [pscustomobject]@{
+            Directory = $script:sunshineDir
+            Exe       = $script:sunshineExe
+            Config    = $script:configPath
+            Version   = '2026.1'
+        }
+
+        Mock -ModuleName $script:ModuleName Get-VegaSunshineInstall { $script:sunshine }
+        Mock -ModuleName $script:ModuleName Remove-VegaLegacyFirewallRule { @() }
+        Mock -ModuleName $script:ModuleName Remove-VegaFirewallRuleByName { $true }
+        Mock -ModuleName $script:ModuleName Enable-VegaSunshineInstallerFirewallRule { @('Sunshine') }
+        Mock -ModuleName $script:ModuleName Restore-VegaSunshineServiceState {
+            param($Name, $StartType, $OriginalStatus)
+            $null = $Name
+            $null = $StartType
+            $null = $OriginalStatus
+            [pscustomobject]@{ Success = $true; Message = 'ok' }
+        }
+        Mock -ModuleName $script:ModuleName Test-VegaWingetAvailable { $true }
+        Mock -ModuleName $script:ModuleName Uninstall-VegaPackage { $true }
+    }
+
+    It '只按清单回滚：按键恢复配置、删 Vega 规则、恢复安装器规则与服务' {
+        $original = "sunshine_name = OldName`nuser_key = keep"
+        Set-Content -LiteralPath $script:configPath -Value $original -NoNewline
+        $installed = Merge-VegaSunshineConfigText -ExistingText $original -Values ([ordered]@{
+                sunshine_name  = 'Vega'
+                address_family = 'both'
+            })
+        Set-Content -LiteralPath $script:configPath -Value $installed -NoNewline
 
         $state = Get-VegaEmptyState
         $state = Add-VegaStatePackage -State $state -PackageId 'LizardByte.Sunshine' -Name 'Sunshine'
-        $state = Add-VegaStatePackage -State $state -PackageId 'Tailscale.Tailscale' -Name 'Tailscale' -PreExisting
         $state = Add-VegaStateFirewallRule -State $state -Name 'Vega-Sunshine-TCP'
         $state = Add-VegaStateFirewallRule -State $state -Name 'Vega-Sunshine-UDP'
         $state = Add-VegaStateDisabledFirewallRule -State $state -Name 'Sunshine'
-        $state = Set-VegaStateServiceStartType -State $state -Name 'SunshineService' -StartType 'Manual'
-        $state = Add-VegaStateBackup -State $state -Path $script:configPath `
-            -BackupPath $written.BackupPath `
-            -OriginalExisted $true `
-            -WrittenSha256 $written.Sha256 `
-            -BackupCreated $true
+        $state = Add-VegaStateService -State $state -Name 'SunshineService' -StartType 'Manual' -Status 'Running'
+        $snapshot = Get-VegaConfigKeySnapshot -Text $original -Keys @('sunshine_name', 'address_family')
+        $state = Add-VegaStateManagedKeys -State $state -Path $script:configPath -Snapshot $snapshot
         $null = Write-VegaState -State $state -Path $script:statePath -Confirm:$false
-    }
-
-    It '只按清单回滚：恢复配置、Vega 规则、安装器规则、服务启动类型' {
-        Mock -ModuleName $script:ModuleName Remove-VegaFirewallRule { 1 }
-        Mock -ModuleName $script:ModuleName Enable-VegaSunshineInstallerFirewallRule { @('Sunshine') }
-        Mock -ModuleName $script:ModuleName Set-VegaSunshineServiceStartType { $true }
-        Mock -ModuleName $script:ModuleName Stop-Service { }
-        Mock -ModuleName $script:ModuleName Test-VegaWingetAvailable { $true }
-        Mock -ModuleName $script:ModuleName Uninstall-VegaPackage { $true }
 
         $result = Invoke-VegaHostUninstall -StatePath $script:statePath -RemoveApps -Confirm:$false
 
         $result.ExitCode | Should -Be 0
-        (Get-Content -LiteralPath $script:configPath -Raw) | Should -Be 'original config'
+        $text = Get-Content -LiteralPath $script:configPath -Raw
+        $text | Should -Match '(?m)^sunshine_name = OldName$'
+        $text | Should -Not -Match 'address_family'
+        $text | Should -Match '(?m)^user_key = keep$'
+        Test-Path -LiteralPath "$($script:configPath).bak" | Should -BeFalse
 
         Should -Invoke -ModuleName $script:ModuleName -CommandName Enable-VegaSunshineInstallerFirewallRule -Times 1 -Exactly
-        Should -Invoke -ModuleName $script:ModuleName -CommandName Set-VegaSunshineServiceStartType -Times 1 -Exactly
-
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Restore-VegaSunshineServiceState -Times 1 -Exactly `
+            -ParameterFilter { $StartType -eq 'Manual' -and $OriginalStatus -eq 'Running' }
         Should -Invoke -ModuleName $script:ModuleName -CommandName Uninstall-VegaPackage -Times 1 -Exactly
-        Should -Invoke -ModuleName $script:ModuleName -CommandName Uninstall-VegaPackage -Times 1 -Exactly `
-            -ParameterFilter { $PackageId -eq 'LizardByte.Sunshine' }
-        Should -Invoke -ModuleName $script:ModuleName -CommandName Uninstall-VegaPackage -Times 0 -Exactly `
-            -ParameterFilter { $PackageId -eq 'Tailscale.Tailscale' }
-
         Test-Path -LiteralPath $script:statePath | Should -BeFalse
     }
 
-    It '配置被用户改过时报告冲突、不覆盖，并保留备份' {
-        Set-Content -LiteralPath $script:configPath -Value 'user changed this' -NoNewline
+    It '没加 -RemoveApps 时保留组件待办清单，不删除整个清单' {
+        Set-Content -LiteralPath $script:configPath -Value 'sunshine_name = Vega' -NoNewline
 
-        Mock -ModuleName $script:ModuleName Remove-VegaFirewallRule { 1 }
-        Mock -ModuleName $script:ModuleName Enable-VegaSunshineInstallerFirewallRule { @('Sunshine') }
-        Mock -ModuleName $script:ModuleName Set-VegaSunshineServiceStartType { $true }
-        Mock -ModuleName $script:ModuleName Stop-Service { }
+        $state = Get-VegaEmptyState
+        $state = Add-VegaStatePackage -State $state -PackageId 'LizardByte.Sunshine' -Name 'Sunshine'
+        $state = Add-VegaStateFirewallRule -State $state -Name 'Vega-Sunshine-TCP'
+        $null = Write-VegaState -State $state -Path $script:statePath -Confirm:$false
 
         $result = Invoke-VegaHostUninstall -StatePath $script:statePath -Confirm:$false
 
         $result.ExitCode | Should -Be 0
-        (Get-Content -LiteralPath $script:configPath -Raw) | Should -Be 'user changed this'
-        Test-Path -LiteralPath "$($script:configPath).bak" | Should -BeTrue
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Uninstall-VegaPackage -Times 0 -Exactly
+        Test-Path -LiteralPath $script:statePath | Should -BeTrue
+    }
+
+    It '清单记录不在白名单时拒绝执行，并保留清单' {
+        $evilConfig = Join-Path (Join-Path $TestDrive 'evil') 'sunshine.conf'
+        $state = Get-VegaEmptyState
+        $state.FirewallRules = @([pscustomobject]@{ Name = 'Evil-Rule' })
+        $state.Services = @([pscustomobject]@{
+                Name = 'EvilService'; OriginalStartType = 'Automatic'; OriginalStatus = 'Running'; Restored = $false
+            })
+        $state.ManagedConfigKeys = @([pscustomobject]@{
+                Path = $evilConfig; Key = 'sunshine_name'; Existed = $false; OriginalValue = ''; Restored = $false
+            })
+        $state.Packages = @([pscustomobject]@{
+                PackageId = 'Evil.Package'; Name = 'Evil'; InstalledByVega = $true
+            })
+        $null = Write-VegaState -State $state -Path $script:statePath -Confirm:$false
+
+        Mock -ModuleName $script:ModuleName Restore-VegaManagedConfig { throw '不该被调用' }
+        Mock -ModuleName $script:ModuleName Restore-VegaSunshineServiceState { throw '不该被调用' }
+        Mock -ModuleName $script:ModuleName Uninstall-VegaPackage { throw '不该被调用' }
+
+        $result = Invoke-VegaHostUninstall -StatePath $script:statePath -RemoveApps -Confirm:$false
+
+        $result.ExitCode | Should -Be 1
+        ($result.Failures -join "`n") | Should -Match 'Evil-Rule'
+        ($result.Failures -join "`n") | Should -Match 'EvilService'
+        ($result.Failures -join "`n") | Should -Match 'Evil.Package'
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Remove-VegaFirewallRuleByName -Times 0 -Exactly `
+            -ParameterFilter { $Name -eq 'Evil-Rule' }
+        Test-Path -LiteralPath $script:statePath | Should -BeTrue
     }
 }
 
-Describe 'Invoke-VegaClientUninstall（mock）' {
+Describe '受管键基线（重跑不覆盖，卸载按键回滚）' {
+    It '重跑只保留第一次的值，回滚时只动受管键' {
+        $path = Join-Path $TestDrive 'managed.conf'
+        $original = "sunshine_name = OldName`nport = 48000"
+        Set-Content -LiteralPath $path -Value $original -NoNewline
+
+        $state = Get-VegaEmptyState
+        $first = Get-VegaConfigKeySnapshot -Text $original -Keys @('sunshine_name', 'address_family')
+        $state = Add-VegaStateManagedKeys -State $state -Path $path -Snapshot $first
+
+        # 模拟重跑：配置已经被 Vega 改过，重跑不能把基线刷新成 Vega 自己的值
+        $changed = "sunshine_name = Vega`naddress_family = both"
+        $second = Get-VegaConfigKeySnapshot -Text $changed -Keys @('sunshine_name', 'address_family')
+        $state = Add-VegaStateManagedKeys -State $state -Path $path -Snapshot $second
+
+        $records = @(Get-VegaStateManagedKey -State $state -Path $path)
+        $records.Count | Should -Be 2
+        ($records | Where-Object { $_.Key -eq 'sunshine_name' }).OriginalValue | Should -Be 'OldName'
+        ($records | Where-Object { $_.Key -eq 'address_family' }).Existed | Should -BeFalse
+
+        $installed = "sunshine_name = Vega`naddress_family = both`nuser_key = keep"
+        Set-Content -LiteralPath $path -Value $installed -NoNewline
+
+        $restore = Restore-VegaManagedConfig -Path $path -Records $records -Confirm:$false
+        $restore.Restored | Should -BeTrue
+
+        $text = Get-Content -LiteralPath $path -Raw
+        $text | Should -Match '(?m)^sunshine_name = OldName$'
+        $text | Should -Not -Match 'address_family'
+        $text | Should -Match '(?m)^user_key = keep$'
+    }
+}
+
+Describe 'Install-VegaPackage -Force' {
+    It '安装前已存在时仍返回 PreExisting，并真的执行了重装' {
+        Mock -ModuleName $script:ModuleName Get-VegaWingetPackageStatus {
+            [pscustomobject]@{ PackageId = 'LizardByte.Sunshine'; Installed = $true; Status = 'Installed'; ExitCode = 0; Error = '' }
+        }
+        Mock -ModuleName $script:ModuleName Invoke-VegaWinget {
+            [pscustomobject]@{ FilePath = 'winget.exe'; ExitCode = 0; Output = @(); StdOut = @(); StdErr = @(); TimedOut = $false }
+        }
+
+        $outcome = Install-VegaPackage -PackageId 'LizardByte.Sunshine' -DisplayName 'Sunshine' -Force -Confirm:$false
+
+        $outcome.PreExisting | Should -BeTrue
+        $outcome.Installed | Should -BeTrue
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Invoke-VegaWinget -Times 1 -Exactly
+    }
+
+    It '查询失败时抛异常，不把“查不到”当成“未安装”' {
+        Mock -ModuleName $script:ModuleName Get-VegaWingetPackageStatus {
+            [pscustomobject]@{ PackageId = 'LizardByte.Sunshine'; Installed = $false; Status = 'Failed'; ExitCode = 1; Error = 'boom' }
+        }
+
+        { Install-VegaPackage -PackageId 'LizardByte.Sunshine' -Confirm:$false } | Should -Throw
+    }
+}
+
+Describe '主控端入口（mock）' {
+    It '安装失败时退出码为 1' {
+        Mock -ModuleName $script:ModuleName Test-VegaWingetAvailable { $true }
+        Mock -ModuleName $script:ModuleName Install-VegaPackage { throw '安装 Moonlight 失败' }
+
+        $statePath = Join-Path $TestDrive 'client-install-state.json'
+        $result = Invoke-VegaClientInstall -StatePath $statePath -SkipTailscale -Confirm:$false
+
+        $result.ExitCode | Should -Be 1
+    }
+
     It '只卸载清单里由 Vega 安装的组件，用户原有的 Tailscale 不动' {
         $statePath = Join-Path $TestDrive 'client-state.json'
         $state = Get-VegaEmptyState
@@ -210,7 +366,7 @@ Describe 'Invoke-VegaClientUninstall（mock）' {
             -ParameterFilter { $PackageId -eq 'MoonlightGameStreamingProject.Moonlight' }
     }
 
-    It '没有状态清单时不动系统' {
+    It '没有状态清单时不动系统，退出码为 0' {
         $statePath = Join-Path $TestDrive 'missing-state.json'
 
         Mock -ModuleName $script:ModuleName Uninstall-VegaPackage { throw '不该被调用' }
