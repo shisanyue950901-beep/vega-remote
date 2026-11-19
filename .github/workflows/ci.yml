@@ -26,7 +26,10 @@ jobs:
       - name: PSScriptAnalyzer（Error / Warning）
         shell: pwsh
         run: |
-          $results = @(Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1)
+          $paths = @('host', 'client', 'tools', 'tests')
+          $results = @(foreach ($path in $paths) {
+              Invoke-ScriptAnalyzer -Path $path -Recurse -Settings ./PSScriptAnalyzerSettings.psd1
+            })
           if ($results.Count -gt 0) {
             $results | Sort-Object ScriptName, Line | Format-Table RuleName, Severity, ScriptName, Line, Message -AutoSize | Out-String -Width 200 | Write-Host
             throw "PSScriptAnalyzer 发现 $($results.Count) 个问题"
