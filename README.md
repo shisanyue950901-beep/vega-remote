@@ -50,6 +50,43 @@ cd server && sudo bash setup-rustdesk-server.sh
 
 脚本输出服务器地址和 Key，填到两端 RustDesk 的「ID/中继服务器」里即可。
 
+## 诊断
+
+连不上、卡顿、怀疑编码器选错时，先跑只读诊断（不安装、不修改任何系统设置，无需管理员）：
+
+```powershell
+pwsh -File .\tools\vega-doctor.ps1
+```
+
+它会列出显卡与推荐编码器（NVENC / AMF / QSV）、Sunshine 安装与服务状态、Vega 防火墙规则、公网 IPv6、Tailscale 状态，并给中文结论。
+
+检查到被控端是否直连（把 `vega-host` 换成被控端的 Tailscale 机器名）：
+
+```powershell
+pwsh -File .\tools\vega-doctor.ps1 -Peer vega-host
+```
+
+`tailscale ping -c 3` 会打进诊断输出，脚本自动判断是 `via 1.2.3.4:41641`（直连）还是 `via DERP(xxx)`（中继）。
+
+## 卸载
+
+两个安装脚本都可以反复执行：已安装的组件跳过，防火墙规则先删后建，配置只在第一次修改前备份一次。
+只想恢复原状时用 `-Uninstall`：
+
+```powershell
+# 被控端：删除 Vega 防火墙规则，恢复 sunshine.conf.bak（若存在），停止 Sunshine 服务
+Set-ExecutionPolicy -Scope Process Bypass -Force
+.\host\install-host.ps1 -Uninstall
+
+# 被控端：连组件一起卸载（winget 卸载 Sunshine / Tailscale，加 -WithRustDesk 时也卸 RustDesk）
+.\host\install-host.ps1 -Uninstall -RemoveApps
+
+# 主控端：卸载 Moonlight / Tailscale（加 -WithRustDesk 时也卸 RustDesk）
+.\client\install-client.ps1 -Uninstall -RemoveApps
+```
+
+`-Uninstall` 不会改动睡眠/电源设置，也不会删除 Sunshine 安装目录里未备份的文件；`-RemoveApps` 才会调用 winget 卸载组件。
+
 ## 推荐设置
 
 | 项目 | 建议 |
