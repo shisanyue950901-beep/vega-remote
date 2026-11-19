@@ -78,6 +78,26 @@ Describe 'Get-VegaBootstrapRelease' {
     }
 }
 
+Describe 'P2-2 资产文件名取 AbsolutePath 末段' {
+    It '镜像 URL 带查询串时资产名不含令牌，校验文件 URL 不带查询串' {
+        $release = Get-VegaBootstrapRelease -ZipUrl 'https://mirror.example.com/vega/vega-remote-0.2.0.zip?token=SECRET'
+        $release.AssetName | Should -Be 'vega-remote-0.2.0.zip'
+        $release.ChecksumUrl | Should -Be 'https://mirror.example.com/vega/SHA256SUMS.txt'
+        $release.ChecksumUrl | Should -Not -Match 'SECRET'
+    }
+
+    It 'URL 解码后只允许安全字符，错误信息只用脱敏 URL' {
+        Get-VegaBootstrapAssetName -Uri 'https://example.com/a%20b.zip' | Should -Be 'a b.zip'
+
+        $record = $null
+        try { Get-VegaBootstrapAssetName -Uri 'https://example.com/..%2fevil.zip?token=SECRET' }
+        catch { $record = $_ }
+        $record | Should -Not -BeNullOrEmpty
+        $record.Exception.Message | Should -Match '资产文件名无效'
+        $record.Exception.Message | Should -Not -Match 'SECRET'
+    }
+}
+
 Describe 'Get-VegaBootstrapSha256 / Test-VegaBootstrapChecksum' {
     It '对同一份字节算出稳定摘要' {
         $bytes = [System.Text.Encoding]::UTF8.GetBytes('payload')
@@ -173,6 +193,94 @@ Describe '受保护工作目录' {
     }
 }
 
+Describe 'P1-1 工作根创建与 ACL 校验' {
+    It '创建目录时用 DirectorySecurity 一次应用 ACL（禁用继承）' {
+        $script:ScriptText | Should -Match '\[System\.IO\.Directory\]::CreateDirectory\(\$Path, \$security\)'
+        $script:ScriptText | Should -Match '\$security\.SetAccessRuleProtection\(\$true, \$false\)'
+    }
+
+    It '写类权限掩码覆盖 Write/Delete/改权限/取得所有权' {
+        Test-VegaBootstrapWriteRights -Rights ([System.Security.AccessControl.FileSystemRights]::FullControl) | Should -BeTrue
+        Test-VegaBootstrapWriteRights -Rights ([System.Security.AccessControl.FileSystemRights]::Delete) | Should -BeTrue
+        Test-VegaBootstrapWriteRights -Rights ([System.Security.AccessControl.FileSystemRights]::ChangePermissions) | Should -BeTrue
+        Test-VegaBootstrapWriteRights -Rights ([System.Security.AccessControl.FileSystemRights]::TakeOwnership) | Should -BeTrue
+        Test-VegaBootstrapWriteRights -Rights ([System.Security.AccessControl.FileSystemRights]::WriteAttributes) | Should -BeTrue
+        Test-VegaBootstrapWriteRights -Rights ([System.Security.AccessControl.FileSystemRights]::ReadAndExecute) | Should -BeFalse
+    }
+
+    It 'ACL 校验拒绝非管理员写权限与不可信所有者' {
+        Mock Test-VegaBootstrapWindows { $true }
+        Mock Test-VegaBootstrapReparsePoint { $false }
+        Mock Get-Acl {
+            [pscustomobject]@{
+                Owner  = 'S-1-5-32-544'
+                Access = @(
+                    [pscustomobject]@{ AccessControlType = 'Allow'; IdentityReference = 'S-1-5-18'; FileSystemRights = [System.Security.AccessControl.FileSystemRights]::FullControl }
+                    [pscustomobject]@{ AccessControlType = 'Allow'; IdentityReference = 'S-1-5-32-545'; FileSystemRights = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute }
+                )
+            }
+        }
+        Test-VegaBootstrapDirectoryAclTrusted -Path $TestDrive | Should -BeTrue
+
+        Mock Get-Acl {
+            [pscustomobject]@{
+                Owner  = 'S-1-5-32-544'
+                Access = @(
+                    [pscustomobject]@{ AccessControlType = 'Allow'; IdentityReference = 'S-1-5-32-545'; FileSystemRights = [System.Security.AccessControl.FileSystemRights]::Modify }
+                )
+            }
+        }
+        Test-VegaBootstrapDirectoryAclTrusted -Path $TestDrive | Should -BeFalse
+
+        Mock Get-Acl {
+            [pscustomobject]@{
+                Owner  = 'S-1-5-21-1-2-3-1001'
+                Access = @(
+                    [pscustomobject]@{ AccessControlType = 'Allow'; IdentityReference = 'S-1-5-18'; FileSystemRights = [System.Security.AccessControl.FileSystemRights]::FullControl }
+                )
+            }
+        }
+        Test-VegaBootstrapDirectoryAclTrusted -Path $TestDrive | Should -BeFalse
+    }
+
+    It '已存在且 ACL 不可信的 %ProgramData%\Vega 中止并提示修复' {
+        $programData = Join-Path $TestDrive 'pd'
+        $vegaRoot = Join-Path $programData 'Vega'
+        $null = New-Item -ItemType Directory -Path $vegaRoot -Force
+        Mock Test-VegaBootstrapReparsePoint { $false }
+        Mock Test-VegaBootstrapDirectoryAclTrusted { $false }
+
+        { Initialize-VegaBootstrapProtectedRoot -Path $vegaRoot } | Should -Throw '*请以管理员身份删除或修复该目录后重试*'
+    }
+
+    It '%ProgramData% 本身是重解析点时中止' {
+        $script:OriginalProgramData = $env:ProgramData
+        $env:ProgramData = $TestDrive
+        try {
+            Mock Test-VegaBootstrapReparsePoint { $true }
+            { Initialize-VegaBootstrapVegaRoot } | Should -Throw '*%ProgramData%*重解析点*'
+        }
+        finally {
+            $env:ProgramData = $script:OriginalProgramData
+        }
+    }
+
+    It '解压后子目录里出现重解析点时中止' {
+        $archive = Join-Path $TestDrive 'pkg.zip'
+        Set-Content -LiteralPath $archive -Value 'stub' -Encoding UTF8
+        $destination = Join-Path $TestDrive 'extract-reparse'
+        Mock Expand-Archive { }
+        Mock Get-ChildItem {
+            [pscustomobject]@{
+                FullName   = (Join-Path $TestDrive 'extract-reparse/link')
+                Attributes = [System.IO.FileAttributes]::ReparsePoint
+            }
+        }
+        { Expand-VegaBootstrapArchive -ArchivePath $archive -DestinationPath $destination -Role 'host' } |
+            Should -Throw '*重解析点*'
+    }
+}
+
 Describe 'Invoke-VegaBootstrap' {
     BeforeEach {
         Mock Test-VegaBootstrapAdmin { $true }
@@ -240,6 +348,24 @@ Describe 'Invoke-VegaBootstrap' {
         { Invoke-VegaBootstrap -Role 'host' -ZipUrl 'http://mirror.example.com/x.zip' -WorkRoot $TestDrive -Confirm:$false } |
             Should -Throw '*只接受 https*'
         Should -Invoke Get-VegaBootstrapByteArray -Times 0 -Exactly
+    }
+
+    It '显式传入空白 -Sha256 在联网前报错' {
+        { Invoke-VegaBootstrap -Role 'host' -Sha256 '   ' -WorkRoot $TestDrive -Confirm:$false } |
+            Should -Throw '*不能为空*'
+        Should -Invoke Get-VegaBootstrapRelease -Times 0 -Exactly
+        Should -Invoke Get-VegaBootstrapByteArray -Times 0 -Exactly
+    }
+
+    It '-ApiUrl 不是 https 时在联网前报错' {
+        { Invoke-VegaBootstrap -Role 'host' -ApiUrl 'http://api.example.com/latest' -WorkRoot $TestDrive -Confirm:$false } |
+            Should -Throw '*ApiUrl 只接受 https*'
+        Should -Invoke Get-VegaBootstrapRelease -Times 0 -Exactly
+    }
+
+    It '下载最终地址校验使用 RequestMessage.RequestUri' {
+        $script:ScriptText | Should -Match 'RequestMessage\.RequestUri'
+        $script:ScriptText | Should -Match '下载被重定向到非 https 地址'
     }
 
     It '非管理员且未跳过检查时拒绝运行' {
