@@ -12,6 +12,40 @@ BeforeAll {
     Import-Module $modulePath -Force
     $script:ModuleName = 'Vega.Common'
     $script:TemplatePath = Join-Path (Join-Path $PSScriptRoot '..') 'host/sunshine.conf'
+
+    # Windows 专有 cmdlet 在 Linux 的 pwsh 上不存在，Pester 的 Mock -ModuleName
+    # 会以找不到命令为由报错。先在模块作用域塞一个签名一致的空 stub，
+    # 再由 Mock 接管；Windows 上这些命令本来就有，直接跳过。
+    $module = Get-Module $script:ModuleName
+    $stubs = @{
+        'Get-CimInstance' = {
+            [CmdletBinding()]
+            param(
+                [Parameter(Position = 0)]
+                [string]$ClassName
+            )
+            $null = $ClassName
+        }
+        'Stop-Service'    = {
+            [CmdletBinding()]
+            param(
+                [Parameter(Position = 0)]
+                [string[]]$Name,
+
+                [switch]$Force
+            )
+            $null = $Name
+            $null = $Force
+        }
+    }
+    foreach ($stubName in $stubs.Keys) {
+        if (Get-Command -Name $stubName -ErrorAction SilentlyContinue) { continue }
+        $stubBody = $stubs[$stubName]
+        & $module {
+            param($name, $body)
+            New-Item -Path ("function:script:{0}" -f $name) -Value $body -Force | Out-Null
+        } $stubName $stubBody
+    }
 }
 
 Describe 'Invoke-VegaHostInstall（mock）' {
@@ -46,7 +80,9 @@ Describe 'Invoke-VegaHostInstall（mock）' {
         Mock -ModuleName $script:ModuleName Get-VegaSunshineInstall { $script:sunshine }
         Mock -ModuleName $script:ModuleName Install-VegaPackage {
             param($PackageId, $DisplayName, [switch]$Force)
-            if ($PackageId -eq 'Tailscale.Tailscale') { throw '安装 Tailscale 失败（winget 退出码 1603）' }
+            # -Force 只是为了让 mock 的签名和真实命令对上
+            $null = $Force
+            if ($PackageId -eq 'Tailscale.Tailscale') { throw "安装 $DisplayName 失败（winget 退出码 1603）" }
             return $true
         }
         Mock -ModuleName $script:ModuleName Get-VegaSunshineInstallerFirewallRule { @() }
