@@ -4453,8 +4453,9 @@ function Get-VegaRustDeskConfigKeySnapshot {
 function Get-VegaRustDeskConfigSummary {
     <#
       诊断用：分别读取当前用户与 LocalService（服务模式）的 RustDesk2.toml。
-      -ServicePresent 时才把服务模式配置算作“应检查”；文件不存在只标记 Exists=false，
-      读取失败单独放在 Error 里，便于区分“没装/没登录过”和“有文件但读不了”。
+      -ServicePresent 时才把服务模式配置算作“应检查”；只有明确的 ItemNotFound 才标记
+      Exists=false（没装/没登录过），其他探测或读取错误标记 Exists=true 并把原因放进 Error，
+      由 doctor 统一加“读取失败”前缀输出。
       返回 { UserPath, UserExists, UserServer, UserRelay, UserError,
              ServicePath, ServiceExists, ServiceServer, ServiceRelay, ServiceError }。
     #>
@@ -4484,10 +4485,10 @@ function Get-VegaRustDeskConfigSummary {
         try {
             $probe = Get-Item -LiteralPath $ConfigPath -Force -ErrorAction Stop
             if ($null -eq $probe) {
-                $errorText = "读取失败：$ConfigPath 探测结果为空"
+                $errorText = "探测结果为空：$ConfigPath"
             }
             elseif ([bool]$probe.PSIsContainer) {
-                $errorText = "读取失败：$ConfigPath 是目录，不是配置文件"
+                $errorText = "不是配置文件（是目录）：$ConfigPath"
             }
             else {
                 $exists = $true
@@ -4502,7 +4503,7 @@ function Get-VegaRustDeskConfigSummary {
             }
             else {
                 $exists = $true
-                $errorText = "读取失败：$($_.Exception.Message)"
+                $errorText = $_.Exception.Message
             }
         }
 
@@ -4518,7 +4519,7 @@ function Get-VegaRustDeskConfigSummary {
                 }
             }
             catch {
-                $errorText = "读取失败：$($_.Exception.Message)"
+                $errorText = $_.Exception.Message
             }
         }
         return [pscustomobject]@{ Exists = $exists; Server = $server; Relay = $relay; Error = $errorText }
