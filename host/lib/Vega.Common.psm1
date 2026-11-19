@@ -2846,12 +2846,12 @@ function Repair-VegaFirewallRuleProfile {
             $union.Add($candidate)
         }
     }
-    foreach ($name in $currentNames) {
-        if ($name -eq 'Any') { continue }
-        if (-not $union.Contains($name)) { $union.Add($name) }
+    foreach ($profileName in $currentNames) {
+        if ($profileName -eq 'Any') { continue }
+        if (-not $union.Contains($profileName)) { $union.Add($profileName) }
     }
-    foreach ($name in $required) {
-        if (-not $union.Contains($name)) { $union.Add($name) }
+    foreach ($profileName in $required) {
+        if (-not $union.Contains($profileName)) { $union.Add($profileName) }
     }
     $targetProfiles = $union.ToArray()
     $target = $targetProfiles -join ','
