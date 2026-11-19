@@ -135,6 +135,14 @@ function Invoke-VegaCommand {
         TimedOut = $false
     }
 
+    # 管理员进程不依赖 PATH/当前目录搜索：只接受绝对路径，避免同名程序劫持。
+    if (-not (Test-VegaAbsolutePath -Path $FilePath)) {
+        $message = "外部程序必须用绝对路径启动：$FilePath"
+        $result.StdErr = @($message)
+        $result.Output = @($message)
+        return $result
+    }
+
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = $FilePath
     $startInfo.Arguments = ConvertTo-VegaArgumentString -ArgumentList $ArgumentList
@@ -316,18 +324,48 @@ function Resolve-VegaWingetPath {
     param()
 
     $packages = @(Get-AppxPackage -Name 'Microsoft.DesktopAppInstaller' -ErrorAction SilentlyContinue)
+
+    $windowsApps = ''
+    if (-not [string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
+        $windowsApps = Join-Path $env:ProgramFiles 'WindowsApps'
+    }
+
     foreach ($package in $packages) {
         if ($null -eq $package) { continue }
+
+        # 只认微软签名的 App Installer：名称、包家族、发布者、安装位置都要对得上。
+        if ([string]$package.Name -ne 'Microsoft.DesktopAppInstaller') { continue }
+        if ([string]$package.PackageFamilyName -notlike 'Microsoft.DesktopAppInstaller_*') { continue }
+        if ([string]$package.Publisher -notmatch '(?i)^CN=Microsoft Corporation') { continue }
+
         $location = [string]$package.InstallLocation
         if ([string]::IsNullOrWhiteSpace($location)) { continue }
+        if (-not (Test-VegaAbsolutePath -Path $location)) { continue }
+        if (Test-VegaReparsePoint -Path $location) { continue }
+
+        if (-not [string]::IsNullOrWhiteSpace($windowsApps)) {
+            try {
+                $root = [System.IO.Path]::GetFullPath($windowsApps).TrimEnd('\') + '\'
+                $actual = [System.IO.Path]::GetFullPath($location).TrimEnd('\') + '\'
+                if (-not $actual.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+            }
+            catch {
+                continue
+            }
+        }
+
         $candidate = Join-Path $location 'winget.exe'
         if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+        if (Test-VegaReparsePoint -Path $candidate) { continue }
+
         try {
-            return (Resolve-Path -LiteralPath $candidate).ProviderPath
+            $resolved = (Resolve-Path -LiteralPath $candidate).ProviderPath
         }
         catch {
-            return $candidate
+            continue
         }
+        if (-not (Test-VegaAbsolutePath -Path $resolved)) { continue }
+        return $resolved
     }
 
     return $null
