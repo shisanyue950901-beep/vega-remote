@@ -318,6 +318,60 @@ function Test-VegaBootstrapDirectoryAclTrusted {
     return $true
 }
 
+function Assert-VegaBootstrapProtectedDirectory {
+    <#
+      受保护目录的唯一校验闸门：无论目录是新建还是已存在、无论创建调用是否返回成功，
+      创建/复用之后都必须过这里，不能只看创建调用有没有报错。
+      要求同时满足：路径非空、确实是目录（不是文件也不是缺失）、不是重解析点、
+      所有者是 SYSTEM/Administrators、不存在非管理员写类权限。
+      任一不满足立即抛异常中止，不做“部分满足就放行”。
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()]
+        [string]$Path = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        throw '受保护目录路径为空，拒绝使用。'
+    }
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        throw "受保护目录不存在或不是目录，拒绝使用：$Path"
+    }
+    if (Test-VegaBootstrapReparsePoint -Path $Path) {
+        throw "目录是重解析点，拒绝使用：$Path。请以管理员身份删除或修复该目录后重试。"
+    }
+    if (-not (Test-VegaBootstrapDirectoryAclTrusted -Path $Path)) {
+        throw ((("目录的权限不安全（所有者不是 SYSTEM/Administrators，或存在非管理员可写/可删除的权限）：{0}。" -f $Path)) +
+            '请以管理员身份删除或修复该目录后重试。')
+    }
+
+    return $Path
+}
+
+function Assert-VegaBootstrapWorkTree {
+    <#
+      逐级复验：工作根 -> GUID 子目录，两级都要单独过 Assert-VegaBootstrapProtectedDirectory。
+      解压后、执行安装脚本前必须再走一次，防止“创建到执行”之间目录被替换成重解析点
+      或 ACL 被放宽。
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()]
+        [string]$RootPath = '',
+
+        [AllowEmptyString()]
+        [string]$WorkDirectory = ''
+    )
+
+    $null = Assert-VegaBootstrapProtectedDirectory -Path $RootPath
+    if (-not [string]::IsNullOrWhiteSpace($WorkDirectory)) {
+        $null = Assert-VegaBootstrapProtectedDirectory -Path $WorkDirectory
+    }
+
+    return $WorkDirectory
+}
+
 function Test-VegaBootstrapAclExtensionsAvailable {
     <#
       纯函数：当前运行时是否提供 [System.IO.FileSystemAclExtensions]。
@@ -404,28 +458,43 @@ function New-VegaBootstrapProtectedDirectory {
     if (Test-Path -LiteralPath $Path) { throw "目录已存在，拒绝覆盖：$Path" }
     if (-not $PSCmdlet.ShouldProcess($Path, '创建受保护的引导目录')) { return '' }
 
-    if (-not (Test-VegaBootstrapWindows)) {
-        $null = New-Item -ItemType Directory -Path $Path -Force
-        return $Path
-    }
-
+    $creationError = ''
     try {
-        $administrators = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
-        $system = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
-
-        $security = New-Object System.Security.AccessControl.DirectorySecurity
-        $security.SetAccessRuleProtection($true, $false)
-        foreach ($sid in @($system, $administrators)) {
-            $accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-                $sid, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')
-            $security.AddAccessRule($accessRule)
+        if (-not (Test-VegaBootstrapWindows)) {
+            $null = New-Item -ItemType Directory -Path $Path -Force
         }
-        $security.SetOwner($administrators)
+        else {
+            $administrators = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+            $system = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
 
-        $null = New-VegaBootstrapDirectoryWithAcl -Path $Path -Security $security
+            $security = New-Object System.Security.AccessControl.DirectorySecurity
+            $security.SetAccessRuleProtection($true, $false)
+            foreach ($sid in @($system, $administrators)) {
+                $accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                    $sid, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')
+                $security.AddAccessRule($accessRule)
+            }
+            $security.SetOwner($administrators)
+
+            $null = New-VegaBootstrapDirectoryWithAcl -Path $Path -Security $security
+        }
     }
     catch {
-        throw "创建受保护目录失败：$Path（$($_.Exception.Message)）"
+        $creationError = $_.Exception.Message
+    }
+
+    # 创建调用“返回成功”不代表目录真的可信：新建后一律过同一个校验闸门。
+    try {
+        $null = Assert-VegaBootstrapProtectedDirectory -Path $Path
+    }
+    catch {
+        if (-not [string]::IsNullOrWhiteSpace($creationError)) {
+            throw "创建受保护目录失败：$Path（$creationError；$($_.Exception.Message)）"
+        }
+        throw
+    }
+    if (-not [string]::IsNullOrWhiteSpace($creationError)) {
+        throw "创建受保护目录失败：$Path（$creationError）"
     }
 
     return $Path
@@ -452,15 +521,9 @@ function Initialize-VegaBootstrapProtectedRoot {
         return (New-VegaBootstrapProtectedDirectory -Path $Path)
     }
 
-    if (Test-VegaBootstrapReparsePoint -Path $Path) {
-        throw "目录是重解析点，拒绝使用：$Path。请以管理员身份删除或修复该目录后重试。"
-    }
-    if (-not (Test-VegaBootstrapDirectoryAclTrusted -Path $Path)) {
-        throw ((("目录的权限不安全（所有者不是 SYSTEM/Administrators，或存在非管理员可写/可删除的权限）：{0}。" -f $Path)) +
-            '请以管理员身份删除或修复该目录后重试。')
-    }
-
-    return $Path
+    # 已存在的目录与新建的目录走同一个校验函数：重解析点、非目录、
+    # 所有者不是 SYSTEM/Administrators、非管理员写类权限，任一不满足即中止。
+    return (Assert-VegaBootstrapProtectedDirectory -Path $Path)
 }
 
 function Initialize-VegaBootstrapVegaRoot {
@@ -507,6 +570,8 @@ function Initialize-VegaBootstrapDirectory {
     else {
         if (Test-VegaBootstrapReparsePoint -Path $Path) { throw "工作目录是重解析点，拒绝使用：$Path" }
         Set-VegaBootstrapDirectoryAcl -Path $Path
+        # 复用已有目录时同样过统一校验：收紧 ACL 之后还要确认收紧确实生效。
+        $null = Assert-VegaBootstrapProtectedDirectory -Path $Path
     }
 
     return $Path
@@ -549,6 +614,8 @@ function New-VegaBootstrapWorkDirectory {
     if (-not $PSCmdlet.ShouldProcess($workDirectory, '创建受保护的引导工作目录')) { return '' }
 
     $null = New-VegaBootstrapProtectedDirectory -Path $workDirectory
+    # GUID 子目录创建后同样过统一校验，并且连同工作根逐级复验一次。
+    $null = Assert-VegaBootstrapWorkTree -RootPath $rootPath -WorkDirectory $workDirectory
     return $workDirectory
 }
 
@@ -628,7 +695,9 @@ function Get-VegaBootstrapAssetName {
         throw "下载地址里的资产文件名无法解码：$shown"
     }
 
-    if ([string]::IsNullOrWhiteSpace($leaf) -or $leaf -notmatch '^[A-Za-z0-9._-]+$') {
+    # \A ... \z 且用 -cmatch：-match 的行模式下 $ 会放过结尾换行，
+    # 大小写不敏感也无意义——这里要的是整串精确白名单。
+    if ([string]::IsNullOrWhiteSpace($leaf) -or $leaf -cnotmatch '\A[A-Za-z0-9._-]+\z') {
         throw "下载地址里的资产文件名无效（只允许字母、数字、点、下划线和连字符）：$shown"
     }
     return $leaf
@@ -1097,6 +1166,9 @@ function Invoke-VegaBootstrap {
 
         $extractRoot = Join-Path $workDirectory 'extract'
         $resolved = Expand-VegaBootstrapArchive -ArchivePath $archivePath -DestinationPath $extractRoot -Role $resolvedRole
+
+        # 解压后、执行前再对 工作根 -> GUID 子目录 逐级复验一次。
+        $null = Assert-VegaBootstrapWorkTree -RootPath (Split-Path -Path $workDirectory -Parent) -WorkDirectory $workDirectory
 
         Write-Host ("运行 {0}（角色：{1}）" -f $resolved.Installer, $resolvedRole) -ForegroundColor Cyan
         Invoke-VegaBootstrapInstaller -Installer $resolved.Installer -Arguments $installerArgs -Confirm:$false
