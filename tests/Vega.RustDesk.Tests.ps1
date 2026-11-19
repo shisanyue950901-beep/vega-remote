@@ -261,3 +261,108 @@ Describe 'Format-VegaRustDeskId / Get-VegaRustDeskDeviceId' {
         $result.Error | Should -Match '超时'
     }
 }
+
+Describe 'Resolve-VegaRustDeskSetting 脱敏' {
+    It '地址格式无效时不回显原值' {
+        $secret = 'user:pass@bad host/?token=abc'
+        $errorRecord = $null
+        try { Resolve-VegaRustDeskSetting -Server $secret -Key ('A' * 43 + '=') }
+        catch { $errorRecord = $_ }
+        $errorRecord | Should -Not -BeNullOrEmpty
+        $errorRecord.Exception.Message | Should -Be 'RustDesk 服务器地址格式无效（应为 主机名/IPv4/IPv6，可带 :端口）。'
+        $errorRecord.Exception.Message | Should -Not -Match 'bad host'
+        $errorRecord.Exception.Message | Should -Not -Match 'token'
+    }
+}
+
+Describe 'Get-VegaRustDeskInstall -RequireSigned' {
+    BeforeEach {
+        $script:OriginalProgramFiles = $env:ProgramFiles
+        $script:OriginalProgramFilesX86 = ${env:ProgramFiles(x86)}
+        $script:OriginalLocalAppData = $env:LOCALAPPDATA
+
+        $env:ProgramFiles = Join-Path $TestDrive 'PF'
+        ${env:ProgramFiles(x86)} = Join-Path $TestDrive 'PF86'
+        $env:LOCALAPPDATA = Join-Path $TestDrive 'LAD'
+
+        foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, (Join-Path $env:LOCALAPPDATA 'Programs'))) {
+            $dir = Join-Path $root 'RustDesk'
+            $null = New-Item -ItemType Directory -Path $dir -Force
+            Set-Content -LiteralPath (Join-Path $dir 'rustdesk.exe') -Value 'stub' -Encoding UTF8
+        }
+    }
+
+    AfterEach {
+        $env:ProgramFiles = $script:OriginalProgramFiles
+        ${env:ProgramFiles(x86)} = $script:OriginalProgramFilesX86
+        $env:LOCALAPPDATA = $script:OriginalLocalAppData
+    }
+
+    It '签名有效时返回 Program Files 下的副本' {
+        Mock Test-VegaRustDeskSignatureValid { $true }
+        $exe = Get-VegaRustDeskInstall -RequireSigned
+        (Split-Path -Leaf (Split-Path -Parent $exe)) | Should -Be 'RustDesk'
+        (Split-Path -Leaf (Split-Path -Parent (Split-Path -Parent $exe))) | Should -Be 'PF'
+    }
+
+    It '签名无效时返回 null，且不回退到 LOCALAPPDATA' {
+        Mock Test-VegaRustDeskSignatureValid { $false }
+        Get-VegaRustDeskInstall -RequireSigned | Should -BeNullOrEmpty
+    }
+
+    It '不提权时仍可使用 LOCALAPPDATA 下的副本' {
+        Mock Test-VegaRustDeskSignatureValid { $false }
+        Remove-Item -LiteralPath (Join-Path (Join-Path $env:ProgramFiles 'RustDesk') 'rustdesk.exe') -Force
+        Remove-Item -LiteralPath (Join-Path (Join-Path ${env:ProgramFiles(x86)} 'RustDesk') 'rustdesk.exe') -Force
+
+        $exe = Get-VegaRustDeskInstall
+        $exe | Should -Match 'LAD'
+    }
+}
+
+Describe 'Invoke-VegaRustDeskSetup 提权设备码' {
+    BeforeEach {
+        Mock Set-VegaRustDeskConfig {
+            [pscustomobject]@{ Applied = @(); Warnings = @(); ServicePresent = $false; Values = @{}; State = $null }
+        }
+        Mock Restart-VegaRustDeskService {
+            [pscustomobject]@{ Found = $false; Restarted = $false; Status = ''; Message = '未找到 RustDesk 服务，跳过重启' }
+        }
+        Mock Write-VegaStatus { }
+    }
+
+    It '提权时只启动签名有效的 Program Files 副本' {
+        Mock Test-VegaProcessElevated { $true }
+        Mock Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
+        Mock Get-VegaRustDeskDeviceId { [pscustomobject]@{ Success = $true; DeviceId = '123456789'; RawOutput = @(); Error = '' } }
+
+        $result = Invoke-VegaRustDeskSetup -Settings ([pscustomobject]@{ Server = 'relay.example.com'; RelayServer = 'relay.example.com:21117'; Key = ('A' * 43 + '=') })
+
+        Should -Invoke Get-VegaRustDeskInstall -Times 1 -Exactly -ParameterFilter { $RequireSigned -eq $true }
+        Should -Invoke Get-VegaRustDeskDeviceId -Times 1 -Exactly -ParameterFilter {
+            $Exe -eq 'C:\Program Files\RustDesk\rustdesk.exe'
+        }
+        $result.DeviceId | Should -Be '123456789'
+    }
+
+    It '提权但没有签名有效的副本时不启动，提示打开 RustDesk 查看设备码' {
+        Mock Test-VegaProcessElevated { $true }
+        Mock Get-VegaRustDeskInstall { $null }
+        Mock Get-VegaRustDeskDeviceId { throw '不应调用' }
+
+        $result = Invoke-VegaRustDeskSetup -Settings ([pscustomobject]@{ Server = 'relay.example.com'; RelayServer = 'relay.example.com:21117'; Key = ('A' * 43 + '=') })
+
+        Should -Invoke Get-VegaRustDeskDeviceId -Times 0 -Exactly
+        ($result.Warnings -join "`n") | Should -Match '打开 RustDesk 查看设备码'
+    }
+
+    It '未提权时仍按普通查找读取设备码' {
+        Mock Test-VegaProcessElevated { $false }
+        Mock Get-VegaRustDeskDeviceId { [pscustomobject]@{ Success = $true; DeviceId = '987654321'; RawOutput = @(); Error = '' } }
+
+        $result = Invoke-VegaRustDeskSetup -Settings ([pscustomobject]@{ Server = 'relay.example.com'; RelayServer = 'relay.example.com:21117'; Key = ('A' * 43 + '=') })
+
+        Should -Invoke Get-VegaRustDeskDeviceId -Times 1 -Exactly
+        $result.DeviceId | Should -Be '987654321'
+    }
+}

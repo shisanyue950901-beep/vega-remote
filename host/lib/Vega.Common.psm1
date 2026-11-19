@@ -3692,7 +3692,7 @@ function Resolve-VegaRustDeskSetting {
     }
 
     if (-not (Test-VegaRustDeskServer -Server $Server)) {
-        throw "RustDesk 服务器地址无效：$Server（应为 主机名/IPv4/IPv6，可带 :端口）"
+        throw 'RustDesk 服务器地址格式无效（应为 主机名/IPv4/IPv6，可带 :端口）。'
     }
     if (-not (Test-VegaRustDeskKey -Key $Key)) {
         throw 'RustDesk 公钥无效：应为 base64 样式字符串（约 44 字符，仅 A-Z a-z 0-9 + / =）。'
@@ -3960,7 +3960,7 @@ function Set-VegaRustDeskConfig {
     )
 
     $endpoint = ConvertFrom-VegaRustDeskServerEndpoint -Server $Server
-    if ($null -eq $endpoint) { throw "RustDesk 服务器地址无效：$Server" }
+    if ($null -eq $endpoint) { throw 'RustDesk 服务器地址格式无效（应为 主机名/IPv4/IPv6，可带 :端口）。' }
 
     if ([string]::IsNullOrWhiteSpace($UserConfigPath)) { $UserConfigPath = Get-VegaRustDeskConfigPath }
     if ([string]::IsNullOrWhiteSpace($ServiceConfigPath)) { $ServiceConfigPath = Get-VegaRustDeskConfigPath -ServiceMode }
@@ -4082,12 +4082,53 @@ function Restore-VegaRustDeskConfig {
     return [pscustomobject]@{ Restored = $true; Changed = $true; Message = "已把受管键恢复为原始值：$Path" }
 }
 
-function Get-VegaRustDeskInstall {
+function Test-VegaProcessElevated {
     <#
-      找 rustdesk.exe；找不到返回 $null。
+      当前进程是否提权（管理员）。非 Windows 返回 $false。
     #>
     [CmdletBinding()]
     param()
+
+    if (-not (Test-VegaWindowsPlatform)) { return $false }
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Test-VegaRustDeskSignatureValid {
+    <#
+      rustdesk.exe 的 Authenticode 签名是否 Valid。取不到签名按无效处理。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    try {
+        $signature = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
+        return ([string]$signature.Status -eq 'Valid')
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-VegaRustDeskInstall {
+    <#
+      找 rustdesk.exe；找不到返回 $null。
+      -RequireSigned：只返回 Program Files / Program Files (x86) 下且 Authenticode 状态为
+      Valid 的副本，并完全不考虑 %LOCALAPPDATA%——提权运行时不能启动低权限目录里的可执行文件。
+    #>
+    [CmdletBinding()]
+    param(
+        [switch]$RequireSigned
+    )
 
     $candidates = New-Object System.Collections.Generic.List[string]
     if (-not [string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
@@ -4096,12 +4137,14 @@ function Get-VegaRustDeskInstall {
     if (-not [string]::IsNullOrWhiteSpace(${env:ProgramFiles(x86)})) {
         $candidates.Add((Join-Path (Join-Path ${env:ProgramFiles(x86)} 'RustDesk') 'rustdesk.exe'))
     }
-    if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+    if (-not $RequireSigned -and -not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
         $candidates.Add((Join-Path (Join-Path (Join-Path $env:LOCALAPPDATA 'Programs') 'RustDesk') 'rustdesk.exe'))
     }
 
     foreach ($candidate in $candidates) {
-        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+        if (-not $RequireSigned) { return $candidate }
+        if (Test-VegaRustDeskSignatureValid -Path $candidate) { return $candidate }
     }
     return $null
 }
@@ -4232,12 +4275,33 @@ function Invoke-VegaRustDeskSetup {
     $restart = Restart-VegaRustDeskService -Confirm:$false
     Write-VegaStatus $restart.Message -Level $(if ($restart.Restarted -or -not $restart.Found) { 'Info' } else { 'Warn' })
 
-    $device = Get-VegaRustDeskDeviceId
+    # 提权运行时只启动 Program Files 下已签名（Valid）的 rustdesk.exe；
+    # 不启动 %LOCALAPPDATA% 等其他位置的副本，否则等于用管理员权限运行用户可写的程序。
+    $elevated = Test-VegaProcessElevated
+    if ($elevated) {
+        $deviceExe = Get-VegaRustDeskInstall -RequireSigned
+        if ([string]::IsNullOrWhiteSpace($deviceExe)) {
+            $message = '未找到 Program Files 下签名有效的 rustdesk.exe，不启动任何其他位置的副本；请打开 RustDesk 查看设备码。'
+            $warnings.Add($message)
+            Write-VegaStatus $message -Level Warn
+            $device = [pscustomobject]@{ Success = $false; DeviceId = ''; RawOutput = @(); Error = $message }
+        }
+        else {
+            $device = Get-VegaRustDeskDeviceId -Exe $deviceExe
+        }
+    }
+    else {
+        $device = Get-VegaRustDeskDeviceId
+    }
+
     if ($device.Success) {
         Write-VegaStatus ("本机设备码：{0}" -f (Format-VegaRustDeskId -DeviceId $device.DeviceId)) -Level Ok
     }
+    elseif ($elevated -and [string]::IsNullOrWhiteSpace($device.DeviceId)) {
+        # 上面已经写过具体原因，这里不再重复
+    }
     else {
-        $message = "读取 RustDesk 设备码失败：$($device.Error)。装好后可在 RustDesk 主界面查看设备码。"
+        $message = "读取 RustDesk 设备码失败：$($device.Error)。装好后可打开 RustDesk 查看设备码。"
         $warnings.Add($message)
         Write-VegaStatus $message -Level Warn
     }
@@ -5250,6 +5314,8 @@ Export-ModuleMember -Function @(
     'Set-VegaRustDeskConfig',
     'Restore-VegaRustDeskConfig',
     'Get-VegaRustDeskInstall',
+    'Test-VegaRustDeskSignatureValid',
+    'Test-VegaProcessElevated',
     'Restart-VegaRustDeskService',
     'Format-VegaRustDeskId',
     'Get-VegaRustDeskDeviceId',
