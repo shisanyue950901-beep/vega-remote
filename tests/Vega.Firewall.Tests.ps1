@@ -352,7 +352,7 @@ Describe 'Set-VegaAdminBlockRule' {
             }
             'Set-NetFirewallRule'       = {
                 [CmdletBinding()]
-                param([string]$Name, $Enabled, $Action, [string]$Protocol, [string[]]$LocalPort, [Alias('Profile')][string]$FwProfile)
+                param([string]$Name, $Enabled, $Action, [string]$Protocol, [string[]]$LocalPort, [Alias('Profile')][string[]]$FwProfile)
                 $null = $Name, $Enabled, $Action, $Protocol, $LocalPort, $FwProfile
             }
             'Get-NetFirewallPortFilter' = {
@@ -540,16 +540,16 @@ Describe 'Set-VegaAdminBlockRule' {
             }
         }
         Mock -ModuleName $script:ModuleName Set-NetFirewallRule {
-            param($Name, $Enabled, $Action, $Protocol, $LocalPort, [Alias('Profile')][string]$FwProfile)
+            param($Name, $Enabled, $Action, $Protocol, $LocalPort, [Alias('Profile')][string[]]$FwProfile)
             $null = $Name, $Enabled, $Action, $Protocol, $LocalPort
-            if ($PesterBoundParameters['Profile'] -eq 'Private') { $env:VEGA_TEST_RULE_PROFILE = 'Private' }
+            if (($FwProfile -join ',') -eq 'Private,Public') { $env:VEGA_TEST_RULE_PROFILE = 'Private,Public' }
         }
 
         try {
             { Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false } | Should -Not -Throw
-            $env:VEGA_TEST_RULE_PROFILE | Should -Be 'Private'
+            $env:VEGA_TEST_RULE_PROFILE | Should -Be 'Private,Public'
             Should -Invoke -ModuleName $script:ModuleName -CommandName Set-NetFirewallRule -Times 1 -Exactly `
-                -ParameterFilter { $PesterBoundParameters['Profile'] -eq 'Private' }
+                -ParameterFilter { ($FwProfile -join ',') -eq 'Private,Public' }
         }
         finally {
             Remove-Item Env:VEGA_TEST_RULE_PROFILE -ErrorAction SilentlyContinue
@@ -574,15 +574,15 @@ Describe 'Set-VegaAdminBlockRule' {
             }
         }
         Mock -ModuleName $script:ModuleName Set-NetFirewallRule {
-            param($Name, $Enabled, $Action, $Protocol, $LocalPort, [Alias('Profile')][string]$FwProfile)
+            param($Name, $Enabled, $Action, $Protocol, $LocalPort, [Alias('Profile')][string[]]$FwProfile)
             $null = $Name, $Enabled, $Action, $Protocol, $LocalPort
-            if ($PesterBoundParameters['Profile'] -eq 'Private,Public') { $env:VEGA_TEST_RULE_PROFILE = 'Private,Public' }
+            if (($FwProfile -join ',') -eq 'Private,Public') { $env:VEGA_TEST_RULE_PROFILE = 'Private,Public' }
         }
 
         try {
             { Set-VegaAdminBlockRule -ManagementPorts @(47990) -Confirm:$false } | Should -Not -Throw
             Should -Invoke -ModuleName $script:ModuleName -CommandName Set-NetFirewallRule -Times 1 -Exactly `
-                -ParameterFilter { $PesterBoundParameters['Profile'] -eq 'Private,Public' }
+                -ParameterFilter { ($FwProfile -join ',') -eq 'Private,Public' }
         }
         finally {
             Remove-Item Env:VEGA_TEST_RULE_PROFILE -ErrorAction SilentlyContinue
@@ -693,7 +693,7 @@ Describe 'Set-VegaFirewallRule 回读' {
             }
             'Set-NetFirewallRule'       = {
                 [CmdletBinding()]
-                param([string]$Name, [Alias('Profile')][string]$FwProfile)
+                param([string]$Name, [Alias('Profile')][string[]]$FwProfile)
                 $null = $Name, $FwProfile
             }
             'Get-NetFirewallPortFilter' = {
@@ -764,9 +764,9 @@ Describe 'Set-VegaFirewallRule 回读' {
             [pscustomobject]@{ Name = $Name; Enabled = 'True'; Action = 'Allow'; Profile = $env:VEGA_TEST_RULE_PROFILE }
         }
         Mock -ModuleName $script:ModuleName Set-NetFirewallRule {
-            param($Name, [Alias('Profile')][string]$FwProfile)
+            param($Name, [Alias('Profile')][string[]]$FwProfile)
             $null = $Name
-            if ($PesterBoundParameters['Profile'] -eq 'Private') { $env:VEGA_TEST_RULE_PROFILE = 'Private' }
+            if (($FwProfile -join ',') -eq 'Private,Public') { $env:VEGA_TEST_RULE_PROFILE = 'Private,Public' }
         }
         Mock -ModuleName $script:ModuleName Get-NetFirewallPortFilter -RemoveParameterType AssociatedNetFirewallRule {
             param($AssociatedNetFirewallRule)
@@ -782,7 +782,7 @@ Describe 'Set-VegaFirewallRule 回读' {
             $created = @(Set-VegaFirewallRule -Program 'C:\Sunshine\sunshine.exe' -Confirm:$false)
             $created | Should -Be @('Vega-Sunshine-TCP', 'Vega-Sunshine-UDP')
             Should -Invoke -ModuleName $script:ModuleName -CommandName Set-NetFirewallRule -Times 1 -Exactly `
-                -ParameterFilter { $PesterBoundParameters['Profile'] -eq 'Private' }
+                -ParameterFilter { ($FwProfile -join ',') -eq 'Private,Public' }
         }
         finally {
             Remove-Item Env:VEGA_TEST_RULE_PROFILE -ErrorAction SilentlyContinue

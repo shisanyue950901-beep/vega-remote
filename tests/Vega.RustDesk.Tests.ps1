@@ -75,15 +75,15 @@ Describe 'ConvertFrom-VegaRustDeskServerEndpoint' {
     }
 }
 
-Describe 'Resolve-VegaRustDeskSettings' {
+Describe 'Resolve-VegaRustDeskSetting' {
     It '参数优先，两个参数必须同时给出' {
-        $settings = Resolve-VegaRustDeskSettings -Server 'relay.example.com:21116' -Key ('A' * 43 + '=')
+        $settings = Resolve-VegaRustDeskSetting -Server 'relay.example.com:21116' -Key ('A' * 43 + '=')
         $settings.Server | Should -Be 'relay.example.com:21116'
         $settings.RelayServer | Should -Be 'relay.example.com:21117'
         $settings.Source | Should -Be 'Parameter'
 
-        { Resolve-VegaRustDeskSettings -Server 'relay.example.com' } | Should -Throw '*同时提供*'
-        { Resolve-VegaRustDeskSettings -Key ('A' * 43 + '=') } | Should -Throw '*同时提供*'
+        { Resolve-VegaRustDeskSetting -Server 'relay.example.com' } | Should -Throw '*同时提供*'
+        { Resolve-VegaRustDeskSetting -Key ('A' * 43 + '=') } | Should -Throw '*同时提供*'
     }
 
     It '参数缺失时读取 vega.config.json' {
@@ -96,7 +96,7 @@ Describe 'Resolve-VegaRustDeskSettings' {
         } | ConvertTo-Json -Depth 5
         Set-Content -LiteralPath $path -Value $json -Encoding UTF8
 
-        $settings = Resolve-VegaRustDeskSettings -Server '' -Key '' -ConfigPath $path
+        $settings = Resolve-VegaRustDeskSetting -Server '' -Key '' -ConfigPath $path
         $settings.Server | Should -Be 'relay.example.com'
         $settings.Source | Should -Be 'ConfigFile'
     }
@@ -104,13 +104,13 @@ Describe 'Resolve-VegaRustDeskSettings' {
     It '配置文件只有一半时抛异常，两者都没有时返回 null' {
         $path = Join-Path $TestDrive 'half.config.json'
         Set-Content -LiteralPath $path -Value '{"rustdesk":{"server":"relay.example.com"}}' -Encoding UTF8
-        { Resolve-VegaRustDeskSettings -ConfigPath $path } | Should -Throw '*必须同时填写*'
+        { Resolve-VegaRustDeskSetting -ConfigPath $path } | Should -Throw '*必须同时填写*'
 
         $empty = Join-Path $TestDrive 'empty.config.json'
         Set-Content -LiteralPath $empty -Value '{"rustdesk":{"server":"","key":""}}' -Encoding UTF8
-        Resolve-VegaRustDeskSettings -ConfigPath $empty | Should -BeNullOrEmpty
+        Resolve-VegaRustDeskSetting -ConfigPath $empty | Should -BeNullOrEmpty
 
-        Resolve-VegaRustDeskSettings -ConfigPath (Join-Path $TestDrive 'missing.json') | Should -BeNullOrEmpty
+        Resolve-VegaRustDeskSetting -ConfigPath (Join-Path $TestDrive 'missing.json') | Should -BeNullOrEmpty
     }
 }
 

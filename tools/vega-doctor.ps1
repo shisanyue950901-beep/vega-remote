@@ -160,7 +160,7 @@ Write-Section 'RustDesk'
 $rustDeskExpected = $null
 $repoConfigPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'vega.config.json'
 try {
-    $rustDeskExpected = Resolve-VegaRustDeskSettings -ConfigPath $repoConfigPath
+    $rustDeskExpected = Resolve-VegaRustDeskSetting -ConfigPath $repoConfigPath
 }
 catch {
     Write-Host "读取 vega.config.json 失败：$($_.Exception.Message)" -ForegroundColor Yellow

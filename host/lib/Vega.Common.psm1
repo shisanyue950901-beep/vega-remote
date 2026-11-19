@@ -2723,7 +2723,7 @@ function Get-VegaFirewallProfileName {
     }
 }
 
-function ConvertTo-VegaFirewallProfileNames {
+function ConvertTo-VegaFirewallProfileName {
     <#
       纯函数：把规则/配置的 Profile 值归一化成名字列表。
       支持 "Any"、"Private, Public"、数组，以及数字位掩码（1=Domain 2=Private 4=Public，0=Any）。
@@ -2732,11 +2732,11 @@ function ConvertTo-VegaFirewallProfileNames {
     param(
         [AllowNull()]
         [AllowEmptyCollection()]
-        $Profile
+        $FwProfile
     )
 
     $names = New-Object System.Collections.Generic.List[string]
-    foreach ($item in @($Profile)) {
+    foreach ($item in @($FwProfile)) {
         if ($null -eq $item) { continue }
         $text = ([string]$item).Trim()
         if ($text.Length -eq 0) { continue }
@@ -2768,7 +2768,7 @@ function Test-VegaFirewallProfileCovered {
     param(
         [AllowNull()]
         [AllowEmptyCollection()]
-        $Profile,
+        $FwProfile,
 
         [AllowNull()]
         [AllowEmptyCollection()]
@@ -2778,7 +2778,7 @@ function Test-VegaFirewallProfileCovered {
     $required = @($RequiredProfiles | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
     if ($required.Count -eq 0) { return $true }
 
-    $covered = @(ConvertTo-VegaFirewallProfileNames -Profile $Profile)
+    $covered = @(ConvertTo-VegaFirewallProfileName -FwProfile $FwProfile)
     if ($covered -contains 'Any') { return $true }
 
     foreach ($name in $required) {
@@ -2835,13 +2835,31 @@ function Repair-VegaFirewallRuleProfile {
 
     $profileProperty = $Rule.PSObject.Properties['Profile']
     $current = $(if ($null -ne $profileProperty) { $profileProperty.Value } else { $null })
-    if (Test-VegaFirewallProfileCovered -Profile $current -RequiredProfiles $required) { return $Rule }
+    if (Test-VegaFirewallProfileCovered -FwProfile $current -RequiredProfiles $required) { return $Rule }
 
-    $target = $required -join ','
+    # 补齐值是原 Profile 与所需配置文件的并集，不能把规则原有的覆盖范围缩小。
+    # 固定按 Domain、Private、Public 排序，保证 Set 的值和回读比较稳定。
+    $currentNames = @(ConvertTo-VegaFirewallProfileName -FwProfile $current)
+    $union = New-Object System.Collections.Generic.List[string]
+    foreach ($candidate in @('Domain', 'Private', 'Public')) {
+        if (($currentNames -contains $candidate) -or ($required -contains $candidate)) {
+            $union.Add($candidate)
+        }
+    }
+    foreach ($name in $currentNames) {
+        if ($name -eq 'Any') { continue }
+        if (-not $union.Contains($name)) { $union.Add($name) }
+    }
+    foreach ($name in $required) {
+        if (-not $union.Contains($name)) { $union.Add($name) }
+    }
+    $targetProfiles = $union.ToArray()
+    $target = $targetProfiles -join ','
+
     if (-not $PSCmdlet.ShouldProcess($Name, "补齐防火墙规则 Profile 为 $target")) { return $Rule }
 
     try {
-        $null = Set-NetFirewallRule -Name $Name -Profile $target -ErrorAction Stop
+        $null = Set-NetFirewallRule -Name $Name -Profile $targetProfiles -ErrorAction Stop
     }
     catch {
         throw "补齐防火墙规则 $Name 的 Profile（$target）失败：$($_.Exception.Message)"
@@ -2852,8 +2870,8 @@ function Repair-VegaFirewallRuleProfile {
 
     $updatedProperty = $updated.PSObject.Properties['Profile']
     $updatedProfile = $(if ($null -ne $updatedProperty) { $updatedProperty.Value } else { $null })
-    if (-not (Test-VegaFirewallProfileCovered -Profile $updatedProfile -RequiredProfiles $required)) {
-        $actual = @(ConvertTo-VegaFirewallProfileNames -Profile $updatedProfile) -join ','
+    if (-not (Test-VegaFirewallProfileCovered -FwProfile $updatedProfile -RequiredProfiles $required)) {
+        $actual = @(ConvertTo-VegaFirewallProfileName -FwProfile $updatedProfile) -join ','
         throw "防火墙规则 $Name 的 Profile 未覆盖活动接口的配置（实际：$actual，需要：$target）。"
     }
 
@@ -3590,7 +3608,7 @@ function Test-VegaRustDeskKey {
     return [bool]($text -match '^[A-Za-z0-9+/=]+$')
 }
 
-function Resolve-VegaRustDeskSettings {
+function Resolve-VegaRustDeskSetting {
     <#
       参数优先，其次仓库根目录的可选 vega.config.json：
         { "rustdesk": { "server": "", "key": "" } }
@@ -4260,7 +4278,7 @@ function Invoke-VegaHostInstallCore {
 
     $failures = New-Object System.Collections.Generic.List[string]
 
-    $rustDeskSettings = Resolve-VegaRustDeskSettings -Server $RustDeskServer -Key $RustDeskKey
+    $rustDeskSettings = Resolve-VegaRustDeskSetting -Server $RustDeskServer -Key $RustDeskKey
     if ($null -eq $rustDeskSettings) {
         Write-VegaStatus '未配置 RustDesk 中继（可选）：加 -RustDeskServer <host[:port]> -RustDeskKey <公钥>，或在仓库根目录放 vega.config.json。' -Level Warn
     }
@@ -4945,7 +4963,7 @@ function Invoke-VegaClientInstallCore {
 
     $failures = New-Object System.Collections.Generic.List[string]
 
-    $rustDeskSettings = Resolve-VegaRustDeskSettings -Server $RustDeskServer -Key $RustDeskKey
+    $rustDeskSettings = Resolve-VegaRustDeskSetting -Server $RustDeskServer -Key $RustDeskKey
     if ($null -eq $rustDeskSettings) {
         Write-VegaStatus '未配置 RustDesk 中继（可选）：加 -RustDeskServer <host[:port]> -RustDeskKey <公钥>，或在仓库根目录放 vega.config.json。' -Level Warn
     }
@@ -5198,7 +5216,7 @@ Export-ModuleMember -Function @(
     'ConvertFrom-VegaRustDeskServerEndpoint',
     'Test-VegaRustDeskServer',
     'Test-VegaRustDeskKey',
-    'Resolve-VegaRustDeskSettings',
+    'Resolve-VegaRustDeskSetting',
     'ConvertFrom-VegaTomlString',
     'ConvertTo-VegaTomlString',
     'ConvertFrom-VegaRustDeskConfigText',
@@ -5231,7 +5249,7 @@ Export-ModuleMember -Function @(
     'ConvertFrom-VegaSunshinePortValue',
     'Get-VegaSunshineBasePort',
     'Get-VegaFirewallProfileName',
-    'ConvertTo-VegaFirewallProfileNames',
+    'ConvertTo-VegaFirewallProfileName',
     'Test-VegaFirewallProfileCovered',
     'Get-VegaActiveFirewallProfile',
     'Repair-VegaFirewallRuleProfile',
