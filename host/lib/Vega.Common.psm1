@@ -262,13 +262,9 @@ function Write-VegaTextFileAtomic {
 
     try {
         if (Test-Path -LiteralPath $Path) {
-            try {
-                [System.IO.File]::Replace($tempPath, $Path, $null)
-            }
-            catch {
-                Remove-Item -LiteralPath $Path -Force
-                [System.IO.File]::Move($tempPath, $Path)
-            }
+            # 备份参数必须是 .NET 的 null 字符串：PowerShell 的 $null 会转成空路径，
+            # File.Replace 随即报错。失败时原文件保持不变，绝不做“先删后移”。
+            [System.IO.File]::Replace($tempPath, $Path, [NullString]::Value)
         }
         else {
             [System.IO.File]::Move($tempPath, $Path)
