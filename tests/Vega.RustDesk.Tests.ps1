@@ -384,10 +384,12 @@ Describe 'Merge-VegaRustDeskConfigText 大小写、注释与换行保真' {
 
     It '表头与键名按精确大小写匹配：[Options]/Key 不受管' {
         $existing = "[Options]`nKey = `"keep`"`n[options]`nkey = `"old`"`n"
-        $result = Merge-VegaRustDeskConfigText -ExistingText $existing -Values ([ordered]@{
-                'Key' = 'NEW'
-                'key' = 'new'
-            })
+        # PowerShell 的哈希字面量键不分大小写，'Key' 与 'key' 放进同一个 @{} 会解析报错；
+        # 这里用 Ordinal 比较器的字典，才能同时表达只有大小写不同的两个键。
+        $values = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
+        $values.Add('Key', 'NEW')
+        $values.Add('key', 'new')
+        $result = Merge-VegaRustDeskConfigText -ExistingText $existing -Values $values
 
         $result | Should -Match '(?m)^\[Options\]$'
         $result | Should -Match '(?m)^Key = "keep"$'
