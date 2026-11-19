@@ -1244,23 +1244,93 @@ function Restart-VegaSunshineService {
 # 防火墙（Vega 自己创建的规则，固定内部 Name，限定 Program）
 # ---------------------------------------------------------------------------
 
-function Get-VegaFirewallRuleSpec {
+function Get-VegaSunshinePorts {
     <#
-      只放行串流端口；管理端口 47990 不在列表里（管理页只允许本机访问）。
+      纯函数：按 Sunshine 的端口偏移规则，从生效配置里的 port（默认 47989）
+      算出全部端口。偏移相对默认 HTTP 端口 47989：
+        HTTPS -5 / HTTP 0 / 管理页 +1 / RTSP +21
+        UDP 视频 +9、控制 +10、音频 +11、麦克风 +13
     #>
     [CmdletBinding()]
-    param()
+    param(
+        [ValidateRange(1, 65535)]
+        [int]$BasePort = 47989
+    )
 
+    $ports = [pscustomobject]@{
+        BasePort        = $BasePort
+        Https           = $BasePort - 5
+        Http            = $BasePort
+        ManagementPort  = $BasePort + 1
+        Rtsp            = $BasePort + 21
+        Video           = $BasePort + 9
+        Control         = $BasePort + 10
+        Audio           = $BasePort + 11
+        Microphone      = $BasePort + 13
+    }
+
+    foreach ($name in @('Https', 'ManagementPort', 'Rtsp', 'Video', 'Control', 'Audio', 'Microphone')) {
+        if ($ports.$name -lt 1 -or $ports.$name -gt 65535) {
+            throw "端口偏移越界：port = $BasePort，$name = $($ports.$name)"
+        }
+    }
+
+    $ports | Add-Member -NotePropertyName TcpPorts -NotePropertyValue @(
+        [string]$ports.Https, [string]$ports.Http, [string]$ports.Rtsp
+    )
+    $ports | Add-Member -NotePropertyName UdpPorts -NotePropertyValue @(
+        ('{0}-{1}' -f $ports.Video, $ports.Audio), [string]$ports.Microphone, [string]$ports.Rtsp
+    )
+
+    return $ports
+}
+
+function Get-VegaSunshineBasePort {
+    <#
+      从生效的 sunshine.conf 读 port；读不到或非法时用默认 47989。
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()]
+        [string]$ConfigPath = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ConfigPath)) { return 47989 }
+    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { return 47989 }
+
+    $text = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8
+    $values = ConvertFrom-VegaSunshineConfigText -Text $text
+    if (-not $values.Contains('port')) { return 47989 }
+
+    $port = 0
+    if ([int]::TryParse(([string]$values['port']).Trim(), [ref]$port) -and $port -ge 1030 -and $port -le 65514) {
+        return $port
+    }
+
+    Write-Warning "sunshine.conf 里的 port 无效（$($values['port'])），按默认 47989 计算端口。"
+    return 47989
+}
+
+function Get-VegaFirewallRuleSpec {
+    <#
+      只放行串流端口（按生效配置计算）；管理端口不在列表里（管理页只允许本机访问）。
+    #>
+    [CmdletBinding()]
+    param(
+        [int]$BasePort = 47989
+    )
+
+    $ports = Get-VegaSunshinePorts -BasePort $BasePort
     return @(
         [pscustomobject]@{
             Name      = 'Vega-Sunshine-TCP'
             Protocol  = 'TCP'
-            LocalPort = @('47984', '47989', '48010')
+            LocalPort = $ports.TcpPorts
         },
         [pscustomobject]@{
             Name      = 'Vega-Sunshine-UDP'
             Protocol  = 'UDP'
-            LocalPort = @('47998-48000', '48002', '48010')
+            LocalPort = $ports.UdpPorts
         }
     )
 }
@@ -1308,7 +1378,9 @@ function Select-VegaSunshineInstallerFirewallRule {
         [AllowEmptyCollection()]
         [object[]]$Rules,
 
-        [string]$SunshineExe = ''
+        [string]$SunshineExe = '',
+
+        [int]$ManagementPort = 47990
     )
 
     $selected = New-Object System.Collections.Generic.List[object]
@@ -1337,7 +1409,7 @@ function Select-VegaSunshineInstallerFirewallRule {
         $ports = @()
         if ($null -ne $rule.PSObject.Properties['LocalPort']) { $ports = @($rule.LocalPort | ForEach-Object { [string]$_ }) }
 
-        if (-not (Test-VegaPortInRange -Ports $ports -Port 47990)) { continue }
+        if (-not (Test-VegaPortInRange -Ports $ports -Port $ManagementPort)) { continue }
 
         $selected.Add($rule)
     }
@@ -1347,12 +1419,14 @@ function Select-VegaSunshineInstallerFirewallRule {
 
 function Get-VegaSunshineInstallerFirewallRule {
     <#
-      枚举入站放行规则，返回 Sunshine 安装器自带、对 47990 放行的规则。
+      枚举入站放行规则，返回 Sunshine 安装器自带、对管理端口放行的规则。
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [string]$SunshineExe
+        [string]$SunshineExe,
+
+        [int]$ManagementPort = 47990
     )
 
     $collected = New-Object System.Collections.Generic.List[object]
@@ -1388,7 +1462,7 @@ function Get-VegaSunshineInstallerFirewallRule {
             })
     }
 
-    return @(Select-VegaSunshineInstallerFirewallRule -Rules $collected.ToArray() -SunshineExe $SunshineExe)
+    return @(Select-VegaSunshineInstallerFirewallRule -Rules $collected.ToArray() -SunshineExe $SunshineExe -ManagementPort $ManagementPort)
 }
 
 function Disable-VegaSunshineInstallerFirewallRule {
@@ -1526,23 +1600,52 @@ function Remove-VegaFirewallRule {
     return $removed
 }
 
+function Test-VegaFirewallSpecSafe {
+    <#
+      纯函数：确认放行规则里不包含管理端口（管理页只允许本机访问）。
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [object[]]$Specs,
+
+        [Parameter(Mandatory)]
+        [int]$ManagementPort
+    )
+
+    foreach ($spec in @($Specs)) {
+        if ($null -eq $spec) { continue }
+        if (Test-VegaPortInRange -Ports @($spec.LocalPort) -Port $ManagementPort) { return $false }
+    }
+    return $true
+}
+
 function Set-VegaFirewallRule {
     <#
-      先删后建，规则限定 Program 为 sunshine.exe 绝对路径、只开串流端口。
-      创建后逐条核对，失败抛异常。返回创建条数。
+      先删后建，规则限定 Program 为 sunshine.exe 绝对路径、只开按生效配置算出的串流端口。
+      创建后逐条核对，失败抛异常。返回创建成功的规则名。
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
-        [string]$Program
+        [string]$Program,
+
+        [int]$BasePort = 47989
     )
 
     if (-not (Test-VegaAbsolutePath -Path $Program)) {
         throw "防火墙规则需要 sunshine.exe 的绝对路径，收到：$Program"
     }
 
-    $created = 0
-    foreach ($spec in (Get-VegaFirewallRuleSpec)) {
+    $ports = Get-VegaSunshinePorts -BasePort $BasePort
+    $specs = @(Get-VegaFirewallRuleSpec -BasePort $BasePort)
+    if (-not (Test-VegaFirewallSpecSafe -Specs $specs -ManagementPort $ports.ManagementPort)) {
+        throw "放行规则覆盖了管理端口 $($ports.ManagementPort)，拒绝创建。"
+    }
+
+    $created = New-Object System.Collections.Generic.List[string]
+    foreach ($spec in $specs) {
         if (-not $PSCmdlet.ShouldProcess($spec.Name, '重建防火墙规则')) { continue }
 
         $null = Remove-VegaFirewallRule -Name $spec.Name -Confirm:$false
@@ -1557,7 +1660,7 @@ function Set-VegaFirewallRule {
             Profile     = 'Any'
             Program     = $Program
             Enabled     = 'True'
-            Description = 'Vega Remote：Sunshine 串流端口（不含管理端口 47990）'
+            Description = 'Vega Remote：Sunshine 串流端口（不含管理端口）'
         }
 
         try {
@@ -1570,15 +1673,15 @@ function Set-VegaFirewallRule {
         if (-not (Test-VegaFirewallRule -Name $spec.Name)) {
             throw "创建后未找到防火墙规则 $($spec.Name)"
         }
-        $created++
+        $created.Add($spec.Name)
     }
 
-    return $created
+    return $created.ToArray()
 }
 
 function Protect-VegaSunshineManagementPort {
     <#
-      检测并禁用 Sunshine 安装器自带、对 47990 放行的入站规则，记录进清单。
+      检测并禁用 Sunshine 安装器自带、对管理端口放行的入站规则，记录进清单。
       返回更新后的清单。
     #>
     [CmdletBinding(SupportsShouldProcess)]
@@ -1587,12 +1690,14 @@ function Protect-VegaSunshineManagementPort {
         $State,
 
         [Parameter(Mandatory)]
-        [string]$SunshineExe
+        [string]$SunshineExe,
+
+        [int]$ManagementPort = 47990
     )
 
     if (-not (Test-Path -LiteralPath $SunshineExe -PathType Leaf)) { return $State }
 
-    $rules = @(Get-VegaSunshineInstallerFirewallRule -SunshineExe $SunshineExe)
+    $rules = @(Get-VegaSunshineInstallerFirewallRule -SunshineExe $SunshineExe -ManagementPort $ManagementPort)
     if ($rules.Count -eq 0) { return $State }
 
     $disabled = @(Disable-VegaSunshineInstallerFirewallRule -Rules $rules -Confirm:$false)
@@ -1601,7 +1706,7 @@ function Protect-VegaSunshineManagementPort {
     }
 
     if ($disabled.Count -gt 0) {
-        Write-VegaStatus ("已隔离管理端口 47990：禁用安装器规则 {0}" -f ($disabled -join '、')) -Level Warn
+        Write-VegaStatus ("已隔离管理端口 ${ManagementPort}：禁用安装器规则 {0}" -f ($disabled -join '、')) -Level Warn
     }
 
     return $State
@@ -1859,7 +1964,8 @@ function Invoke-VegaHostInstall {
     # 已经装过 Sunshine 的机器：先隔离管理端口，再动配置
     $existingSunshine = Get-VegaSunshineInstall
     if ($null -ne $existingSunshine) {
-        $state = Protect-VegaSunshineManagementPort -State $state -SunshineExe $existingSunshine.Exe -Confirm:$false
+        $existingPort = Get-VegaSunshineBasePort -ConfigPath $existingSunshine.Config
+        $state = Protect-VegaSunshineManagementPort -State $state -SunshineExe $existingSunshine.Exe -ManagementPort (Get-VegaSunshinePorts -BasePort $existingPort).ManagementPort -Confirm:$false
         $null = Write-VegaState -State $state -Path $StatePath -Confirm:$false
     }
 
@@ -1903,7 +2009,9 @@ function Invoke-VegaHostInstall {
         }
     }
 
-    $state = Protect-VegaSunshineManagementPort -State $state -SunshineExe $sunshine.Exe -Confirm:$false
+    $basePort = Get-VegaSunshineBasePort -ConfigPath $sunshine.Config
+    $ports = Get-VegaSunshinePorts -BasePort $basePort
+    $state = Protect-VegaSunshineManagementPort -State $state -SunshineExe $sunshine.Exe -ManagementPort $ports.ManagementPort -Confirm:$false
     $null = Write-VegaState -State $state -Path $StatePath -Confirm:$false
 
     Write-VegaStatus '检测显卡'
@@ -1968,14 +2076,14 @@ function Invoke-VegaHostInstall {
     }
     Write-VegaStatus "配置已写入 $($configResult.Path)"
 
-    Write-VegaStatus '放行串流端口（仅 sunshine.exe，不含管理端口 47990）'
+    Write-VegaStatus "放行串流端口（仅 sunshine.exe，不含管理端口 $($ports.ManagementPort)）"
     try {
-        $null = Set-VegaFirewallRule -Program $sunshine.Exe -Confirm:$false
-        foreach ($spec in (Get-VegaFirewallRuleSpec)) {
-            $state = Add-VegaStateFirewallRule -State $state -Name $spec.Name
+        $createdRules = @(Set-VegaFirewallRule -Program $sunshine.Exe -BasePort $basePort -Confirm:$false)
+        foreach ($ruleName in $createdRules) {
+            $state = Add-VegaStateFirewallRule -State $state -Name $ruleName
         }
         $null = Write-VegaState -State $state -Path $StatePath -Confirm:$false
-        Write-VegaStatus 'Vega 防火墙规则已就绪（TCP 47984/47989/48010，UDP 47998-48000/48002/48010）' -Level Ok
+        Write-VegaStatus ("Vega 防火墙规则已就绪（TCP {0}；UDP {1}）" -f ($ports.TcpPorts -join '/'), ($ports.UdpPorts -join '/')) -Level Ok
     }
     catch {
         $failures.Add("防火墙规则创建失败：$($_.Exception.Message)")
@@ -2024,8 +2132,8 @@ function Invoke-VegaHostInstall {
     }
 
     Write-VegaStatus '完成' -Level Ok
-    Write-VegaStatus '首次设置管理密码：在本机浏览器打开 https://localhost:47990 ，按页面提示设置账号密码。'
-    Write-VegaStatus '管理页只允许本机访问（origin_web_ui_allowed = pc），47990 不放行到网络。'
+    Write-VegaStatus "首次设置管理密码：在本机浏览器打开 https://localhost:$($ports.ManagementPort) ，按页面提示设置账号密码。"
+    Write-VegaStatus "管理页只允许本机访问（origin_web_ui_allowed = pc），$($ports.ManagementPort) 不放行到网络。"
     if (-not $SkipTailscale) {
         Write-VegaStatus '下一步：打开 Tailscale 登录，记下本机 100.x.x.x 地址'
     }
@@ -2252,7 +2360,7 @@ function Invoke-VegaClientInstall {
     Write-VegaStatus '接下来：'
     Write-VegaStatus '1. 登录 Tailscale（与被控端同一账号）'
     Write-VegaStatus '2. 打开 Moonlight → 右上角 + → 输入被控端 100.x.x.x 或 IPv6 地址'
-    Write-VegaStatus '3. 在被控端本机浏览器打开 https://localhost:47990 完成首次设密，再在 PIN 页面输入 Moonlight 显示的 PIN'
+    Write-VegaStatus '3. 在被控端本机浏览器打开 https://localhost:<管理端口，默认 47990> 完成首次设密，再在 PIN 页面输入 Moonlight 显示的 PIN'
     Write-VegaStatus '4. Moonlight 设置：分辨率选原生，帧率 60，码率默认，开启 HEVC'
     Write-VegaStatus '诊断：.\tools\vega-doctor.ps1 -Peer <被控端机器名>'
 
@@ -2374,7 +2482,10 @@ Export-ModuleMember -Function @(
     'Get-VegaSunshineService',
     'Set-VegaSunshineServiceStartType',
     'Restart-VegaSunshineService',
+    'Get-VegaSunshinePorts',
+    'Get-VegaSunshineBasePort',
     'Get-VegaFirewallRuleSpec',
+    'Test-VegaFirewallSpecSafe',
     'Test-VegaPortInRange',
     'Select-VegaSunshineInstallerFirewallRule',
     'Get-VegaSunshineInstallerFirewallRule',
