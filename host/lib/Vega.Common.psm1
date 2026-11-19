@@ -3084,7 +3084,10 @@ function Repair-VegaFirewallRuleProfile {
     $updatedProperty = $updated.PSObject.Properties['Profile']
     $updatedProfile = $(if ($null -ne $updatedProperty) { $updatedProperty.Value } else { $null })
     # 回读必须同时覆盖原范围与活动配置：只核对活动配置会把规则原有 Profile 弄丢。
-    $expectedProfiles = @(@($currentNames) + @($required) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    # 期望值直接复用补齐时写下去的并集：已去重、固定 Domain/Private/Public 顺序。
+    # 用 @($currentNames) + @($required) 拼接会在两者重叠时产生 Private,Private,Public 这种重复项，
+    # 报错信息和覆盖比较都跟着不稳定。
+    $expectedProfiles = @($targetProfiles)
     if (-not (Test-VegaFirewallProfileCovered -FwProfile $updatedProfile -RequiredProfiles $expectedProfiles)) {
         $actual = @(ConvertTo-VegaFirewallProfileName -FwProfile $updatedProfile) -join ','
         throw "防火墙规则 $Name 的 Profile 未覆盖完整并集（实际：$actual，需要：$($expectedProfiles -join ',')）。"

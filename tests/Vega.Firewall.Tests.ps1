@@ -273,9 +273,14 @@ Describe 'Test-VegaHostFirewallEnabled' {
                 $null = $PolicyStore
             }
         }
+        # 过滤器 cmdlet 在 Windows PowerShell 5.1 的动态参数会强转 CimInstance；
+        # Get-/Set-NetFirewallRule 在 Windows 上真实存在，Pester 的模块作用域 mock 会沿用
+        # CDXML 的真实参数类型，mock 里回写的“规则状态”在回读时读不回来。
+        # 这几类命令不论平台都用同名 stub 覆盖，参数签名由 stub 对齐。
+        $alwaysStub = @('Get-NetFirewallRule', 'Set-NetFirewallRule')
         foreach ($stubName in $stubs.Keys) {
-            # 过滤器 cmdlet 在 Windows PowerShell 5.1 的动态参数会强转 CimInstance，始终用 stub 覆盖。
-            if ($stubName -notlike "*Filter" -and (Get-Command -Name $stubName -ErrorAction SilentlyContinue)) { continue }
+            $mustStub = ($stubName -like '*Filter') -or ($stubName -in $alwaysStub)
+            if (-not $mustStub -and (Get-Command -Name $stubName -ErrorAction SilentlyContinue)) { continue }
             $stubBody = $stubs[$stubName]
             & $module {
                 param($name, $body)
@@ -385,9 +390,14 @@ Describe 'Set-VegaAdminBlockRule' {
                 $null = $AssociatedNetFirewallRule
             }
         }
+        # 过滤器 cmdlet 在 Windows PowerShell 5.1 的动态参数会强转 CimInstance；
+        # Get-/Set-NetFirewallRule 在 Windows 上真实存在，Pester 的模块作用域 mock 会沿用
+        # CDXML 的真实参数类型，mock 里回写的“规则状态”在回读时读不回来。
+        # 这几类命令不论平台都用同名 stub 覆盖，参数签名由 stub 对齐。
+        $alwaysStub = @('Get-NetFirewallRule', 'Set-NetFirewallRule')
         foreach ($stubName in $stubs.Keys) {
-            # 过滤器 cmdlet 在 Windows PowerShell 5.1 的动态参数会强转 CimInstance，始终用 stub 覆盖。
-            if ($stubName -notlike "*Filter" -and (Get-Command -Name $stubName -ErrorAction SilentlyContinue)) { continue }
+            $mustStub = ($stubName -like '*Filter') -or ($stubName -in $alwaysStub)
+            if (-not $mustStub -and (Get-Command -Name $stubName -ErrorAction SilentlyContinue)) { continue }
             $stubBody = $stubs[$stubName]
             & $module {
                 param($name, $body)
@@ -726,9 +736,14 @@ Describe 'Set-VegaFirewallRule 回读' {
                 $null = $AssociatedNetFirewallRule
             }
         }
+        # 过滤器 cmdlet 在 Windows PowerShell 5.1 的动态参数会强转 CimInstance；
+        # Get-/Set-NetFirewallRule 在 Windows 上真实存在，Pester 的模块作用域 mock 会沿用
+        # CDXML 的真实参数类型，mock 里回写的“规则状态”在回读时读不回来。
+        # 这几类命令不论平台都用同名 stub 覆盖，参数签名由 stub 对齐。
+        $alwaysStub = @('Get-NetFirewallRule', 'Set-NetFirewallRule')
         foreach ($stubName in $stubs.Keys) {
-            # 过滤器 cmdlet 在 Windows PowerShell 5.1 的动态参数会强转 CimInstance，始终用 stub 覆盖。
-            if ($stubName -notlike "*Filter" -and (Get-Command -Name $stubName -ErrorAction SilentlyContinue)) { continue }
+            $mustStub = ($stubName -like '*Filter') -or ($stubName -in $alwaysStub)
+            if (-not $mustStub -and (Get-Command -Name $stubName -ErrorAction SilentlyContinue)) { continue }
             $stubBody = $stubs[$stubName]
             & $module {
                 param($name, $body)
