@@ -2696,6 +2696,12 @@ function Protect-VegaSunshineManagementPort {
         Write-VegaStatus ("已隔离管理端口 ${ManagementPort}：禁用安装器规则 {0}" -f ($disabled -join '、')) -Level Warn
     }
 
+    # 串流放行规则已经确认，安装器规则却禁不掉：管理页仍然暴露，必须中止而不是继续
+    $failed = @($rules | Where-Object { $disabled -notcontains [string]$_.Name })
+    if ($failed.Count -gt 0) {
+        throw ("未能禁用 Sunshine 安装器放行规则：{0}" -f (($failed | ForEach-Object { [string]$_.Name }) -join '、'))
+    }
+
     return $State
 }
 

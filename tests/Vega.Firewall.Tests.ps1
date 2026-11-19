@@ -387,3 +387,34 @@ Describe 'Set-VegaFirewallRule 回读' {
         { Set-VegaFirewallRule -Program 'C:\Sunshine\sunshine.exe' -Confirm:$false } | Should -Throw '*状态异常*'
     }
 }
+
+Describe 'Protect-VegaSunshineManagementPort' {
+    BeforeAll {
+        $script:ModuleName = 'Vega.Common'
+        $script:sunshineExe = Join-Path $TestDrive 'sunshine.exe'
+        $null = New-Item -ItemType File -Path $script:sunshineExe -Force
+    }
+
+    It '禁用成功时把规则记进清单' {
+        Mock -ModuleName $script:ModuleName Get-VegaSunshineInstallerFirewallRule {
+            @([pscustomobject]@{ Name = 'Sunshine'; DisplayName = 'Sunshine'; Enabled = 'True'; Program = 'sunshine.exe'; LocalPort = @('Any') })
+        }
+        Mock -ModuleName $script:ModuleName Disable-VegaSunshineInstallerFirewallRule { @('Sunshine') }
+
+        $state = Get-VegaEmptyState
+        $result = Protect-VegaSunshineManagementPort -State $state -SunshineExe $script:sunshineExe -Confirm:$false
+
+        @($result.DisabledFirewallRules | ForEach-Object { $_.Name }) | Should -Contain 'Sunshine'
+    }
+
+    It '禁用失败时抛异常，让安装中止' {
+        Mock -ModuleName $script:ModuleName Get-VegaSunshineInstallerFirewallRule {
+            @([pscustomobject]@{ Name = 'Sunshine'; DisplayName = 'Sunshine'; Enabled = 'True'; Program = 'sunshine.exe'; LocalPort = @('Any') })
+        }
+        Mock -ModuleName $script:ModuleName Disable-VegaSunshineInstallerFirewallRule { @() }
+
+        $state = Get-VegaEmptyState
+        { Protect-VegaSunshineManagementPort -State $state -SunshineExe $script:sunshineExe -Confirm:$false } |
+            Should -Throw '*未能禁用*'
+    }
+}
