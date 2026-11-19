@@ -200,18 +200,18 @@ Describe 'P1-1 工作根创建与 ACL 校验' {
     }
 
     It '写类权限掩码覆盖 Write/Delete/改权限/取得所有权' {
-        Test-VegaBootstrapWriteRights -Rights ([System.Security.AccessControl.FileSystemRights]::FullControl) | Should -BeTrue
-        Test-VegaBootstrapWriteRights -Rights ([System.Security.AccessControl.FileSystemRights]::Delete) | Should -BeTrue
-        Test-VegaBootstrapWriteRights -Rights ([System.Security.AccessControl.FileSystemRights]::ChangePermissions) | Should -BeTrue
-        Test-VegaBootstrapWriteRights -Rights ([System.Security.AccessControl.FileSystemRights]::TakeOwnership) | Should -BeTrue
-        Test-VegaBootstrapWriteRights -Rights ([System.Security.AccessControl.FileSystemRights]::WriteAttributes) | Should -BeTrue
-        Test-VegaBootstrapWriteRights -Rights ([System.Security.AccessControl.FileSystemRights]::ReadAndExecute) | Should -BeFalse
+        Test-VegaBootstrapWriteRight -Rights ([System.Security.AccessControl.FileSystemRights]::FullControl) | Should -BeTrue
+        Test-VegaBootstrapWriteRight -Rights ([System.Security.AccessControl.FileSystemRights]::Delete) | Should -BeTrue
+        Test-VegaBootstrapWriteRight -Rights ([System.Security.AccessControl.FileSystemRights]::ChangePermissions) | Should -BeTrue
+        Test-VegaBootstrapWriteRight -Rights ([System.Security.AccessControl.FileSystemRights]::TakeOwnership) | Should -BeTrue
+        Test-VegaBootstrapWriteRight -Rights ([System.Security.AccessControl.FileSystemRights]::WriteAttributes) | Should -BeTrue
+        Test-VegaBootstrapWriteRight -Rights ([System.Security.AccessControl.FileSystemRights]::ReadAndExecute) | Should -BeFalse
     }
 
     It 'ACL 校验拒绝非管理员写权限与不可信所有者' {
         Mock Test-VegaBootstrapWindows { $true }
         Mock Test-VegaBootstrapReparsePoint { $false }
-        Mock Get-Acl {
+        Mock Get-VegaBootstrapDirectoryAcl {
             [pscustomobject]@{
                 Owner  = 'S-1-5-32-544'
                 Access = @(
@@ -222,7 +222,7 @@ Describe 'P1-1 工作根创建与 ACL 校验' {
         }
         Test-VegaBootstrapDirectoryAclTrusted -Path $TestDrive | Should -BeTrue
 
-        Mock Get-Acl {
+        Mock Get-VegaBootstrapDirectoryAcl {
             [pscustomobject]@{
                 Owner  = 'S-1-5-32-544'
                 Access = @(
@@ -232,7 +232,7 @@ Describe 'P1-1 工作根创建与 ACL 校验' {
         }
         Test-VegaBootstrapDirectoryAclTrusted -Path $TestDrive | Should -BeFalse
 
-        Mock Get-Acl {
+        Mock Get-VegaBootstrapDirectoryAcl {
             [pscustomobject]@{
                 Owner  = 'S-1-5-21-1-2-3-1001'
                 Access = @(
