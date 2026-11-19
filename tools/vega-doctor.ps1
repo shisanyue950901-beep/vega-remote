@@ -170,13 +170,18 @@ $rustDeskService = Get-Service -Name 'RustDesk' -ErrorAction SilentlyContinue
 $rustDeskSummary = Get-VegaRustDeskConfigSummary -ServicePresent:([bool]$rustDeskService)
 $rustDeskToml = $rustDeskSummary.UserPath
 $rustDeskActual = [string]$rustDeskSummary.UserServer
+$rustDeskActualRelay = [string]$rustDeskSummary.UserRelay
 if ($rustDeskSummary.UserExists) {
     Write-Host "用户配置: $rustDeskToml"
-    if ([string]::IsNullOrWhiteSpace($rustDeskActual)) {
+    if (-not [string]::IsNullOrWhiteSpace($rustDeskSummary.UserError)) {
+        Write-Host "用户配置读取失败: $($rustDeskSummary.UserError)" -ForegroundColor Yellow
+    }
+    elseif ([string]::IsNullOrWhiteSpace($rustDeskActual)) {
         Write-Host '用户配置中继服务器: 未配置（custom-rendezvous-server 为空）' -ForegroundColor Yellow
     }
     else {
         Write-Host "用户配置中继服务器: $rustDeskActual" -ForegroundColor Green
+        Write-Host "用户配置 relay-server: $(if ($rustDeskActualRelay) { $rustDeskActualRelay } else { '未配置' })"
     }
 }
 else {
@@ -187,13 +192,19 @@ if ($rustDeskService) {
     # RustDesk 服务存在时实际生效的是 LocalService 配置，必须和用户配置一起报告。
     if ($rustDeskSummary.ServiceExists) {
         Write-Host "服务配置: $($rustDeskSummary.ServicePath)"
-        if ([string]::IsNullOrWhiteSpace($rustDeskSummary.ServiceServer)) {
+        if (-not [string]::IsNullOrWhiteSpace($rustDeskSummary.ServiceError)) {
+            Write-Host "服务配置读取失败: $($rustDeskSummary.ServiceError)" -ForegroundColor Yellow
+        }
+        elseif ([string]::IsNullOrWhiteSpace($rustDeskSummary.ServiceServer)) {
             Write-Host '服务配置中继服务器: 未配置（custom-rendezvous-server 为空）' -ForegroundColor Yellow
         }
         else {
             Write-Host "服务配置中继服务器: $($rustDeskSummary.ServiceServer)" -ForegroundColor Green
+            Write-Host "服务配置 relay-server: $(if ($rustDeskSummary.ServiceRelay) { $rustDeskSummary.ServiceRelay } else { '未配置' })"
         }
-        if (-not [string]::IsNullOrWhiteSpace($rustDeskActual) -and $rustDeskSummary.ServiceServer -ne $rustDeskActual) {
+        $sameServer = [string]::Equals([string]$rustDeskSummary.ServiceServer, $rustDeskActual, [StringComparison]::OrdinalIgnoreCase)
+        $sameRelay = [string]::Equals([string]$rustDeskSummary.ServiceRelay, $rustDeskActualRelay, [StringComparison]::OrdinalIgnoreCase)
+        if (-not $sameServer -or -not $sameRelay) {
             Write-Host '用户配置与服务配置指向不同中继服务器，以服务配置为准。' -ForegroundColor Yellow
         }
     }
@@ -204,25 +215,37 @@ if ($rustDeskService) {
 
 # 服务存在时实际生效的是 LocalService 配置；一致性检查以它为准，用户配置只作参考。
 $rustDeskEffective = $rustDeskActual
+$rustDeskEffectiveRelay = $rustDeskActualRelay
 $rustDeskEffectiveName = '用户配置'
 if ($rustDeskService) {
     $rustDeskEffective = [string]$rustDeskSummary.ServiceServer
+    $rustDeskEffectiveRelay = [string]$rustDeskSummary.ServiceRelay
     $rustDeskEffectiveName = '服务配置'
 }
 
 if ($null -ne $rustDeskExpected) {
-    if ($rustDeskEffective -eq $rustDeskExpected.Server) {
-        Write-Host "与 vega.config.json 一致（$rustDeskEffectiveName）: $($rustDeskExpected.Server)" -ForegroundColor Green
+    $serverMatches = [string]::Equals($rustDeskEffective, [string]$rustDeskExpected.Server, [StringComparison]::OrdinalIgnoreCase)
+    $relayMatches = [string]::Equals($rustDeskEffectiveRelay, [string]$rustDeskExpected.RelayServer, [StringComparison]::OrdinalIgnoreCase)
+    if ($serverMatches -and $relayMatches) {
+        Write-Host "与 vega.config.json 一致（$rustDeskEffectiveName）: ID $($rustDeskExpected.Server) / relay $($rustDeskExpected.RelayServer)" -ForegroundColor Green
     }
     else {
-        Write-Host ("与 vega.config.json 不一致（{0}）：期望 {1}，实际 {2}" -f $rustDeskEffectiveName, $rustDeskExpected.Server, $(if ($rustDeskEffective) { $rustDeskEffective } else { '未配置' })) -ForegroundColor Yellow
+        $parts = New-Object System.Collections.Generic.List[string]
+        if (-not $serverMatches) {
+            $parts.Add(("custom-rendezvous-server 期望 {0}，实际 {1}" -f $rustDeskExpected.Server, $(if ($rustDeskEffective) { $rustDeskEffective } else { '未配置' })))
+        }
+        if (-not $relayMatches) {
+            $parts.Add(("relay-server 期望 {0}，实际 {1}" -f $rustDeskExpected.RelayServer, $(if ($rustDeskEffectiveRelay) { $rustDeskEffectiveRelay } else { '未配置' })))
+        }
+        Write-Host ("与 vega.config.json 不一致（{0}）：{1}" -f $rustDeskEffectiveName, ($parts -join '；')) -ForegroundColor Yellow
     }
 }
 
 $rustDeskDeviceId = ''
-$rustDeskExe = Get-VegaRustDeskInstall
+# 提权时只查找 Program Files 下签名有效的副本；设备码函数内部还会再校验一次。
+$rustDeskExe = $(if (Test-VegaProcessElevated) { Get-VegaRustDeskInstall -RequireSigned } else { Get-VegaRustDeskInstall })
 if ([string]::IsNullOrWhiteSpace($rustDeskExe)) {
-    Write-Host '未检测到 rustdesk.exe（Program Files / LOCALAPPDATA\Programs 下都没有）' -ForegroundColor Yellow
+    Write-Host '未检测到可用的 rustdesk.exe（提权时只认 Program Files 下签名有效的副本）' -ForegroundColor Yellow
 }
 else {
     Write-Host "已安装: $rustDeskExe"
@@ -340,12 +363,19 @@ $facts = @{
     TailscaleInstalled   = $tailscaleInstalled
     Peer                 = $Peer
     RustDeskTomlServer    = $rustDeskEffective
+    RustDeskTomlRelay     = $rustDeskEffectiveRelay
     RustDeskServiceServer = $rustDeskSummary.ServiceServer
+    RustDeskServiceRelay  = $rustDeskSummary.ServiceRelay
     RustDeskServicePresent = [bool]$rustDeskService
+    RustDeskUserError     = $rustDeskSummary.UserError
+    RustDeskServiceError  = $rustDeskSummary.ServiceError
     RustDeskDeviceId     = $rustDeskDeviceId
 }
 
-if ($null -ne $rustDeskExpected) { $facts['RustDeskExpectedServer'] = $rustDeskExpected.Server }
+if ($null -ne $rustDeskExpected) {
+    $facts['RustDeskExpectedServer'] = $rustDeskExpected.Server
+    $facts['RustDeskExpectedRelay'] = $rustDeskExpected.RelayServer
+}
 
 if ($null -ne $pingResult) { $facts['Ping'] = $pingResult }
 
