@@ -191,13 +191,14 @@ function Set-VegaBootstrapDirectoryAcl {
       禁用继承，只留 Administrators 与 SYSTEM 完全控制，所有者设为 Administrators。
       任何一步失败都抛异常（调用方据此中止）。非 Windows 直接返回。
     #>
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
         [string]$Path
     )
 
     if (-not (Test-VegaBootstrapWindows)) { return }
+    if (-not $PSCmdlet.ShouldProcess($Path, '收紧工作目录 ACL 为 Administrators/SYSTEM 专用')) { return }
 
     try {
         $administrators = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
@@ -268,7 +269,7 @@ function New-VegaBootstrapWorkDirectory {
     <#
       在工作根下建一个带新 GUID 的工作目录，建完立刻设 ACL。
     #>
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [AllowEmptyString()]
         [string]$Root = ''
@@ -279,6 +280,8 @@ function New-VegaBootstrapWorkDirectory {
 
     $workDirectory = Join-Path $rootPath ([guid]::NewGuid().ToString('N'))
     if (Test-Path -LiteralPath $workDirectory) { throw "工作目录已存在，拒绝复用：$workDirectory" }
+
+    if (-not $PSCmdlet.ShouldProcess($workDirectory, '创建受保护的引导工作目录')) { return '' }
 
     $null = New-Item -ItemType Directory -Path $workDirectory -Force
     if (Test-VegaBootstrapReparsePoint -Path $workDirectory) {
@@ -292,7 +295,7 @@ function Remove-VegaBootstrapWorkDirectory {
     <#
       删除工作目录（结束清理）。删不掉只警告，不影响已完成的安装。
     #>
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [AllowEmptyString()]
         [string]$Path = ''
@@ -300,6 +303,7 @@ function Remove-VegaBootstrapWorkDirectory {
 
     if ([string]::IsNullOrWhiteSpace($Path)) { return }
     if (-not (Test-Path -LiteralPath $Path)) { return }
+    if (-not $PSCmdlet.ShouldProcess($Path, '删除引导工作目录')) { return }
     try {
         Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
     }
@@ -394,7 +398,7 @@ function Get-VegaBootstrapRelease {
     }
 }
 
-function Get-VegaBootstrapBytes {
+function Get-VegaBootstrapByteArray {
     <#
       下载到内存字节数组（不落盘）。失败时附带镜像提示，URL 去掉 userinfo 与查询参数。
     #>
@@ -429,7 +433,7 @@ function Get-VegaBootstrapText {
         [string]$Uri
     )
 
-    $bytes = Get-VegaBootstrapBytes -Uri $Uri
+    $bytes = Get-VegaBootstrapByteArray -Uri $Uri
     return [System.Text.Encoding]::UTF8.GetString($bytes)
 }
 
@@ -703,7 +707,7 @@ function Invoke-VegaBootstrap {
         }
 
         Write-Host ("下载 {0} ..." -f (Hide-VegaBootstrapUri -Uri $release.ZipUrl)) -ForegroundColor Cyan
-        $zipBytes = Get-VegaBootstrapBytes -Uri $release.ZipUrl
+        $zipBytes = Get-VegaBootstrapByteArray -Uri $release.ZipUrl
 
         if (-not [string]::IsNullOrWhiteSpace($Sha256)) {
             $null = Test-VegaBootstrapChecksum -Bytes $zipBytes -ExpectedHash $Sha256
