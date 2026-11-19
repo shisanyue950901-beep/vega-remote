@@ -4,8 +4,14 @@
 - T1 安装脚本可重复执行、支持 `-Uninstall`、兼容 Windows PowerShell 5.1 与 PowerShell 7
 - T1 `vega-doctor.ps1` 一键诊断：显卡与编码器、Sunshine 服务、端口、公网 IPv6、Tailscale 直连/中继、带宽建议
 - T1 测试与 CI：Pester 单测、PSScriptAnalyzer、shellcheck、`docker compose config`，GitHub Actions 自动跑
-- T2 一行安装：`irm <raw-url> | iex` 引导脚本，GitHub Releases 发布 zip
-- T2 贡献指南、Issue / PR 模板
+- T2 一行安装：`irm <raw-url> | iex` 引导脚本，GitHub Releases 发布 zip ✅
+  - `bootstrap.ps1`：管理员检查、TLS 1.2、latest Release 下载、`SHA256SUMS.txt` 校验、解压并透传参数；`-Role` 交互选择，`-ZipUrl` 支持镜像
+  - `.github/workflows/release.yml`：tag `v*` 打包（排除 `tests/`、`.github/`、`work/`）、生成校验文件、创建 Release
+  - CI 覆盖 `bootstrap.ps1` 的 PSSA 与 Pester（mock 下载/校验/调用）
+- T2 RustDesk 中继自动配置：`-RustDeskServer` / `-RustDeskKey` 或 `vega.config.json`，写 `RustDesk2.toml` 三个键并按键回滚，读设备码，`vega-doctor` 核对指向 ✅
+- T2 开箱即用：MIT、零广告、零付费、无强制登录；README 顶部一行安装 ✅
+- T2 贡献指南、Issue / PR 模板、SECURITY ✅
+- T1-fix8：端口解析对齐上游（注释前空格、1019-65514）、EnforcementStatus 归一化、Profile 覆盖活动接口、旧规则迁移时序、接口排除提示 ✅
 
 ## M2 Vega 控制台（v0.5，图形界面）
 - 一个窗口完成：安装组件、检测显卡、显示连接地址、配对、诊断
