@@ -97,7 +97,6 @@ rollback_rules() {
 # 退出路径统一走 EXIT trap：fail()/exit 1 这类“函数内 if 分支里的退出”
 # 不会触发 ERR trap，只有 EXIT 能保证撤销本次新增的 ufw 规则、停掉本次启动的容器。
 cleanup_on_error() {
-  local code=$?
   if [[ "$CLEANED" == true ]]; then
     return 0
   fi
@@ -120,13 +119,9 @@ check_parent_dir() {
   local parent
   parent=$(dirname "$DATA_DIR")
   [[ -L "$parent" ]] && fail "数据目录的父目录是符号链接，拒绝继续：$parent"
-  local owner_sid mode
-  owner_sid=$(stat -c '%u' "$parent")
-  if [[ "$owner_sid" != "0" ]]; then
-    fail "数据目录的父目录所有者 uid=$owner_sid，不是 root；请 sudo chown root:root \"$parent\" 后重试。"
-  fi
+  local mode
   mode=$(stat -c '%a' "$parent")
-  # 其他用户可写（o+w）时不安全，父目录可被别人换掉
+  # 父目录其他人可写时，别人可以替换 data 目录；属主不强制为 root。
   if (( 8#$mode & 8#002 )); then
     fail "数据目录的父目录 $parent 其他人可写（$mode），请先 chmod o-w 后重试。"
   fi
@@ -282,7 +277,7 @@ fi
 echo "==> 放行端口（容器就绪后，逐条检查失败即退出）"
 if command -v ufw >/dev/null 2>&1; then
   if ! UFW_STATUS=$(ufw status 2>/dev/null); then
-    echo "ufw status 查询失败：未自动修改防火墙，请手动放行 TCP 21115-21117、UDP 21116。" >&2
+    fail "ufw status 查询失败，无法确认端口放行状态；请修复 ufw 后重试。"
   elif [[ "$UFW_STATUS" == *"Status: active"* ]]; then
     for rule in "${TCP_RULES[@]}" "${UDP_RULES[@]}"; do
       if ufw allow "$rule" >/dev/null 2>&1; then
