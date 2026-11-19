@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
   ConvertTo-VegaArgumentString / Test-VegaAbsolutePath 的单元测试（Pester 5）。
   纯字符串处理，不启动任何进程。
@@ -7,6 +7,8 @@
 BeforeAll {
     $modulePath = Join-Path (Join-Path $PSScriptRoot '..') 'host/lib/Vega.Common.psm1'
     Import-Module $modulePath -Force
+    # 测试要在 Windows 和 Linux 的 pwsh 上都能跑，绝对路径样例按平台给
+    $script:IsWindowsHost = [System.IO.Path]::DirectorySeparatorChar -eq '\'
 }
 
 Describe 'ConvertTo-VegaArgumentString' {
@@ -50,7 +52,17 @@ Describe 'ConvertTo-VegaArgumentString' {
 
 Describe 'Test-VegaAbsolutePath' {
     It '绝对路径返回 $true' {
-        Test-VegaAbsolutePath -Path 'C:\Windows\System32\powercfg.exe' | Should -BeTrue
+        if ($script:IsWindowsHost) {
+            Test-VegaAbsolutePath -Path 'C:\Windows\System32\powercfg.exe' | Should -BeTrue
+            Test-VegaAbsolutePath -Path 'D:\Vega\sunshine.exe' | Should -BeTrue
+            Test-VegaAbsolutePath -Path '\\server\share\sunshine.exe' | Should -BeTrue
+        }
+        else {
+            Test-VegaAbsolutePath -Path '/usr/bin/powercfg.exe' | Should -BeTrue
+            # 目标机是 Windows：即使测试跑在 Linux 上，盘符与 UNC 路径也要认成绝对路径
+            Test-VegaAbsolutePath -Path 'C:\Windows\System32\powercfg.exe' | Should -BeTrue
+            Test-VegaAbsolutePath -Path '\\server\share\sunshine.exe' | Should -BeTrue
+        }
     }
 
     It '相对路径与空值返回 $false' {
