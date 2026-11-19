@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
   防火墙规则定义与安装器规则筛选的单元测试（Pester 5）。
   纯函数，不查询真实防火墙。
@@ -36,20 +36,20 @@ Describe 'Get-VegaFirewallRuleSpec' {
     }
 }
 
-Describe 'Test-VegaPortRangeContains' {
+Describe 'Test-VegaPortInRange' {
     It '单端口精确匹配' {
-        Test-VegaPortRangeContains -Ports @('47990') -Port 47990 | Should -BeTrue
-        Test-VegaPortRangeContains -Ports @('47990') -Port 47984 | Should -BeFalse
+        Test-VegaPortInRange -Ports @('47990') -Port 47990 | Should -BeTrue
+        Test-VegaPortInRange -Ports @('47990') -Port 47984 | Should -BeFalse
     }
 
     It '端口区间匹配' {
-        Test-VegaPortRangeContains -Ports @('47998-48000') -Port 47999 | Should -BeTrue
-        Test-VegaPortRangeContains -Ports @('47998-48000') -Port 48001 | Should -BeFalse
+        Test-VegaPortInRange -Ports @('47998-48000') -Port 47999 | Should -BeTrue
+        Test-VegaPortInRange -Ports @('47998-48000') -Port 48001 | Should -BeFalse
     }
 
     It 'Any 与空集合视为覆盖所有端口' {
-        Test-VegaPortRangeContains -Ports @('Any') -Port 47990 | Should -BeTrue
-        Test-VegaPortRangeContains -Ports @() -Port 47990 | Should -BeTrue
+        Test-VegaPortInRange -Ports @('Any') -Port 47990 | Should -BeTrue
+        Test-VegaPortInRange -Ports @() -Port 47990 | Should -BeTrue
     }
 }
 
