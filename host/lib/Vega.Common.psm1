@@ -2084,14 +2084,43 @@ function Get-VegaSunshinePortMap {
     return $ports
 }
 
+function Get-VegaSunshineRawValue {
+    <#
+      纯函数：按行读取指定键的原始值（不 Trim），同名键以第一次出现为准。
+      端口预检必须看原始文本：裁剪后的值会掩盖“行尾空格 / 引号内空格”这类
+      与上游解析不一致的格式，导致 Vega 阻断错误的管理端口。
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Text,
+
+        [Parameter(Mandatory)]
+        [string]$Key
+    )
+
+    if ([string]::IsNullOrEmpty($Text)) { return $null }
+    if ([string]::IsNullOrWhiteSpace($Key)) { return $null }
+
+    $pattern = '^\s*(?<key>' + [regex]::Escape($Key) + ')\s*=(?<value>.*)$'
+    foreach ($line in ($Text -split "\r?\n")) {
+        if ($line -cmatch $pattern) { return [string]$Matches['value'] }
+    }
+    return $null
+}
+
 function ConvertFrom-VegaSunshinePortValue {
     <#
-      纯函数：按 Sunshine v2026.914 的解析方式读取 port 值。
-      先去掉行尾 # 注释，但保留注释前的空格——上游的十进制转换会因为这段空格失败，
-      Vega 不再替它 Trim，按“无法可靠确定端口”中止。
-      只剥离成对双引号（单引号不剥离，交给调用方中止）；
-      十进制允许前导零，支持 0x 十六进制；有效范围 1019-65514。
-      解析失败或超出范围时返回 $null，由调用方中止。
+      纯函数：严格解析 sunshine.conf 的 port 原始值，只接受纯十进制。
+      各步规则：
+        - 行尾 # 注释先去掉；注释前若有空格（即去掉注释后残留行尾空格）中止；
+        - 没有注释时，行尾空格同样中止（与上游的十进制转换结果不可靠一致）；
+        - 行首空白可以忽略（十进制转换本身会跳过）；
+        - 只剥离成对双引号，引号内有空白中止；单引号不剥离；
+        - 十六进制（0x / 0X）、前导 +、其他格式一律中止，提示改成纯十进制；
+        - 有效范围 1019-65514。
+      返回 $null 表示无法可靠确定端口，由调用方中止并提示用户。
     #>
     [CmdletBinding()]
     param(
@@ -2102,39 +2131,35 @@ function ConvertFrom-VegaSunshinePortValue {
 
     if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
 
-    $text = $Value
+    $text = [string]$Value
     $commentIndex = $text.IndexOf('#')
-    if ($commentIndex -ge 0) { $text = $text.Substring(0, $commentIndex) }
-    # 不 Trim：注释前的空格会保留下来，十进制转换失败 → 无法可靠确定端口。
+    $hasComment = ($commentIndex -ge 0)
+    if ($hasComment) { $text = $text.Substring(0, $commentIndex) }
 
-    if ($text.Length -ge 2) {
-        $first = $text[0]
-        $last = $text[$text.Length - 1]
-        if ($first -eq '"' -and $last -eq '"') {
-            $text = $text.Substring(1, $text.Length - 2).Trim()
-        }
+    # 行首空白：十进制转换会跳过，可以接受；行尾空白（含注释前的空格）不接受。
+    $text = $text.TrimStart()
+    if ($text.Length -eq 0) { return $null }
+    if ([char]::IsWhiteSpace($text[$text.Length - 1])) { return $null }
+
+    if ($text.Length -ge 2 -and $text[0] -eq '"' -and $text[$text.Length - 1] -eq '"') {
+        $inner = $text.Substring(1, $text.Length - 2)
+        if ($inner.Length -eq 0) { return $null }
+        if ($inner -match '\s') { return $null }
+        $text = $inner
     }
+
+    if ($text -notmatch '^[0-9]+$') { return $null }
 
     $port = 0
-    if ($text -match '^0[xX](?<hex>[0-9A-Fa-f]{1,8})$') {
-        try { $port = [Convert]::ToInt32($Matches['hex'], 16) }
-        catch { return $null }
-    }
-    elseif ($text -match '^[0-9]+$') {
-        if (-not [int]::TryParse($text, [ref]$port)) { return $null }
-    }
-    else {
-        return $null
-    }
-
+    if (-not [int]::TryParse($text, [ref]$port)) { return $null }
     if ($port -lt 1019 -or $port -gt 65514) { return $null }
     return $port
 }
 
 function Get-VegaSunshineBasePort {
     <#
-      从生效的 sunshine.conf 读 port；读不到文件或没有 port 键时用默认 47989。
-      port 值存在但解析失败时抛出异常中止，不再静默回退默认值——
+      从生效的 sunshine.conf 读 port 原始值；读不到文件或没有 port 键时用默认 47989。
+      值存在但格式无法与上游一致确定时抛出异常中止，不再静默回退默认值——
       否则 Vega 会阻断错误的管理端口，把真实管理页暴露出去。
     #>
     [CmdletBinding()]
@@ -2147,12 +2172,12 @@ function Get-VegaSunshineBasePort {
     if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { return 47989 }
 
     $text = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8
-    $values = ConvertFrom-VegaSunshineConfigText -Text $text
-    if (-not $values.Contains('port')) { return 47989 }
+    $raw = Get-VegaSunshineRawValue -Text $text -Key 'port'
+    if ($null -eq $raw) { return 47989 }
 
-    $port = ConvertFrom-VegaSunshinePortValue -Value ([string]$values['port'])
+    $port = ConvertFrom-VegaSunshinePortValue -Value $raw
     if ($null -eq $port) {
-        throw "sunshine.conf 里的 port 无效（$($values['port'])），无法可靠确定端口；请改成 1019-65514 的十进制或 0x 十六进制值（不加行尾注释；单引号不会被剥离，请用双引号或不加引号）后重试。"
+        throw 'sunshine.conf 里的 port 无效：无法与上游一致地确定端口。请把 port 改成 1019-65514 的纯十进制（不加引号、不加行尾注释、行尾不留空格）后重试。'
     }
 
     return [int]$port
@@ -5246,6 +5271,7 @@ Export-ModuleMember -Function @(
     'Restore-VegaSunshineServiceState',
     'Restart-VegaSunshineService',
     'Get-VegaSunshinePortMap',
+    'Get-VegaSunshineRawValue',
     'ConvertFrom-VegaSunshinePortValue',
     'Get-VegaSunshineBasePort',
     'Get-VegaFirewallProfileName',

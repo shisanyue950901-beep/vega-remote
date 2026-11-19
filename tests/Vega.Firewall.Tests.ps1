@@ -133,53 +133,70 @@ Describe 'Test-VegaManagementPortConflict' {
 }
 
 Describe 'Get-VegaSunshineBasePort' {
-    It '只剥离成对双引号' {
+    It '去掉成对双引号后按纯十进制解析' {
         $path = Join-Path $TestDrive 'quoted.conf'
         Set-Content -LiteralPath $path -Value 'port = "50000"' -Encoding UTF8
         Get-VegaSunshineBasePort -ConfigPath $path | Should -Be 50000
     }
 
-    It '单引号不剥离，按 Sunshine 的行为解析失败并中止' {
+    It '单引号不剥离，按无法确定端口中止' {
         $path = Join-Path $TestDrive 'single-quoted.conf'
         Set-Content -LiteralPath $path -Value "port = '50000'" -Encoding UTF8
-        { Get-VegaSunshineBasePort -ConfigPath $path } | Should -Throw '*port 无效*'
+        { Get-VegaSunshineBasePort -ConfigPath $path } | Should -Throw '*纯十进制*'
     }
 
-    It '接受 0x 十六进制端口值' {
+    It '十六进制（0x / 0X）中止，提示改成纯十进制' {
         $path = Join-Path $TestDrive 'hex.conf'
         Set-Content -LiteralPath $path -Value 'port = 0xC350' -Encoding UTF8
-        Get-VegaSunshineBasePort -ConfigPath $path | Should -Be 50000
+        { Get-VegaSunshineBasePort -ConfigPath $path } | Should -Throw '*纯十进制*'
 
-        Set-Content -LiteralPath $path -Value 'port = 0xBB80' -Encoding UTF8
-        Get-VegaSunshineBasePort -ConfigPath $path | Should -Be 48000
+        Set-Content -LiteralPath $path -Value 'port = 0XC350' -Encoding UTF8
+        { Get-VegaSunshineBasePort -ConfigPath $path } | Should -Throw '*纯十进制*'
+
+        ConvertFrom-VegaSunshinePortValue -Value '0xC350' | Should -BeNullOrEmpty
+        ConvertFrom-VegaSunshinePortValue -Value '0XC350' | Should -BeNullOrEmpty
     }
 
-    It '十进制允许前导零，与 Sunshine 的十进制转换一致' {
+    It '十进制允许前导零' {
         $path = Join-Path $TestDrive 'leading-zero.conf'
         Set-Content -LiteralPath $path -Value 'port = 047989' -Encoding UTF8
         Get-VegaSunshineBasePort -ConfigPath $path | Should -Be 47989
     }
 
-    It '去掉行尾 # 注释且注释前没有空格时按十进制解析' {
+    It '去掉紧贴数字的行尾 # 注释后解析' {
         $path = Join-Path $TestDrive 'comment.conf'
         Set-Content -LiteralPath $path -Value 'port = 50000# 自定义端口' -Encoding UTF8
         Get-VegaSunshineBasePort -ConfigPath $path | Should -Be 50000
     }
 
-    It '注释前有空格时与上游一致：保留空格导致十进制转换失败，按无法确定端口中止' {
-        # Sunshine 去注释后不 Trim，'50000 ' 的十进制转换失败；Vega 不替它修，直接中止
+    It '注释前有空格时按无法确定端口中止' {
         $path = Join-Path $TestDrive 'comment-space.conf'
         Set-Content -LiteralPath $path -Value 'port = 50000 # 自定义端口' -Encoding UTF8
-        { Get-VegaSunshineBasePort -ConfigPath $path } | Should -Throw '*无法可靠确定端口*'
+        { Get-VegaSunshineBasePort -ConfigPath $path } | Should -Throw '*纯十进制*'
+    }
+
+    It '没有注释的行尾空格中止' {
+        $path = Join-Path $TestDrive 'trailing-space.conf'
+        Set-Content -LiteralPath $path -Value 'port = 50000  ' -Encoding UTF8
+        { Get-VegaSunshineBasePort -ConfigPath $path } | Should -Throw '*纯十进制*'
+        ConvertFrom-VegaSunshinePortValue -Value '50000 ' | Should -BeNullOrEmpty
+        ConvertFrom-VegaSunshinePortValue -Value ' 50000' | Should -Be 50000
+    }
+
+    It '引号内有空格时中止' {
+        $path = Join-Path $TestDrive 'quoted-space.conf'
+        Set-Content -LiteralPath $path -Value 'port = " 50000"' -Encoding UTF8
+        { Get-VegaSunshineBasePort -ConfigPath $path } | Should -Throw '*纯十进制*'
+        ConvertFrom-VegaSunshinePortValue -Value '"50000 "' | Should -BeNullOrEmpty
     }
 
     It '有效范围是 1019-65514，越界中止' {
         $path = Join-Path $TestDrive 'range.conf'
         Set-Content -LiteralPath $path -Value 'port = 1018' -Encoding UTF8
-        { Get-VegaSunshineBasePort -ConfigPath $path } | Should -Throw '*port 无效*'
+        { Get-VegaSunshineBasePort -ConfigPath $path } | Should -Throw '*纯十进制*'
 
         Set-Content -LiteralPath $path -Value 'port = 65515' -Encoding UTF8
-        { Get-VegaSunshineBasePort -ConfigPath $path } | Should -Throw '*port 无效*'
+        { Get-VegaSunshineBasePort -ConfigPath $path } | Should -Throw '*纯十进制*'
 
         Set-Content -LiteralPath $path -Value 'port = 1019' -Encoding UTF8
         Get-VegaSunshineBasePort -ConfigPath $path | Should -Be 1019
@@ -196,7 +213,14 @@ Describe 'Get-VegaSunshineBasePort' {
     It '端口值解析失败时中止，不再静默回退 47989' {
         $path = Join-Path $TestDrive 'bad.conf'
         Set-Content -LiteralPath $path -Value 'port = "50000x"' -Encoding UTF8
-        { Get-VegaSunshineBasePort -ConfigPath $path } | Should -Throw '*port 无效*'
+        { Get-VegaSunshineBasePort -ConfigPath $path } | Should -Throw '*纯十进制*'
+    }
+
+    It '读取未裁剪的原始值：配置解析裁剪后的值不参与端口判定' {
+        $text = "sunshine_name = Vega`nport = 48000   `n"
+        (Get-VegaSunshineRawValue -Text $text -Key 'port') | Should -Be ' 48000   '
+        (ConvertFrom-VegaSunshineConfigText -Text $text)['port'] | Should -Be '48000'
+        ConvertFrom-VegaSunshinePortValue -Value (Get-VegaSunshineRawValue -Text $text -Key 'port') | Should -BeNullOrEmpty
     }
 
     It '没有 port 键时仍用默认 47989' {
