@@ -24,6 +24,15 @@ BeforeAll {
             param([Parameter(Position = 0)][string]$ClassName)
             $null = $ClassName
         }
+        'Get-NetFirewallProfile' = {
+            [CmdletBinding()]
+            param([string]$PolicyStore)
+            $null = $PolicyStore
+        }
+        'Get-NetConnectionProfile' = {
+            [CmdletBinding()]
+            param()
+        }
         'Get-Service'     = {
             [CmdletBinding()]
             param([Parameter(Position = 0)][string[]]$Name)
@@ -84,6 +93,7 @@ Describe 'Invoke-VegaHostInstall（mock）' {
         }
 
         Mock -ModuleName $script:ModuleName Test-VegaWingetAvailable { $true }
+        Mock -ModuleName $script:ModuleName Test-VegaHostFirewallEnabled { $true }
         Mock -ModuleName $script:ModuleName Remove-VegaLegacyFirewallRule { @() }
         Mock -ModuleName $script:ModuleName Set-VegaAdminBlockRule { 'Vega-Block-Admin' }
         Mock -ModuleName $script:ModuleName Protect-VegaSunshineManagementPort { param($State) $State }
@@ -155,6 +165,19 @@ Describe 'Invoke-VegaHostInstall（mock）' {
 
         $result.ExitCode | Should -Be 1
         ($result.Failures -join "`n") | Should -Match 'port'
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Set-VegaAdminBlockRule -Times 0 -Exactly
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Install-VegaPackage -Times 0 -Exactly
+    }
+
+    It '当前网络防火墙关闭时中止安装，不建阻断规则也不调用 winget' {
+        Mock -ModuleName $script:ModuleName Get-VegaSunshineInstall { $script:sunshine }
+        Mock -ModuleName $script:ModuleName Test-VegaHostFirewallEnabled { $false }
+        Mock -ModuleName $script:ModuleName Install-VegaPackage { throw '不该被调用' }
+
+        $result = Invoke-VegaHostInstall -StatePath $script:statePath -TemplatePath $script:TemplatePath -SkipTailscale
+
+        $result.ExitCode | Should -Be 1
+        ($result.Failures -join "`n") | Should -Match 'Windows 防火墙在当前网络已关闭'
         Should -Invoke -ModuleName $script:ModuleName -CommandName Set-VegaAdminBlockRule -Times 0 -Exactly
         Should -Invoke -ModuleName $script:ModuleName -CommandName Install-VegaPackage -Times 0 -Exactly
     }
