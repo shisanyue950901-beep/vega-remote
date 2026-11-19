@@ -6,27 +6,35 @@
 #   - 镜像固定 rustdesk/rustdesk-server:1.1.16，部署与 CI 使用同一份 compose 文件。
 #   - 用 host 网络，不发布端口：Docker 的端口发布经过 DNAT，不经过 UFW 的 INPUT 规则，
 #     会绕过已有的入站限制；host 网络下 ufw 规则才真正生效。
-#   - --websocket 只决定是否额外 ufw allow 21118/21119（host 网络下服务本来就在这些端口监听）。
-#   - 未检测到启用的 UFW 时打印醒目警告：21115-21119 将直接暴露，安全组只放行必要端口。
+#   - 只支持全新部署：启动前项目里已有容器时默认拒绝；--reinstall 先 compose down，
+#     数据目录和密钥保留，再按全新流程部署。
+#   - 启动前用 ss -lntup 检查 21115-21119 是否已被占用，占用则拒绝。
+#   - host 网络下服务本来就在 21115-21119 监听；--websocket 只决定是否额外 ufw allow
+#     21118/21119。未启用 WebSocket 且 UFW 默认 deny 时，额外 ufw deny 21118:21119/tcp。
+#   - UFW 未启用/未安装，或已启用但默认入站为 allow 时，打印醒目警告：
+#     21118/21119（WebSocket）也会对外可达，请用云安全组只放行 TCP 21115-21117、UDP 21116。
 #   - compose 一律 --env-file /dev/null，避免读取项目里的 .env 改变部署结果。
 #   - 启动前完成数据目录检查（0700、属主 root、非符号链接、父目录非他人可写）
 #     与已有私钥检查（普通文件、0600）；任何一项不满足立即退出。
-#   - 启动前记录项目已有容器及其 RestartCount；只有启动前项目没有任何容器时，
-#     失败才 compose down。就绪判定用本次检查期间的 RestartCount 增量。
+#   - compose up 之前置 ATTEMPTED=true；失败时一定 compose down（容器都是本次新建的）。
+#   - 就绪判定按 up 后采样的容器 ID：ID 必须不变、RestartCount 必须保持 0 持续 5 秒。
 #   - 公钥是 44 字符 base64，私钥是普通文件且 0600；失败时回滚本次新增的 ufw 规则。
-#   - ufw 每条 allow 前先查该规则是否已存在，已存在的不计入本次新增；只撤销本次新增的规则。
+#   - ufw 里已有涉及 21115-21119 的规则时不再追加，只提示用户自查。
 set -euo pipefail
 cd "$(dirname "$0")"
 
 ALLOW_WEBSOCKET=false
+REINSTALL=false
 usage() {
-  echo "用法: sudo bash setup-rustdesk-server.sh [--websocket]" >&2
+  echo "用法: sudo bash setup-rustdesk-server.sh [--websocket] [--reinstall]" >&2
   echo "  --websocket  额外放行 WebSocket 端口 TCP 21118-21119（host 网络下服务本来就监听）" >&2
+  echo "  --reinstall  已有部署时先 compose down（数据目录和密钥保留）再重新部署" >&2
 }
 
 for arg in "$@"; do
   case "$arg" in
     --websocket) ALLOW_WEBSOCKET=true ;;
+    --reinstall) REINSTALL=true ;;
     -h|--help) usage; exit 0 ;;
     *) echo "未知参数: $arg" >&2; usage; exit 2 ;;
   esac
@@ -74,21 +82,20 @@ compose() {
 }
 
 ADDED_RULES=()
-STARTED=false
+ATTEMPTED=false
 CLEANED=false
-# up 之前项目里是否已经有容器：有就绝不在失败时 compose down
-HAS_PRE_EXISTING=false
-declare -A RESTART_BASELINE=()
 
 rollback_rules() {
   if [[ ${#ADDED_RULES[@]} -eq 0 ]]; then
     return 0
   fi
   echo "==> 回滚本次新增的 ufw 规则" >&2
-  local rule
-  for rule in "${ADDED_RULES[@]}"; do
-    if ! ufw delete allow "$rule" >/dev/null 2>&1; then
-      echo "回滚 ufw 规则失败，请手动执行：ufw delete allow $rule" >&2
+  local entry action spec
+  for entry in "${ADDED_RULES[@]}"; do
+    action="${entry%% *}"
+    spec="${entry#* }"
+    if ! ufw delete "$action" "$spec" >/dev/null 2>&1; then
+      echo "回滚 ufw 规则失败，请手动执行：ufw delete $action $spec" >&2
     fi
   done
   ADDED_RULES=()
@@ -102,16 +109,12 @@ cleanup_on_error() {
   fi
   CLEANED=true
   rollback_rules
-  if [[ "$STARTED" != true ]]; then
+  if [[ "$ATTEMPTED" != true ]]; then
     return 0
   fi
-  if [[ "$HAS_PRE_EXISTING" == false ]]; then
-    echo "==> 清理本次启动的容器" >&2
-    compose down >/dev/null 2>&1 || true
-  else
-    # 启动前就有容器：不能 compose down，那会删掉正在用的部署
-    echo "==> 启动前项目里已有容器，失败时不删除；请手动检查：docker compose ps" >&2
-  fi
+  # 只支持全新部署（--reinstall 会先 down），所以这里的容器一定是本次新建的
+  echo "==> 清理本次启动的容器" >&2
+  compose down >/dev/null 2>&1 || true
   return 0
 }
 trap cleanup_on_error EXIT
@@ -190,34 +193,54 @@ check_existing_keys() {
   fi
 }
 
-container_running() {
-  docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null | grep -q '^true$'
+check_no_existing_deployment() {
+  local ids
+  if ! ids=$(compose ps -a -q 2>/dev/null); then
+    fail "无法读取 compose 项目现有容器（compose ps 失败）。"
+  fi
+  if [[ -z "$ids" ]]; then
+    return 0
+  fi
+  if [[ "$REINSTALL" != true ]]; then
+    fail "检测到已有 RustDesk 部署。如需重装，请加 --reinstall（会先 compose down，数据目录和密钥保留）"
+  fi
+  echo "==> --reinstall：先 compose down 现有部署（数据目录和密钥保留）"
+  compose down || fail "compose down 失败，中止。"
+}
+
+check_ports_free() {
+  if ! command -v ss >/dev/null 2>&1; then
+    fail "未找到 ss（iproute2），无法确认 21115-21119 是否被占用。"
+  fi
+  local listening port
+  if ! listening=$(ss -lntup 2>/dev/null); then
+    fail "ss -lntup 查询失败，无法确认端口占用。"
+  fi
+  for port in 21115 21116 21117 21118 21119; do
+    if awk -v p="$port" '$0 ~ (":" p "([^0-9]|$)") { found = 1 } END { exit found ? 0 : 1 }' <<<"$listening"; then
+      fail "端口 $port 已被占用（ss -lntup），拒绝启动。请先释放端口后重试。"
+    fi
+  done
 }
 
 container_restarts() {
-  # 容器不存在或 inspect 失败时按 0 计：基线只用来算“本次检查期间的增量”
   local value
   value=$(docker inspect -f '{{.RestartCount}}' "$1" 2>/dev/null || true)
   if [[ ! "$value" =~ ^[0-9]+$ ]]; then
-    printf '0'
+    printf '-1'
     return 0
   fi
   printf '%s' "$value"
 }
 
-record_container_baseline() {
-  # 启动前记录项目已有容器与各自 RestartCount；重跑时绝不能删别人的部署
-  local ids
-  if ! ids=$(compose ps -a -q 2>/dev/null); then
-    fail "无法读取 compose 项目现有容器（compose ps 失败）。"
-  fi
-  if [[ -n "$ids" ]]; then
-    HAS_PRE_EXISTING=true
-    echo "==> 项目里已有容器，本次失败不会删除它们"
-  fi
-  local name
+record_container_ids() {
+  local name current_id
   for name in vega-hbbs vega-hbbr; do
-    RESTART_BASELINE[$name]=$(container_restarts "$name")
+    current_id=$(docker inspect -f '{{.Id}}' "$name" 2>/dev/null || true)
+    if [[ -z "$current_id" ]]; then
+      fail "compose up 后找不到容器：$name"
+    fi
+    EXPECTED_ID[$name]="$current_id"
   done
 }
 
@@ -225,15 +248,15 @@ wait_containers_ready() {
   local stable=0
   # 默认最多等 60 秒；测试里用 VEGA_READY_ATTEMPTS 缩短，不能延长就绪判定本身
   local attempts="${VEGA_READY_ATTEMPTS:-60}"
+  local name current_id restarts running
   for _ in $(seq 1 "$attempts"); do
     local ok=1
-    local name current baseline delta
     for name in vega-hbbs vega-hbbr; do
-      current=$(container_restarts "$name")
-      baseline=${RESTART_BASELINE[$name]:-0}
-      delta=$((current - baseline))
-      # 只看本次检查期间的增量：历史重启计数不能算本次不稳定
-      if ! container_running "$name" || (( delta != 0 )); then
+      current_id=$(docker inspect -f '{{.Id}}' "$name" 2>/dev/null || true)
+      restarts=$(container_restarts "$name")
+      running=$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || true)
+      # 容器 ID 必须还是 up 后采样的那个，RestartCount 必须一直是 0
+      if [[ "$current_id" != "${EXPECTED_ID[$name]:-}" || "$restarts" != "0" || "$running" != "true" ]]; then
         ok=0
       fi
     done
@@ -250,19 +273,23 @@ wait_containers_ready() {
   return 1
 }
 
+echo "==> 检查现有部署"
+check_no_existing_deployment
+
 echo "==> 检查数据目录与已有密钥"
 prepare_data_dir
 check_existing_keys
 
-echo "==> 记录项目已有容器（host 网络，不发布端口）"
-record_container_baseline
+echo "==> 检查端口占用（21115-21119）"
+check_ports_free
 
 echo "==> 启动 hbbs / hbbr（$IMAGE）"
+ATTEMPTED=true
 compose up -d
-# 只有 up 成功才标记 STARTED：失败时是否清理还要看 up 前有没有容器
-STARTED=true
+declare -A EXPECTED_ID=()
+record_container_ids
 
-echo "==> 等待容器就绪（running 且本次重启增量为 0，持续 5 秒）"
+echo "==> 等待容器就绪（ID 不变且 RestartCount 为 0，持续 5 秒）"
 if ! wait_containers_ready; then
   echo "hbbs / hbbr 未在 60 秒内稳定运行。日志：" >&2
   compose logs --tail=50 hbbs hbbr >&2 || true
@@ -309,20 +336,34 @@ if [[ "$ALLOW_WEBSOCKET" == true ]]; then
   TCP_RULES+=("21118:21119/tcp")
 fi
 
-# ufw 里已经有同一条规则时，ufw allow 也会成功，但那是别人的规则，不能算本次新增
-ufw_rule_present() {
-  local rule="$1" status
-  if ! status=$(ufw status 2>/dev/null); then
-    fail "ufw status 查询失败，无法确认端口放行状态；请修复 ufw 后重试。"
+ufw_status_has_port_rules() {
+  awk '/2111[5-9]/ { found = 1 } END { exit found ? 0 : 1 }' <<<"$1"
+}
+
+ufw_default_incoming() {
+  local verbose="$1"
+  if [[ "$verbose" =~ Default:\ (deny|reject|allow)\ \(incoming\) ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+  else
+    printf 'unknown'
   fi
-  awk -v rule="$rule" '$1 == rule && $2 == "ALLOW" { found = 1 } END { exit found ? 0 : 1 }' <<<"$status"
 }
 
 warn_ufw_not_enabled() {
   cat >&2 <<'EOF'
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-警告：未检测到启用的 UFW，21115-21119 将直接暴露，请在云厂商安全组只放行
-      TCP 21115-21117、UDP 21116。
+警告：未检测到启用的 UFW，21115-21119 将直接对外暴露，其中
+      21118/21119（WebSocket）也会对外可达。
+      请用云厂商安全组只放行 TCP 21115-21117、UDP 21116。
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+EOF
+}
+
+warn_websocket_reachable() {
+  cat >&2 <<'EOF'
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+警告：UFW 默认入站为 allow，21118/21119（WebSocket）也会对外可达。
+      请用云厂商安全组只放行 TCP 21115-21117、UDP 21116。
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 EOF
 }
@@ -331,19 +372,40 @@ echo "==> 放行端口（容器就绪后，逐条检查失败即退出）"
 if command -v ufw >/dev/null 2>&1; then
   if ! UFW_STATUS=$(ufw status 2>/dev/null); then
     fail "ufw status 查询失败，无法确认端口放行状态；请修复 ufw 后重试。"
-  elif [[ "$UFW_STATUS" == *"Status: active"* ]]; then
-    for rule in "${TCP_RULES[@]}" "${UDP_RULES[@]}"; do
-      if ufw_rule_present "$rule"; then
-        echo "    已存在，不计入本次新增：$rule"
-        continue
+  fi
+  if [[ "$UFW_STATUS" == *"Status: active"* ]]; then
+    if ! UFW_VERBOSE=$(ufw status verbose 2>/dev/null); then
+      fail "ufw status verbose 查询失败，无法确认默认入站策略；请修复 ufw 后重试。"
+    fi
+    DEFAULT_IN=$(ufw_default_incoming "$UFW_VERBOSE")
+    if ufw_status_has_port_rules "$UFW_STATUS"; then
+      echo "警告：ufw 已有涉及 21115-21119 的规则，本次不追加。" >&2
+      echo "      请自行核对放行范围应为 TCP 21115-21117、UDP 21116。" >&2
+      if [[ "$DEFAULT_IN" == "allow" ]]; then
+        warn_websocket_reachable
       fi
-      if ufw allow "$rule" >/dev/null 2>&1; then
-        ADDED_RULES+=("$rule")
-      else
-        echo "ufw allow $rule 失败。" >&2
-        exit 1
+    else
+      for rule in "${TCP_RULES[@]}" "${UDP_RULES[@]}"; do
+        if ufw allow "$rule" >/dev/null 2>&1; then
+          ADDED_RULES+=("allow $rule")
+        else
+          echo "ufw allow $rule 失败。" >&2
+          exit 1
+        fi
+      done
+      if [[ "$ALLOW_WEBSOCKET" != true && "$DEFAULT_IN" != "allow" ]]; then
+        if ufw deny 21118:21119/tcp >/dev/null 2>&1; then
+          ADDED_RULES+=("deny 21118:21119/tcp")
+          echo "    已额外阻断 WebSocket 端口：21118:21119/tcp"
+        else
+          echo "ufw deny 21118:21119/tcp 失败。" >&2
+          exit 1
+        fi
       fi
-    done
+      if [[ "$DEFAULT_IN" == "allow" ]]; then
+        warn_websocket_reachable
+      fi
+    fi
   else
     warn_ufw_not_enabled
   fi
