@@ -366,3 +366,173 @@ Describe 'Invoke-VegaRustDeskSetup 提权设备码' {
         $result.DeviceId | Should -Be '987654321'
     }
 }
+
+Describe 'Merge-VegaRustDeskConfigText 大小写、注释与换行保真' {
+    It '表头带行尾注释仍识别，CRLF 与行尾注释、尾部空行原样保留' {
+        $existing = "[options]  # 默认段`r`ncustom-rendezvous-server = `"old.example.com`"  # 中继地址`r`nkey = `"oldkey`"`r`n`r`n"
+        $result = Merge-VegaRustDeskConfigText -ExistingText $existing -Values ([ordered]@{
+                'custom-rendezvous-server' = 'new.example.com'
+            })
+
+        $result | Should -Match '(?m)^\[options\]  # 默认段$'
+        $result | Should -Match '(?m)^custom-rendezvous-server = "new\.example\.com"  # 中继地址$'
+        $result | Should -Match '(?m)^key = "oldkey"$'
+        $result | Should -Match "`r`n`r`n$"
+        $result.Contains("`n`n") | Should -BeTrue
+        $result.Contains("`r`n") | Should -BeTrue
+    }
+
+    It '表头与键名按精确大小写匹配：[Options]/Key 不受管' {
+        $existing = "[Options]`nKey = `"keep`"`n[options]`nkey = `"old`"`n"
+        $result = Merge-VegaRustDeskConfigText -ExistingText $existing -Values ([ordered]@{
+                'Key' = 'NEW'
+                'key' = 'new'
+            })
+
+        $result | Should -Match '(?m)^\[Options\]$'
+        $result | Should -Match '(?m)^Key = "keep"$'
+        $result | Should -Match '(?m)^key = "new"$'
+        # 找不到精确的 [options] 时不会把 [Options] 当受管段，但仍会识别真正的 [options]
+        ([regex]::Matches($result, '(?m)^\[options\]$')).Count | Should -Be 1
+    }
+
+    It '没有 [options] 段时在文件末尾追加' {
+        $existing = "[other]`nx = 1"
+        $result = Merge-VegaRustDeskConfigText -ExistingText $existing -Values ([ordered]@{ key = 'abc' })
+        $result | Should -Match '(?m)^\[other\]\r?\nx = 1\r?\n\r?\n\[options\]\r?\nkey = "abc"$'
+    }
+
+    It '读取键值时不把行尾注释读进值' {
+        $values = ConvertFrom-VegaRustDeskConfigText -Text "[options]`nkey = `"abc`"  # 注释`ncustom-rendezvous-server = 'host:21116' # 另一个注释`n"
+        $values['key'] | Should -Be 'abc'
+        $values['custom-rendezvous-server'] | Should -Be 'host:21116'
+    }
+}
+
+Describe 'RustDesk 配置路径与服务模式清单' {
+    It '记录路径必须与预期路径规范化后完全相等，后缀相同不算' {
+        $expected = Join-Path $TestDrive 'AppData/RustDesk/config/RustDesk2.toml'
+        $lookalike = Join-Path $TestDrive 'evil/RustDesk/config/RustDesk2.toml'
+
+        Test-VegaRustDeskManagedConfigPath -Path $expected -ExpectedPath $expected | Should -BeTrue
+        Test-VegaRustDeskManagedConfigPath -Path $lookalike -ExpectedPath $expected | Should -BeFalse
+    }
+
+    It '父目录是重解析点时拒绝回滚' {
+        $expected = Join-Path $TestDrive 'link/RustDesk/config/RustDesk2.toml'
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $expected) -Force
+        Mock -ModuleName $script:ModuleName Test-VegaReparsePoint { $true }
+
+        Test-VegaRustDeskManagedConfigPath -Path $expected -ExpectedPath $expected | Should -BeFalse
+    }
+
+    It '回滚只恢复三个受管键，其他键忽略并警告' {
+        $path = Join-Path $TestDrive 'restore-managed/RustDesk/config/RustDesk2.toml'
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force
+        Set-Content -LiteralPath $path -Encoding UTF8 -NoNewline -Value @"
+[options]
+custom-rendezvous-server = "new.example.com"
+password = "should-not-touch"
+"@
+
+        $state = Get-VegaEmptyState
+        $state.RustDeskConfigKeys = @(
+            [pscustomobject]@{ Path = $path; Key = 'custom-rendezvous-server'; Existed = $true; OriginalValue = 'old.example.com'; Restored = $false }
+            [pscustomobject]@{ Path = $path; Key = 'password'; Existed = $true; OriginalValue = 'attacker-value'; Restored = $false }
+        )
+        $statePath = Join-Path $TestDrive 'restore-managed-state.json'
+
+        $result = Restore-VegaRustDeskState -State $state -StatePath $statePath -ExpectedPath $path -Confirm:$false
+        $result.Failures.Count | Should -Be 0
+        ($result.Messages -join "`n") | Should -Match '忽略清单里的非受管 RustDesk 键：password'
+
+        $text = Get-Content -LiteralPath $path -Raw -Encoding UTF8
+        $text | Should -Match '(?m)^custom-rendezvous-server = "old\.example\.com"$'
+        $text | Should -Match '(?m)^password = "should-not-touch"$'
+        $text | Should -Not -Match 'attacker-value'
+    }
+
+    It '服务模式记录只写管理员清单，用户清单只保留当前用户路径' {
+        $userPath = Join-Path $TestDrive 'svc/user/RustDesk/config/RustDesk2.toml'
+        $servicePath = Join-Path $TestDrive 'svc/service/RustDesk2.toml'
+        $clientStatePath = Join-Path $TestDrive 'svc/client-state.json'
+        $serviceStatePath = Join-Path $TestDrive 'svc/admin/state.json'
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $userPath) -Force
+
+        Mock -ModuleName $script:ModuleName Get-Service {
+            [pscustomobject]@{ Name = 'RustDesk'; Status = 'Running' }
+        }
+
+        $clientState = Get-VegaEmptyState
+        $null = Set-VegaRustDeskConfig -Server 'relay.example.com' -Key ('C' * 43 + '=') `
+            -State $clientState -StatePath $clientStatePath `
+            -UserConfigPath $userPath -ServiceConfigPath $servicePath -ServiceStatePath $serviceStatePath -Confirm:$false
+
+        $savedClient = Read-VegaState -Path $clientStatePath
+        $clientPaths = @($savedClient.RustDeskConfigKeys | ForEach-Object { [string]$_.Path } | Select-Object -Unique)
+        $clientPaths | Should -Be @($userPath)
+        ($clientPaths -contains $servicePath) | Should -BeFalse
+
+        $savedService = Read-VegaState -Path $serviceStatePath
+        $servicePaths = @($savedService.RustDeskConfigKeys | ForEach-Object { [string]$_.Path } | Select-Object -Unique)
+        $servicePaths | Should -Be @($servicePath)
+        $savedService.SchemaVersion | Should -Be 2
+    }
+}
+
+Describe 'RustDesk 回滚清单只登记实际变化' {
+    BeforeEach {
+        Mock -ModuleName $script:ModuleName Get-Service { $null }
+    }
+
+    It '三个键都已是目标值时不留待回滚记录' {
+        $path = Join-Path $TestDrive 'unchanged/RustDesk/config/RustDesk2.toml'
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force
+        $key = ('D' * 43 + '=')
+        $original = "[options]`ncustom-rendezvous-server = `"relay.example.com:21116`"`nrelay-server = `"relay.example.com:21117`"`nkey = `"$key`"`n"
+        Set-Content -LiteralPath $path -Value $original -Encoding UTF8 -NoNewline
+
+        $statePath = Join-Path $TestDrive 'unchanged-state.json'
+        $state = Get-VegaEmptyState
+        $result = Set-VegaRustDeskConfig -Server 'relay.example.com:21116' -Key $key `
+            -State $state -StatePath $statePath -UserConfigPath $path -Confirm:$false
+
+        $result.Applied.Count | Should -Be 1
+        @((Read-VegaState -Path $statePath).RustDeskConfigKeys).Count | Should -Be 0
+    }
+
+    It '写入失败时不登记任何待回滚记录' {
+        $path = Join-Path $TestDrive 'failed/RustDesk/config/RustDesk2.toml'
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force
+        $statePath = Join-Path $TestDrive 'failed-state.json'
+        Mock -ModuleName $script:ModuleName Write-VegaTextFileAtomic { throw '磁盘已满' }
+
+        $state = Get-VegaEmptyState
+        { Set-VegaRustDeskConfig -Server 'relay.example.com' -Key ('E' * 43 + '=') `
+                -State $state -StatePath $statePath -UserConfigPath $path -Confirm:$false } |
+            Should -Throw '*写入*'
+        Test-Path -LiteralPath $statePath | Should -BeFalse
+    }
+
+    It '重新安装时 Restored=true 的记录重新采集基线并重置' {
+        $path = Join-Path $TestDrive 'reinstall/RustDesk/config/RustDesk2.toml'
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force
+        Set-Content -LiteralPath $path -Encoding UTF8 -NoNewline -Value @"
+[options]
+custom-rendezvous-server = "current.example.com"
+"@
+
+        $state = Get-VegaEmptyState
+        $state.RustDeskConfigKeys = @(
+            [pscustomobject]@{ Path = $path; Key = 'custom-rendezvous-server'; Existed = $true; OriginalValue = 'stale.example.com'; Restored = $true }
+        )
+        $statePath = Join-Path $TestDrive 'reinstall-state.json'
+
+        $result = Set-VegaRustDeskConfig -Server 'next.example.com' -Key ('F' * 43 + '=') `
+            -State $state -StatePath $statePath -UserConfigPath $path -Confirm:$false
+
+        $record = @($result.State.RustDeskConfigKeys | Where-Object { $_.Key -eq 'custom-rendezvous-server' })[0]
+        $record.OriginalValue | Should -Be 'current.example.com'
+        [bool]$record.Restored | Should -BeFalse
+    }
+}

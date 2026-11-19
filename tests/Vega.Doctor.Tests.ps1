@@ -217,3 +217,82 @@ Describe 'Get-VegaDoctorAdvice' {
         ($advice -join "`n") | Should -Match '读取不到 RustDesk 设备码'
     }
 }
+
+Describe 'Get-VegaRustDeskConfigSummary' {
+    It '服务存在时同时读取用户配置与 LocalService 配置' {
+        $userPath = Join-Path $TestDrive 'user/RustDesk2.toml'
+        $servicePath = Join-Path $TestDrive 'service/RustDesk2.toml'
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $userPath) -Force
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $servicePath) -Force
+        Set-Content -LiteralPath $userPath -Encoding UTF8 -Value "[options]`ncustom-rendezvous-server = `"user.example.com`""
+        Set-Content -LiteralPath $servicePath -Encoding UTF8 -Value "[options]`ncustom-rendezvous-server = `"svc.example.com`""
+
+        $summary = Get-VegaRustDeskConfigSummary -UserConfigPath $userPath -ServiceConfigPath $servicePath -ServicePresent
+
+        $summary.UserExists | Should -BeTrue
+        $summary.UserServer | Should -Be 'user.example.com'
+        $summary.ServiceExists | Should -BeTrue
+        $summary.ServiceServer | Should -Be 'svc.example.com'
+    }
+
+    It '服务不存在时不读取服务配置' {
+        $userPath = Join-Path $TestDrive 'user-only/RustDesk2.toml'
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $userPath) -Force
+        Set-Content -LiteralPath $userPath -Encoding UTF8 -Value "[options]`ncustom-rendezvous-server = `"user.example.com`""
+
+        $summary = Get-VegaRustDeskConfigSummary -UserConfigPath $userPath -ServiceConfigPath (Join-Path $TestDrive 'missing.toml')
+
+        $summary.ServiceExists | Should -BeFalse
+        $summary.ServiceServer | Should -Be ''
+    }
+
+    It 'vega-doctor 脚本在服务存在时报告两份配置' {
+        $scriptText = Get-Content -LiteralPath (Join-Path (Join-Path $PSScriptRoot '..') 'tools/vega-doctor.ps1') -Raw -Encoding UTF8
+        $scriptText | Should -Match 'Get-VegaRustDeskConfigSummary'
+        $scriptText | Should -Match '用户配置'
+        $scriptText | Should -Match '服务配置'
+        $scriptText | Should -Match 'RustDeskServicePresent'
+    }
+}
+
+Describe 'Get-VegaDoctorAdvice 服务模式优先' {
+    It '用户配置正确但服务配置不一致时仍报不一致' {
+        $advice = @(Get-VegaDoctorAdvice -Facts @{
+                SunshineInstalled      = $true
+                SunshineRunning        = $true
+                Encoder                = 'NVENC'
+                MissingFirewallRules   = @()
+                Ipv6                   = @('2001:db8::1')
+                TailscaleInstalled     = $true
+                RustDeskExpectedServer = 'relay.example.com'
+                RustDeskTomlServer     = 'relay.example.com'
+                RustDeskServiceServer  = 'old.example.com'
+                RustDeskServicePresent = $true
+                RustDeskDeviceId       = '123456789'
+            })
+
+        $text = $advice -join "`n"
+        $text | Should -Match '不一致'
+        $text | Should -Match '服务配置'
+        $text | Should -Not -Match 'RustDesk 中继配置正确'
+    }
+
+    It '服务配置与期望一致时判定正确，即使用户配置不同' {
+        $advice = @(Get-VegaDoctorAdvice -Facts @{
+                SunshineInstalled      = $true
+                SunshineRunning        = $true
+                Encoder                = 'NVENC'
+                MissingFirewallRules   = @()
+                Ipv6                   = @('2001:db8::1')
+                TailscaleInstalled     = $true
+                RustDeskExpectedServer = 'relay.example.com'
+                RustDeskTomlServer     = 'user-only.example.com'
+                RustDeskServiceServer  = 'relay.example.com'
+                RustDeskServicePresent = $true
+                RustDeskDeviceId       = '123456789'
+            })
+
+        $text = $advice -join "`n"
+        $text | Should -Match 'RustDesk 中继配置正确'
+    }
+}
