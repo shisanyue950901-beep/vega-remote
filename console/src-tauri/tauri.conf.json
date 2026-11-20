@@ -32,6 +32,10 @@
     "active": true,
     "targets": "all",
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.ico"],
+    "resources": {
+      "../../host/install-host.ps1": "host/install-host.ps1",
+      "../../host/lib/Vega.Common.psm1": "host/lib/Vega.Common.psm1"
+    },
     "shortDescription": "Vega 远程协助控制台",
     "longDescription": "零登录、零广告的远程协助与串流控制台。",
     "windows": {
