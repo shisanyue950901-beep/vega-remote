@@ -109,25 +109,28 @@ async function refreshSharedConfig(): Promise<void> {
     return;
   }
   configRefreshInFlight = true;
-  // 循环只在本轮读取期间没人再请求时退出；有请求就再读一次，
-  // 用最新快照覆盖远程协助页和设置页两个视图。
-  for (;;) {
-    configRefreshPending = false;
-    let config: ServerConfigView | null = null;
-    try {
-      config = await invoke<ServerConfigView>("get_server_config");
-    } catch {
-      // 读取失败也要通知每个页面：旧快照可能已经不成立，不能继续拿来测试。
-      config = null;
+  try {
+    // 循环只在本轮读取期间没人再请求时退出；有请求就再读一次，
+    // 用最新快照覆盖远程协助页和设置页两个视图。
+    for (;;) {
+      configRefreshPending = false;
+      let config: ServerConfigView | null = null;
+      try {
+        config = await invoke<ServerConfigView>("get_server_config");
+      } catch {
+        // 读取失败也要通知每个页面：旧快照可能已经不成立，不能继续拿来测试。
+        config = null;
+      }
+      for (const handler of configHandlers) {
+        handler(config);
+      }
+      if (!configRefreshPending) {
+        break;
+      }
     }
-    for (const handler of configHandlers) {
-      handler(config);
-    }
-    if (!configRefreshPending) {
-      break;
-    }
+  } finally {
+    configRefreshInFlight = false;
   }
-  configRefreshInFlight = false;
 }
 
 async function refreshOnFocus(): Promise<void> {
