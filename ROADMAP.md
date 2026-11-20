@@ -24,17 +24,20 @@
   - 零网络请求、零遥测；`.github/workflows/console.yml` 在 `console/**` 变更时跑 Windows `tauri build --no-bundle`
 - M2b 控制台接入 RustDesk（done-in-progress，待 Codex 审计）：
   - Rust 侧拆出 `console/src-tauri/src/rustdesk.rs`：定位 `rustdesk.exe`（Program Files → PATH）、
-    `--get-id`（总 deadline 5 秒、`CREATE_NO_WINDOW`、stderr 丢弃、stdout `recv_timeout`、超时 kill、
-    3-3-3 / 3-3-4 展示）、`RustDesk2.toml [options]` 三个键用 toml crate 读写（临时文件 + rename 原子写、
-    保留其他键、公钥只露前 8 位指纹、不写日志）
+    `--get-id`（总 deadline 5 秒、`CREATE_NO_WINDOW`、stderr 丢弃、stdout 重定向到本次独占的临时文件并轮询
+    `try_wait`、超时 kill、只回读前 4 KB 后删文件、3-3-3 / 3-3-4 展示）、`RustDesk2.toml [options]`
+    用 toml crate **只读**解析（公钥只露前 8 位指纹、不写日志、不回写文件）
   - `connect_peer` 校验 9-10 位数字后 `--connect` / `--file-transfer`，最近 10 条存 app config 目录 JSON；
     临时密码不读不传，「显示临时密码」只无参启动 RustDesk 主窗口，界面去掉假的掩码密码
-  - RustDesk 进程/服务状态行；未安装时不再在应用内提权安装（无 runas、无捆绑脚本），只提供「复制安装命令」——
-    复制 `winget install --id RustDesk.RustDesk --exact --source winget` 并提示到 PowerShell 运行；
-    服务模式不写用户 TOML（提示在 RustDesk 的「网络」设置中修改并提供打开窗口按钮），写入后回读三键校验；
-    IPv6 保存前归一化为 `[addr]:port`（ID 21116 / 中继 21117）；「允许远程协助」开关禁用并指向 RustDesk；
-    保存后远程协助页重读服务器并清掉旧探测结果；审计 r2/r3 的 P2（OS 文件锁争用断言、设备码分组与往返测试、
-    空中继、托盘 worker）已修
+  - RustDesk 进程/服务状态行；未安装时不再在应用内提权安装（无 runas、无捆绑脚本），
+    WinGet 下架 RustDesk 后改为按钮「打开 RustDesk 官方下载页」（URL 写死在 Rust 侧，
+    `explorer.exe <url>` 交给默认浏览器）；「允许远程协助」开关禁用并指向 RustDesk
+  - Vega 对 RustDesk 网络配置改为**只读**：删除写入命令、配置合并、跨进程文件锁与服务模式判定，
+    设置页只显示 `RustDesk2.toml` 当前 ID/中继与公钥指纹，保留 TCP `server:21116` 测试，
+    并提示「服务器地址请在 RustDesk 的 设置 → 网络 中修改」，按钮「在 RustDesk 中修改」打开 RustDesk 主窗口
+  - 两个页面的连通性探测都带「被测地址 + 单调代次」：地址变更或重读配置后，在途探测的回包直接丢弃；
+    审计 r2/r3/r4 的 P2/P3（设备码分组与往返测试、托盘 worker、get-id 超时不再有读线程、
+    服务查询与可移植版覆盖配置）随只读化一并消除
   - 前端 `main.ts` 全部占位换成 invoke：加载/错误状态、最近设备码下拉（3-3-3 / 3-3-4）、设置页网络读取/保存/测试
     （测试 = Rust 侧 TCP connect `server:21116` 超时 3 秒）
   - `build.rs` 用 `AppManifest::commands` 声明全部命令，`capabilities/default.json` 授权 `allow-*`
@@ -48,9 +51,12 @@
 - 多设备管理面板、RustDesk 中继一键迁移国内 VPS
 - 英文文档
 
-## Backlog（M2b 审计 r3 未做项）
+## Backlog（M2b 审计 r3/r4 未做项）
 - P3：CI 只跑 `tauri build --no-bundle`，没有安装包冒烟测试；需要 Windows bundle 冒烟并监听 `host/**`/`console/**` 资源变更。
-  本轮 r3 只记录待办、不新增安装包测试（按总控要求）。
+  本轮 r3/r4 只记录待办、不新增安装包测试（按总控要求）。
+- RustDesk 改为手动安装（2026-03 起 WinGet 社区源移除 RustDesk）：控制台与 host 脚本都不再调用 winget 安装，
+  只给出官方下载页 `https://github.com/rustdesk/rustdesk/releases/latest`；已安装的 RustDesk 仍应用中继配置。
+  是否要在安装包冒烟测试里一并验证「未安装 RustDesk 时只显示下载页按钮」留待 M2c。
 
 ## 团队分工
 - 规划、任务单、UI 设计、验收：Hark
