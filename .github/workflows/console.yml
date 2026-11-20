@@ -34,7 +34,10 @@ jobs:
         with:
           node-version: "20"
 
-      # 仓库暂未提交 package-lock.json：有 lock 用 npm ci，没有则 npm install。
+      # 仓库暂未提交 package-lock.json / Cargo.lock：离线环境无法生成，先保留 npm install。
+      # TODO(m2b): 在联网机器上生成并提交 package-lock.json 与 src-tauri/Cargo.lock，
+      # 然后把这里换成 `npm ci`，构建步骤换成 Cargo `--locked`（或 tauri build -- --locked）。
+      # 有 lock 时下面的分支已经会走 npm ci。
       - name: 安装前端依赖
         shell: bash
         run: |
@@ -44,5 +47,6 @@ jobs:
             npm install --no-audit --no-fund
           fi
 
+      # TODO(m2b): Cargo.lock 提交后追加 --locked，保证依赖可复现。
       - name: 构建（--no-bundle）
         run: npm run tauri build -- --no-bundle
