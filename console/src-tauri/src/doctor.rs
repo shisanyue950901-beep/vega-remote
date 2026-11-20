@@ -315,7 +315,10 @@ fn diagnose_blocking() -> DiagnoseOutcome {
         DOCTOR_RUNNING.store(false, Ordering::Release);
         return DiagnoseOutcome::WorkerFailed;
     }
-    match receiver.recv_timeout(DOCTOR_BUDGET) {
+    // 等待也用同一个 deadline 算剩余预算：spawn 与调度耗时同样吃掉这 8 秒，
+    // 不能再开一个满额的 8 秒等待。
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match receiver.recv_timeout(remaining) {
         Ok(items) => DiagnoseOutcome::Done(items),
         // worker panic 后 channel 断开：报告线程失败而不是超时。
         Err(RecvTimeoutError::Disconnected) => DiagnoseOutcome::WorkerFailed,
