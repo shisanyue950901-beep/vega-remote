@@ -84,9 +84,15 @@
 - RustDesk 用户配置提权写入的检查-写入竞态：提权进程在“检查路径可信”与“写入文件”之间仍可能被替换；需改为以用户权限写入、或先拿句柄再按句柄写入（T2-fix7 总控决定不实现）。
 - 5.1 下载逐跳 HTTPS 校验与 Release API 摘要附件可选：Windows PowerShell 5.1 下 `HttpWebRequest` 的逐跳重定向校验与 Release API 摘要附件仍为可选项，未强制（T2-fix7 总控决定不实现）。
 
-### M2c r4 遗留（Codex m2c-r4 PASS，2026-11-20）
-- P2 焦点刷新在配置读取中被丢弃 → 排队一次补读并同步两个视图（main.ts:104）
-- P2 诊断入口竞态：串流页快捷入口可二次启动；过期导出回包覆盖新快照（main.ts:658/709）
-- P2 超时后排队的 doctor 任务仍可能启动并占闸门（doctor.rs:297/321）
-- P2 同卷 junction 可让 Program Files 根被重定向（winpaths.rs:44/149）
-- P3 脱敏测试依赖运行者 USERNAME，改为显式身份夹具（doctor.rs:640/906）
+### M2c r4 遗留（Codex m2c-r4 PASS，2026-11-20；m2c-fix4 已修）
+- P2 焦点刷新在配置读取中被丢弃 → 排队一次补读并同步两个视图 ✅ 已修（main.ts:104）：
+  读取中的焦点事件记「待补读」标志，本轮结束后再读一次并把最新快照应用到远程协助页与设置页
+- P2 诊断入口竞态：串流页快捷入口可二次启动；过期导出回包覆盖新快照 ✅ 已修（main.ts:658/709）：
+  两个入口共用 running 标志，运行中再次触发直接忽略；导出携带发起时 snapshot_id，回包时快照已变则整包丢弃
+- P2 超时后排队的 doctor 任务仍可能启动并占闸门 ✅ 已修（doctor.rs:297/321）：
+  deadline 为绝对 Instant，超时对 spawn_blocking 任务置 Arc<AtomicBool> 取消标志，worker 开始前与每个探测前检查
+- P2 同卷 junction 可让 Program Files 根被重定向 ✅ 已修（winpaths.rs:44/149）：
+  根必须等于 `<系统盘根>\Program Files[(x86)]`（GetSystemDirectoryW 卷根、大小写不敏感）、根自身非重解析点、
+  最终 exe 规范化后仍在根内且 GetVolumePathNameW 卷根与系统卷一致，并补纯函数单测
+- P3 脱敏测试依赖运行者 USERNAME，改为显式身份夹具 ✅ 已修（doctor.rs:640/906）：
+  脱敏接收 RedactionIdentity（用户名/计算机名/域/主目录），环境变量只在生产入口 export_blocking 读一次
