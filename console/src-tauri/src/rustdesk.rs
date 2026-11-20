@@ -1115,12 +1115,15 @@ pub async fn test_server_connection(server: String) -> TestResult {
         })
 }
 
-/// Win32 剪贴板写入（`CF_UNICODETEXT`）。
+/// 剪贴板写入的通用失败文案：不把 Win32 错误码或系统状态透给前端。
+const CLIPBOARD_ERROR: &str = "写剪贴板失败，请重试";
+
+/// Win32 剪贴板写入（`CF_UNICODETEXT`），必须传主窗口 HWND。
 ///
 /// 不经过 PowerShell：那会走 PATH 解析、需要拼接命令行，还会把设备码放进
 /// 子进程参数（审计 P2）。这里直接调用 user32/kernel32。
 #[cfg(windows)]
-fn set_clipboard_text(text: &str) -> Result<(), String> {
+fn set_clipboard_text(hwnd: *mut std::ffi::c_void, text: &str) -> Result<(), String> {
     use std::ffi::c_void;
 
     const CF_UNICODETEXT: u32 = 13;
@@ -1149,27 +1152,32 @@ fn set_clipboard_text(text: &str) -> Result<(), String> {
     // SAFETY: 每个分配都有对应释放；SetClipboardData 成功后所有权归系统，
     // 因此只有失败分支才 GlobalFree。OpenClipboard 成功后必定 CloseClipboard。
     unsafe {
-        if OpenClipboard(std::ptr::null_mut()) == 0 {
-            return Err("写剪贴板失败：无法打开剪贴板".to_string());
+        // 不能用 OpenClipboard(NULL)：NULL 关联的是调用线程的隐藏窗口，
+        // 而剪贴板归主线程（Tauri 事件循环）上的主窗口所有。这里显式传
+        // 主窗口 HWND，并保证调用发生在主线程。
+        if OpenClipboard(hwnd) == 0 {
+            return Err(CLIPBOARD_ERROR.to_string());
         }
         let result: Result<(), String> = (|| {
             if EmptyClipboard() == 0 {
-                return Err("写剪贴板失败：无法清空剪贴板".to_string());
+                return Err(CLIPBOARD_ERROR.to_string());
             }
             let mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
             if mem.is_null() {
-                return Err("写剪贴板失败：内存不足".to_string());
+                return Err(CLIPBOARD_ERROR.to_string());
             }
             let target = GlobalLock(mem);
             if target.is_null() {
                 GlobalFree(mem);
-                return Err("写剪贴板失败：无法锁定内存".to_string());
+                return Err(CLIPBOARD_ERROR.to_string());
             }
             std::ptr::copy_nonoverlapping(wide.as_ptr() as *const c_void, target, bytes);
             GlobalUnlock(mem);
             if SetClipboardData(CF_UNICODETEXT, mem).is_null() {
                 GlobalFree(mem);
-                return Err("写剪贴板失败：系统拒绝写入".to_string());
+                // 失败时唯一的副作用是上面已经清空的剪贴板：不再写别的数据，
+                // 也不再重试，只回通用错误。
+                return Err(CLIPBOARD_ERROR.to_string());
             }
             Ok(())
         })();
@@ -1179,10 +1187,11 @@ fn set_clipboard_text(text: &str) -> Result<(), String> {
 }
 
 /// 托盘「复制设备码」用：拿设备码写到剪贴板，不经过前端。
+///
+/// 两段式：`--get-id` 是子进程等待，留在调用方给的工作线程；剪贴板写入
+/// 必须回主线程，用主窗口 HWND 打开剪贴板（审计 P2）。
 #[cfg(windows)]
-pub fn copy_device_id_to_clipboard() -> Result<String, String> {
-    // 由托盘事件里 spawn 的 worker 线程调用：这里会等 --get-id，
-    // 绝不能放到 Tauri 的事件循环上。
+pub fn copy_device_id_to_clipboard(app: &tauri::AppHandle) -> Result<String, String> {
     let info = get_device_id_blocking();
     if info.formatted_id.is_empty() {
         return Err(if info.error.is_empty() {
@@ -1191,12 +1200,31 @@ pub fn copy_device_id_to_clipboard() -> Result<String, String> {
             info.error
         });
     }
-    set_clipboard_text(&info.formatted_id)?;
-    Ok(info.formatted_id)
+    let text = info.formatted_id.clone();
+    let handle = app.clone();
+    let (sender, receiver) = mpsc::channel();
+    handle
+        .run_on_main_thread(move || {
+            let result = match handle.get_webview_window("main") {
+                Some(window) => window
+                    .hwnd()
+                    .map_err(|_| CLIPBOARD_ERROR.to_string())
+                    .and_then(|hwnd| set_clipboard_text(hwnd.0, &text)),
+                None => Err(CLIPBOARD_ERROR.to_string()),
+            };
+            // 主线程只回传结果，不阻塞在 worker 的等待上。
+            let _ = sender.send(result);
+        })
+        .map_err(|_| CLIPBOARD_ERROR.to_string())?;
+    match receiver.recv_timeout(Duration::from_secs(5)) {
+        Ok(result) => result.map(|()| info.formatted_id),
+        // 主线程 5 秒内没回：事件循环卡住或窗口已销毁，按通用失败处理。
+        Err(_) => Err(CLIPBOARD_ERROR.to_string()),
+    }
 }
 
 #[cfg(not(windows))]
-pub fn copy_device_id_to_clipboard() -> Result<String, String> {
+pub fn copy_device_id_to_clipboard(_app: &tauri::AppHandle) -> Result<String, String> {
     Err(NOT_INSTALLED.to_string())
 }
 

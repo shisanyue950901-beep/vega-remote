@@ -70,10 +70,12 @@ fn main() {
                         }
                     }
                     // 复制设备码要跑子进程（--get-id）并写系统剪贴板，绝不能占用
-                    // 托盘事件线程：丢到独立 worker 里，失败只影响这一次复制。
+                    // 托盘事件线程：子进程等待丢到独立 worker，剪贴板写入由
+                    // worker 通过 run_on_main_thread 切回主线程（主窗口 HWND）。
                     "copy-code" => {
-                        std::thread::spawn(|| {
-                            let _ = rustdesk::copy_device_id_to_clipboard();
+                        let handle = app.clone();
+                        std::thread::spawn(move || {
+                            let _ = rustdesk::copy_device_id_to_clipboard(&handle);
                         });
                     }
                     // 「断开」当前仍是 RustDesk 窗口自己的挂断按钮；M2c 接入会话事件后
