@@ -60,10 +60,11 @@
             <div class="card">
               <div class="card__head">
                 <h2 class="card__title">本设备</h2>
-                <label class="switch">
-                  <input id="allow-assist" type="checkbox" checked />
+                <label class="switch" title="请在 RustDesk 中控制">
+                  <input id="allow-assist" type="checkbox" checked disabled />
                   <span class="switch__track" aria-hidden="true"></span>
                   <span class="switch__label">允许远程协助</span>
+                  <span class="field__hint">请在 RustDesk 中控制</span>
                 </label>
               </div>
 
@@ -96,10 +97,10 @@
                 <span class="dot dot--off" id="service-dot" aria-hidden="true"></span>
                 <span id="service-status-text"></span>
                 <button id="copy-install-command" class="link is-hidden" type="button">复制安装命令</button>
-                <span id="install-hint" class="field__hint">请在管理员 PowerShell 中运行</span>
+                <span id="install-hint" class="field__hint">请在 PowerShell 中运行（使用 winget）</span>
               </div>
               <p class="field__hint">
-                RustDesk 不在控制台内提权安装；复制上面的一行命令到管理员 PowerShell 执行即可。
+                RustDesk 不在控制台内提权安装；复制上面的 winget 命令到 PowerShell 执行即可。
                 详细步骤见
                 <a
                   class="link"
@@ -122,7 +123,7 @@
                   class="input input--code"
                   type="text"
                   inputmode="numeric"
-                  placeholder="输入对方设备码（123456789 / 123 456 789 / 123-456-789）"
+                  placeholder="输入对方设备码（123456789 / 123 456 789 / 123-456-7890）"
                   list="recent-devices"
                   autocomplete="off"
                 />
@@ -343,6 +344,7 @@
               <div class="row">
                 <button id="save-network" class="btn btn--primary" type="button">保存</button>
                 <button id="test-connection" class="btn btn--ghost" type="button">测试连接</button>
+                <button id="open-rustdesk-network" class="btn btn--ghost is-hidden" type="button">打开 RustDesk 窗口</button>
                 <span id="test-connection-result" class="field__hint">未测试</span>
               </div>
               <span id="network-status" class="field__hint" role="status" aria-live="polite"></span>
