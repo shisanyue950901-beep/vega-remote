@@ -102,6 +102,43 @@ async function copyText(text: string): Promise<boolean> {
   }
 }
 
+/** README 的一行安装命令。控制台只复制文本，不在应用内提权执行任何脚本。 */
+const INSTALL_COMMAND =
+  "irm https://raw.githubusercontent.com/shisanyue950901-beep/vega-remote/main/bootstrap.ps1 | iex";
+
+/**
+ * 设备码解析：只接受 9/10 位纯数字，或控制台自己展示的 3-3-3 / 3-3-4 分组
+ * （空格或连字符，整串分隔符必须一致）。返回纯数字，供 IPC 使用。
+ * 不做「删掉多余字符」式清洗：粘错的码会被拒绝，而不是被改成另一台设备。
+ */
+function parsePeerId(raw: string): string | null {
+  const value = raw.trim();
+  if (!value) {
+    return null;
+  }
+  if (/^\d+$/.test(value)) {
+    return value.length === 9 || value.length === 10 ? value : null;
+  }
+  const sep = value.includes("-") ? "-" : value.includes(" ") ? " " : null;
+  if (!sep) {
+    return null;
+  }
+  const groups = value.split(sep);
+  if (groups.length !== 3) {
+    return null;
+  }
+  if (!groups.every((group) => /^\d+$/.test(group))) {
+    return null;
+  }
+  if (groups[0].length !== 3 || groups[1].length !== 3) {
+    return null;
+  }
+  if (groups[2].length !== 3 && groups[2].length !== 4) {
+    return null;
+  }
+  return groups.join("");
+}
+
 /** 把「关闭到托盘」勾选状态同步给 Rust（Rust 侧默认 true）。 */
 function syncCloseToTray(enabled: boolean): void {
   void invoke("set_close_to_tray", { enabled });
@@ -175,7 +212,8 @@ function setupAssistPage(): void {
   const serviceStatusRow = byId<HTMLDivElement>("service-status");
   const serviceDot = byId<HTMLSpanElement>("service-dot");
   const serviceStatusText = byId<HTMLSpanElement>("service-status-text");
-  const installButton = byId<HTMLButtonElement>("install-rustdesk");
+  const copyInstallButton = byId<HTMLButtonElement>("copy-install-command");
+  const installHint = byId<HTMLSpanElement>("install-hint");
   const peerInput = byId<HTMLInputElement>("peer-code");
   const recentList = byId<HTMLDataListElement>("recent-devices");
   const connectButton = byId<HTMLButtonElement>("connect-peer");
@@ -226,7 +264,8 @@ function setupAssistPage(): void {
       serviceStatusText.textContent = status.message;
       serviceDot.classList.toggle("dot--ok", status.running);
       serviceDot.classList.toggle("dot--off", !status.running);
-      installButton.classList.toggle("is-hidden", status.installed);
+      copyInstallButton.classList.toggle("is-hidden", status.installed);
+      installHint.classList.toggle("is-hidden", status.installed);
     });
 
     void invoke<ServerConfigView>("get_server_config").then((config) => {
@@ -315,37 +354,40 @@ function setupAssistPage(): void {
     });
   });
 
-  installButton.addEventListener("click", () => {
-    setStatus(serviceStatusText, "正在请求管理员授权…");
-    void invoke<OpResult>("install_rustdesk").then((result) => {
-      if (!result) {
-        setStatus(serviceStatusText, "浏览器预览：命令不可用", "warn");
-        return;
-      }
-      setStatus(serviceStatusText, result.message, result.ok ? "ok" : "error");
+  copyInstallButton.addEventListener("click", () => {
+    // 不再在应用内 runas 提权执行脚本：只把 README 的一行命令塞进剪贴板，
+    // 由用户自己在管理员 PowerShell 里确认后运行。
+    void copyText(INSTALL_COMMAND).then((ok) => {
+      flashLabel(copyInstallButton, ok ? "已复制" : "复制失败");
+      setStatus(
+        serviceStatusText,
+        ok ? "已复制安装命令，请在管理员 PowerShell 中运行" : "复制失败，请到 README 手动复制安装命令",
+        ok ? "ok" : "error",
+      );
     });
   });
 
   peerInput.addEventListener("input", () => {
-    // 只提示、不悄悄删字符或截断：用户输错 11 位或带非法字符时要看到原因，
-    // 而不是被前端「修正」成另一个可连接设备码。
-    const raw = peerInput.value;
-    if (!/^[\d\s]*$/.test(raw)) {
-      setStatus(connectStatus, "设备码只能包含数字（可带分隔空格）", "error");
+    // 只提示、不悄悄删字符或截断：粘错的码必须显示原因，不能被改成另一台设备。
+    if (peerInput.value.trim() === "") {
+      setStatus(connectStatus, "");
       return;
     }
-    const digits = raw.replace(/\s/g, "");
-    if (digits.length > 10) {
-      setStatus(connectStatus, "设备码最多 10 位", "error");
+    if (parsePeerId(peerInput.value) === null) {
+      setStatus(
+        connectStatus,
+        "设备码格式：123456789 / 123 456 789 / 123-456-789（9-10 位）",
+        "error",
+      );
       return;
     }
     setStatus(connectStatus, "");
   });
 
   connectButton.addEventListener("click", () => {
-    const digits = peerInput.value.replace(/\s/g, "");
-    if (!/^\d{9,10}$/.test(digits)) {
-      setStatus(connectStatus, "请输入 9-10 位设备码", "error");
+    const digits = parsePeerId(peerInput.value);
+    if (digits === null) {
+      setStatus(connectStatus, "请输入 9-10 位设备码（可带空格或连字符分组）", "error");
       return;
     }
     const mode =
