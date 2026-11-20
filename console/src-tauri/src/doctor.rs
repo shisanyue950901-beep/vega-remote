@@ -8,6 +8,8 @@ use std::io::Write;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -259,28 +261,90 @@ fn timeout_items() -> Vec<DoctorItem> {
     )]
 }
 
-#[tauri::command]
-pub async fn run_doctor() -> Vec<DoctorItem> {
+fn worker_failed_items() -> Vec<DoctorItem> {
+    vec![item("诊断", DoctorStatus::Fail, "诊断线程失败，请重试")]
+}
+
+/// 一次诊断的结局：只有 `Done` 才是「完成的快照」，其余都不进缓存。
+enum DiagnoseOutcome {
+    Done(Vec<DoctorItem>),
+    Busy,
+    Timeout,
+    WorkerFailed,
+}
+
+impl DiagnoseOutcome {
+    fn into_items(self) -> Vec<DoctorItem> {
+        match self {
+            DiagnoseOutcome::Done(items) => items,
+            DiagnoseOutcome::Busy => busy_items(),
+            DiagnoseOutcome::Timeout => timeout_items(),
+            DiagnoseOutcome::WorkerFailed => worker_failed_items(),
+        }
+    }
+}
+
+/// 唯一的诊断路径：并发闸门 + 8 秒总预算。`run_doctor` 与导出都走这里，
+/// 导出不再自己重跑一套探测。
+fn diagnose_blocking() -> DiagnoseOutcome {
     // 第二个并发调用直接返回，不再排队等一次完整诊断。
     if DOCTOR_RUNNING
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        return busy_items();
+        return DiagnoseOutcome::Busy;
     }
     // 唯一的总 deadline 在投递 worker 之前就确定：排队时间也算进 8 秒。
     let deadline = Instant::now() + DOCTOR_BUDGET;
-    let worker = tauri::async_runtime::spawn_blocking(move || {
-        // 闸门由 worker 自己释放：IPC 层超时返回时 worker 可能还在跑，
-        // 这时继续拒绝第二次诊断，直到它真正退出。
-        let _guard = DoctorGuard;
-        doctor_items(deadline)
-    });
-    match tokio::time::timeout(DOCTOR_BUDGET, worker).await {
-        Ok(Ok(items)) => items,
-        Ok(Err(_)) => vec![item("诊断", DoctorStatus::Fail, "诊断线程失败，请重试")],
-        Err(_) => timeout_items(),
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("vega-doctor".to_string())
+        .spawn(move || {
+            // 闸门由 worker 自己释放：IPC 层超时返回时 worker 可能还在跑，
+            // 这时继续拒绝第二次诊断，直到它真正退出。
+            let _guard = DoctorGuard;
+            let items = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                doctor_items(deadline)
+            }));
+            if let Ok(items) = items {
+                // 发送失败说明调用方已经超时走了，直接丢弃这次结果。
+                let _ = sender.send(items);
+            }
+        });
+    if spawned.is_err() {
+        DOCTOR_RUNNING.store(false, Ordering::Release);
+        return DiagnoseOutcome::WorkerFailed;
     }
+    match receiver.recv_timeout(DOCTOR_BUDGET) {
+        Ok(items) => DiagnoseOutcome::Done(items),
+        // worker panic 后 channel 断开：报告线程失败而不是超时。
+        Err(RecvTimeoutError::Disconnected) => DiagnoseOutcome::WorkerFailed,
+        Err(RecvTimeoutError::Timeout) => DiagnoseOutcome::Timeout,
+    }
+}
+
+/// 最近一次「完成」的诊断快照。导出复用它，避免再跑一遍探测。
+static LAST_SNAPSHOT: Mutex<Option<Vec<DoctorItem>>> = Mutex::new(None);
+
+fn store_snapshot(items: &[DoctorItem]) {
+    if let Ok(mut guard) = LAST_SNAPSHOT.lock() {
+        *guard = Some(items.to_vec());
+    }
+}
+
+fn cached_snapshot() -> Option<Vec<DoctorItem>> {
+    LAST_SNAPSHOT.lock().ok().and_then(|guard| guard.clone())
+}
+
+#[tauri::command]
+pub async fn run_doctor() -> Vec<DoctorItem> {
+    let outcome = tauri::async_runtime::spawn_blocking(diagnose_blocking)
+        .await
+        .unwrap_or(DiagnoseOutcome::WorkerFailed);
+    if let DiagnoseOutcome::Done(items) = &outcome {
+        store_snapshot(items);
+    }
+    outcome.into_items()
 }
 
 /* ------------------------------------------------------------------ */
@@ -543,8 +607,21 @@ fn log_directory() -> PathBuf {
     root.join("Vega").join("logs")
 }
 
+/// 导出用的诊断结果：优先用最近一次完成的快照；没有快照时走与
+/// `run_doctor` 相同的并发闸门 + 8 秒预算路径。
+fn export_items() -> Vec<DoctorItem> {
+    if let Some(items) = cached_snapshot() {
+        return items;
+    }
+    let outcome = diagnose_blocking();
+    if let DiagnoseOutcome::Done(items) = &outcome {
+        store_snapshot(items);
+    }
+    outcome.into_items()
+}
+
 fn export_blocking() -> Result<(), String> {
-    let items = doctor_items(Instant::now() + DOCTOR_BUDGET);
+    let items = export_items();
     let redacted: Vec<DoctorItem> = items
         .into_iter()
         .map(|entry| DoctorItem {
