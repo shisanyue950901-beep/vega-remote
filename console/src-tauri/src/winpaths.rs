@@ -135,6 +135,11 @@ fn trim_separators(path: &str) -> &str {
     path.trim_end_matches(['\\', '/'])
 }
 
+/// 剥掉 `canonicalize` 在 Windows 上加的 verbatim 前缀（`\\?\`）。
+fn strip_verbatim(path: &str) -> &str {
+    path.strip_prefix(r"\\?\").unwrap_or(path)
+}
+
 /// `Program Files` 根是否正好是 `<系统卷根>\Program Files` 或 `(x86)`。
 ///
 /// 纯字符串比较：Windows 路径大小写不敏感；不做前缀匹配，`Program Files Evil`
@@ -147,7 +152,8 @@ fn is_system_program_files_root(root: &Path, system_volume: &Path) -> bool {
     if volume.is_empty() {
         return false;
     }
-    let root = trim_separators(root);
+    // canonicalize 在 Windows 上返回 `\\?\C:\...`：先剥前缀，再比根。
+    let root = trim_separators(strip_verbatim(root));
     ["Program Files", "Program Files (x86)"]
         .iter()
         .any(|name| root.eq_ignore_ascii_case(&format!("{volume}\\{name}")))
@@ -351,6 +357,11 @@ mod tests {
         assert!(is_system_program_files_root(
             Path::new("C:\\Program Files"),
             Path::new("C:")
+        ));
+        // canonicalize 返回的 verbatim 前缀不影响比较。
+        assert!(is_system_program_files_root(
+            Path::new("\\\\?\\C:\\Program Files"),
+            system
         ));
         // 别的卷、前缀相近、更深一层、伪造的 (x64) 都不算根。
         assert!(!is_system_program_files_root(
