@@ -92,23 +92,18 @@
                 <span id="id-status-text">正在读取 RustDesk 状态…</span>
                 <button id="id-test" class="link is-hidden" type="button">测试连通性</button>
               </div>
+              <p class="field__hint">服务器地址请在 RustDesk 的 设置 → 网络 中修改；这里只显示当前配置。</p>
 
               <div class="statusline is-hidden" id="service-status">
                 <span class="dot dot--off" id="service-dot" aria-hidden="true"></span>
                 <span id="service-status-text"></span>
-                <button id="copy-install-command" class="link is-hidden" type="button">复制安装命令</button>
-                <span id="install-hint" class="field__hint">请在 PowerShell 中运行（使用 winget）</span>
+                <button id="open-install-page" class="link is-hidden" type="button">打开 RustDesk 官方下载页</button>
+                <span id="install-hint" class="field__hint">从官方发行页下载安装包手动安装</span>
               </div>
               <p class="field__hint">
-                RustDesk 不在控制台内提权安装；复制上面的 winget 命令到 PowerShell 执行即可。
-                详细步骤见
-                <a
-                  class="link"
-                  href="https://github.com/shisanyue950901-beep/vega-remote#一行安装windows管理员-powershell"
-                  target="_blank"
-                  rel="noreferrer"
-                  >README 安装说明</a
-                >。
+                WinGet 已下架 RustDesk（`RustDesk.RustDesk` 不在社区源里），控制台不再复制安装命令，
+                只打开官方下载页 <code>github.com/rustdesk/rustdesk/releases/latest</code>；
+                安装完成后回到这里即可读取设备码与中继配置。
               </p>
             </div>
 
@@ -327,27 +322,23 @@
               <h2 class="card__title">网络</h2>
               <div class="row">
                 <span>ID 服务器</span>
-                <input id="set-id-server" class="input" type="text" placeholder="relay.example.com[:端口]" autocomplete="off" />
+                <input id="set-id-server" class="input" type="text" readonly placeholder="RustDesk2.toml 里未配置" />
               </div>
               <div class="row">
                 <span>中继服务器</span>
-                <input id="set-relay-server" class="input" type="text" placeholder="留空表示不指定，由 RustDesk 自动推导" autocomplete="off" />
-              </div>
-              <div class="row">
-                <span>服务器公钥</span>
-                <textarea id="set-server-key" class="input input--key" rows="2" spellcheck="false" placeholder="粘贴 44 位 base64 公钥（留空则保留当前公钥）"></textarea>
+                <input id="set-relay-server" class="input" type="text" readonly placeholder="未指定，由 RustDesk 自动推导" />
               </div>
               <div class="row">
                 <span>当前公钥指纹</span>
                 <span id="server-key-fingerprint" class="field__hint">未读取</span>
               </div>
               <div class="row">
-                <button id="save-network" class="btn btn--primary" type="button">保存</button>
                 <button id="test-connection" class="btn btn--ghost" type="button">测试连接</button>
-                <button id="open-rustdesk-network" class="btn btn--ghost is-hidden" type="button">打开 RustDesk 窗口</button>
+                <button id="open-rustdesk-network" class="btn btn--primary" type="button">在 RustDesk 中修改</button>
                 <span id="test-connection-result" class="field__hint">未测试</span>
               </div>
               <span id="network-status" class="field__hint" role="status" aria-live="polite"></span>
+              <span class="field__hint">服务器地址请在 RustDesk 的 设置 → 网络 中修改。控制台只读取 <code>RustDesk2.toml</code> 显示当前值。</span>
             </div>
 
             <div class="card">
