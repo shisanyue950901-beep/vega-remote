@@ -816,8 +816,16 @@ function setupStreamingPage(): void {
     }
   };
 
+  // 串流状态的请求序号：刷新连续触发时只应用最新一次的回包，
+  // 旧请求晚到的结果直接丢弃（与 Assist 页做法一致）。
+  let statusRequest = 0;
+
   const load = (): void => {
+    const request = ++statusRequest;
     void invoke<StreamingStatus>("get_streaming_status").then((value) => {
+      if (request !== statusRequest) {
+        return;
+      }
       if (!value) {
         setTag(sunshineTag, "预览模式", "warn");
         setTag(moonlightTag, "预览模式", "warn");
