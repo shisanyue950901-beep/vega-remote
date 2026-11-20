@@ -329,33 +329,62 @@ fn looks_like_hostname(core: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn split_edge_punctuation(token: &str) -> (&str, &str, &str) {
+/// 端点两侧可能粘着标点：`(1.2.3.4)`、`[1.2.3.4]:21116,`、`"relay=…"`。
+/// 这些字符先原样记下来，脱敏后再接回去。
+fn is_wrapper(c: char) -> bool {
+    matches!(
+        c,
+        '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | '<' | '>' | ',' | ';' | ':' | '='
+    )
+}
+
+/// 剥掉首尾包裹标点，返回 (前缀, 主体, 后缀)。主体为空表示整串都是标点。
+fn peel_wrapping(token: &str) -> (&str, &str, &str) {
     let leading = token
         .char_indices()
-        .find(|&(_, c)| {
-            !c.is_ascii_punctuation()
-                || matches!(c, '[' | '(' | '{' | '"' | '\'')
-        })
+        .find(|&(_, c)| !is_wrapper(c))
         .map(|(index, _)| index)
         .unwrap_or(token.len());
     let rest = &token[leading..];
-    let trailing = rest
+    let trailing_index = rest
         .char_indices()
         .rev()
-        .find(|&(_, c)| {
-            !c.is_ascii_punctuation()
-                || matches!(c, ']' | ')' | '}' | '"' | '\'')
-        })
+        .find(|&(_, c)| !is_wrapper(c))
         .map(|(index, c)| index + c.len_utf8())
-        .unwrap_or(rest.len());
-    (&token[..leading], &rest[..trailing], &rest[trailing..])
+        .unwrap_or(0);
+    (&token[..leading], &rest[..trailing_index], &rest[trailing_index..])
+}
+
+/// 赋值前缀：`relay=`、`key:`、`server =`（token 内无空格，所以只剩前两种）。
+///
+/// IPv6 地址本身含冒号（`2001:db8::1`），因此这里只认「像标识符的左半段」，
+/// 且调用方还要确认剥掉前缀后确实认出了地址/主机，才会保留前缀。
+fn split_assignment(core: &str) -> Option<(&str, &str)> {
+    let index = core.find(['=', ':'])?;
+    let prefix = &core[..index];
+    if prefix.is_empty() || prefix.len() > 32 {
+        return None;
+    }
+    let mut chars = prefix.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return None,
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return None;
+    }
+    // 纯数字左半段是地址的一部分（`2001:…`），不能当键名。
+    if prefix.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some((&core[..index + 1], &core[index + 1..]))
 }
 
 /// 把 token 当 IP 解析：先整串 `SocketAddr`，再拆掉括号/端口后按 `IpAddr`。
 ///
-/// 端点可能写成 `1.2.3.4:21116`、`[2001:db8::1]:21117`，也可能在
-/// `split_edge_punctuation` 之后只剩 `2001:db8::1]:21117`（开头括号被当成
-/// 标点剥掉）。这几种都要认出来，不能因为一个残留的 `]` 就漏掉地址。
+/// 端点可能写成 `1.2.3.4:21116`、`[2001:db8::1]:21117`，也可能只剩
+/// `2001:db8::1]:21117`（开头括号被剥掉）。这几种都要认出来，不能因为一个
+/// 残留的 `]` 就漏掉地址。
 fn ip_from_token(token: &str) -> Option<IpAddr> {
     if let Ok(addr) = token.parse::<IpAddr>() {
         return Some(addr);
@@ -403,9 +432,36 @@ fn mask_core(core: &str) -> String {
     core.to_string()
 }
 
+/// 对单个 token 脱敏：先整体识别；不行再剥赋值前缀；最后剥包裹标点。
+/// 三层都认不出来时原样返回（普通版本号、状态文字不能被动到）。
+fn redact_core(core: &str) -> String {
+    if core.is_empty() {
+        return String::new();
+    }
+    let direct = mask_core(core);
+    if direct != core {
+        return direct;
+    }
+    if let Some((prefix, rest)) = split_assignment(core) {
+        if !rest.is_empty() {
+            let inner = redact_core(rest);
+            if inner != rest {
+                return format!("{prefix}{inner}");
+            }
+        }
+    }
+    let (leading, middle, trailing) = peel_wrapping(core);
+    if middle.len() != core.len() && !middle.is_empty() {
+        let inner = redact_core(middle);
+        if inner != middle {
+            return format!("{leading}{inner}{trailing}");
+        }
+    }
+    core.to_string()
+}
+
 fn redact_token(token: &str) -> String {
-    let (leading, core, trailing) = split_edge_punctuation(token);
-    format!("{leading}{}{trailing}", mask_core(core))
+    redact_core(token)
 }
 
 fn redact_with(input: &str, profile: Option<&str>) -> String {
@@ -621,7 +677,7 @@ mod tests {
             ip_from_token("[2001:db8::1]:21117"),
             Some("2001:db8::1".parse().unwrap())
         );
-        // split_edge_punctuation 会把开头括号当标点剥掉，留下 "…]:port"。
+        // 剥掉开头的 `[` 后只剩 "…]:port"，残留的 `]` 不能挡住识别。
         assert_eq!(
             ip_from_token("2001:db8::1]:21117"),
             Some("2001:db8::1".parse().unwrap())
@@ -641,7 +697,22 @@ mod tests {
         ] {
             let output = redact_with(input, None);
             assert!(!output.contains("2001:db8"), "{input} -> {output}");
+            assert!(output.contains("<ip>"), "{input} -> {output}");
         }
+        // 赋值前缀与包裹标点要原样保留，只换掉地址本体。
+        let comma = redact_with("relay=[2001:db8::1]:21117,", None);
+        assert!(!comma.contains("2001:db8"), "{comma}");
+        assert!(comma.starts_with("relay="), "{comma}");
+        assert!(comma.ends_with(','), "{comma}");
+        assert_eq!(redact_with("(2001:db8::1)", None), "(<ip>)");
+        assert_eq!(redact_with("key:1.2.3.4", None), "key:<ip>");
+    }
+
+    #[test]
+    fn redaction_keeps_key_name_but_masks_host_value() {
+        // `key:` 是键名不是地址；冒号不能被当成 IPv6 分隔符。
+        assert_eq!(redact_with("key:pc.example.com", None), "key:<host>");
+        assert_eq!(redact_with("fe80::1", None), "<ip>");
     }
 
     #[test]
