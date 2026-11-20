@@ -23,6 +23,9 @@ const DOCTOR_BUDGET: Duration = Duration::from_secs(8);
 const SUNSHINE_SERVICE: &str = "SunshineService";
 const SUNSHINE_PORT: u16 = 47990;
 const TCP_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+/// RustDesk ID 服务器探测的独立上限：DNS + TCP 最多吃掉 3 秒，
+/// 不能把整份 8 秒 doctor 预算用完，让后面的检查一条都跑不到。
+const RUSTDESK_PROBE_LIMIT: Duration = Duration::from_secs(3);
 
 /// 导出文件名的进程内递增序号：同一毫秒内的两次导出也不能互相覆盖。
 static EXPORT_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -186,12 +189,14 @@ fn doctor_items(deadline: Instant, cancel: &Arc<AtomicBool>) -> Option<Vec<Docto
         } else {
             // DNS 解析前最后确认：预算已耗尽或已取消时不再发起解析。
             // 直接把命令入口的绝对 deadline 和取消标志传给探测，不再从
-            // 剩余时间重建一份相对预算。
+            // 剩余时间重建一份相对预算；探测再叠加自己的 3 秒上限，
+            // 取两者中更早的那个，DNS/TCP 不能独吞整份 8 秒预算。
             if expired(deadline, cancel) {
                 return None;
             }
+            let probe_deadline = deadline.min(Instant::now() + RUSTDESK_PROBE_LIMIT);
             let result =
-                probe_server_with_timeout(&config.server, deadline, Some(Arc::clone(cancel)));
+                probe_server_with_timeout(&config.server, probe_deadline, Some(Arc::clone(cancel)));
             items.push(if result.ok {
                 item("RustDesk ID 服务器", DoctorStatus::Pass, "")
             } else {
