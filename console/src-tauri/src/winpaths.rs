@@ -114,6 +114,72 @@ pub(crate) fn program_files_dir() -> Option<PathBuf> {
     program_files_dirs().into_iter().next()
 }
 
+/// 本地 AppData 目录（`FOLDERID_LocalAppData`），日志目录的根。
+///
+/// 不用 `%LOCALAPPDATA%`：环境变量可被启动环境改写，日志会写到别处。
+#[cfg(windows)]
+pub(crate) fn local_app_data_dir() -> Option<PathBuf> {
+    use windows::Win32::UI::Shell::FOLDERID_LocalAppData;
+
+    known_folder(&FOLDERID_LocalAppData)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn local_app_data_dir() -> Option<PathBuf> {
+    None
+}
+
+/// 用 `ShellExecuteW` 打开一个目录（verb `open`，`lpFile` 直接给路径）。
+///
+/// 不走 `explorer.exe` 命令行：路径里的空格/引号不需要拼 shell 参数，
+/// 也不会把用户目录当成命令行文本解释。返回 `HINSTANCE > 32` 才算成功。
+#[cfg(windows)]
+pub(crate) fn open_directory(path: &Path) -> Result<(), ()> {
+    use std::ffi::{c_void, OsStr};
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(
+            hwnd: *mut c_void,
+            lp_operation: *const u16,
+            lp_file: *const u16,
+            lp_parameters: *const u16,
+            lp_directory: *const u16,
+            n_show_cmd: i32,
+        ) -> *mut c_void;
+    }
+
+    fn wide(text: &OsStr) -> Vec<u16> {
+        text.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    let file = wide(path.as_os_str());
+    let verb = wide(OsStr::new("open"));
+    // SAFETY: 两个字符串都以 NUL 结尾并在调用期间存活；其余句柄/参数传空，
+    // 返回值只是 HINSTANCE，不解引用。
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1, // SW_SHOWNORMAL
+        )
+    };
+    if result as isize > 32 {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn open_directory(_path: &Path) -> Result<(), ()> {
+    Err(())
+}
+
 /// `System32` 目录（`FOLDERID_System`）。
 #[cfg(windows)]
 pub(crate) fn system32_dir() -> Option<PathBuf> {

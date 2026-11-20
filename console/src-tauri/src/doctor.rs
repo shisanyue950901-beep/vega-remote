@@ -13,9 +13,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-use crate::rustdesk::{
-    explorer_exe, get_server_config, locate_rustdesk, probe_server_with_timeout, spawn_detached,
-};
+use crate::rustdesk::{get_server_config, locate_rustdesk, probe_server_with_timeout};
+use crate::winpaths::{local_app_data_dir, open_directory};
 use crate::scm::{query_service_state, ServiceState};
 use crate::streaming::{moonlight_exe, tailscale_installed};
 
@@ -822,9 +821,8 @@ struct DoctorLog {
 }
 
 fn log_directory() -> PathBuf {
-    let root = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
+    // 由 `SHGetKnownFolderPath(FOLDERID_LocalAppData)` 解析，不读环境变量。
+    let root = local_app_data_dir().unwrap_or_else(std::env::temp_dir);
     root.join("Vega").join("logs")
 }
 
@@ -888,11 +886,8 @@ fn export_blocking(deadline: Instant, snapshot_id: u64) -> Result<(), String> {
         .map_err(|_| "写入脱敏日志失败".to_string())?;
 
     if cfg!(windows) {
-        let directory_text = directory.display().to_string();
-        let Some(explorer) = explorer_exe() else {
-            return Err("日志已导出，但打开目录失败".to_string());
-        };
-        spawn_detached(&explorer, &[directory_text.as_str()])
+        // 直接 ShellExecuteW(verb=open, lpFile=目录)，不拼 explorer.exe 命令行。
+        open_directory(&directory)
             .map_err(|_| "日志已导出，但打开目录失败".to_string())?;
     }
     Ok(())
