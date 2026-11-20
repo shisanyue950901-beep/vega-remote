@@ -18,8 +18,18 @@
 use std::path::{Path, PathBuf};
 
 /// 候选文件是否仍在根目录内（软链接已由 `canonicalize` 展开后比较）。
+///
+/// 两侧都先走 [`normalize`]：调用方可能拿到 `\\?\` verbatim 路径、正斜杠或
+/// 尾部反斜杠，不能因为写法不同就把同一个目录判成不同根。
 fn is_inside(root: &Path, candidate: &Path) -> bool {
-    candidate != root && candidate.starts_with(root)
+    let (Some(root), Some(candidate)) = (root.to_str(), candidate.to_str()) else {
+        return false;
+    };
+    let root = normalize(root).to_ascii_lowercase();
+    let candidate = normalize(candidate).to_ascii_lowercase();
+    candidate.len() > root.len()
+        && candidate.starts_with(&root)
+        && candidate.as_bytes()[root.len()] == b'\\'
 }
 
 /// 已知文件夹的原始路径（不规范化、不跟随重解析点）；拿不到就返回 `None`。
@@ -135,9 +145,32 @@ fn trim_separators(path: &str) -> &str {
     path.trim_end_matches(['\\', '/'])
 }
 
-/// 剥掉 `canonicalize` 在 Windows 上加的 verbatim 前缀（`\\?\`）。
-fn strip_verbatim(path: &str) -> &str {
-    path.strip_prefix(r"\\?\").unwrap_or(path)
+/// 前缀匹配（Windows 路径前缀大小写不敏感；不在字符边界上就返回 `None`）。
+fn strip_prefix_ignore_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = text.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &text[prefix.len()..])
+}
+
+/// 统一路径写法，只用于比较：
+///
+/// - 剥掉 `canonicalize` 加的 verbatim 前缀（`\\?\`）；
+/// - `\\?\UNC\server\share` 还原成 `\\server\share`；
+/// - 正斜杠统一成反斜杠；
+/// - 去掉尾部反斜杠（卷根 `C:\` 归一成 `C:`）。
+///
+/// 大小写不敏感由比较方按需处理。`Program Files` 根校验与最终可执行文件
+/// 校验都走这一个函数，不能各写一套。
+fn normalize(path: &str) -> String {
+    let stripped = if let Some(rest) = strip_prefix_ignore_case(path, r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = strip_prefix_ignore_case(path, r"\\?\") {
+        rest.to_string()
+    } else {
+        path.to_string()
+    };
+    let unified = stripped.replace('/', "\\");
+    trim_separators(&unified).to_string()
 }
 
 /// `Program Files` 根是否正好是 `<系统卷根>\Program Files` 或 `(x86)`。
@@ -148,12 +181,12 @@ fn is_system_program_files_root(root: &Path, system_volume: &Path) -> bool {
     let (Some(root), Some(volume)) = (root.to_str(), system_volume.to_str()) else {
         return false;
     };
-    let volume = trim_separators(volume);
+    // 两侧都走同一个 normalize：verbatim 前缀 / 正斜杠 / 尾部分隔符都不影响比较。
+    let volume = normalize(volume);
     if volume.is_empty() {
         return false;
     }
-    // canonicalize 在 Windows 上返回 `\\?\C:\...`：先剥前缀，再比根。
-    let root = trim_separators(strip_verbatim(root));
+    let root = normalize(root);
     ["Program Files", "Program Files (x86)"]
         .iter()
         .any(|name| root.eq_ignore_ascii_case(&format!("{volume}\\{name}")))
@@ -162,10 +195,13 @@ fn is_system_program_files_root(root: &Path, system_volume: &Path) -> bool {
 /// 两个卷根是否一致。Windows 路径不区分大小写；任一侧拿不到都算不一致。
 fn same_volume_root(a: Option<PathBuf>, b: Option<PathBuf>) -> bool {
     match (a, b) {
-        (Some(a), Some(b)) => a
-            .as_os_str()
-            .to_string_lossy()
-            .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy()),
+        (Some(a), Some(b)) => {
+            let (Some(a), Some(b)) = (a.to_str(), b.to_str()) else {
+                return false;
+            };
+            // 最终可执行文件的卷根同样走 normalize：`\\?\C:\` 与 `C:\` 视为同一卷。
+            normalize(a).eq_ignore_ascii_case(&normalize(b))
+        }
         _ => false,
     }
 }
@@ -339,6 +375,49 @@ mod tests {
         assert!(!same_volume_root(None, c()));
         assert!(!same_volume_root(c(), None));
         assert!(!same_volume_root(None, None));
+    }
+
+    #[test]
+    fn normalize_strips_verbatim_and_unifies_separators() {
+        // 卷根、正斜杠、尾部反斜杠：都归一成同一种写法。
+        assert_eq!(normalize(r"\\?\C:\"), "C:");
+        assert_eq!(normalize(r"C:\"), "C:");
+        assert_eq!(normalize("C:/"), "C:");
+        assert_eq!(normalize(r"C:\Program Files\\"), r"C:\Program Files");
+        // verbatim UNC 还原成普通 UNC，不留下 `UNC` 这一段。
+        assert_eq!(normalize(r"\\?\UNC\server\share\"), r"\\server\share");
+        // 大小写保留，比较时再忽略。
+        assert_eq!(
+            normalize(r"\\?\c:\program files\x\a.exe"),
+            r"c:\program files\x\a.exe"
+        );
+    }
+
+    #[test]
+    fn verbatim_paths_compare_as_same_volume_and_inside_root() {
+        // `\\?\C:\` 与 `C:\` 是同一个卷根。
+        assert!(same_volume_root(
+            Some(PathBuf::from(r"\\?\C:\")),
+            Some(PathBuf::from(r"C:\"))
+        ));
+        assert!(same_volume_root(
+            Some(PathBuf::from(r"\\?\c:\")),
+            Some(PathBuf::from("C:/"))
+        ));
+        // 可执行文件带 verbatim 前缀、小写、正斜杠，仍判定在 `C:\Program Files` 下。
+        assert!(is_inside(
+            Path::new(r"C:\Program Files"),
+            Path::new(r"\\?\c:\program files\x\a.exe")
+        ));
+        assert!(is_inside(
+            Path::new(r"\\?\C:\Program Files\"),
+            Path::new("C:/Program Files/x/a.exe")
+        ));
+        // 前缀相近的兄弟目录不能算在里面。
+        assert!(!is_inside(
+            Path::new(r"C:\Program Files"),
+            Path::new(r"\\?\c:\program files evil\a.exe")
+        ));
     }
 
     #[test]
