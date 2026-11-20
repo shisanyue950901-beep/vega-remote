@@ -50,3 +50,7 @@ jobs:
       # TODO(m2b): Cargo.lock 提交后追加 --locked，保证依赖可复现。
       - name: 构建（--no-bundle）
         run: npm run tauri build -- --no-bundle
+
+      # 上面已生成 ../dist，cargo test 的 build.rs（generate_context!）才有前端资源可用。
+      - name: Rust 单元测试
+        run: cargo test --manifest-path src-tauri/Cargo.toml
