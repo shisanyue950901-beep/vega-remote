@@ -56,7 +56,64 @@ interface TestResult {
   latencyMs: number;
 }
 
+interface GpuInfo {
+  name: string;
+  kind: string;
+  encoder: string;
+  memoryMb: number;
+}
+
+interface StreamingStatus {
+  sunshineState: string;
+  sunshineLabel: string;
+  gpus: GpuInfo[];
+  moonlightInstalled: boolean;
+  moonlightError: string;
+  hostInstallCommand: string;
+  clientInstallCommand: string;
+}
+
+interface DoctorItem {
+  item: string;
+  status: string;
+  advice: string;
+}
+
 let currentDeviceCode = "";
+
+/** 串流页与 doctor 的跨区动作；由各自 setup 设置。 */
+let refreshStreaming: (() => void) | null = null;
+let refreshAssistDevice: (() => void) | null = null;
+let refreshAssistStatus: (() => void) | null = null;
+let runDoctorAction: (() => void) | null = null;
+
+/** 设置页与远程协助页共用同一份配置快照，避免 focus 时各读一遍。 */
+type ConfigHandler = (config: ServerConfigView | null) => void;
+const configHandlers: ConfigHandler[] = [];
+let configRefreshInFlight = false;
+
+async function refreshSharedConfig(): Promise<void> {
+  if (configRefreshInFlight) {
+    return;
+  }
+  configRefreshInFlight = true;
+  try {
+    const config = await invoke<ServerConfigView>("get_server_config");
+    for (const handler of configHandlers) {
+      handler(config);
+    }
+  } finally {
+    configRefreshInFlight = false;
+  }
+}
+
+async function refreshOnFocus(): Promise<void> {
+  await refreshSharedConfig();
+  // 从 RustDesk 安装/改配置回来时，设备码与安装状态也要跟着重查。
+  refreshAssistDevice?.();
+  refreshAssistStatus?.();
+  refreshStreaming?.();
+}
 
 function byId<T extends HTMLElement>(id: string): T {
   const el = document.getElementById(id);
@@ -166,18 +223,21 @@ export function formatDeviceCode(digits: string): string {
 }
 
 /* ---------- 左栏导航 ---------- */
-function setupNav(): void {
+function navigateTo(page: string): void {
   const items = Array.from(document.querySelectorAll<HTMLButtonElement>(".nav__item"));
   const pages = Array.from(document.querySelectorAll<HTMLElement>(".page"));
+  items.forEach((item) => item.classList.toggle("is-active", item.dataset.page === page));
+  pages.forEach((target) => target.classList.toggle("is-active", target.id === `page-${page}`));
+}
 
+function setupNav(): void {
+  const items = Array.from(document.querySelectorAll<HTMLButtonElement>(".nav__item"));
   items.forEach((item) => {
     item.addEventListener("click", () => {
       const target = item.dataset.page;
-      if (!target) {
-        return;
+      if (target) {
+        navigateTo(target);
       }
-      items.forEach((other) => other.classList.toggle("is-active", other === item));
-      pages.forEach((page) => page.classList.toggle("is-active", page.id === `page-${target}`));
     });
   });
 }
@@ -264,7 +324,7 @@ function setupAssistPage(): void {
     });
   };
 
-  const loadServerConfig = (): void => {
+  const applyServerConfig = (config: ServerConfigView | null): void => {
     // 先清掉上一次的探测结论，并作废在途探测：RustDesk 里改完地址后
     // 旧地址的绿点不能留着。
     probeGeneration += 1;
@@ -272,30 +332,24 @@ function setupAssistPage(): void {
     idTestButton.classList.add("is-hidden");
     idTestButton.disabled = false;
     idDot.className = "dot dot--off";
-    idStatusText.textContent = "正在读取 ID 服务器配置…";
-    void invoke<ServerConfigView>("get_server_config").then((config) => {
-      if (!config) {
-        idStatusText.textContent = "预览模式：无法读取 RustDesk 配置";
-        idDot.className = "dot dot--off";
-        return;
-      }
-      const server = config.server.trim();
-      configuredServer = server;
-      const key = config.keyFingerprint ? ` · 公钥 ${config.keyFingerprint}…` : " · 无公钥";
-      // 绿点只代表「已配置且测试连通」；读到了空白地址或还没测连通性时
-      // 分别显示未配置 / 待测试，不能拿「TOML 解析成功」冒充在线。
-      if (config.error) {
-        idStatusText.textContent = `ID 服务器：${config.error}`;
-        idDot.className = "dot dot--off";
-      } else if (!server) {
-        idStatusText.textContent = "ID 服务器未配置（在 RustDesk 的 设置 → 网络 中填写）";
-        idDot.className = "dot dot--off";
-      } else {
-        idStatusText.textContent = `ID 服务器已配置 ${server}${key}（尚未测试连通性）`;
-        idDot.className = "dot dot--busy";
-        idTestButton.classList.remove("is-hidden");
-      }
-    });
+    if (!config) {
+      idStatusText.textContent = "预览模式：无法读取 RustDesk 配置";
+      return;
+    }
+    const server = config.server.trim();
+    configuredServer = server;
+    const key = config.keyFingerprint ? ` · 公钥 ${config.keyFingerprint}…` : " · 无公钥";
+    // 绿点只代表「已配置且测试连通」；读到了空白地址或还没测连通性时
+    // 分别显示未配置 / 待测试，不能拿「TOML 解析成功」冒充在线。
+    if (config.error) {
+      idStatusText.textContent = `ID 服务器：${config.error}`;
+    } else if (!server) {
+      idStatusText.textContent = "ID 服务器未配置（在 RustDesk 的 设置 → 网络 中填写）";
+    } else {
+      idStatusText.textContent = `ID 服务器已配置 ${server}${key}（尚未测试连通性）`;
+      idDot.className = "dot dot--busy";
+      idTestButton.classList.remove("is-hidden");
+    }
   };
 
   const loadStatus = (): void => {
@@ -310,8 +364,6 @@ function setupAssistPage(): void {
       openInstallPageButton.classList.toggle("is-hidden", status.installed);
       installHint.classList.toggle("is-hidden", status.installed);
     });
-
-    loadServerConfig();
   };
 
   idTestButton.addEventListener("click", () => {
@@ -432,6 +484,9 @@ function setupAssistPage(): void {
     });
   });
 
+  configHandlers.push(applyServerConfig);
+  refreshAssistDevice = loadDeviceCode;
+  refreshAssistStatus = loadStatus;
   loadDeviceCode();
   loadStatus();
   loadRecents();
@@ -461,30 +516,30 @@ function setupSettingsPage(): void {
   // 只读页：配置只显示 RustDesk2.toml 里的当前值，写入一律在 RustDesk 里做。
   let probeGeneration = 0;
 
-  const loadNetwork = (): void => {
-    // 重读配置就作废在途探测，避免旧地址的结论落到新地址上。
+  const applyConfig = (config: ServerConfigView | null): void => {
+    // 每次重读配置都作废在途探测，并把上一次的结果与按钮状态复位。
+    // 旧回调只认自己的代次，不能把按钮永久留在 disabled（审计 r5 P2）。
     probeGeneration += 1;
-    setStatus(networkStatus, "正在读取 RustDesk 配置…");
-    void invoke<ServerConfigView>("get_server_config").then((config) => {
-      if (!config) {
-        setStatus(networkStatus, "浏览器预览：未连接 Tauri，命令不可用", "warn");
-        return;
-      }
-      idServerInput.value = config.server;
-      relayServerInput.value = config.relay;
-      if (config.keyPresent) {
-        fingerprint.textContent = `${config.keyFingerprint}…（完整公钥不回显）`;
-      } else {
-        fingerprint.textContent = config.error || "未设置";
-      }
-      setStatus(networkStatus, config.error ? config.error : `配置文件：${config.path}`, config.error ? "warn" : "ok");
-    });
+    testButton.disabled = true;
+    setStatus(testResult, "未测试");
+    if (!config) {
+      setStatus(networkStatus, "浏览器预览：未连接 Tauri，命令不可用", "warn");
+      testButton.disabled = false;
+      return;
+    }
+    idServerInput.value = config.server;
+    relayServerInput.value = config.relay;
+    if (config.keyPresent) {
+      fingerprint.textContent = `${config.keyFingerprint}…（完整公钥不回显）`;
+    } else {
+      fingerprint.textContent = config.error || "未设置";
+    }
+    setStatus(networkStatus, config.error ? config.error : `配置文件：${config.path}`, config.error ? "warn" : "ok");
+    // 最新配置已经落地，按钮总是可用；是否可点由地址是否为空决定。
+    testButton.disabled = false;
   };
 
-  // 从 RustDesk 改完配置切回来时刷新一次显示。
-  window.addEventListener("focus", () => {
-    loadNetwork();
-  });
+  configHandlers.push(applyConfig);
 
   // 修改入口：打开 RustDesk 主窗口，让用户在「设置 → 网络」里改。
   openRustdeskNetworkButton.addEventListener("click", () => {
@@ -512,7 +567,8 @@ function setupSettingsPage(): void {
     setStatus(testResult, "正在连接 21116…");
     testButton.disabled = true;
     void invoke<TestResult>("test_server_connection", { server: testedServer }).then((result) => {
-      // 地址或代次变了就丢结果：旧地址的「连接成功」不能贴到新地址上。
+      // 地址或代次变了就丢结果；按钮由最新一次 applyConfig 恢复，
+      // 这里不再碰 disabled，避免和刷新流程抢状态。
       if (generation !== probeGeneration || testedServer !== idServerInput.value.trim()) {
         return;
       }
@@ -528,12 +584,63 @@ function setupSettingsPage(): void {
     });
   });
 
-  runDoctorButton.addEventListener("click", () => {
-    flashLabel(runDoctorButton, "M2c 接入");
-  });
+  const doctorResults = byId<HTMLUListElement>("doctor-results");
+  const doctorStatus = byId<HTMLSpanElement>("doctor-status");
+
+  const renderDoctor = (items: DoctorItem[]): void => {
+    doctorResults.innerHTML = "";
+    if (items.length === 0) {
+      const empty = document.createElement("li");
+      empty.className = "doctor__item";
+      empty.textContent = "没有诊断结果";
+      doctorResults.append(empty);
+      return;
+    }
+    for (const entry of items) {
+      const row = document.createElement("li");
+      const modifier =
+        entry.status === "通过" ? "pass" : entry.status === "警告" ? "warn" : "fail";
+      const tagClass =
+        entry.status === "通过" ? "tag--ok" : entry.status === "警告" ? "tag--warn" : "tag--fail";
+      row.className = `doctor__item doctor__item--${modifier}`;
+      const tag = document.createElement("span");
+      tag.className = `tag ${tagClass}`;
+      tag.textContent = entry.status;
+      row.append(tag);
+      const text = document.createElement("span");
+      text.textContent = entry.advice ? `${entry.item}：${entry.advice}` : entry.item;
+      row.append(text);
+      doctorResults.append(row);
+    }
+  };
+
+  const runDoctor = (): void => {
+    runDoctorButton.disabled = true;
+    setStatus(doctorStatus, "正在诊断（最多 8 秒）…");
+    void invoke<DoctorItem[]>("run_doctor").then((items) => {
+      runDoctorButton.disabled = false;
+      if (!items) {
+        setStatus(doctorStatus, "浏览器预览：命令不可用", "warn");
+        return;
+      }
+      renderDoctor(items);
+      setStatus(doctorStatus, `诊断完成：${items.length} 项`, "ok");
+    });
+  };
+  runDoctorAction = runDoctor;
+  runDoctorButton.addEventListener("click", runDoctor);
 
   exportButton.addEventListener("click", () => {
-    flashLabel(exportButton, "M2c 接入");
+    exportButton.disabled = true;
+    setStatus(doctorStatus, "正在导出脱敏日志…");
+    void invoke<OpResult>("export_doctor_log").then((result) => {
+      exportButton.disabled = false;
+      if (!result) {
+        setStatus(doctorStatus, "浏览器预览：命令不可用", "warn");
+        return;
+      }
+      setStatus(doctorStatus, result.message, result.ok ? "ok" : "error");
+    });
   });
 
   fixedPasswordButton.addEventListener("click", () => {
@@ -541,42 +648,155 @@ function setupSettingsPage(): void {
     flashLabel(fixedPasswordButton, configured ? "请在 RustDesk 里设置" : "请在 RustDesk 里清除");
     fixedPasswordInput.value = "";
   });
-
-  loadNetwork();
 }
 
-/* ---------- 我的设备：配对输入框（M2a r2 遗留） ---------- */
-function setupPairing(): void {
-  const openPairing = byId<HTMLButtonElement>("sunshine-pair");
-  const pinInput = byId<HTMLInputElement>("sunshine-pin");
-  const pinSubmit = byId<HTMLButtonElement>("sunshine-pin-submit");
-  let opened = false;
+/* ---------- 我的设备：高性能串流 ---------- */
+function setupStreamingPage(): void {
+  const sunshineTag = byId<HTMLSpanElement>("sunshine-tag");
+  const gpuList = byId<HTMLUListElement>("gpu-list");
+  const sunshineStatus = byId<HTMLSpanElement>("sunshine-status");
+  const pairingButton = byId<HTMLButtonElement>("sunshine-pair");
+  const settingsButton = byId<HTMLButtonElement>("sunshine-settings");
+  const installButton = byId<HTMLButtonElement>("sunshine-install");
+  const moonlightTag = byId<HTMLSpanElement>("moonlight-tag");
+  const moonlightStart = byId<HTMLButtonElement>("moonlight-start");
+  const moonlightInstall = byId<HTMLButtonElement>("moonlight-install");
+  const moonlightStatus = byId<HTMLSpanElement>("moonlight-status");
+  const diagnoseButton = byId<HTMLButtonElement>("diagnose-net");
 
-  const setOpened = (value: boolean): void => {
-    opened = value;
-    pinInput.classList.toggle("is-hidden", !value);
-    pinSubmit.classList.toggle("is-hidden", !value);
-    openPairing.textContent = value ? "收起配对" : "打开配对";
-    if (value) {
-      pinInput.focus();
+  const setTag = (el: HTMLSpanElement, text: string, kind: "ok" | "warn" | "fail"): void => {
+    el.textContent = text;
+    el.className = `tag tag--${kind}`;
+  };
+
+  const renderGpus = (gpus: GpuInfo[]): void => {
+    gpuList.innerHTML = "";
+    if (gpus.length === 0) {
+      const empty = document.createElement("li");
+      empty.className = "field__hint";
+      empty.textContent = "未识别到可用于编码的显卡";
+      gpuList.append(empty);
+      return;
+    }
+    for (const gpu of gpus) {
+      const row = document.createElement("li");
+      row.className = "gpu";
+      const name = document.createElement("span");
+      name.className = "gpu__name";
+      name.textContent = gpu.name;
+      const meta = document.createElement("span");
+      meta.className = "field__hint";
+      const memory = gpu.memoryMb > 0 ? ` · 显存 ${gpu.memoryMb} MB` : "";
+      meta.textContent = `${gpu.kind} · 编码器 ${gpu.encoder}${memory}`;
+      row.append(name, meta);
+      gpuList.append(row);
     }
   };
 
-  openPairing.addEventListener("click", () => {
-    setOpened(!opened);
-  });
+  let status: StreamingStatus | null = null;
 
-  pinInput.addEventListener("input", () => {
-    pinInput.value = pinInput.value.replace(/\D/g, "").slice(0, 4);
-  });
+  const renderStatus = (value: StreamingStatus): void => {
+    status = value;
+    if (value.sunshineState === "running") {
+      setTag(sunshineTag, `Sunshine ${value.sunshineLabel}`, "ok");
+    } else if (value.sunshineState === "notInstalled" || value.sunshineState === "unknown") {
+      setTag(sunshineTag, `Sunshine ${value.sunshineLabel}`, "fail");
+    } else {
+      setTag(sunshineTag, `Sunshine ${value.sunshineLabel}`, "warn");
+    }
+    renderGpus(value.gpus);
+    setTag(moonlightTag, value.moonlightInstalled ? "Moonlight 已安装" : "Moonlight 未安装", value.moonlightInstalled ? "ok" : "warn");
+    moonlightStart.disabled = !value.moonlightInstalled;
+    if (value.moonlightError) {
+      setStatus(moonlightStatus, value.moonlightError, "warn");
+    } else if (value.moonlightInstalled) {
+      setStatus(moonlightStatus, "在 Moonlight 中选择已配对主机", "ok");
+    } else {
+      setStatus(moonlightStatus, "安装后点「开始串流」，在 Moonlight 里添加已配对主机", "warn");
+    }
+  };
 
-  pinSubmit.addEventListener("click", () => {
-    if (pinInput.value.length !== 4) {
-      flashLabel(pinSubmit, "PIN 需 4 位");
+  const load = (): void => {
+    void invoke<StreamingStatus>("get_streaming_status").then((value) => {
+      if (!value) {
+        setTag(sunshineTag, "预览模式", "warn");
+        setTag(moonlightTag, "预览模式", "warn");
+        return;
+      }
+      renderStatus(value);
+    });
+  };
+  refreshStreaming = load;
+
+  const copyInstallCommand = (command: string, statusEl: HTMLSpanElement, what: string): void => {
+    void copyText(command).then((ok) => {
+      setStatus(
+        statusEl,
+        ok
+          ? `${what}安装命令已复制，请在管理员 PowerShell 中运行（会同时配置防火墙）`
+          : "复制失败，请手动从 README 复制安装命令",
+        ok ? "ok" : "error",
+      );
+    });
+  };
+
+  installButton.addEventListener("click", () => {
+    if (!status) {
+      setStatus(sunshineStatus, "还在读取串流状态，请稍后重试", "warn");
       return;
     }
-    flashLabel(pinSubmit, "M2c 接入");
+    copyInstallCommand(status.hostInstallCommand, sunshineStatus, "Sunshine ");
   });
+
+  pairingButton.addEventListener("click", () => {
+    setStatus(sunshineStatus, "正在打开 Sunshine 配对页…");
+    void invoke<OpResult>("open_sunshine_pairing").then((result) => {
+      setStatus(
+        sunshineStatus,
+        result ? result.message : "浏览器预览：命令不可用",
+        result && result.ok ? "ok" : "error",
+      );
+    });
+  });
+
+  settingsButton.addEventListener("click", () => {
+    setStatus(sunshineStatus, "正在打开 Sunshine 设置页…");
+    void invoke<OpResult>("open_sunshine_settings").then((result) => {
+      setStatus(
+        sunshineStatus,
+        result ? result.message : "浏览器预览：命令不可用",
+        result && result.ok ? "ok" : "error",
+      );
+    });
+  });
+
+  moonlightStart.addEventListener("click", () => {
+    setStatus(moonlightStatus, "正在打开 Moonlight…");
+    void invoke<OpResult>("start_moonlight_stream").then((result) => {
+      setStatus(
+        moonlightStatus,
+        result ? result.message : "浏览器预览：命令不可用",
+        result && result.ok ? "ok" : "error",
+      );
+    });
+  });
+
+  moonlightInstall.addEventListener("click", () => {
+    if (!status) {
+      setStatus(moonlightStatus, "还在读取串流状态，请稍后重试", "warn");
+      return;
+    }
+    copyInstallCommand(status.clientInstallCommand, moonlightStatus, "Moonlight ");
+  });
+
+  // 诊断网络：跳到设置页的诊断卡片并立刻运行 doctor。
+  diagnoseButton.addEventListener("click", () => {
+    navigateTo("settings");
+    byId<HTMLDivElement>("doctor-card").scrollIntoView({ behavior: "smooth", block: "start" });
+    runDoctorAction?.();
+  });
+
+  load();
 }
 
 /* ---------- 被控弹窗 / 浮条 ---------- */
@@ -639,9 +859,15 @@ function main(): void {
   setupTabs();
   setupAssistPage();
   setupSettingsPage();
-  setupPairing();
+  setupStreamingPage();
   setupIncomingDialog();
   setupWindowControls();
+
+  // 两页共用一份配置快照；启动时读一次，focus 时再刷新并复查设备码/安装状态。
+  void refreshSharedConfig();
+  window.addEventListener("focus", () => {
+    void refreshOnFocus();
+  });
 }
 
 if (document.readyState === "loading") {
