@@ -110,3 +110,11 @@
 - **P2 — Export can still write or open Explorer after timing out.** Folder resolution and creation can run past the last pre-write check. The STA thread can also start late. Recheck before publishing the report and inside the STA thread immediately before `ShellExecuteW`. Stage the JSON and publish it with a no-overwrite move so failed writes leave no partial report. 
 - **P2 — The new snapshot tests can fail in parallel CI.** Both mutate `LAST_SNAPSHOT`, so either can replace or clear the fixture before the other asserts it exists. Give each test its own cache. 
 - **P3 — Folder opening proceeds if COM initialization fails.** Return the existing generic folder-open error on a failed `CoInitializeEx` before calling `ShellExecuteW`. 
+
+## M2c r8 遗留（Codex m2c-r8 PASS）
+- **P2 — Export can start disk writes after timeout.** Slow folder resolution can still be followed by directory creation, and a slow staging-file open can still be followed by a write. Check expiry after folder resolution, before each staging attempt, and after opening the staging file. 
+- **P2 — Export requires hard-link support.** A log volume that supports renames but lacks hard links cannot export. Publish the staged report with a same-directory `MoveFileExW` call with flags `0` and retry name collisions. 
+- **P2 — The manual TCP test excludes worker queue time.** Start its three-second deadline at IPC entry, enforce it with `timeout_at`, and reject a TCP success returned after expiry. 
+- **P2 — A queued focus refresh briefly re-enables the old server.** A Node check reproduced Settings probing the previous address while the follow-up read was pending. Invalidate both views’ probes when refresh starts and apply only the last queued snapshot. 
+- **P3 — The GPU list displays VRAM capacity.** Keep capacity internal to the classifier and display the adapter name, class, and likely encoder. 
+- **P3 — Documentation is stale.** Correct the README’s PATH fallback and TOML write claims. Update the r7 checklist and remove the trailing spaces flagged by `git diff --check`. 
