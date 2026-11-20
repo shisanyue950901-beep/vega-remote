@@ -69,45 +69,32 @@
 
               <div class="field field--code">
                 <span class="field__label">设备码</span>
-                <span id="device-code" class="device-code">123 456 789</span>
+                <span id="device-code" class="device-code">读取中…</span>
                 <button id="copy-code" class="btn btn--ghost" type="button">复制</button>
               </div>
+              <p id="device-code-status" class="field__hint" role="status" aria-live="polite"></p>
 
               <div class="field">
                 <span class="field__label">临时密码</span>
-                <span id="temp-password" class="password" data-revealed="false">●●●●●●●●</span>
-                <button id="toggle-password" class="iconbtn" type="button" title="显示密码" aria-label="显示密码">
-                  <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1.5 8s2.4-4 6.5-4 6.5 4 6.5 4-2.4 4-6.5 4S1.5 8 1.5 8z" /><circle cx="8" cy="8" r="1.8" /></svg>
-                </button>
-                <button id="refresh-password" class="iconbtn" type="button" title="刷新密码" aria-label="刷新密码">
-                  <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 8a5 5 0 1 1-1.6-3.7" /><path d="M13 2.5V5h-2.5" /></svg>
-                </button>
-                <span id="refresh-status" class="field__hint" role="status" aria-live="polite"></span>
-                <label class="field__inline">
-                  <span class="field__hint">刷新频率</span>
-                  <select id="password-rotate" class="select select--compact">
-                    <option>每次会话后</option>
-                    <option selected>每天</option>
-                    <option>从不</option>
-                  </select>
-                </label>
+                <button id="show-password" class="btn btn--ghost" type="button">显示临时密码</button>
+                <span class="field__hint">密码由 RustDesk 自己管理，控制台不读取、不记录。点击后打开 RustDesk 主窗口查看。</span>
+                <span id="password-status" class="field__hint" role="status" aria-live="polite"></span>
               </div>
 
               <div class="field">
                 <button id="copy-share" class="btn btn--primary" type="button">复制并分享</button>
-                <span class="field__hint">复制「设备码 + 临时密码」一段文字发给对方</span>
+                <span class="field__hint">复制「设备码 + 让对方在 RustDesk 窗口查看临时密码」一段文字</span>
               </div>
 
               <div class="statusline" id="id-status">
-                <span class="dot dot--ok" aria-hidden="true"></span>
-                <span>已连接 ID 服务器（rustdesk.vega.example.com）</span>
-                <button id="diagnose" class="link" type="button">诊断</button>
+                <span class="dot dot--off" id="id-dot" aria-hidden="true"></span>
+                <span id="id-status-text">正在读取 RustDesk 状态…</span>
               </div>
-              <!-- 未连接态（M2b 绑定后切换显示） -->
-              <div class="statusline is-hidden" id="id-status-offline">
-                <span class="dot dot--off" aria-hidden="true"></span>
-                <span>未连接：ID 服务器不可达（原因：连接超时）</span>
-                <button class="link" type="button" data-action="diagnose">诊断</button>
+
+              <div class="statusline is-hidden" id="service-status">
+                <span class="dot dot--off" id="service-dot" aria-hidden="true"></span>
+                <span id="service-status-text"></span>
+                <button id="install-rustdesk" class="link is-hidden" type="button">安装 RustDesk</button>
               </div>
             </div>
 
@@ -122,24 +109,14 @@
                   class="input input--code"
                   type="text"
                   inputmode="numeric"
-                  maxlength="11"
+                  maxlength="13"
                   placeholder="输入对方设备码"
                   list="recent-devices"
                   autocomplete="off"
                 />
-                <datalist id="recent-devices">
-                  <option value="987 654 321">书房台式机</option>
-                  <option value="234 567 891">办公室笔记本</option>
-                  <option value="345 678 912">父母的电脑</option>
-                  <option value="456 789 123">NAS 旁的小主机</option>
-                  <option value="567 891 234">会议室 HTPC</option>
-                  <option value="678 912 345">测试机 Win11</option>
-                  <option value="789 123 456">测试机 Win10</option>
-                  <option value="891 234 567">笔记本 Ubuntu</option>
-                  <option value="912 345 678">远程渲染机</option>
-                  <option value="135 792 468">备用笔记本</option>
-                </datalist>
+                <datalist id="recent-devices"></datalist>
                 <button id="connect-peer" class="btn btn--primary" type="button">连接</button>
+                <span id="connect-status" class="field__hint" role="status" aria-live="polite"></span>
               </div>
 
               <div class="field">
@@ -254,8 +231,8 @@
                 <div class="field">
                   <button id="sunshine-install" class="btn btn--primary" type="button">安装/修复 Sunshine</button>
                   <button id="sunshine-pair" class="btn btn--ghost" type="button">打开配对</button>
-                  <input id="sunshine-pin" class="input input--pin" type="text" inputmode="numeric" maxlength="6" placeholder="输入 6 位配对 PIN" />
-                  <button id="sunshine-pin-submit" class="btn btn--ghost" type="button">提交 PIN</button>
+                  <input id="sunshine-pin" class="input input--pin is-hidden" type="text" inputmode="numeric" maxlength="4" placeholder="输入 4 位配对 PIN" />
+                  <button id="sunshine-pin-submit" class="btn btn--ghost is-hidden" type="button">提交 PIN</button>
                 </div>
               </div>
 
@@ -337,20 +314,26 @@
               <h2 class="card__title">网络</h2>
               <div class="row">
                 <span>ID 服务器</span>
-                <input id="set-id-server" class="input" type="text" value="rustdesk.vega.example.com" />
+                <input id="set-id-server" class="input" type="text" placeholder="relay.example.com[:端口]" autocomplete="off" />
               </div>
               <div class="row">
                 <span>中继服务器</span>
-                <input id="set-relay-server" class="input" type="text" value="rustdesk.vega.example.com" />
+                <input id="set-relay-server" class="input" type="text" placeholder="留空则与 ID 服务器相同" autocomplete="off" />
               </div>
               <div class="row">
                 <span>服务器公钥</span>
-                <textarea id="set-server-key" class="input input--key" rows="2" spellcheck="false">VEGA_PUBLIC_KEY_PLACEHOLDER</textarea>
+                <textarea id="set-server-key" class="input input--key" rows="2" spellcheck="false" placeholder="粘贴 44 位 base64 公钥（留空则保留当前公钥）"></textarea>
               </div>
               <div class="row">
-                <button id="test-connection" class="btn btn--primary" type="button">测试连接</button>
+                <span>当前公钥指纹</span>
+                <span id="server-key-fingerprint" class="field__hint">未读取</span>
+              </div>
+              <div class="row">
+                <button id="save-network" class="btn btn--primary" type="button">保存</button>
+                <button id="test-connection" class="btn btn--ghost" type="button">测试连接</button>
                 <span id="test-connection-result" class="field__hint">未测试</span>
               </div>
+              <span id="network-status" class="field__hint" role="status" aria-live="polite"></span>
             </div>
 
             <div class="card">

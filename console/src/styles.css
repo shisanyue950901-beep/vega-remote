@@ -289,6 +289,22 @@ textarea {
   font-size: 12px;
 }
 
+/* M2b：命令回显状态（成功/警告/失败） */
+[data-kind="ok"].field__hint,
+[data-kind="ok"].statusline {
+  color: var(--ok);
+}
+
+[data-kind="warn"].field__hint,
+[data-kind="warn"].statusline {
+  color: var(--warn);
+}
+
+[data-kind="error"].field__hint,
+[data-kind="error"].statusline {
+  color: var(--danger);
+}
+
 .hint {
   margin: 8px 0 0;
 }
