@@ -311,9 +311,18 @@ function setupAssistPage(): void {
     });
   };
 
+  // 设备码与安装状态的请求序号：focus 连续触发时只应用最新一次的回包，
+  // 旧请求晚到的结果直接丢弃（否则会拿旧状态覆盖刚刷新出来的界面）。
+  let deviceCodeRequest = 0;
+  let statusRequest = 0;
+
   const loadDeviceCode = (): void => {
+    const request = ++deviceCodeRequest;
     codeStatus.textContent = "";
     void invoke<DeviceInfo>("get_device_id").then((info) => {
+      if (request !== deviceCodeRequest) {
+        return;
+      }
       if (!info) {
         codeEl.textContent = "预览模式";
         setStatus(codeStatus, "浏览器预览：未连接 Tauri，命令不可用", "warn");
@@ -363,7 +372,11 @@ function setupAssistPage(): void {
   };
 
   const loadStatus = (): void => {
+    const request = ++statusRequest;
     void invoke<StatusView>("get_rustdesk_status").then((status) => {
+      if (request !== statusRequest) {
+        return;
+      }
       if (!status) {
         return;
       }
