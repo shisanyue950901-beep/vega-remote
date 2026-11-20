@@ -5,7 +5,7 @@ description = "Vega 远程协助控制台（Tauri 2 外壳）"
 authors = ["Vega Remote"]
 license = "MIT"
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.90"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
