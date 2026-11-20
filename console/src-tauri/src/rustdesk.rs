@@ -27,8 +27,9 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// 原子写临时文件序号，保证同名写入之间不会互相覆盖临时文件。
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-/// RustDesk 默认 ID/中继端口（hbbs 21116）。
+/// RustDesk 默认 ID/中继端口（hbbs 21116 / hbbr 21117）。
 const RUSTDESK_DEFAULT_PORT: u16 = 21116;
+const RUSTDESK_DEFAULT_RELAY_PORT: u16 = 21117;
 const RECENT_LIMIT: usize = 10;
 const RECENT_FILE: &str = "recent-ids.json";
 
@@ -305,14 +306,30 @@ pub fn endpoint_from_server(server: &str) -> Result<(String, u16), String> {
     ))
 }
 
+/// 保存前归一化服务器地址：IPv6 一律写成 `[addr]:port`。
+///
+/// RustDesk 不认裸 IPv6 或省略端口的 IPv6，而 Vega 的 TCP 探测会自动补
+/// 默认端口；不归一化就会出现「测试通、RustDesk 连不上」。IPv4 和域名
+/// 保持原样（RustDesk 会自己补端口）。
+pub fn normalize_server_for_save(input: &str, default_port: u16) -> Result<String, String> {
+    let value = validate_server(input)?;
+    let (host, port) = split_host_port(&value)?;
+    if host.parse::<Ipv6Addr>().is_ok() {
+        let port = port.unwrap_or(default_port);
+        return Ok(format!("[{}]:{}", host, port));
+    }
+    Ok(value)
+}
+
 /// 中继地址：留空就保持为空，由 RustDesk 自己推导中继。
 /// 不能把 ID 服务器抄进 `relay-server`：ID 服务器常带 `:21116`，
-/// 抄过去会把中继流量指到 ID 端口。
+/// 抄过去会把中继流量指到 ID 端口。IPv6 按中继默认端口 21117 补齐。
 pub fn resolve_relay(relay_input: &str) -> Result<String, String> {
     if relay_input.trim().is_empty() {
         return Ok(String::new());
     }
-    validate_server(relay_input).map_err(|e| format!("中继服务器：{e}"))
+    normalize_server_for_save(relay_input, RUSTDESK_DEFAULT_RELAY_PORT)
+        .map_err(|e| format!("中继服务器：{e}"))
 }
 
 /* ------------------------------------------------------------------ */
@@ -460,19 +477,20 @@ pub fn locate_rustdesk() -> Option<PathBuf> {
     None
 }
 
-/// 运行命令并限时收集输出。
+/// 运行命令并限时收集 stdout。
 ///
-/// stdout / stderr 各由一个读线程排空到 EOF：子进程写满管道缓冲区时不会
-/// 因为父进程还在 `try_wait` 而互相卡死，超时也能立刻 kill 并返回。
-/// 失败只回固定文本（退出码或超时），不把 stderr 原文透给前端——那里面
-/// 可能有路径、用户名、库版本等环境信息。
+/// 只有一个 deadline：等待子进程退出与收集输出共用 `timeout`，不会出现
+/// 「进程已退出，但读线程还被后代进程持有的管道卡住」而再多等一轮。
+/// stderr 直接丢到 null：控制台从不用它，也不把路径/用户名透给前端。
+/// stdout 由独立读线程排空到 EOF，主线程用 `recv_timeout` 等到 deadline；
+/// 到期就 kill + wait 后返回固定文本（读线程在管道 EOF 后自行退出）。
 fn run_capture(exe: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
     let mut command = Command::new(exe);
     command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -484,20 +502,17 @@ fn run_capture(exe: &Path, args: &[&str], timeout: Duration) -> Result<String, S
         .spawn()
         .map_err(|e| format!("启动 {} 失败：{e}", exe.display()))?;
     let (out_tx, out_rx) = mpsc::channel();
-    let (err_tx, err_rx) = mpsc::channel();
     spawn_pipe_reader(child.stdout.take(), out_tx);
-    spawn_pipe_reader(child.stderr.take(), err_tx);
 
-    let started = Instant::now();
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
-                if started.elapsed() >= timeout {
+                if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    // 读线程会在管道 EOF 后自行退出，这里不再等待。
-                    return Err(format!("命令超时（{} 秒）", timeout.as_secs()));
+                    return Err(timeout_error(timeout));
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -509,15 +524,24 @@ fn run_capture(exe: &Path, args: &[&str], timeout: Duration) -> Result<String, S
         }
     };
 
-    // 进程已退出，管道随即关闭；给读线程 1 秒把尾部输出取完。
-    let drain = Duration::from_secs(1);
-    let stdout = out_rx.recv_timeout(drain).unwrap_or_default();
-    let _stderr = err_rx.recv_timeout(drain).unwrap_or_default();
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(timeout_error(timeout));
+    }
+    let stdout = match out_rx.recv_timeout(remaining) {
+        Ok(bytes) => bytes,
+        // 进程已退出，但管道仍被后代进程占着：到 deadline 就放弃读取。
+        Err(_) => return Err(timeout_error(timeout)),
+    };
     if status.success() {
         Ok(String::from_utf8_lossy(&stdout).to_string())
     } else {
         Err(format!("命令退出码 {:?}", status.code()))
     }
+}
+
+fn timeout_error(timeout: Duration) -> String {
+    format!("命令超时（{} 秒）", timeout.as_secs())
 }
 
 /// 独立线程里把管道读到 EOF。读完之后管道关闭，子进程不会被写阻塞。
@@ -746,6 +770,19 @@ fn rustdesk_service_state() -> Option<String> {
     None
 }
 
+/// RustDesk 是否以 Windows 服务安装。服务模式下生效配置归服务进程所有，
+/// 写用户 `RustDesk2.toml` 不会改变正在运行的 RustDesk。
+fn rustdesk_service_installed() -> bool {
+    #[cfg(windows)]
+    {
+        rustdesk_service_state().is_some()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* Tauri 命令                                                          */
 /* ------------------------------------------------------------------ */
@@ -776,6 +813,9 @@ pub struct ServerConfigView {
 pub struct OpResult {
     pub ok: bool,
     pub message: String,
+    /// true 表示 RustDesk 以 Windows 服务运行，用户 TOML 不是生效配置，
+    /// 前端据此显示「打开 RustDesk 窗口」按钮而不是成功提示。
+    pub service_mode: bool,
 }
 
 impl OpResult {
@@ -783,12 +823,21 @@ impl OpResult {
         Self {
             ok: true,
             message: message.into(),
+            service_mode: false,
         }
     }
     fn err(message: impl Into<String>) -> Self {
         Self {
             ok: false,
             message: message.into(),
+            service_mode: false,
+        }
+    }
+    fn service_mode(message: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            message: message.into(),
+            service_mode: true,
         }
     }
 }
@@ -960,7 +1009,7 @@ fn set_server_config_blocking(
     if !cfg!(windows) {
         return OpResult::err(NOT_INSTALLED);
     }
-    let server = match validate_server(&server) {
+    let server = match normalize_server_for_save(&server, RUSTDESK_DEFAULT_PORT) {
         Ok(value) => value,
         Err(e) => return OpResult::err(e),
     };
@@ -969,6 +1018,12 @@ fn set_server_config_blocking(
         Ok(value) => value,
         Err(e) => return OpResult::err(e),
     };
+
+    // 服务模式：服务进程读自己的配置，改用户 TOML 不影响正在运行的服务。
+    // 不写文件、不报成功，直接指向 RustDesk 的「网络」设置。
+    if rustdesk_service_installed() {
+        return OpResult::service_mode("服务模式：请在 RustDesk 的 网络 设置中修改");
+    }
 
     let Some(path) = user_config_path() else {
         return OpResult::err("找不到 RustDesk 配置目录（%APPDATA% 缺失）");
@@ -1008,6 +1063,19 @@ fn set_server_config_blocking(
     if let Err(e) = write_atomic(&path, &merged) {
         return OpResult::err(e);
     }
+    // 回读校验：磁盘上真正落下的就是这三个值才算保存成功，
+    // 不拿「写调用没报错」冒充「配置已生效」。
+    let verified = std::fs::read_to_string(&path)
+        .map_err(|e| format!("回读配置失败：{e}"))
+        .and_then(|text| read_server_config(&text));
+    match verified {
+        Ok(snapshot)
+            if snapshot.server == server
+                && snapshot.relay == relay
+                && snapshot.key == key => {}
+        Ok(_) => return OpResult::err("写入后回读与预期不一致，请重试或检查配置文件"),
+        Err(e) => return OpResult::err(e),
+    }
     OpResult::ok("已保存，重启 RustDesk 后生效")
 }
 
@@ -1040,6 +1108,7 @@ pub fn connect_peer(peer_id: String, mode: String, app: tauri::AppHandle) -> OpR
         return OpResult {
             ok: true,
             message: format!("已发起连接，但最近设备码没保存：{e}"),
+            service_mode: false,
         };
     }
     OpResult::ok("已发起连接，请在 RustDesk 窗口输入对方临时密码")
@@ -1278,10 +1347,22 @@ mod tests {
     }
 
     #[test]
-    fn device_id_format_is_three_three_three() {
+    fn device_id_format_is_three_three_three_or_three_three_four() {
         assert_eq!(format_device_id("123456789"), "123-456-789");
         assert_eq!(format_device_id("1234567890"), "123-456-7890");
         assert_eq!(format_device_id("short"), "short");
+    }
+
+    #[test]
+    fn device_id_format_round_trips_through_parser() {
+        // 最近设备码列表用 format_device_id 展示，粘回输入框由 parse_peer_id
+        // 解析：3-3-3 与 3-3-4 都必须原样回到同一串数字。
+        for id in ["123456789", "1234567890"] {
+            let formatted = format_device_id(id);
+            assert_eq!(parse_peer_id(&formatted).unwrap(), id, "连字符分组");
+            let spaced = formatted.replace('-', " ");
+            assert_eq!(parse_peer_id(&spaced).unwrap(), id, "空格分组");
+        }
     }
 
     #[test]
@@ -1308,6 +1389,33 @@ mod tests {
             endpoint_from_server("relay.example.com:21117").unwrap(),
             ("relay.example.com".to_string(), 21117)
         );
+    }
+
+    #[test]
+    fn ipv6_is_normalized_with_brackets_and_default_ports() {
+        // ID 服务器：无括号 / 有括号缺端口都补 21116。
+        assert_eq!(
+            normalize_server_for_save("[::1]", RUSTDESK_DEFAULT_PORT).unwrap(),
+            "[::1]:21116"
+        );
+        assert_eq!(
+            normalize_server_for_save("2001:db8::1", RUSTDESK_DEFAULT_PORT).unwrap(),
+            "[2001:db8::1]:21116"
+        );
+        // 已带端口时保持原端口，只统一成 [addr]:port。
+        assert_eq!(
+            normalize_server_for_save("[2001:db8::1]:21116", RUSTDESK_DEFAULT_PORT).unwrap(),
+            "[2001:db8::1]:21116"
+        );
+        // 中继默认端口是 21117，不能套用 21116。
+        assert_eq!(resolve_relay("[::1]").unwrap(), "[::1]:21117");
+        assert_eq!(resolve_relay("2001:db8::1").unwrap(), "[2001:db8::1]:21117");
+        // IPv4 / 域名不加端口，交给 RustDesk 自己补。
+        assert_eq!(
+            normalize_server_for_save("relay.example.com", RUSTDESK_DEFAULT_PORT).unwrap(),
+            "relay.example.com"
+        );
+        assert_eq!(resolve_relay("relay.example.com").unwrap(), "relay.example.com");
     }
 
     #[test]
@@ -1516,18 +1624,30 @@ flag = true
     fn config_lock_is_exclusive_then_released_without_deleting_lock_file() {
         let dir = temp_dir("lock");
         let target = dir.join("RustDesk2.toml");
-        let first = acquire_config_lock(&target).unwrap();
         let path = lock_path(&target);
+        let first = acquire_config_lock(&target).unwrap();
         assert!(path.is_file());
 
-        // 第二个持有者必须等第一个释放；释放后 lock 文件仍然存在。
-        let second = std::thread::spawn({
-            let target = target.clone();
-            move || acquire_config_lock(&target)
-        });
-        std::thread::sleep(Duration::from_millis(200));
+        // 第一个句柄仍持锁时，第二个句柄必须被拒绝：只验证「最终能拿到」
+        // 无法证明互斥，必须直接断言争用。
+        let second = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        let contended = fs2::FileExt::try_lock_exclusive(&second);
+        assert!(contended.is_err(), "锁被持有时第二个句柄不应加锁成功");
+        assert!(lock_contended(&contended.unwrap_err()));
+
+        // 释放第一个句柄后，第二个句柄立刻可以加锁；锁文件仍然存在。
         drop(first);
-        assert!(second.join().unwrap().is_ok());
+        fs2::FileExt::try_lock_exclusive(&second).unwrap();
+        fs2::FileExt::unlock(&second).unwrap();
+        drop(second);
+        let third = acquire_config_lock(&target).unwrap();
+        drop(third);
         assert!(path.is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }
