@@ -1221,8 +1221,8 @@ mod tests {
         );
         file.write_all(b"new report").unwrap();
         drop(file);
-        assert_eq!(std::fs::read(&taken).unwrap(), b"old report");
-        assert_eq!(std::fs::read(&path).unwrap(), b"new report");
+        assert_eq!(std::fs::read(&taken).unwrap(), b"old report".to_vec());
+        assert_eq!(std::fs::read(&path).unwrap(), b"new report".to_vec());
 
         // 5 个候选全被占用：返回 AlreadyExists，不再无限重试。
         for seq in 0..EXPORT_NAME_ATTEMPTS {
