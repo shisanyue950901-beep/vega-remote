@@ -34,6 +34,8 @@ interface ServerConfigView {
   relay: string;
   keyFingerprint: string;
   keyPresent: boolean;
+  /** 公钥存在但格式无效；非空时只显示通用文案，不展示值。 */
+  keyError: string;
   path: string;
   error: string;
 }
@@ -97,13 +99,17 @@ async function refreshSharedConfig(): Promise<void> {
     return;
   }
   configRefreshInFlight = true;
+  let config: ServerConfigView | null = null;
   try {
-    const config = await invoke<ServerConfigView>("get_server_config");
-    for (const handler of configHandlers) {
-      handler(config);
-    }
+    config = await invoke<ServerConfigView>("get_server_config");
+  } catch {
+    // 读取失败也要通知每个页面：旧快照可能已经不成立，不能继续拿来测试。
+    config = null;
   } finally {
     configRefreshInFlight = false;
+  }
+  for (const handler of configHandlers) {
+    handler(config);
   }
 }
 
@@ -338,7 +344,11 @@ function setupAssistPage(): void {
     }
     const server = config.server.trim();
     configuredServer = server;
-    const key = config.keyFingerprint ? ` · 公钥 ${config.keyFingerprint}…` : " · 无公钥";
+    const key = config.keyError
+      ? " · 公钥格式无效"
+      : config.keyFingerprint
+        ? ` · 公钥 ${config.keyFingerprint}…`
+        : " · 无公钥";
     // 绿点只代表「已配置且测试连通」；读到了空白地址或还没测连通性时
     // 分别显示未配置 / 待测试，不能拿「TOML 解析成功」冒充在线。
     if (config.error) {
@@ -523,20 +533,26 @@ function setupSettingsPage(): void {
     testButton.disabled = true;
     setStatus(testResult, "未测试");
     if (!config) {
-      setStatus(networkStatus, "浏览器预览：未连接 Tauri，命令不可用", "warn");
-      testButton.disabled = false;
+      // 刷新失败：旧地址不能留在页面上，更不能拿旧地址去测试（审计 P2）。
+      idServerInput.value = "";
+      relayServerInput.value = "";
+      fingerprint.textContent = "—";
+      testButton.disabled = true;
+      setStatus(networkStatus, "读取 RustDesk 配置失败：请重新打开设置页", "error");
       return;
     }
     idServerInput.value = config.server;
     relayServerInput.value = config.relay;
-    if (config.keyPresent) {
+    if (config.keyError) {
+      fingerprint.textContent = config.keyError;
+    } else if (config.keyPresent) {
       fingerprint.textContent = `${config.keyFingerprint}…（完整公钥不回显）`;
     } else {
       fingerprint.textContent = config.error || "未设置";
     }
     setStatus(networkStatus, config.error ? config.error : `配置文件：${config.path}`, config.error ? "warn" : "ok");
-    // 最新配置已经落地，按钮总是可用；是否可点由地址是否为空决定。
-    testButton.disabled = false;
+    // 只有当最新快照里确实有地址时才允许测试。
+    testButton.disabled = config.server.trim() === "";
   };
 
   configHandlers.push(applyConfig);
@@ -572,7 +588,7 @@ function setupSettingsPage(): void {
       if (generation !== probeGeneration || testedServer !== idServerInput.value.trim()) {
         return;
       }
-      testButton.disabled = false;
+      testButton.disabled = idServerInput.value.trim() === "";
       if (!result) {
         setStatus(testResult, "浏览器预览：命令不可用", "warn");
         return;
