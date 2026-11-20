@@ -192,9 +192,6 @@ fn validate_host(host: &str) -> Result<(), String> {
 }
 
 /// 公钥必须是 44 个 base64 字符（末尾恰好 1 个 `=`），解码后正好 32 字节。
-///
-/// 只读控制台不再写入公钥，这个校验保留给单元测试固定 base64 口径。
-#[allow(dead_code)]
 pub fn validate_key(input: &str) -> Result<String, String> {
     let key: String = input
         .chars()
@@ -302,9 +299,20 @@ pub fn parse_peer_id(raw: &str) -> Result<String, String> {
     }
 }
 
-/// 公钥指纹：只暴露前 8 位。
+/// 公钥指纹：先按 base64/32 字节校验，通过后只暴露前 8 位。
+///
+/// 格式无效时返回空串：调用方只能展示通用的「公钥格式无效」，
+/// 不能把畸形值（哪怕只有几个字符）回显给前端。
 pub fn key_fingerprint(key: &str) -> String {
-    key.chars().take(8).collect()
+    match validate_key(key) {
+        Ok(valid) => valid.chars().take(8).collect(),
+        Err(_) => String::new(),
+    }
+}
+
+/// 公钥存在但格式无效：对外只给通用文案。
+pub fn key_invalid(key: &str) -> bool {
+    !key.is_empty() && validate_key(key).is_err()
 }
 
 /// 从 `host[:port]` 得到用于 TCP 探测的 (主机, 端口)。
@@ -420,29 +428,13 @@ pub fn user_config_path() -> Option<PathBuf> {
 /* 进程工具                                                            */
 /* ------------------------------------------------------------------ */
 
-/// 找 rustdesk.exe：先 Program Files\RustDesk，再 PATH。
+/// 找 rustdesk.exe：只认 `Program Files` / `Program Files (x86)` 下
+/// 受信任的安装路径（已知文件夹 + 规范化 + 根目录包含校验）。
+///
+/// 不做 PATH 搜索：PATH 由启动环境决定，任何被改写的目录都能塞进一个
+/// `rustdesk.exe`（审计 P2）。返回的就是校验通过、可直接启动的路径。
 pub fn locate_rustdesk() -> Option<PathBuf> {
-    for key in ["ProgramFiles", "ProgramFiles(x86)"] {
-        if let Some(root) = std::env::var_os(key) {
-            let root = PathBuf::from(root);
-            if root.as_os_str().is_empty() {
-                continue;
-            }
-            let candidate = root.join("RustDesk").join(RUSTDESK_EXE);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let candidate = dir.join(RUSTDESK_EXE);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
+    crate::winpaths::trusted_install_exe(&["RustDesk", RUSTDESK_EXE])
 }
 
 /// 运行命令并限时收集 stdout。
@@ -644,30 +636,17 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
 /* 服务 / 进程状态                                                      */
 /* ------------------------------------------------------------------ */
 
-/// 系统目录下的固定绝对路径；不依赖 PATH 搜索。
-fn system32_exe(name: &str) -> PathBuf {
-    let root = std::env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("C:\\Windows"));
-    root.join("System32").join(name)
-}
-
-/// 默认浏览器/资源管理器入口：固定使用 `%SystemRoot%\explorer.exe`。
-pub(crate) fn explorer_exe() -> PathBuf {
-    let root = std::env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("C:\\Windows"));
-    let candidate = root.join("explorer.exe");
-    if candidate.is_file() {
-        candidate
-    } else {
-        PathBuf::from("C:\\Windows\\explorer.exe")
-    }
+/// 默认浏览器/资源管理器入口：`explorer.exe` 由已知文件夹解析，
+/// 不使用 `%SystemRoot%` 环境变量，也不接受 `C:\Windows` 兜底拼接。
+pub(crate) fn explorer_exe() -> Option<PathBuf> {
+    crate::winpaths::explorer_exe()
 }
 
 #[cfg(windows)]
 fn rustdesk_process_running() -> bool {
-    let tasklist = system32_exe("tasklist.exe");
+    let Some(tasklist) = crate::winpaths::system32_exe("tasklist.exe") else {
+        return false;
+    };
     match run_capture(
         &tasklist,
         &["/FI", "IMAGENAME eq rustdesk.exe", "/NH"],
@@ -716,6 +695,8 @@ pub struct ServerConfigView {
     pub relay: String,
     pub key_fingerprint: String,
     pub key_present: bool,
+    /// 公钥存在但格式无效时是通用文案，空串表示没有这个问题。
+    pub key_error: String,
     pub path: String,
     pub error: String,
 }
@@ -828,6 +809,7 @@ pub fn get_server_config() -> ServerConfigView {
             relay: String::new(),
             key_fingerprint: String::new(),
             key_present: false,
+            key_error: String::new(),
             path: String::new(),
             error: NOT_INSTALLED.to_string(),
         };
@@ -838,6 +820,7 @@ pub fn get_server_config() -> ServerConfigView {
             relay: String::new(),
             key_fingerprint: String::new(),
             key_present: false,
+            key_error: String::new(),
             path: String::new(),
             error: "找不到 %APPDATA%\\RustDesk\\config\\RustDesk2.toml".into(),
         };
@@ -851,6 +834,7 @@ pub fn get_server_config() -> ServerConfigView {
                 relay: String::new(),
                 key_fingerprint: String::new(),
                 key_present: false,
+                key_error: String::new(),
                 path: display,
                 error: format!("{NOT_INSTALLED} 或还没登录过（配置尚未生成）"),
             };
@@ -861,6 +845,7 @@ pub fn get_server_config() -> ServerConfigView {
                 relay: String::new(),
                 key_fingerprint: String::new(),
                 key_present: false,
+                key_error: String::new(),
                 path: display,
                 error: format!("读取配置失败：{e}"),
             };
@@ -871,11 +856,18 @@ pub fn get_server_config() -> ServerConfigView {
             // 先算指纹/存在性，再移动 server/relay：否则会借用已移出的 snapshot。
             let key_fingerprint = snapshot.key_fingerprint();
             let key_present = snapshot.key_present();
+            // 畸形公钥只给通用文案，不回显任何字符（审计 P3）。
+            let key_error = if key_invalid(&snapshot.key) {
+                "公钥格式无效".to_string()
+            } else {
+                String::new()
+            };
             ServerConfigView {
                 server: snapshot.server,
                 relay: snapshot.relay,
                 key_fingerprint,
                 key_present,
+                key_error,
                 path: display,
                 error: String::new(),
             }
@@ -885,6 +877,7 @@ pub fn get_server_config() -> ServerConfigView {
             relay: String::new(),
             key_fingerprint: String::new(),
             key_present: false,
+            key_error: String::new(),
             path: display,
             error,
         },
@@ -957,7 +950,10 @@ pub fn open_rustdesk_download_page() -> OpResult {
     if !cfg!(windows) {
         return OpResult::err("只有 Windows 控制台能打开下载页");
     }
-    match spawn_detached(&explorer_exe(), &[RUSTDESK_DOWNLOAD_URL]) {
+    let Some(explorer) = explorer_exe() else {
+        return OpResult::err("找不到系统资源管理器，无法打开下载页");
+    };
+    match spawn_detached(&explorer, &[RUSTDESK_DOWNLOAD_URL]) {
         Ok(()) => OpResult::ok("已在默认浏览器中打开 RustDesk 官方下载页，请手动安装"),
         Err(e) => OpResult::err(format!("打开浏览器失败：{e}")),
     }
@@ -1119,10 +1115,73 @@ pub async fn test_server_connection(server: String) -> TestResult {
         })
 }
 
+/// Win32 剪贴板写入（`CF_UNICODETEXT`）。
+///
+/// 不经过 PowerShell：那会走 PATH 解析、需要拼接命令行，还会把设备码放进
+/// 子进程参数（审计 P2）。这里直接调用 user32/kernel32。
+#[cfg(windows)]
+fn set_clipboard_text(text: &str) -> Result<(), String> {
+    use std::ffi::c_void;
+
+    const CF_UNICODETEXT: u32 = 13;
+    const GMEM_MOVEABLE: u32 = 0x0002;
+    type Bool = i32;
+    type Handle = *mut c_void;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn OpenClipboard(hwnd: Handle) -> Bool;
+        fn EmptyClipboard() -> Bool;
+        fn SetClipboardData(format: u32, mem: Handle) -> Handle;
+        fn CloseClipboard() -> Bool;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GlobalAlloc(flags: u32, bytes: usize) -> Handle;
+        fn GlobalLock(mem: Handle) -> *mut c_void;
+        fn GlobalUnlock(mem: Handle) -> Bool;
+        fn GlobalFree(mem: Handle) -> Handle;
+    }
+
+    // 剪贴板文本是 NUL 结尾的 UTF-16。
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let bytes = wide.len() * std::mem::size_of::<u16>();
+    // SAFETY: 每个分配都有对应释放；SetClipboardData 成功后所有权归系统，
+    // 因此只有失败分支才 GlobalFree。OpenClipboard 成功后必定 CloseClipboard。
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return Err("写剪贴板失败：无法打开剪贴板".to_string());
+        }
+        let result: Result<(), String> = (|| {
+            if EmptyClipboard() == 0 {
+                return Err("写剪贴板失败：无法清空剪贴板".to_string());
+            }
+            let mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+            if mem.is_null() {
+                return Err("写剪贴板失败：内存不足".to_string());
+            }
+            let target = GlobalLock(mem);
+            if target.is_null() {
+                GlobalFree(mem);
+                return Err("写剪贴板失败：无法锁定内存".to_string());
+            }
+            std::ptr::copy_nonoverlapping(wide.as_ptr() as *const c_void, target, bytes);
+            GlobalUnlock(mem);
+            if SetClipboardData(CF_UNICODETEXT, mem).is_null() {
+                GlobalFree(mem);
+                return Err("写剪贴板失败：系统拒绝写入".to_string());
+            }
+            Ok(())
+        })();
+        CloseClipboard();
+        result
+    }
+}
+
 /// 托盘「复制设备码」用：拿设备码写到剪贴板，不经过前端。
 #[cfg(windows)]
 pub fn copy_device_id_to_clipboard() -> Result<String, String> {
-    // 由托盘事件里 spawn 的 worker 线程调用：这里会等 --get-id 和 PowerShell，
+    // 由托盘事件里 spawn 的 worker 线程调用：这里会等 --get-id，
     // 绝不能放到 Tauri 的事件循环上。
     let info = get_device_id_blocking();
     if info.formatted_id.is_empty() {
@@ -1132,15 +1191,7 @@ pub fn copy_device_id_to_clipboard() -> Result<String, String> {
             info.error
         });
     }
-    let value = info.formatted_id.replace('\'', "''");
-    let command = format!("Set-Clipboard -Value '{value}'");
-    let mut cmd = Command::new("powershell.exe");
-    use std::os::windows::process::CommandExt;
-    cmd.args(["-NoProfile", "-NonInteractive", "-Command", &command])
-        .stdin(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW);
-    cmd.spawn()
-        .map_err(|e| format!("写剪贴板失败：{e}"))?;
+    set_clipboard_text(&info.formatted_id)?;
     Ok(info.formatted_id)
 }
 
@@ -1253,6 +1304,26 @@ mod tests {
         assert!(validate_key(&("A".repeat(45))).is_err());
         assert!(validate_key(&(format!("{}!", "A".repeat(43)))).is_err());
         assert_eq!(key_fingerprint(&valid), "AAAAAAAA");
+    }
+
+    #[test]
+    fn malformed_key_yields_generic_status_without_echoing_value() {
+        // 短到能整个塞进「前 8 位」的畸形值也不能被回显（审计 P3）。
+        let snapshot = ServerSnapshot {
+            server: "relay.example.com".into(),
+            relay: String::new(),
+            key: "SHORT".into(),
+        };
+        assert!(snapshot.key_present());
+        assert!(key_invalid(&snapshot.key));
+        assert_eq!(snapshot.key_fingerprint(), "");
+        assert!(!snapshot.key_fingerprint().contains("SHORT"));
+        // 非 base64 的 44 字符值同样只得到空指纹。
+        let non_base64 = format!("{}!", "A".repeat(43));
+        assert!(key_invalid(&non_base64));
+        assert_eq!(key_fingerprint(&non_base64), "");
+        // 合法公钥仍然给前 8 位。
+        assert!(!key_invalid(&format!("{}=", "A".repeat(43))));
     }
 
     #[test]
