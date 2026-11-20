@@ -16,7 +16,14 @@
 
 ## M2 Vega 控制台（v0.5，图形界面）
 - 一个窗口完成：安装组件、检测显卡、显示连接地址、配对、诊断
-- UI 设计先出稿，确认后再实现（Tauri，体积小）
+- UI 设计稿已完成：`docs/ui/console-design.md`（Tauri 2 + 原生 HTML/CSS/TS）✅
+- M2a 控制台骨架（done-in-progress，待 Codex 审计）：
+  - `console/` 前端 index.html / styles.css / main.ts，三页静态界面（远程协助 / 我的设备 / 设置）全部控件 + 占位数据
+  - 窗口 960×640、最小 860×580、自绘标题栏、左栏 200px、主色 #2F6BFF、圆角 10px、浅色 + `prefers-color-scheme` 深色
+  - `console/src-tauri/`：Tauri 2、系统托盘（显示主窗口 / 复制设备码 / 断开当前会话 / 退出，后两项为 M2b 桩）、最小权限 capability、占位图标
+  - 零网络请求、零遥测；`.github/workflows/console.yml` 在 `console/**` 变更时跑 Windows `tauri build --no-bundle`
+- M2b：读写 RustDesk 配置（设备码、临时密码、服务器）并发起连接
+- M2c：串流页对接 Sunshine/Moonlight，设置页 doctor 与脱敏日志
 
 ## M3 进阶（v1.0）
 - 虚拟显示器自动安装（无显示器被控端）
