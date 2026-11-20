@@ -1,0 +1,17 @@
+{
+  "name": "vega-console",
+  "private": true,
+  "version": "0.5.0",
+  "description": "Vega 远程协助控制台（Tauri 2 + 原生 HTML/CSS/TS）",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "tsc && node scripts/build-static.mjs",
+    "dev": "npm run build && tauri dev",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "typescript": "^5.4.0"
+  }
+}
