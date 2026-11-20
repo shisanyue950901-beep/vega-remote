@@ -535,8 +535,8 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
     Ok(buffer)
 }
 
-/// 以无窗口方式启动进程（RustDesk 会自绘窗口，不需要控制台）。
-fn spawn_detached(exe: &Path, args: &[&str]) -> Result<(), String> {
+/// 以无窗口方式启动进程（RustDesk / Moonlight 会自绘窗口，不需要控制台）。
+pub(crate) fn spawn_detached(exe: &Path, args: &[&str]) -> Result<(), String> {
     let mut command = Command::new(exe);
     command.args(args).stdin(Stdio::null());
     #[cfg(windows)]
@@ -659,16 +659,9 @@ fn rustdesk_process_running() -> bool {
 
 #[cfg(windows)]
 fn rustdesk_service_state() -> Option<String> {
-    let text = run_capture(Path::new("sc"), &["query", "RustDesk"], CONFIG_TIMEOUT).ok()?;
-    for line in text.lines() {
-        if line.trim_start().starts_with("STATE") {
-            // STATE : 4  RUNNING
-            if let Some(state) = line.split_whitespace().last() {
-                return Some(state.to_string());
-            }
-        }
-    }
-    Some("UNKNOWN".to_string())
+    // 与串流页共用 SCM 查询：只有 ERROR_SERVICE_DOES_NOT_EXIST 返回空串
+    // （未安装），查询失败返回 QUERY_FAILED，不能混为「未安装」（审计 r5 P3）。
+    crate::scm::service_state_code("RustDesk")
 }
 
 #[cfg(not(windows))]
@@ -1017,11 +1010,11 @@ fn resolve_with_timeout(host: &str, port: u16, timeout: Duration) -> Result<Vec<
     }
 }
 
-/// 纯阻塞探测：解析和所有连接尝试共用一个 3 秒 deadline，不会每换一个
-/// 地址就重新计 3 秒。命令层用 `spawn_blocking` 把它挪出 UI 线程。
-fn probe_server(server: &str) -> TestResult {
+/// 纯阻塞探测：解析和所有连接尝试共用一个 deadline，不会每换一个
+/// 地址就重新计时。命令层用 `spawn_blocking` 把它挪出 UI 线程。
+pub(crate) fn probe_server_with_timeout(server: &str, timeout: Duration) -> TestResult {
     let started = Instant::now();
-    let deadline = started + TEST_TIMEOUT;
+    let deadline = started + timeout;
     let (host, port) = match endpoint_from_server(server) {
         Ok(value) => value,
         Err(e) => {
@@ -1072,10 +1065,14 @@ fn probe_server(server: &str) -> TestResult {
         ok: false,
         message: format!(
             "TCP 连接失败（{} 秒总超时）：{last_error}",
-            TEST_TIMEOUT.as_secs()
+            timeout.as_secs()
         ),
         latency_ms: started.elapsed().as_millis() as u64,
     }
+}
+
+fn probe_server(server: &str) -> TestResult {
+    probe_server_with_timeout(server, TEST_TIMEOUT)
 }
 
 #[tauri::command]
@@ -1352,7 +1349,8 @@ other = "keep"
     #[test]
     fn toml_parse_error_does_not_echo_source_line() {
         let secret = "SUPERSECRETKEYVALUE";
-        let text = format!("[options]\nkey = \"{secret}\"\nbroken = \n");
+        // 哨兵放在真正解析失败的那一行：解析器若回显源码片段，这个测试才会失败。
+        let text = format!("[options]\nkey = \"ok\"\nbroken = {secret}\n");
         let error = read_server_config(&text).unwrap_err();
         assert!(!error.contains(secret));
         assert!(error.contains("解析失败"));
