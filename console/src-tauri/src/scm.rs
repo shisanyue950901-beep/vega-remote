@@ -98,13 +98,13 @@ pub fn query_service_state(_name: &str) -> ServiceState {
 }
 
 /// RustDesk 状态行沿用旧的字符串字段：空串表示服务不存在，
-/// `QUERY_FAILED` 表示查询失败（与「未安装」区分开）。
+/// 「查询失败」与「未安装」区分开。
 pub fn service_state_code(name: &str) -> Option<String> {
     match query_service_state(name) {
-        ServiceState::Running => Some("RUNNING".to_string()),
-        ServiceState::Stopped => Some("STOPPED".to_string()),
+        ServiceState::Running => Some("运行中".to_string()),
+        ServiceState::Stopped => Some("已停止".to_string()),
         ServiceState::NotInstalled => None,
-        ServiceState::Unknown => Some("QUERY_FAILED".to_string()),
+        ServiceState::Unknown => Some("查询失败".to_string()),
     }
 }
 
