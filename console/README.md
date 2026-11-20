@@ -84,8 +84,8 @@ TODO 见工作流注释，联网生成后改为 `npm ci` + `--locked`。
 | `get_streaming_status` | Sunshine 服务经 SCM（`OpenSCManagerW`/`OpenServiceW`/`QueryServiceStatusEx`）查 `SunshineService`，区分运行中 / 已停止 / 未安装 / 无法查询；DXGI `EnumAdapters1` 只读枚举显卡（跳过软件适配器），按厂商与显存标核显/独显和 NVENC/AMF/QSV；检查 `%ProgramFiles%\Moonlight Game Streaming\Moonlight.exe`；返回 README 里逐字的一行安装命令 |
 | `open_sunshine_pairing` / `open_sunshine_settings` | 用默认浏览器打开写死的 `https://localhost:47990/pin` / `https://localhost:47990`；PIN 由 Sunshine 页面接收，控制台不读不存 |
 | `start_moonlight_stream` | 无参数启动已校验（系统盘 Program Files 下、canonicalize 后）的 `Moonlight.exe` |
-| `run_doctor` | 8 秒总预算：RustDesk 安装、RustDesk ID 服务器 TCP（3 秒）、Sunshine 服务、本机 47990（1 秒）、公网 IPv6（UDP connect 只看本地源地址，不发包）、Tailscale、Moonlight；每项返回 `{item,status,advice}` |
-| `export_doctor_log` | 重新跑 doctor，写 `%LOCALAPPDATA%\Vega\logs\doctor-<时间戳>.json`（app 版本 + Windows build + 结果），IPv4/IPv6/主机名/用户目录统一脱敏后打开目录 |
+| `run_doctor` | 8 秒总预算（deadline 在命令入口确定，闸门在 worker 里直到退出才释放）：RustDesk 安装、RustDesk ID 服务器 TCP（3 秒）、Sunshine 服务、本机 47990（1 秒）、公网 IPv6（UDP connect 只看本地源地址，不发包）、Tailscale、Moonlight；每项返回 `{item,status,advice}`，整体返回 `{snapshotId,snapshotAvailable,items}`，超时也占一个递增 id 但 `snapshotAvailable=false` |
+| `export_doctor_log` | 接收前端当前显示的 `snapshotId`，只导出与之匹配的快照；不匹配或本次无快照时返回通用错误（前端禁用导出按钮）。写 `%LOCALAPPDATA%\Vega\logs\doctor-<时间戳>.json`（app 版本 + Windows build + 结果），IPv4/IPv6/主机名/用户目录统一脱敏后打开目录 |
 
 串流页只显示，不保存选择：编码器、分辨率、帧率请在 Sunshine 网页中设置。安装/修复按钮只
 复制 README 的一行安装命令，并提示「请在管理员 PowerShell 中运行（会同时配置防火墙）」；
