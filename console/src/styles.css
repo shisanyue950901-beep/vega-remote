@@ -815,3 +815,26 @@ input[type="radio"] {
   border-left: 3px solid var(--danger);
   padding-left: 8px;
 }
+
+/* ---------- 高性能串流 ---------- */
+.gpu-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.gpu {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.gpu:last-child {
+  border-bottom: 0;
+}
+
+.gpu__name {
+  font-weight: 600;
+}
