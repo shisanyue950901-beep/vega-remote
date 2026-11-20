@@ -95,8 +95,20 @@
               <div class="statusline is-hidden" id="service-status">
                 <span class="dot dot--off" id="service-dot" aria-hidden="true"></span>
                 <span id="service-status-text"></span>
-                <button id="install-rustdesk" class="link is-hidden" type="button">安装 RustDesk</button>
+                <button id="copy-install-command" class="link is-hidden" type="button">复制安装命令</button>
+                <span id="install-hint" class="field__hint">请在管理员 PowerShell 中运行</span>
               </div>
+              <p class="field__hint">
+                RustDesk 不在控制台内提权安装；复制上面的一行命令到管理员 PowerShell 执行即可。
+                详细步骤见
+                <a
+                  class="link"
+                  href="https://github.com/shisanyue950901-beep/vega-remote#一行安装windows管理员-powershell"
+                  target="_blank"
+                  rel="noreferrer"
+                  >README 安装说明</a
+                >。
+              </p>
             </div>
 
             <div class="card">
@@ -110,8 +122,7 @@
                   class="input input--code"
                   type="text"
                   inputmode="numeric"
-                  maxlength="13"
-                  placeholder="输入对方设备码"
+                  placeholder="输入对方设备码（123456789 / 123 456 789 / 123-456-789）"
                   list="recent-devices"
                   autocomplete="off"
                 />
@@ -319,7 +330,7 @@
               </div>
               <div class="row">
                 <span>中继服务器</span>
-                <input id="set-relay-server" class="input" type="text" placeholder="留空则与 ID 服务器相同" autocomplete="off" />
+                <input id="set-relay-server" class="input" type="text" placeholder="留空表示不指定，由 RustDesk 自动推导" autocomplete="off" />
               </div>
               <div class="row">
                 <span>服务器公钥</span>
