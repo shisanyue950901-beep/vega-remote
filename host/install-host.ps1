@@ -63,36 +63,6 @@ if (-not (Test-Path -LiteralPath $modulePath)) {
 }
 Import-Module $modulePath -Force
 
-# 控制台的「安装 RustDesk」只认管理员目录里的脚本：提权前不再读取
-# %VEGA_HOST_SCRIPT% 或仓库 checkout，避免普通用户可写的路径被 UAC 提权执行。
-# 安装模式下把本脚本与共享模块固定发布到 %ProgramData%\Vega\host（该目录
-# 继承 ProgramData ACL，只有管理员可写）。
-if (-not $Uninstall) {
-    try {
-        $publishRoot = Join-Path (Join-Path $env:ProgramData 'Vega') 'host'
-        $publishLib = Join-Path $publishRoot 'lib'
-        $publishScript = Join-Path $publishRoot 'install-host.ps1'
-        $publishModule = Join-Path $publishLib 'Vega.Common.psm1'
-        $null = New-Item -ItemType Directory -Path $publishLib -Force
-        # 从发布目录再次运行时源和目标是同一个文件，跳过复制。
-        if ($PSCommandPath -ne $publishScript) {
-            Copy-Item -LiteralPath $PSCommandPath -Destination $publishScript -Force
-        }
-        if ($modulePath -ne $publishModule) {
-            Copy-Item -LiteralPath $modulePath -Destination $publishModule -Force
-        }
-        # 去掉继承，只留管理员/系统可写、普通用户可读执行；用 SID 避免系统语言差异。
-        $null = & icacls.exe $publishRoot /inheritance:r `
-            /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw 'icacls 设置 %ProgramData%\Vega\host 权限失败。'
-        }
-    }
-    catch {
-        Write-Host "警告：未能发布安装脚本到 %ProgramData%\Vega\host，控制台内的「安装 RustDesk」将不可用：$($_.Exception.Message)" -ForegroundColor Yellow
-    }
-}
-
 $result = $null
 try {
     if ($Uninstall) {
