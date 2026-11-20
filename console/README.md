@@ -1,11 +1,13 @@
-# Vega 控制台（M2b：接入 RustDesk）
+# Vega 控制台（M2c：RustDesk + 高性能串流 + doctor）
 
 Tauri 2 + 原生 HTML/CSS/TypeScript（无前端框架）。窗口 960×640（最小 860×580），
 自绘标题栏、左栏三页、浅色/深色主题、系统托盘。
 
-设计稿：`../docs/ui/console-design.md`。M2a 静态界面 + **M2b RustDesk 接入**：设备码、
-服务器配置读写出自 Rust，连接直接调 `rustdesk.exe`；控制台不发网络请求（测试连接只做
-本地 TCP connect）、不采集遥测、零广告。临时密码不进前端、不进命令行、不进日志——
+设计稿：`../docs/ui/console-design.md`。M2a 静态界面 + **M2b RustDesk 接入** +
+**M2c 高性能串流与诊断**：设备码、服务器配置读写出自 Rust，连接直接调 `rustdesk.exe`；
+Sunshine/Moonlight 只做状态检测与固定入口（不写配置、不接管管理密码）；设置页 doctor
+只做本地检查并可导出脱敏日志。控制台不发网络请求（连通性测试只做本地 TCP connect /
+UDP 路由选择）、不采集遥测、零广告。临时密码不进前端、不进命令行、不进日志——
 「显示临时密码」只打开 RustDesk 主窗口。
 
 窗口行为：点关闭按钮按「关闭窗口时最小化到托盘」设置隐藏窗口（Rust
@@ -27,9 +29,12 @@ console/
    ├─ Cargo.toml
    ├─ tauri.conf.json    # 窗口尺寸、CSP、withGlobalTauri
    ├─ build.rs           # AppManifest::commands 声明全部命令（生成 allow-*）
-   ├─ capabilities/default.json  # 窗口控制 + RustDesk 命令，最小权限
+   ├─ capabilities/default.json  # 窗口控制 + RustDesk/串流/诊断命令，最小权限
    ├─ icons/             # 占位图标（见 icons/README.md；离线无法重生成 ICO）
-   ├─ src/rustdesk.rs    # 设备码/TOML 读写/连接/状态/服务模式检测 + 单元测试
+   ├─ src/rustdesk.rs    # 设备码/TOML 只读/连接/状态/服务检测 + 单元测试
+   ├─ src/scm.rs         # SCM 服务状态四分类（Sunshine / RustDesk 共用）
+   ├─ src/streaming.rs   # 串流页：Sunshine 状态、DXGI 显卡、Moonlight 启动
+   ├─ src/doctor.rs      # doctor 检查、脱敏与日志导出 + 单元测试
    └─ src/main.rs        # 托盘菜单：显示主窗口/复制设备码/断开/退出
 ```
 
@@ -72,6 +77,24 @@ TODO 见工作流注释，联网生成后改为 `npm ci` + `--locked`。
 非 Windows 平台全部返回「未安装 RustDesk」，不 spawn 进程。纯函数（设备码、
 服务器/公钥校验、`RustDesk2.toml` 解析）带 `#[cfg(test)]` 单测：`cargo test`。
 
+## 高性能串流与诊断（M2c）
+
+| 命令 | 作用 |
+|---|---|
+| `get_streaming_status` | Sunshine 服务经 SCM（`OpenSCManagerW`/`OpenServiceW`/`QueryServiceStatusEx`）查 `SunshineService`，区分运行中 / 已停止 / 未安装 / 无法查询；DXGI `EnumAdapters1` 只读枚举显卡（跳过软件适配器），按厂商与显存标核显/独显和 NVENC/AMF/QSV；检查 `%ProgramFiles%\Moonlight Game Streaming\Moonlight.exe`；返回 README 里逐字的一行安装命令 |
+| `open_sunshine_pairing` / `open_sunshine_settings` | 用默认浏览器打开写死的 `https://localhost:47990/pin` / `https://localhost:47990`；PIN 由 Sunshine 页面接收，控制台不读不存 |
+| `start_moonlight_stream` | 无参数启动已校验（系统盘 Program Files 下、canonicalize 后）的 `Moonlight.exe` |
+| `run_doctor` | 8 秒总预算：RustDesk 安装、RustDesk ID 服务器 TCP（3 秒）、Sunshine 服务、本机 47990（1 秒）、公网 IPv6（UDP connect 只看本地源地址，不发包）、Tailscale、Moonlight；每项返回 `{item,status,advice}` |
+| `export_doctor_log` | 重新跑 doctor，写 `%LOCALAPPDATA%\Vega\logs\doctor-<时间戳>.json`（app 版本 + Windows build + 结果），IPv4/IPv6/主机名/用户目录统一脱敏后打开目录 |
+
+串流页只显示，不保存选择：编码器、分辨率、帧率请在 Sunshine 网页中设置。安装/修复按钮只
+复制 README 的一行安装命令，并提示「请在管理员 PowerShell 中运行（会同时配置防火墙）」；
+Vega 不常驻管理员、不提权、不写 Sunshine/Moonlight 配置、不处理 Sunshine 管理密码。
+
+设置页的「诊断网络」会跳到设置 → 诊断并立即运行 doctor；「导出脱敏日志」的脱敏与状态
+映射有单元测试。`focus` 时 Assist 与 Settings 共用一份 `RustDesk2.toml` 快照，并重查设备码
+与 RustDesk 安装状态；设置页的连通性测试在每次重读配置时复位结果并恢复按钮。
+
 网络配置是只读的：设置页显示 `RustDesk2.toml` 里的当前 ID/中继服务器与公钥指纹，
 保留 `server:21116` 的 TCP 测试，并提示「服务器地址请在 RustDesk 的 设置 → 网络 中修改」，
 按钮「在 RustDesk 中修改」直接打开 RustDesk 主窗口。两个页面的探测都带地址 + 代次，
@@ -88,4 +111,5 @@ TODO 见工作流注释，联网生成后改为 `npm ci` + `--locked`。
 
 ## 后续
 
-- M2c：Sunshine/Moonlight 对接、设置页 doctor 与脱敏日志导出、会话事件（被控弹窗/浮条）。
+- 会话事件（被控弹窗/浮条）仍待接入；M2c 已完成串流页与 doctor/脱敏日志。
+- 安装包冒烟测试仍按总控要求延后（CI 只跑 `tauri build --no-bundle`）。
