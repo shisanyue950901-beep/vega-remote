@@ -12,10 +12,10 @@
     "allow-set-close-to-tray",
     "allow-get-device-id",
     "allow-get-server-config",
-    "allow-set-server-config",
     "allow-connect-peer",
     "allow-get-recent-peers",
     "allow-open-rustdesk-window",
+    "allow-open-rustdesk-download-page",
     "allow-get-rustdesk-status",
     "allow-test-server-connection"
   ]
