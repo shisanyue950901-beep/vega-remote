@@ -1221,9 +1221,9 @@ fn install_rustdesk_blocking() -> OpResult {
 /// 没有超时参数，直接调用可能把命令拖住很久。
 fn resolve_with_timeout(host: &str, port: u16, timeout: Duration) -> Result<Vec<SocketAddr>, String> {
     let (tx, rx) = mpsc::channel();
-    let host = host.to_string();
+    let lookup_host = host.to_string();
     std::thread::spawn(move || {
-        let result = (host.as_str(), port)
+        let result = (lookup_host.as_str(), port)
             .to_socket_addrs()
             .map(|iter| iter.collect::<Vec<_>>())
             .map_err(|e| e.to_string());
@@ -1318,7 +1318,8 @@ pub async fn test_server_connection(server: String) -> TestResult {
 /// 托盘「复制设备码」用：拿设备码写到剪贴板，不经过前端。
 #[cfg(windows)]
 pub fn copy_device_id_to_clipboard() -> Result<String, String> {
-    let info = get_device_id();
+    // 托盘回调本身已在非 UI 线程跑，直接调阻塞实现，不要 await 命令。
+    let info = get_device_id_blocking();
     if info.formatted_id.is_empty() {
         return Err(if info.error.is_empty() {
             NOT_INSTALLED.to_string()
