@@ -5,8 +5,9 @@
 //! 导出日志再统一做一次脱敏，然后交给资源管理器打开目录。
 
 use std::io::Write;
-use std::net::{Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -63,11 +64,19 @@ fn remaining(deadline: Instant) -> Duration {
 /* 单项检查（纯函数带单测）                                              */
 /* ------------------------------------------------------------------ */
 
-/// 47990 可达性与 Sunshine 服务状态的关系：只有可达才算通过；
-/// Sunshine 正在运行却连不上就是失败，其余情况给警告而不是失败。
+/// 47990 可达性与 Sunshine 服务状态的关系。
+///
+/// 只有「Sunshine 服务在运行 **且** 47990 可连」才算通过：任何程序都能
+/// 在 47990 上监听，单看端口只会把别的进程认成 Sunshine（审计 P2）。
 fn port_47990_status(reachable: bool, sunshine: ServiceState) -> (DoctorStatus, &'static str) {
+    if reachable && sunshine == ServiceState::Running {
+        return (DoctorStatus::Pass, "Sunshine 服务运行中，本机管理页可访问");
+    }
     if reachable {
-        return (DoctorStatus::Pass, "本机管理页可访问");
+        return (
+            DoctorStatus::Warn,
+            "47990 有进程监听，但 Sunshine 服务未运行，确认是否被其他程序占用",
+        );
     }
     match sunshine {
         ServiceState::Running => (
@@ -121,8 +130,7 @@ fn probe_local_port(port: u16, timeout: Duration) -> bool {
 /* doctor 主流程                                                        */
 /* ------------------------------------------------------------------ */
 
-fn doctor_items() -> Vec<DoctorItem> {
-    let deadline = Instant::now() + DOCTOR_BUDGET;
+fn doctor_items(deadline: Instant) -> Vec<DoctorItem> {
     let mut items = Vec::new();
 
     let rustdesk_installed = locate_rustdesk().is_some();
@@ -223,17 +231,56 @@ fn doctor_items() -> Vec<DoctorItem> {
     items
 }
 
+/// doctor 并发闸门：同一时间只允许一个诊断在跑。
+static DOCTOR_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// worker 退出（正常、panic 或被丢弃）时清闸门。
+struct DoctorGuard;
+
+impl Drop for DoctorGuard {
+    fn drop(&mut self) {
+        DOCTOR_RUNNING.store(false, Ordering::Release);
+    }
+}
+
+fn busy_items() -> Vec<DoctorItem> {
+    vec![item(
+        "诊断",
+        DoctorStatus::Warn,
+        "已有诊断在进行中，请等待本次结果",
+    )]
+}
+
+fn timeout_items() -> Vec<DoctorItem> {
+    vec![item(
+        "诊断",
+        DoctorStatus::Fail,
+        "诊断超时（8 秒），请稍后重试",
+    )]
+}
+
 #[tauri::command]
 pub async fn run_doctor() -> Vec<DoctorItem> {
-    tauri::async_runtime::spawn_blocking(doctor_items)
-        .await
-        .unwrap_or_else(|_| {
-            vec![item(
-                "诊断",
-                DoctorStatus::Fail,
-                "诊断线程失败，请重试",
-            )]
-        })
+    // 第二个并发调用直接返回，不再排队等一次完整诊断。
+    if DOCTOR_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return busy_items();
+    }
+    // 唯一的总 deadline 在投递 worker 之前就确定：排队时间也算进 8 秒。
+    let deadline = Instant::now() + DOCTOR_BUDGET;
+    let worker = tauri::async_runtime::spawn_blocking(move || {
+        // 闸门由 worker 自己释放：IPC 层超时返回时 worker 可能还在跑，
+        // 这时继续拒绝第二次诊断，直到它真正退出。
+        let _guard = DoctorGuard;
+        doctor_items(deadline)
+    });
+    match tokio::time::timeout(DOCTOR_BUDGET, worker).await {
+        Ok(Ok(items)) => items,
+        Ok(Err(_)) => vec![item("诊断", DoctorStatus::Fail, "诊断线程失败，请重试")],
+        Err(_) => timeout_items(),
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -304,6 +351,30 @@ fn split_edge_punctuation(token: &str) -> (&str, &str, &str) {
     (&token[..leading], &rest[..trailing], &rest[trailing..])
 }
 
+/// 把 token 当 IP 解析：先整串 `SocketAddr`，再拆掉括号/端口后按 `IpAddr`。
+///
+/// 端点可能写成 `1.2.3.4:21116`、`[2001:db8::1]:21117`，也可能在
+/// `split_edge_punctuation` 之后只剩 `2001:db8::1]:21117`（开头括号被当成
+/// 标点剥掉）。这几种都要认出来，不能因为一个残留的 `]` 就漏掉地址。
+fn ip_from_token(token: &str) -> Option<IpAddr> {
+    if let Ok(addr) = token.parse::<IpAddr>() {
+        return Some(addr);
+    }
+    if let Ok(endpoint) = token.parse::<SocketAddr>() {
+        return Some(endpoint.ip());
+    }
+    let bare = token.trim_matches(|c| c == '[' || c == ']');
+    if let Ok(addr) = bare.parse::<IpAddr>() {
+        return Some(addr);
+    }
+    let (host, port) = token.rsplit_once(':')?;
+    if host.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let host = host.trim_matches(|c| c == '[' || c == ']');
+    host.parse::<IpAddr>().ok()
+}
+
 fn mask_core(core: &str) -> String {
     if core.is_empty() {
         return String::new();
@@ -311,24 +382,13 @@ fn mask_core(core: &str) -> String {
     if core.contains('@') {
         return "<email>".to_string();
     }
-    // [IPv6]:port 这种带端口的写法先拆括号，再按地址解析。
-    if let Some(end) = core.find("]:") {
-        if core[..end].parse::<Ipv6Addr>().is_ok() {
-            return "<ip>".to_string();
-        }
-    }
-    let bracketed = core.trim_start_matches('[').trim_end_matches(']');
-    if bracketed.parse::<std::net::Ipv4Addr>().is_ok()
-        || bracketed.parse::<Ipv6Addr>().is_ok()
-    {
+    if ip_from_token(core).is_some() {
         return "<ip>".to_string();
     }
-    // host:port（IPv4 / 主机名）
+    // host:port（主机名）
     if let Some((host, port)) = core.rsplit_once(':') {
         if port.chars().all(|c| c.is_ascii_digit()) && !host.is_empty() {
-            if host.parse::<std::net::Ipv4Addr>().is_ok() {
-                return "<ip>".to_string();
-            }
+            let host = host.trim_matches(|c| c == '[' || c == ']');
             if looks_like_hostname(host) {
                 return "<host>".to_string();
             }
@@ -428,7 +488,7 @@ fn log_directory() -> PathBuf {
 }
 
 fn export_blocking() -> Result<(), String> {
-    let items = doctor_items();
+    let items = doctor_items(Instant::now() + DOCTOR_BUDGET);
     let redacted: Vec<DoctorItem> = items
         .into_iter()
         .map(|entry| DoctorItem {
@@ -463,7 +523,10 @@ fn export_blocking() -> Result<(), String> {
 
     if cfg!(windows) {
         let directory_text = directory.display().to_string();
-        spawn_detached(&explorer_exe(), &[directory_text.as_str()])
+        let Some(explorer) = explorer_exe() else {
+            return Err("日志已导出，但打开目录失败".to_string());
+        };
+        spawn_detached(&explorer, &[directory_text.as_str()])
             .map_err(|_| "日志已导出，但打开目录失败".to_string())?;
     }
     Ok(())
@@ -501,9 +564,18 @@ mod tests {
 
     #[test]
     fn port_47990_mapping_depends_on_sunshine_state() {
+        // 只有「服务运行中 + 端口可连」才算通过；端口被别人监听只给警告。
+        assert_eq!(
+            port_47990_status(true, ServiceState::Running).0,
+            DoctorStatus::Pass
+        );
         assert_eq!(
             port_47990_status(true, ServiceState::NotInstalled).0,
-            DoctorStatus::Pass
+            DoctorStatus::Warn
+        );
+        assert_eq!(
+            port_47990_status(true, ServiceState::Stopped).0,
+            DoctorStatus::Warn
         );
         assert_eq!(
             port_47990_status(false, ServiceState::Running).0,
@@ -540,6 +612,36 @@ mod tests {
         assert!(output.contains("<host>"));
         assert!(output.contains("<profile>"));
         assert!(output.contains("<path>"));
+    }
+
+    #[test]
+    fn ip_detection_accepts_socket_addrs_and_bracket_leftovers() {
+        assert_eq!(ip_from_token("192.0.2.1:21116"), Some("192.0.2.1".parse().unwrap()));
+        assert_eq!(
+            ip_from_token("[2001:db8::1]:21117"),
+            Some("2001:db8::1".parse().unwrap())
+        );
+        // split_edge_punctuation 会把开头括号当标点剥掉，留下 "…]:port"。
+        assert_eq!(
+            ip_from_token("2001:db8::1]:21117"),
+            Some("2001:db8::1".parse().unwrap())
+        );
+        assert_eq!(ip_from_token("2001:db8::1"), Some("2001:db8::1".parse().unwrap()));
+        assert_eq!(ip_from_token("pc.example.com:21116"), None);
+    }
+
+    #[test]
+    fn redaction_masks_endpoint_after_punctuation_split() {
+        // 审计复现场景：方括号 IPv6 端点在任何标点组合下都不能原样留下。
+        for input in [
+            "[2001:db8::1]:21117",
+            "relay=[2001:db8::1]:21117",
+            "2001:db8::1]:21117",
+            "(2001:db8::1)",
+        ] {
+            let output = redact_with(input, None);
+            assert!(!output.contains("2001:db8"), "{input} -> {output}");
+        }
     }
 
     #[test]
