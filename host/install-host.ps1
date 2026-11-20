@@ -71,9 +71,16 @@ if (-not $Uninstall) {
     try {
         $publishRoot = Join-Path (Join-Path $env:ProgramData 'Vega') 'host'
         $publishLib = Join-Path $publishRoot 'lib'
+        $publishScript = Join-Path $publishRoot 'install-host.ps1'
+        $publishModule = Join-Path $publishLib 'Vega.Common.psm1'
         $null = New-Item -ItemType Directory -Path $publishLib -Force
-        Copy-Item -LiteralPath $PSCommandPath -Destination (Join-Path $publishRoot 'install-host.ps1') -Force
-        Copy-Item -LiteralPath $modulePath -Destination (Join-Path $publishLib 'Vega.Common.psm1') -Force
+        # 从发布目录再次运行时源和目标是同一个文件，跳过复制。
+        if ($PSCommandPath -ne $publishScript) {
+            Copy-Item -LiteralPath $PSCommandPath -Destination $publishScript -Force
+        }
+        if ($modulePath -ne $publishModule) {
+            Copy-Item -LiteralPath $modulePath -Destination $publishModule -Force
+        }
     }
     catch {
         Write-Host "警告：未能发布安装脚本到 %ProgramData%\Vega\host，控制台内的「安装 RustDesk」将不可用：$($_.Exception.Message)" -ForegroundColor Yellow
