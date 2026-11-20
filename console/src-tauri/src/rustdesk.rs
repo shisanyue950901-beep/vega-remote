@@ -877,7 +877,20 @@ pub struct TestResult {
 }
 
 #[tauri::command]
-pub fn get_device_id() -> DeviceInfo {
+pub async fn get_device_id() -> DeviceInfo {
+    // --get-id 最多等 5 秒，不能卡在 Tauri 主线程上。
+    tauri::async_runtime::spawn_blocking(get_device_id_blocking)
+        .await
+        .unwrap_or_else(|e| DeviceInfo {
+            installed: false,
+            id: String::new(),
+            formatted_id: String::new(),
+            path: String::new(),
+            error: format!("读取设备码线程失败：{e}"),
+        })
+}
+
+fn get_device_id_blocking() -> DeviceInfo {
     if !cfg!(windows) {
         return DeviceInfo {
             installed: false,
@@ -998,7 +1011,18 @@ pub fn get_server_config() -> ServerConfigView {
 /// 写 `[options]` 三个键。`key` 为空表示保留现有公钥（前端只拿到指纹，
 /// 不显示完整公钥，所以留空保存不能把公钥清掉）。
 #[tauri::command]
-pub fn set_server_config(server: String, key: String, relay: Option<String>) -> OpResult {
+pub async fn set_server_config(server: String, key: String, relay: Option<String>) -> OpResult {
+    // 等跨实例锁最多 3 秒，加上磁盘写入，不能占着 UI 线程。
+    tauri::async_runtime::spawn_blocking(move || set_server_config_blocking(server, key, relay))
+        .await
+        .unwrap_or_else(|e| OpResult::err(format!("保存配置线程失败：{e}")))
+}
+
+fn set_server_config_blocking(
+    server: String,
+    key: String,
+    relay: Option<String>,
+) -> OpResult {
     if !cfg!(windows) {
         return OpResult::err(NOT_INSTALLED);
     }
@@ -1117,7 +1141,19 @@ pub fn open_rustdesk_window() -> OpResult {
 }
 
 #[tauri::command]
-pub fn get_rustdesk_status() -> StatusView {
+pub async fn get_rustdesk_status() -> StatusView {
+    // tasklist / sc 各最多 5 秒，全部挪到阻塞线程池。
+    tauri::async_runtime::spawn_blocking(get_rustdesk_status_blocking)
+        .await
+        .unwrap_or_else(|e| StatusView {
+            installed: false,
+            running: false,
+            service_state: String::new(),
+            message: format!("读取 RustDesk 状态线程失败：{e}"),
+        })
+}
+
+fn get_rustdesk_status_blocking() -> StatusView {
     if !cfg!(windows) {
         return StatusView {
             installed: false,
@@ -1159,7 +1195,14 @@ pub fn get_rustdesk_status() -> StatusView {
 }
 
 #[tauri::command]
-pub fn install_rustdesk() -> OpResult {
+pub async fn install_rustdesk() -> OpResult {
+    // ShellExecuteExW 会等到用户处理 UAC 才返回，必须离开 UI 线程。
+    tauri::async_runtime::spawn_blocking(install_rustdesk_blocking)
+        .await
+        .unwrap_or_else(|e| OpResult::err(format!("调起安装线程失败：{e}")))
+}
+
+fn install_rustdesk_blocking() -> OpResult {
     if !cfg!(windows) {
         return OpResult::err(NOT_INSTALLED);
     }
