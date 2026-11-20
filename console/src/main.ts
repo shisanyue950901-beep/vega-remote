@@ -279,3 +279,5 @@ if (document.readyState === "loading") {
 } else {
   main();
 }
+
+export {};

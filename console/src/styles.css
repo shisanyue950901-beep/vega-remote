@@ -778,3 +778,24 @@ input[type="radio"] {
   border-radius: 999px;
   border: 3px solid var(--bg);
 }
+
+.version {
+  color: var(--text-muted);
+  font-family: Consolas, monospace;
+  font-size: 11px;
+}
+
+.doctor__item--pass {
+  border-left: 3px solid var(--ok);
+  padding-left: 8px;
+}
+
+.doctor__item--warn {
+  border-left: 3px solid var(--warn);
+  padding-left: 8px;
+}
+
+.doctor__item--fail {
+  border-left: 3px solid var(--danger);
+  padding-left: 8px;
+}
