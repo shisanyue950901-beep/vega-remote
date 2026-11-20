@@ -135,7 +135,7 @@ pub(crate) fn local_app_data_dir() -> Option<PathBuf> {
 /// 也不会把用户目录当成命令行文本解释。返回 `HINSTANCE > 32` 才算成功。
 #[cfg(windows)]
 pub(crate) fn open_directory(path: &Path) -> Result<(), ()> {
-    use std::ffi::{c_void, OsStr};
+    use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
 
     #[link(name = "shell32")]
@@ -150,12 +150,12 @@ pub(crate) fn open_directory(path: &Path) -> Result<(), ()> {
         ) -> *mut c_void;
     }
 
-    fn wide(text: &OsStr) -> Vec<u16> {
-        text.encode_wide().chain(std::iter::once(0)).collect()
-    }
-
-    let file = wide(path.as_os_str());
-    let verb = wide(OsStr::new("open"));
+    let file: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let verb: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
     // SAFETY: 两个字符串都以 NUL 结尾并在调用期间存活；其余句柄/参数传空，
     // 返回值只是 HINSTANCE，不解引用。
     let result = unsafe {
