@@ -12,7 +12,6 @@ fn main() {
             "get_recent_peers",
             "open_rustdesk_window",
             "get_rustdesk_status",
-            "install_rustdesk",
             "test_server_connection",
         ])),
     )

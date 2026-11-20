@@ -17,7 +17,6 @@
     "allow-get-recent-peers",
     "allow-open-rustdesk-window",
     "allow-get-rustdesk-status",
-    "allow-install-rustdesk",
     "allow-test-server-connection"
   ]
 }

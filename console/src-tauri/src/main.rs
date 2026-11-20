@@ -36,7 +36,6 @@ fn main() {
             rustdesk::get_recent_peers,
             rustdesk::open_rustdesk_window,
             rustdesk::get_rustdesk_status,
-            rustdesk::install_rustdesk,
             rustdesk::test_server_connection,
         ])
         .setup(|app| {
@@ -60,9 +59,12 @@ fn main() {
                             let _ = window.set_focus();
                         }
                     }
-                    // 直接由 Rust 读设备码写剪贴板，不经过前端。
+                    // 复制设备码要跑子进程（--get-id）和 PowerShell，绝不能占用
+                    // 托盘事件线程：丢到独立 worker 里，失败只影响这一次复制。
                     "copy-code" => {
-                        let _ = rustdesk::copy_device_id_to_clipboard();
+                        std::thread::spawn(|| {
+                            let _ = rustdesk::copy_device_id_to_clipboard();
+                        });
                     }
                     // 「断开」当前仍是 RustDesk 窗口自己的挂断按钮；M2c 接入会话事件后
                     // 才能在这里自动化，先保持禁用。
