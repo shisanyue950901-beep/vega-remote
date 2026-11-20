@@ -15,7 +15,7 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -1013,9 +1013,31 @@ fn get_rustdesk_status_blocking() -> StatusView {
     }
 }
 
-/// DNS 解析放在独立线程里，用 channel 超时收结果：`to_socket_addrs` 本身
-/// 没有超时参数，直接调用可能把命令拖住很久。
-fn resolve_with_timeout(host: &str, port: u16, timeout: Duration) -> Result<Vec<SocketAddr>, String> {
+/// 解析前的统一门槛：调用方的原始 deadline 已到，或收到取消标志。
+///
+/// 这里不重建 deadline：预算只由调用方算一次，之后一路传绝对时间点。
+fn lookup_stopped(deadline: Instant, cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) || Instant::now() >= deadline
+}
+
+/// DNS 解析放在独立线程里，用 channel 等到调用方给的原始 deadline：
+/// `to_socket_addrs` 本身没有超时参数，直接调用可能把命令拖住很久。
+///
+/// 启动线程前先查 deadline 和取消标志；已过期/已取消就直接返回超时，
+/// 不再为一次注定被丢弃的解析创建线程。
+fn resolve_with_timeout(
+    host: &str,
+    port: u16,
+    deadline: Instant,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<SocketAddr>, String> {
+    if lookup_stopped(deadline, cancel) {
+        return Err(format!("解析 {host}:{port} 超时"));
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(format!("解析 {host}:{port} 超时"));
+    }
     let (tx, rx) = mpsc::channel();
     let lookup_host = host.to_string();
     std::thread::spawn(move || {
@@ -1025,18 +1047,22 @@ fn resolve_with_timeout(host: &str, port: u16, timeout: Duration) -> Result<Vec<
             .map_err(|e| e.to_string());
         let _ = tx.send(result);
     });
-    match rx.recv_timeout(timeout) {
+    match rx.recv_timeout(remaining) {
         Ok(Ok(addrs)) => Ok(addrs),
         Ok(Err(e)) => Err(format!("解析 {host}:{port} 失败：{e}")),
-        Err(_) => Err(format!("解析 {host}:{port} 超时（{} 秒）", timeout.as_secs())),
+        Err(_) => Err(format!("解析 {host}:{port} 超时")),
     }
 }
 
-/// 纯阻塞探测：解析和所有连接尝试共用一个 deadline，不会每换一个
-/// 地址就重新计时。命令层用 `spawn_blocking` 把它挪出 UI 线程。
-pub(crate) fn probe_server_with_timeout(server: &str, timeout: Duration) -> TestResult {
+/// 纯阻塞探测：解析和所有连接尝试共用调用方传入的同一个绝对 deadline，
+/// 不会每换一个地址就重新计时；`cancel` 置位后不再发起新的解析。
+/// 命令层用 `spawn_blocking` 把它挪出 UI 线程。
+pub(crate) fn probe_server_with_timeout(
+    server: &str,
+    deadline: Instant,
+    cancel: Option<&AtomicBool>,
+) -> TestResult {
     let started = Instant::now();
-    let deadline = started + timeout;
     let (host, port) = match endpoint_from_server(server) {
         Ok(value) => value,
         Err(e) => {
@@ -1047,8 +1073,7 @@ pub(crate) fn probe_server_with_timeout(server: &str, timeout: Duration) -> Test
             }
         }
     };
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let addrs = match resolve_with_timeout(&host, port, remaining) {
+    let addrs = match resolve_with_timeout(&host, port, deadline, cancel) {
         Ok(addrs) => addrs,
         Err(e) => {
             return TestResult {
@@ -1067,11 +1092,11 @@ pub(crate) fn probe_server_with_timeout(server: &str, timeout: Duration) -> Test
     }
     let mut last_error = String::new();
     for addr in addrs {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        if lookup_stopped(deadline, cancel) {
             last_error = "总超时已用完".to_string();
             break;
         }
+        let remaining = deadline.saturating_duration_since(Instant::now());
         match TcpStream::connect_timeout(&addr, remaining) {
             Ok(_) => {
                 return TestResult {
@@ -1085,16 +1110,13 @@ pub(crate) fn probe_server_with_timeout(server: &str, timeout: Duration) -> Test
     }
     TestResult {
         ok: false,
-        message: format!(
-            "TCP 连接失败（{} 秒总超时）：{last_error}",
-            timeout.as_secs()
-        ),
+        message: format!("TCP 连接失败（总超时已用完）：{last_error}"),
         latency_ms: started.elapsed().as_millis() as u64,
     }
 }
 
 fn probe_server(server: &str) -> TestResult {
-    probe_server_with_timeout(server, TEST_TIMEOUT)
+    probe_server_with_timeout(server, Instant::now() + TEST_TIMEOUT, None)
 }
 
 #[tauri::command]
@@ -1242,6 +1264,35 @@ pub fn copy_device_id_to_clipboard(_app: &tauri::AppHandle) -> Result<String, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_returns_timeout_before_spawning_when_deadline_passed() {
+        // 已过期的 deadline 不能再创建解析线程：直接返回超时。
+        let past = Instant::now() - Duration::from_secs(1);
+        let started = Instant::now();
+        let result = resolve_with_timeout("host.invalid", 21116, past, None);
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn resolve_returns_timeout_before_spawning_when_cancelled() {
+        // 取消标志优先于还很远的 deadline：同样不能启动解析线程。
+        let cancel = AtomicBool::new(true);
+        let future = Instant::now() + Duration::from_secs(60);
+        let started = Instant::now();
+        let result = resolve_with_timeout("host.invalid", 21116, future, Some(&cancel));
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn probe_with_expired_deadline_reports_failure_without_resolving() {
+        let past = Instant::now() - Duration::from_secs(1);
+        let result = probe_server_with_timeout("host.invalid", past, None);
+        assert!(!result.ok);
+        assert!(result.message.contains("超时"), "{}", result.message);
+    }
 
     #[test]
     fn device_id_accepts_nine_and_ten_digits() {

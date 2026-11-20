@@ -178,12 +178,13 @@ fn doctor_items(deadline: Instant, cancel: &AtomicBool) -> Option<Vec<DoctorItem
                 "在 RustDesk 的 设置 → 网络 中填写 ID 服务器",
             ));
         } else {
-            let budget = remaining(deadline).min(Duration::from_secs(3));
             // DNS 解析前最后确认：预算已耗尽或已取消时不再发起解析。
-            if budget.is_zero() || expired(deadline, cancel) {
+            // 直接把命令入口的绝对 deadline 和取消标志传给探测，不再从
+            // 剩余时间重建一份相对预算。
+            if expired(deadline, cancel) {
                 return None;
             }
-            let result = probe_server_with_timeout(&config.server, budget);
+            let result = probe_server_with_timeout(&config.server, deadline, Some(cancel));
             items.push(if result.ok {
                 item("RustDesk ID 服务器", DoctorStatus::Pass, "")
             } else {
