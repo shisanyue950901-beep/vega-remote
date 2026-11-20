@@ -694,8 +694,19 @@ fn verify_host_dir(root: &Path) -> Option<PathBuf> {
 /// 不再读 `VEGA_HOST_SCRIPT`，也不搜索仓库 checkout：那些路径普通用户可写，
 /// 等于把提权入口递给非管理员。
 pub fn locate_host_script(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let mut roots = Vec::new();
     if let Ok(resource_dir) = app.path().resource_dir() {
-        if let Some(path) = verify_host_dir(&resource_dir.join("host")) {
+        // Windows 安装器把资源放在 exe 同级；个别打包方式会多一层 resources。
+        roots.push(resource_dir.join("host"));
+        roots.push(resource_dir.join("resources").join("host"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            roots.push(dir.join("host"));
+        }
+    }
+    for root in roots {
+        if let Some(path) = verify_host_dir(&root) {
             return Some(path);
         }
     }
