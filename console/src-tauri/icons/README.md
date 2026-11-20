@@ -14,3 +14,15 @@ magick logo.svg -resize 128x128 icons/128x128.png
 magick logo.svg -resize 256x256 icons/128x128@2x.png
 magick logo.svg -define icon:auto-resize=256,48,32,16 icons/icon.ico
 ```
+
+## 待办（M2b 遗留）
+
+`icon.ico` 在离线环境**无法重新生成**（仓库里没有源 SVG，本地也没有 ImageMagick /
+`tauri icon`），M2b 保留现有占位 ICO 不动，等联网或有 Windows 环境时执行：
+
+```bash
+# 需要先有正式 logo.svg / logo.png（1024×1024）
+npm run tauri icon path/to/logo.png
+```
+
+生成后会覆盖本目录全部图标文件，无需改 `tauri.conf.json`。

@@ -29,10 +29,10 @@ jobs:
       - name: 安装 Rust stable
         uses: dtolnay/rust-toolchain@stable
 
-      - name: 安装 Node 20
+      - name: 安装 Node 24
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
 
       # 仓库暂未提交 package-lock.json / Cargo.lock：离线环境无法生成，先保留 npm install。
       # TODO(m2b): 在联网机器上生成并提交 package-lock.json 与 src-tauri/Cargo.lock，

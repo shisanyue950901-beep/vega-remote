@@ -22,7 +22,19 @@
   - 窗口 960×640、最小 860×580、自绘标题栏、左栏 200px、主色 #2F6BFF、圆角 10px、浅色 + `prefers-color-scheme` 深色
   - `console/src-tauri/`：Tauri 2、系统托盘（显示主窗口 / 复制设备码 / 断开当前会话 / 退出，后两项为 M2b 桩）、最小权限 capability、占位图标
   - 零网络请求、零遥测；`.github/workflows/console.yml` 在 `console/**` 变更时跑 Windows `tauri build --no-bundle`
-- M2b：读写 RustDesk 配置（设备码、临时密码、服务器）并发起连接
+- M2b 控制台接入 RustDesk（done-in-progress，待 Codex 审计）：
+  - Rust 侧拆出 `console/src-tauri/src/rustdesk.rs`：定位 `rustdesk.exe`（Program Files → PATH）、
+    `--get-id`（5 秒超时、`CREATE_NO_WINDOW`、3-3-3 展示）、`RustDesk2.toml [options]` 三个键用
+    toml crate 读写（临时文件 + rename 原子写、保留其他键、公钥只露前 8 位指纹、不写日志）
+  - `connect_peer` 校验 9-10 位数字后 `--connect` / `--file-transfer`，最近 10 条存 app config 目录 JSON；
+    临时密码不读不传，「显示临时密码」只无参启动 RustDesk 主窗口，界面去掉假的掩码密码
+  - RustDesk 进程/服务状态行；未安装时按钮调现有 `host/install-host.ps1 -WithRustDesk`（UAC，参数无密钥）
+  - 前端 `main.ts` 全部占位换成 invoke：加载/错误状态、最近设备码下拉、设置页网络读取/保存/测试
+    （测试 = Rust 侧 TCP connect `server:21116` 超时 3 秒）
+  - `build.rs` 用 `AppManifest::commands` 声明全部命令，`capabilities/default.json` 授权 `allow-*`
+    （修复 M2a 审计 r2 P3，含 `set_close_to_tray`）；Rust 纯函数带 `#[cfg(test)]` 单测
+- M2a 审计 r2 遗留修复：串流页配对输入框默认隐藏、打开配对后才显示且改 4 位 PIN；CI Node 24；
+  `icon.ico` 离线无法重生成，保留占位并在 `icons/README.md` 记录待办
 - M2c：串流页对接 Sunshine/Moonlight，设置页 doctor 与脱敏日志
 
 ## M3 进阶（v1.0）
