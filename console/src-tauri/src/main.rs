@@ -31,10 +31,10 @@ fn main() {
             set_close_to_tray,
             rustdesk::get_device_id,
             rustdesk::get_server_config,
-            rustdesk::set_server_config,
             rustdesk::connect_peer,
             rustdesk::get_recent_peers,
             rustdesk::open_rustdesk_window,
+            rustdesk::open_rustdesk_download_page,
             rustdesk::get_rustdesk_status,
             rustdesk::test_server_connection,
         ])
