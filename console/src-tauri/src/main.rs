@@ -1,11 +1,31 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::Manager;
+use tauri::{Manager, State, WindowEvent};
+
+/// 「关闭窗口时最小化到托盘」开关。默认开启，由前端通过
+/// `set_close_to_tray` 命令同步（设置页勾选状态）。
+struct CloseToTray(AtomicBool);
+
+impl Default for CloseToTray {
+    fn default() -> Self {
+        Self(AtomicBool::new(true))
+    }
+}
+
+/// 前端在启动与勾选变更时调用；不涉及任何文件或网络访问。
+#[tauri::command]
+fn set_close_to_tray(enabled: bool, state: State<'_, CloseToTray>) {
+    state.0.store(enabled, Ordering::Relaxed);
+}
 
 fn main() {
     tauri::Builder::default()
+        .manage(CloseToTray::default())
+        .invoke_handler(tauri::generate_handler![set_close_to_tray])
         .setup(|app| {
             // 托盘菜单：显示主窗口 / 复制设备码 / 断开当前会话 / 退出
             let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
@@ -31,6 +51,7 @@ fn main() {
                     "copy-code" => {}
                     // M2b：结束当前 RustDesk 会话
                     "disconnect" => {}
+                    // 托盘「退出」是唯一真正退出的入口（关闭窗口只隐藏）。
                     "quit" => app.exit(0),
                     _ => {}
                 });
@@ -41,6 +62,14 @@ fn main() {
             tray.build(app)?;
 
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                if window.state::<CloseToTray>().0.load(Ordering::Relaxed) {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
         })
         .run(tauri::generate_context!())
         .expect("启动 Vega 控制台失败");
