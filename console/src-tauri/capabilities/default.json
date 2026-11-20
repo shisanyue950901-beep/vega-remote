@@ -17,6 +17,12 @@
     "allow-open-rustdesk-window",
     "allow-open-rustdesk-download-page",
     "allow-get-rustdesk-status",
-    "allow-test-server-connection"
+    "allow-test-server-connection",
+    "allow-get-streaming-status",
+    "allow-open-sunshine-pairing",
+    "allow-open-sunshine-settings",
+    "allow-start-moonlight-stream",
+    "allow-run-doctor",
+    "allow-export-doctor-log"
   ]
 }
