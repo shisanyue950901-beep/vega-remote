@@ -7,11 +7,13 @@
 //! - 非 Windows 平台一律返回「未安装 RustDesk」，不 spawn 任何进程。
 
 use serde::Serialize;
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use tauri::Manager;
@@ -293,13 +295,31 @@ impl ServerSnapshot {
     }
 }
 
+/// 只回位置、不回原文：toml 的 Display 会把出错那行源码带出来，
+/// 可能包含公钥或别的配置值，不能经 IPC 回给前端。
+fn toml_parse_error(err: &toml::de::Error, text: &str) -> String {
+    let location = err
+        .span()
+        .and_then(|span| {
+            let end = span.start.min(text.len());
+            if text.is_char_boundary(end) {
+                Some(text[..end].matches('\n').count() + 1)
+            } else {
+                None
+            }
+        })
+        .map(|line| format!("第 {line} 行附近"))
+        .unwrap_or_else(|| "位置未知".to_string());
+    format!("RustDesk2.toml 解析失败（{location}），请检查文件格式")
+}
+
 /// 解析 TOML 文本，只取 `[options]` 下的受管键；其他键保持不动。
 pub fn read_server_config(text: &str) -> Result<ServerSnapshot, String> {
     if text.trim().is_empty() {
         return Ok(ServerSnapshot::default());
     }
-    let doc: toml::Table = toml::from_str(text)
-        .map_err(|e| format!("RustDesk2.toml 解析失败：{e}"))?;
+    let doc: toml::Table =
+        toml::from_str(text).map_err(|e| toml_parse_error(&e, text))?;
     let options = match doc.get("options").and_then(|v| v.as_table()) {
         Some(table) => table,
         None => return Ok(ServerSnapshot::default()),
@@ -328,8 +348,7 @@ pub fn merge_server_config(
     let mut doc: toml::Table = if text.trim().is_empty() {
         toml::Table::new()
     } else {
-        toml::from_str(text)
-            .map_err(|e| format!("RustDesk2.toml 解析失败：{e}"))?
+        toml::from_str(text).map_err(|e| toml_parse_error(&e, text))?
     };
 
     if !doc.contains_key("options") {
@@ -513,7 +532,71 @@ fn save_recent_peers(app: &tauri::AppHandle, list: &[String]) -> Result<(), Stri
     write_atomic(&path, &text)
 }
 
-/// 原子写：同目录临时文件 + rename，避免面板崩溃留下半个文件。
+/// 读现有配置：只有「文件不存在」才当空文件；权限错误、非法 UTF-8 等
+/// 必须中止，否则保存会用一个只含三个受管键的新文件覆盖掉用户原配置。
+fn read_existing_config(path: &Path) -> Result<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(format!("读取现有 RustDesk 配置失败，已中止保存：{e}")),
+    }
+}
+
+/// 跨进程配置锁：同目录 `*.vega-lock`，`create_new` 保证只有一个实例拿到。
+struct ConfigLock {
+    path: PathBuf,
+}
+
+impl Drop for ConfigLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_config_lock(target: &Path) -> Result<ConfigLock, String> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败：{e}"))?;
+    }
+    let mut name = target.as_os_str().to_os_string();
+    name.push(".vega-lock");
+    let lock_path = PathBuf::from(name);
+    let started = Instant::now();
+    loop {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut file) => {
+                let _ = writeln!(file, "{}", std::process::id());
+                return Ok(ConfigLock { path: lock_path });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // 崩溃留下的陈旧锁：超过 STALE_LOCK_AGE 直接回收。
+                let stale = std::fs::metadata(&lock_path)
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .map(|age| age > STALE_LOCK_AGE)
+                    .unwrap_or(false);
+                if stale {
+                    let _ = std::fs::remove_file(&lock_path);
+                    continue;
+                }
+                if started.elapsed() >= LOCK_TIMEOUT {
+                    return Err(
+                        "另一个 Vega 窗口正在保存 RustDesk 配置，请稍后重试".to_string()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("创建配置锁失败：{e}")),
+        }
+    }
+}
+
+/// 原子写：同目录临时文件 + rename。临时文件用 `create_new` 独占创建，
+/// 文件名带进程号与序号，两个 Vega 实例不会互相踩到对方的临时文件。
 fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
     let parent = path
         .parent()
@@ -523,8 +606,24 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("rustdesk.toml");
-    let tmp = parent.join(format!(".{file_name}.vega-tmp"));
-    std::fs::write(&tmp, contents.as_bytes()).map_err(|e| format!("写临时文件失败：{e}"))?;
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(
+        ".{file_name}.{}.{seq}.vega-tmp",
+        std::process::id()
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|e| format!("创建临时文件失败：{e}"))?;
+    let result = file
+        .write_all(contents.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("写临时文件失败：{e}"));
+    }
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("替换目标文件失败：{e}")
@@ -575,61 +674,137 @@ fn rustdesk_service_state() -> Option<String> {
 /* 提权安装（复用现有 host 脚本，参数里不带任何密钥）                    */
 /* ------------------------------------------------------------------ */
 
-/// 定位 `host/install-host.ps1`：环境变量优先，其次从可执行文件向上找，
-/// 最后看 `%ProgramData%\Vega\host\install-host.ps1`。
+/// 定位安装脚本：只认 `%ProgramData%\Vega\host\install-host.ps1`。
+/// 这里不再读 `VEGA_HOST_SCRIPT`，也不从可执行文件所在目录往上找仓库 checkout：
+/// 那些路径的写权限在普通用户手里，等于把提权入口递给非管理员。
 pub fn locate_host_script() -> Option<PathBuf> {
-    if let Some(explicit) = std::env::var_os("VEGA_HOST_SCRIPT") {
-        let path = PathBuf::from(explicit);
-        if path.is_file() {
-            return Some(path);
+    let program_data = std::env::var_os("ProgramData")?;
+    let root = PathBuf::from(program_data).join("Vega").join("host");
+    let candidate = root.join("install-host.ps1");
+    if !candidate.is_file() {
+        return None;
+    }
+    // 脚本与模块都必须在这个管理员目录里，且目录不能是重解析点。
+    if !root.join("lib").join("Vega.Common.psm1").is_file() {
+        return None;
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(&root) {
+        if meta.file_type().is_symlink() {
+            return None;
         }
     }
-    if let Ok(exe) = std::env::current_exe() {
-        let mut dir = exe.parent().map(Path::to_path_buf);
-        for _ in 0..6 {
-            let Some(current) = dir else { break };
-            let candidate = current.join("host").join("install-host.ps1");
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-            dir = current.parent().map(Path::to_path_buf);
-        }
-    }
-    if let Some(program_data) = std::env::var_os("ProgramData") {
-        let candidate = PathBuf::from(program_data)
-            .join("Vega")
-            .join("host")
-            .join("install-host.ps1");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    Some(candidate)
 }
 
 #[cfg(windows)]
-fn spawn_elevated_host_script(script: &Path) -> Result<(), String> {
-    use std::os::windows::process::CommandExt;
+fn system_powershell() -> Result<PathBuf, String> {
+    let root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .ok_or_else(|| "找不到 %SystemRoot%，无法定位 PowerShell".to_string())?;
+    let exe = root
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    if exe.is_file() {
+        Ok(exe)
+    } else {
+        Err("找不到系统 PowerShell（System32\\WindowsPowerShell\\v1.0\\powershell.exe）".to_string())
+    }
+}
 
-    let script = script.display().to_string().replace('\'', "''");
-    // 只传 -File <脚本> -WithRustDesk：脚本自己按需安装 RustDesk，不接收密钥。
-    let command = format!(
-        "Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','{script}','-WithRustDesk') -WindowStyle Normal"
+/// 用 `ShellExecuteExW` + `runas` 直接提权：不经过 `powershell -Command` 拼字符串，
+/// 路径只作为 `-File` 的引号参数传递，UAC 取消与启动失败都能回给前端。
+#[cfg(windows)]
+fn spawn_elevated_host_script(script: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const SEE_MASK_NOCLOSEPROCESS: u32 = 0x0000_0040;
+    const SW_SHOWNORMAL: i32 = 1;
+
+    #[repr(C)]
+    struct ShellExecuteInfoW {
+        cb_size: u32,
+        f_mask: u32,
+        hwnd: *mut core::ffi::c_void,
+        lp_verb: *const u16,
+        lp_file: *const u16,
+        lp_parameters: *const u16,
+        lp_directory: *const u16,
+        n_show: i32,
+        h_inst_app: *mut core::ffi::c_void,
+        lp_id_list: *mut core::ffi::c_void,
+        lp_class: *const u16,
+        h_key_class: *mut core::ffi::c_void,
+        dw_hot_key: u32,
+        h_icon: *mut core::ffi::c_void,
+        h_process: *mut core::ffi::c_void,
+    }
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteExW(info: *mut ShellExecuteInfoW) -> i32;
+    }
+
+    let powershell = system_powershell()?;
+    let script = script.display().to_string();
+    if script.contains('"') {
+        return Err("安装脚本路径包含引号，拒绝执行".to_string());
+    }
+    // -File 后接一个被引号包住的绝对路径；路径里的空格不会再把参数拆开。
+    let parameters = format!(
+        "-NoProfile -ExecutionPolicy Bypass -File \"{script}\" -WithRustDesk"
     );
-    let mut cmd = Command::new("powershell.exe");
-    cmd.args([
-        "-NoProfile",
-        "-NonInteractive",
-        "-WindowStyle",
-        "Hidden",
-        "-Command",
-        &command,
-    ])
-    .stdin(Stdio::null())
-    .creation_flags(CREATE_NO_WINDOW);
-    cmd.spawn()
-        .map(|_| ())
-        .map_err(|e| format!("调起安装脚本失败：{e}"))
+
+    let mut verb: Vec<u16> = "runas\0".encode_utf16().collect();
+    let mut file: Vec<u16> = powershell
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut params: Vec<u16> = parameters
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut info = ShellExecuteInfoW {
+        cb_size: std::mem::size_of::<ShellExecuteInfoW>() as u32,
+        f_mask: SEE_MASK_NOCLOSEPROCESS,
+        hwnd: std::ptr::null_mut(),
+        lp_verb: verb.as_mut_ptr(),
+        lp_file: file.as_mut_ptr(),
+        lp_parameters: params.as_mut_ptr(),
+        lp_directory: std::ptr::null(),
+        n_show: SW_SHOWNORMAL,
+        h_inst_app: std::ptr::null_mut(),
+        lp_id_list: std::ptr::null_mut(),
+        lp_class: std::ptr::null(),
+        h_key_class: std::ptr::null_mut(),
+        dw_hot_key: 0,
+        h_icon: std::ptr::null_mut(),
+        h_process: std::ptr::null_mut(),
+    };
+
+    // SAFETY: 结构体、字符串缓冲都在本函数栈上存活到调用结束，字段布局与 Win32 一致。
+    let launched = unsafe { ShellExecuteExW(&mut info) };
+    if launched == 0 {
+        let error = std::io::Error::last_os_error();
+        return Err(match error.raw_os_error() {
+            Some(1223) => "已取消管理员授权（UAC），没有安装任何东西".to_string(),
+            _ => format!("调起安装脚本失败：{error}"),
+        });
+    }
+    if !info.h_process.is_null() {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+        }
+        // SAFETY: h_process 由 ShellExecuteExW 在成功后返回，未使用前有效。
+        unsafe {
+            CloseHandle(info.h_process);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -703,6 +878,15 @@ pub struct TestResult {
 
 #[tauri::command]
 pub fn get_device_id() -> DeviceInfo {
+    if !cfg!(windows) {
+        return DeviceInfo {
+            installed: false,
+            id: String::new(),
+            formatted_id: String::new(),
+            path: String::new(),
+            error: NOT_INSTALLED.to_string(),
+        };
+    }
     let Some(exe) = locate_rustdesk() else {
         return DeviceInfo {
             installed: false,
@@ -742,6 +926,16 @@ pub fn get_device_id() -> DeviceInfo {
 
 #[tauri::command]
 pub fn get_server_config() -> ServerConfigView {
+    if !cfg!(windows) {
+        return ServerConfigView {
+            server: String::new(),
+            relay: String::new(),
+            key_fingerprint: String::new(),
+            key_present: false,
+            path: String::new(),
+            error: NOT_INSTALLED.to_string(),
+        };
+    }
     let Some(path) = user_config_path() else {
         return ServerConfigView {
             server: String::new(),
@@ -777,14 +971,19 @@ pub fn get_server_config() -> ServerConfigView {
         }
     };
     match read_server_config(&text) {
-        Ok(snapshot) => ServerConfigView {
-            server: snapshot.server,
-            relay: snapshot.relay,
-            key_fingerprint: snapshot.key_fingerprint(),
-            key_present: snapshot.key_present(),
-            path: display,
-            error: String::new(),
-        },
+        Ok(snapshot) => {
+            // 先算指纹/存在性，再移动 server/relay：否则会借用已移出的 snapshot。
+            let key_fingerprint = snapshot.key_fingerprint();
+            let key_present = snapshot.key_present();
+            ServerConfigView {
+                server: snapshot.server,
+                relay: snapshot.relay,
+                key_fingerprint,
+                key_present,
+                path: display,
+                error: String::new(),
+            }
+        }
         Err(error) => ServerConfigView {
             server: String::new(),
             relay: String::new(),
@@ -800,6 +999,9 @@ pub fn get_server_config() -> ServerConfigView {
 /// 不显示完整公钥，所以留空保存不能把公钥清掉）。
 #[tauri::command]
 pub fn set_server_config(server: String, key: String, relay: Option<String>) -> OpResult {
+    if !cfg!(windows) {
+        return OpResult::err(NOT_INSTALLED);
+    }
     let server = match validate_server(&server) {
         Ok(value) => value,
         Err(e) => return OpResult::err(e),
@@ -817,8 +1019,20 @@ pub fn set_server_config(server: String, key: String, relay: Option<String>) -> 
     let Some(path) = user_config_path() else {
         return OpResult::err("找不到 RustDesk 配置目录（%APPDATA% 缺失）");
     };
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let existing_snapshot = read_server_config(&existing).unwrap_or_default();
+    // 从读现有内容到替换文件全程持锁：两个 Vega 实例同时保存时后者等锁，
+    // 不会各自基于旧内容 merge，把对方刚写的键覆盖回去。
+    let _lock = match acquire_config_lock(&path) {
+        Ok(lock) => lock,
+        Err(e) => return OpResult::err(e),
+    };
+    let existing = match read_existing_config(&path) {
+        Ok(text) => text,
+        Err(e) => return OpResult::err(e),
+    };
+    let existing_snapshot = match read_server_config(&existing) {
+        Ok(snapshot) => snapshot,
+        Err(e) => return OpResult::err(e),
+    };
 
     let key = if key.trim().is_empty() {
         if existing_snapshot.key.is_empty() {
@@ -845,15 +1059,21 @@ pub fn set_server_config(server: String, key: String, relay: Option<String>) -> 
 
 #[tauri::command]
 pub fn connect_peer(peer_id: String, mode: String, app: tauri::AppHandle) -> OpResult {
-    let Some(id) = normalize_device_id(&peer_id) else {
-        return OpResult::err("设备码必须是 9-10 位数字");
+    if !cfg!(windows) {
+        return OpResult::err(NOT_INSTALLED);
+    }
+    // IPC 入口不做字符清洗：多余字符、11 位、8 位一律拒绝，不猜用户想连哪台。
+    let id = match parse_peer_id(&peer_id) {
+        Ok(id) => id,
+        Err(e) => return OpResult::err(e),
     };
     let Some(exe) = locate_rustdesk() else {
         return OpResult::err(NOT_INSTALLED);
     };
     let args = match mode.as_str() {
+        "control" => vec!["--connect", id.as_str()],
         "file" => vec!["--file-transfer", id.as_str()],
-        _ => vec!["--connect", id.as_str()],
+        _ => return OpResult::err("未知连接模式（只支持 control 或 file）"),
     };
     if let Err(e) = spawn_detached(&exe, &args) {
         return OpResult::err(e);
@@ -873,6 +1093,9 @@ pub fn connect_peer(peer_id: String, mode: String, app: tauri::AppHandle) -> OpR
 
 #[tauri::command]
 pub fn get_recent_peers(app: tauri::AppHandle) -> Vec<String> {
+    if !cfg!(windows) {
+        return Vec::new();
+    }
     recent_path(&app)
         .map(|path| read_recent_peers_at(&path))
         .unwrap_or_default()
@@ -881,6 +1104,9 @@ pub fn get_recent_peers(app: tauri::AppHandle) -> Vec<String> {
 /// 「显示临时密码」：只是打开 RustDesk 主窗口，控制台不读取密码。
 #[tauri::command]
 pub fn open_rustdesk_window() -> OpResult {
+    if !cfg!(windows) {
+        return OpResult::err(NOT_INSTALLED);
+    }
     let Some(exe) = locate_rustdesk() else {
         return OpResult::err(NOT_INSTALLED);
     };
@@ -892,6 +1118,14 @@ pub fn open_rustdesk_window() -> OpResult {
 
 #[tauri::command]
 pub fn get_rustdesk_status() -> StatusView {
+    if !cfg!(windows) {
+        return StatusView {
+            installed: false,
+            running: false,
+            service_state: String::new(),
+            message: NOT_INSTALLED.to_string(),
+        };
+    }
     let Some(_exe) = locate_rustdesk() else {
         return StatusView {
             installed: false,
@@ -926,8 +1160,13 @@ pub fn get_rustdesk_status() -> StatusView {
 
 #[tauri::command]
 pub fn install_rustdesk() -> OpResult {
+    if !cfg!(windows) {
+        return OpResult::err(NOT_INSTALLED);
+    }
     let Some(script) = locate_host_script() else {
-        return OpResult::err("找不到 host/install-host.ps1，请先用一行安装脚本部署仓库");
+        return OpResult::err(
+            "未找到管理员目录里的安装脚本（%ProgramData%\\Vega\\host\\install-host.ps1），请先用一行安装脚本部署",
+        );
     };
     match spawn_elevated_host_script(&script) {
         Ok(()) => OpResult::ok("已弹出管理员授权，安装完成后回到这里刷新状态"),
@@ -935,9 +1174,31 @@ pub fn install_rustdesk() -> OpResult {
     }
 }
 
-#[tauri::command]
-pub fn test_server_connection(server: String) -> TestResult {
-    let (host, port) = match endpoint_from_server(&server) {
+/// DNS 解析放在独立线程里，用 channel 超时收结果：`to_socket_addrs` 本身
+/// 没有超时参数，直接调用可能把命令拖住很久。
+fn resolve_with_timeout(host: &str, port: u16, timeout: Duration) -> Result<Vec<SocketAddr>, String> {
+    let (tx, rx) = mpsc::channel();
+    let host = host.to_string();
+    std::thread::spawn(move || {
+        let result = (host.as_str(), port)
+            .to_socket_addrs()
+            .map(|iter| iter.collect::<Vec<_>>())
+            .map_err(|e| e.to_string());
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(addrs)) => Ok(addrs),
+        Ok(Err(e)) => Err(format!("解析 {host}:{port} 失败：{e}")),
+        Err(_) => Err(format!("解析 {host}:{port} 超时（{} 秒）", timeout.as_secs())),
+    }
+}
+
+/// 纯阻塞探测：解析和所有连接尝试共用一个 3 秒 deadline，不会每换一个
+/// 地址就重新计 3 秒。命令层用 `spawn_blocking` 把它挪出 UI 线程。
+fn probe_server(server: &str) -> TestResult {
+    let started = Instant::now();
+    let deadline = started + TEST_TIMEOUT;
+    let (host, port) = match endpoint_from_server(server) {
         Ok(value) => value,
         Err(e) => {
             return TestResult {
@@ -947,13 +1208,14 @@ pub fn test_server_connection(server: String) -> TestResult {
             }
         }
     };
-    let addrs: Vec<SocketAddr> = match (host.as_str(), port).to_socket_addrs() {
-        Ok(iter) => iter.collect(),
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let addrs = match resolve_with_timeout(&host, port, remaining) {
+        Ok(addrs) => addrs,
         Err(e) => {
             return TestResult {
                 ok: false,
-                message: format!("解析 {host}:{port} 失败：{e}"),
-                latency_ms: 0,
+                message: e,
+                latency_ms: started.elapsed().as_millis() as u64,
             }
         }
     };
@@ -961,13 +1223,17 @@ pub fn test_server_connection(server: String) -> TestResult {
         return TestResult {
             ok: false,
             message: format!("解析 {host}:{port} 没有结果"),
-            latency_ms: 0,
+            latency_ms: started.elapsed().as_millis() as u64,
         };
     }
-    let started = Instant::now();
     let mut last_error = String::new();
     for addr in addrs {
-        match TcpStream::connect_timeout(&addr, TEST_TIMEOUT) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            last_error = "总超时已用完".to_string();
+            break;
+        }
+        match TcpStream::connect_timeout(&addr, remaining) {
             Ok(_) => {
                 return TestResult {
                     ok: true,
@@ -980,9 +1246,30 @@ pub fn test_server_connection(server: String) -> TestResult {
     }
     TestResult {
         ok: false,
-        message: format!("TCP 连接失败（3 秒超时）：{last_error}"),
+        message: format!(
+            "TCP 连接失败（{} 秒总超时）：{last_error}",
+            TEST_TIMEOUT.as_secs()
+        ),
         latency_ms: started.elapsed().as_millis() as u64,
     }
+}
+
+#[tauri::command]
+pub async fn test_server_connection(server: String) -> TestResult {
+    if !cfg!(windows) {
+        return TestResult {
+            ok: false,
+            message: NOT_INSTALLED.to_string(),
+            latency_ms: 0,
+        };
+    }
+    tauri::async_runtime::spawn_blocking(move || probe_server(&server))
+        .await
+        .unwrap_or_else(|e| TestResult {
+            ok: false,
+            message: format!("连接测试线程失败：{e}"),
+            latency_ms: 0,
+        })
 }
 
 /// 托盘「复制设备码」用：拿设备码写到剪贴板，不经过前端。
@@ -1172,5 +1459,116 @@ flag = true
         let payload = serde_json::json!({ "ids": list });
         let text = serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())?;
         write_atomic(path, &text)
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "vega-{tag}-{}-{seq}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn peer_id_requires_nine_or_ten_digits_without_cleaning() {
+        assert_eq!(parse_peer_id("123456789").unwrap(), "123456789");
+        assert_eq!(parse_peer_id("1234567890").unwrap(), "1234567890");
+        assert!(parse_peer_id("12345678").is_err());
+        assert!(parse_peer_id("12345678901").is_err());
+        assert!(parse_peer_id("123 456 789").is_err());
+        assert!(parse_peer_id("12345678a").is_err());
+        assert!(parse_peer_id("").is_err());
+    }
+
+    #[test]
+    fn server_validation_rejects_malformed_hosts() {
+        // 方括号里只能是 IPv6，不能拿它包 DNS 名。
+        assert!(validate_server("[example.com]:21116").is_err());
+        assert!(validate_server("[not-ipv6]").is_err());
+        // 下划线、空标签、伪 IPv4 都不是合法主机名。
+        assert!(validate_server("bad_host.example.com").is_err());
+        assert!(validate_server("a..b").is_err());
+        assert!(validate_server("999.1.1.1").is_err());
+        assert!(validate_server("host:21116:1").is_err());
+    }
+
+    #[test]
+    fn key_validation_rejects_interior_padding_and_bad_bits() {
+        // 中间的 `=` 不能当填充符。
+        let interior = format!("{}={}=", "A".repeat(20), "A".repeat(22));
+        assert_eq!(interior.len(), 44);
+        assert!(validate_key(&interior).is_err());
+        // 43 位正文的末尾填充位必须为 0，否则不是规范 base64。
+        let bad_bits = format!("{}B=", "A".repeat(42));
+        assert_eq!(bad_bits.len(), 44);
+        assert!(validate_key(&bad_bits).is_err());
+        assert!(validate_key(&("A".repeat(44))).is_err());
+    }
+
+    #[test]
+    fn toml_parse_error_does_not_echo_source_line() {
+        let secret = "SUPERSECRETKEYVALUE";
+        let text = format!("[options]\nkey = \"{secret}\"\nbroken = \n");
+        let error = read_server_config(&text).unwrap_err();
+        assert!(!error.contains(secret));
+        assert!(error.contains("解析失败"));
+    }
+
+    #[test]
+    fn write_atomic_replaces_existing_file_and_leaves_no_temp() {
+        let dir = temp_dir("atomic");
+        let path = dir.join("RustDesk2.toml");
+        write_atomic(&path, "[options]\nother = \"first\"\n").unwrap();
+        write_atomic(&path, "[options]\nother = \"second\"\n").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("second"));
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".vega-tmp"))
+            .collect();
+        assert!(leftovers.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn existing_config_aborts_on_invalid_utf8_instead_of_replacing() {
+        let dir = temp_dir("utf8");
+        let path = dir.join("RustDesk2.toml");
+        std::fs::write(&path, [0xff, 0xfe, 0x00, 0x41]).unwrap();
+        assert!(read_existing_config(&path).is_err());
+        // 文件保持原样，没有被当成空文件覆盖。
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0xff, 0xfe, 0x00, 0x41]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_merge_preserves_existing_keys_when_replacing() {
+        let dir = temp_dir("merge");
+        let path = dir.join("RustDesk2.toml");
+        std::fs::write(
+            &path,
+            "[options]\nother = \"keep\"\npassword = \"not-managed\"\n",
+        )
+        .unwrap();
+        let existing = read_existing_config(&path).unwrap();
+        let key = "B".repeat(43) + "=";
+        let merged =
+            merge_server_config(&existing, "relay.example.com", "relay.example.com", &key).unwrap();
+        write_atomic(&path, &merged).unwrap();
+        let snapshot = read_server_config(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(snapshot.server, "relay.example.com");
+        assert_eq!(snapshot.key, key);
+        let reparsed: toml::Table =
+            toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let options = reparsed.get("options").unwrap().as_table().unwrap();
+        assert_eq!(options.get("other").unwrap().as_str().unwrap(), "keep");
+        assert_eq!(
+            options.get("password").unwrap().as_str().unwrap(),
+            "not-managed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
