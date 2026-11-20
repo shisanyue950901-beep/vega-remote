@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'"
+    />
+    <title>Vega 控制台</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script type="module" src="main.js"></script>
+  </head>
+  <body>
+    <div class="app">
+      <!-- 自绘标题栏 -->
+      <header class="titlebar" data-tauri-drag-region>
+        <div class="titlebar__title" data-tauri-drag-region>Vega 控制台</div>
+        <div class="titlebar__controls">
+          <button id="win-minimize" class="winbtn" type="button" title="最小化" aria-label="最小化">
+            <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2 6h8" /></svg>
+          </button>
+          <button id="win-maximize" class="winbtn" type="button" title="最大化" aria-label="最大化">
+            <svg viewBox="0 0 12 12" aria-hidden="true"><rect x="2.5" y="2.5" width="7" height="7" rx="1" /></svg>
+          </button>
+          <button id="win-close" class="winbtn winbtn--close" type="button" title="关闭" aria-label="关闭">
+            <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 3l6 6M9 3l-6 6" /></svg>
+          </button>
+        </div>
+      </header>
+
+      <div class="shell">
+        <!-- 左栏 -->
+        <aside class="sidebar">
+          <div class="brand">
+            <span class="brand__mark" aria-hidden="true"></span>
+            <span class="brand__text">Vega</span>
+          </div>
+          <nav class="nav" aria-label="主导航">
+            <button class="nav__item is-active" type="button" data-page="assist">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3" width="12" height="8" rx="1.5" /><path d="M6 14h4M8 11v3" /></svg>
+              远程协助
+            </button>
+            <button class="nav__item" type="button" data-page="devices">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="2" width="5" height="5" rx="1" /><rect x="9" y="2" width="5" height="5" rx="1" /><rect x="2" y="9" width="5" height="5" rx="1" /><rect x="9" y="9" width="5" height="5" rx="1" /></svg>
+              我的设备
+            </button>
+            <button class="nav__item" type="button" data-page="settings">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="2.2" /><path d="M8 2v1.6M8 12.4V14M2 8h1.6M12.4 8H14M3.8 3.8l1.1 1.1M11.1 11.1l1.1 1.1M12.2 3.8l-1.1 1.1M4.9 11.1l-1.1 1.1" /></svg>
+              设置
+            </button>
+          </nav>
+          <div class="sidebar__footer">
+            <span class="version">v0.5.0</span>
+            <button id="check-update" class="link" type="button">检查更新</button>
+          </div>
+        </aside>
+
+        <main class="content">
+          <!-- 1 远程协助 -->
+          <section id="page-assist" class="page is-active" aria-labelledby="assist-title">
+            <h1 id="assist-title" class="page__title">远程协助</h1>
+
+            <div class="card">
+              <div class="card__head">
+                <h2 class="card__title">本设备</h2>
+                <label class="switch">
+                  <input id="allow-assist" type="checkbox" checked />
+                  <span class="switch__track" aria-hidden="true"></span>
+                  <span class="switch__label">允许远程协助</span>
+                </label>
+              </div>
+
+              <div class="field field--code">
+                <span class="field__label">设备码</span>
+                <span id="device-code" class="device-code">123 456 789</span>
+                <button id="copy-code" class="btn btn--ghost" type="button">复制</button>
+              </div>
+
+              <div class="field">
+                <span class="field__label">临时密码</span>
+                <span id="temp-password" class="password" data-revealed="false">●●●●●●●●</span>
+                <button id="toggle-password" class="iconbtn" type="button" title="显示密码" aria-label="显示密码">
+                  <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1.5 8s2.4-4 6.5-4 6.5 4 6.5 4-2.4 4-6.5 4S1.5 8 1.5 8z" /><circle cx="8" cy="8" r="1.8" /></svg>
+                </button>
+                <button id="refresh-password" class="iconbtn" type="button" title="刷新密码" aria-label="刷新密码">
+                  <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 8a5 5 0 1 1-1.6-3.7" /><path d="M13 2.5V5h-2.5" /></svg>
+                </button>
+                <label class="field__inline">
+                  <span class="field__hint">刷新频率</span>
+                  <select id="password-rotate" class="select select--compact">
+                    <option>每次会话后</option>
+                    <option selected>每天</option>
+                    <option>从不</option>
+                  </select>
+                </label>
+              </div>
+
+              <div class="field">
+                <button id="copy-share" class="btn btn--primary" type="button">复制并分享</button>
+                <span class="field__hint">复制「设备码 + 临时密码」一段文字发给对方</span>
+              </div>
+
+              <div class="statusline" id="id-status">
+                <span class="dot dot--ok" aria-hidden="true"></span>
+                <span>已连接 ID 服务器（rustdesk.vega.example.com）</span>
+                <button id="diagnose" class="link" type="button">诊断</button>
+              </div>
+              <!-- 未连接态（M2b 绑定后切换显示） -->
+              <div class="statusline is-hidden" id="id-status-offline">
+                <span class="dot dot--off" aria-hidden="true"></span>
+                <span>未连接：ID 服务器不可达（原因：连接超时）</span>
+                <button class="link" type="button" data-action="diagnose">诊断</button>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card__head">
+                <h2 class="card__title">控制其他设备</h2>
+              </div>
+
+              <div class="field">
+                <input
+                  id="peer-code"
+                  class="input input--code"
+                  type="text"
+                  inputmode="numeric"
+                  maxlength="11"
+                  placeholder="输入对方设备码"
+                  list="recent-devices"
+                  autocomplete="off"
+                />
+                <datalist id="recent-devices">
+                  <option value="987 654 321">书房台式机</option>
+                  <option value="234 567 891">办公室笔记本</option>
+                  <option value="345 678 912">父母的电脑</option>
+                  <option value="456 789 123">NAS 旁的小主机</option>
+                  <option value="567 891 234">会议室 HTPC</option>
+                  <option value="678 912 345">测试机 Win11</option>
+                  <option value="789 123 456">测试机 Win10</option>
+                  <option value="891 234 567">笔记本 Ubuntu</option>
+                  <option value="912 345 678">远程渲染机</option>
+                  <option value="135 792 468">备用笔记本</option>
+                </datalist>
+                <button id="connect-peer" class="btn btn--primary" type="button">连接</button>
+              </div>
+
+              <div class="field">
+                <label class="radio">
+                  <input type="radio" name="connect-mode" value="control" checked />
+                  <span>远程控制</span>
+                </label>
+                <label class="radio">
+                  <input type="radio" name="connect-mode" value="file" />
+                  <span>文件传输</span>
+                </label>
+              </div>
+
+              <p class="hint">连接后弹出 RustDesk 会话窗口，输入对方临时密码。</p>
+            </div>
+          </section>
+
+          <!-- 2 我的设备 -->
+          <section id="page-devices" class="page" aria-labelledby="devices-title">
+            <h1 id="devices-title" class="page__title">我的设备</h1>
+
+            <div class="tabs" role="tablist" aria-label="设备类型">
+              <button class="tabs__tab is-active" type="button" role="tab" data-tab="rd" aria-selected="true">远程协助设备</button>
+              <button class="tabs__tab" type="button" role="tab" data-tab="stream" aria-selected="false">高性能串流</button>
+            </div>
+
+            <div id="tab-rd" class="tabpanel is-active" role="tabpanel">
+              <div class="card">
+                <ul class="device-list">
+                  <li class="device">
+                    <div class="device__main">
+                      <span class="device__name">书房台式机</span>
+                      <span class="device__code">987 654 321</span>
+                    </div>
+                    <div class="device__meta">
+                      <span class="dot dot--ok" aria-hidden="true"></span>在线 · 上次连接 2024-06-11 21:03
+                    </div>
+                    <div class="device__actions">
+                      <button class="btn btn--ghost" type="button">连接</button>
+                      <button class="btn btn--ghost" type="button">改名</button>
+                      <button class="btn btn--danger" type="button">删除</button>
+                    </div>
+                  </li>
+                  <li class="device">
+                    <div class="device__main">
+                      <span class="device__name">办公室笔记本</span>
+                      <span class="device__code">234 567 891</span>
+                    </div>
+                    <div class="device__meta">
+                      <span class="dot dot--off" aria-hidden="true"></span>离线 · 上次连接 2024-06-09 09:41
+                    </div>
+                    <div class="device__actions">
+                      <button class="btn btn--ghost" type="button">连接</button>
+                      <button class="btn btn--ghost" type="button">改名</button>
+                      <button class="btn btn--danger" type="button">删除</button>
+                    </div>
+                  </li>
+                  <li class="device">
+                    <div class="device__main">
+                      <span class="device__name">父母的电脑</span>
+                      <span class="device__code">345 678 912</span>
+                    </div>
+                    <div class="device__meta">
+                      <span class="dot dot--ok" aria-hidden="true"></span>在线 · 上次连接 2024-06-10 19:28
+                    </div>
+                    <div class="device__actions">
+                      <button class="btn btn--ghost" type="button">连接</button>
+                      <button class="btn btn--ghost" type="button">改名</button>
+                      <button class="btn btn--danger" type="button">删除</button>
+                    </div>
+                  </li>
+                </ul>
+                <p class="hint">列表仅保存在本地，不上传。M2b 接入后支持新增与编辑。</p>
+              </div>
+            </div>
+
+            <div id="tab-stream" class="tabpanel" role="tabpanel">
+              <div class="card">
+                <div class="card__head">
+                  <h2 class="card__title">本机作为被控端</h2>
+                  <span class="tag tag--ok">Sunshine 运行中</span>
+                </div>
+
+                <div class="field">
+                  <span class="field__label">显卡</span>
+                  <select id="stream-gpu" class="select">
+                    <option selected>自动识别：NVIDIA RTX 4060（独显）</option>
+                    <option>核显：Intel UHD Graphics 770</option>
+                    <option>手动选择…</option>
+                  </select>
+                </div>
+
+                <div class="field">
+                  <span class="field__label">编码器</span>
+                  <select id="stream-encoder" class="select">
+                    <option selected>NVENC</option>
+                    <option>AMF</option>
+                    <option>QSV</option>
+                  </select>
+                </div>
+
+                <div class="field">
+                  <span class="field__label">分辨率与帧率</span>
+                  <select id="stream-mode" class="select">
+                    <option selected>跟随显示器</option>
+                    <option>1080p60</option>
+                    <option>1440p60</option>
+                    <option>1440p120</option>
+                  </select>
+                </div>
+
+                <div class="field">
+                  <button id="sunshine-install" class="btn btn--primary" type="button">安装/修复 Sunshine</button>
+                  <button id="sunshine-pair" class="btn btn--ghost" type="button">打开配对</button>
+                  <input id="sunshine-pin" class="input input--pin" type="text" inputmode="numeric" maxlength="6" placeholder="输入 6 位配对 PIN" />
+                  <button id="sunshine-pin-submit" class="btn btn--ghost" type="button">提交 PIN</button>
+                </div>
+              </div>
+
+              <div class="card">
+                <div class="card__head">
+                  <h2 class="card__title">本机作为控制端</h2>
+                </div>
+                <ul class="host-list">
+                  <li class="host">
+                    <span>客厅主机（Moonlight）</span>
+                    <span class="field__hint">上次串流 2024-06-08 22:15</span>
+                    <button class="btn btn--ghost" type="button">开始串流</button>
+                  </li>
+                  <li class="host">
+                    <span>工作站 4090</span>
+                    <span class="field__hint">上次串流 2024-05-30 20:02</span>
+                    <button class="btn btn--ghost" type="button">开始串流</button>
+                  </li>
+                </ul>
+                <button id="moonlight-install" class="btn btn--ghost" type="button">安装 Moonlight</button>
+              </div>
+
+              <div class="banner">
+                <span>串流需要 IPv6 直连或 Tailscale；连接不通时先跑诊断。</span>
+                <button id="diagnose-net" class="link" type="button">诊断网络</button>
+              </div>
+            </div>
+          </section>
+
+          <!-- 3 设置 -->
+          <section id="page-settings" class="page" aria-labelledby="settings-title">
+            <h1 id="settings-title" class="page__title">设置</h1>
+
+            <div class="card">
+              <h2 class="card__title">常规</h2>
+              <label class="row">
+                <input id="set-autostart" type="checkbox" />
+                <span>开机自启</span>
+              </label>
+              <label class="row">
+                <input id="set-tray" type="checkbox" checked />
+                <span>关闭窗口时最小化到托盘</span>
+              </label>
+              <div class="row">
+                <span>语言</span>
+                <select id="set-language" class="select select--compact">
+                  <option selected>简体中文</option>
+                  <option>English</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="card">
+              <h2 class="card__title">安全</h2>
+              <div class="row">
+                <span>临时密码长度</span>
+                <select id="set-password-length" class="select select--compact">
+                  <option>6</option>
+                  <option selected>8</option>
+                  <option>10</option>
+                </select>
+              </div>
+              <div class="row">
+                <span>固定密码（可选，设置后无人值守）</span>
+                <input id="set-fixed-password" class="input input--short" type="password" placeholder="留空表示不使用" autocomplete="off" />
+                <button id="save-fixed-password" class="btn btn--ghost" type="button">保存</button>
+              </div>
+              <label class="row">
+                <input id="set-allow-list" type="checkbox" />
+                <span>仅允许设备列表里的设备连接</span>
+              </label>
+              <label class="row">
+                <input id="set-lock-on-end" type="checkbox" checked />
+                <span>会话结束自动锁屏</span>
+              </label>
+            </div>
+
+            <div class="card">
+              <h2 class="card__title">网络</h2>
+              <div class="row">
+                <span>ID 服务器</span>
+                <input id="set-id-server" class="input" type="text" value="rustdesk.vega.example.com" />
+              </div>
+              <div class="row">
+                <span>中继服务器</span>
+                <input id="set-relay-server" class="input" type="text" value="rustdesk.vega.example.com" />
+              </div>
+              <div class="row">
+                <span>服务器公钥</span>
+                <textarea id="set-server-key" class="input input--key" rows="2" spellcheck="false">VEGA_PUBLIC_KEY_PLACEHOLDER</textarea>
+              </div>
+              <div class="row">
+                <button id="test-connection" class="btn btn--primary" type="button">测试连接</button>
+                <span id="test-connection-result" class="field__hint">未测试</span>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card__head">
+                <h2 class="card__title">诊断</h2>
+                <button id="run-doctor" class="btn btn--ghost" type="button">运行 doctor</button>
+              </div>
+              <ul id="doctor-results" class="doctor">
+                <li class="doctor__item doctor__item--pass"><span class="tag tag--ok">通过</span>显卡与编码器：NVENC 可用（RTX 4060）</li>
+                <li class="doctor__item doctor__item--warn"><span class="tag tag--warn">警告</span>公网 IPv6：未检测到，建议启用 Tailscale</li>
+                <li class="doctor__item doctor__item--fail"><span class="tag tag--fail">失败</span>Sunshine 服务：未运行（建议：以管理员身份重新安装）</li>
+              </ul>
+              <button id="export-log" class="btn btn--ghost" type="button">导出脱敏日志</button>
+            </div>
+
+            <div class="card">
+              <h2 class="card__title">关于</h2>
+              <div class="row"><span>版本</span><span>v0.5.0</span></div>
+              <div class="row"><span>许可</span><span>MIT</span></div>
+              <div class="row"><span>开源仓库</span><span class="link-text">github.com/vega-remote/vega-remote</span></div>
+              <p class="hint">第三方组件：RustDesk（AGPL，仅调用不打包）、Sunshine、Moonlight。</p>
+            </div>
+          </section>
+        </main>
+      </div>
+    </div>
+
+    <!-- 被控时的接受弹窗（RustDesk 事件接入后显示） -->
+    <div id="incoming-dialog" class="modal is-hidden" role="dialog" aria-modal="true" aria-labelledby="incoming-title">
+      <div class="modal__box">
+        <h2 id="incoming-title" class="modal__title">收到远程协助请求</h2>
+        <p class="modal__text">对方设备码：<strong>987 654 321</strong>（书房台式机）</p>
+        <div class="modal__options">
+          <label class="row"><input type="checkbox" checked /><span>允许键鼠控制</span></label>
+          <label class="row"><input type="checkbox" checked /><span>允许剪贴板同步</span></label>
+          <label class="row"><input type="checkbox" /><span>允许文件传输</span></label>
+        </div>
+        <p class="modal__timer" id="incoming-timer">60 秒后自动拒绝</p>
+        <div class="modal__actions">
+          <button id="incoming-reject" class="btn btn--danger" type="button">拒绝</button>
+          <button id="incoming-accept" class="btn btn--primary" type="button">接受</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 被控中右下角浮条（M2b 接入后显示） -->
+    <div id="session-float" class="floatbar is-hidden">
+      <span class="dot dot--busy" aria-hidden="true"></span>
+      <span>被控中 · 987 654 321</span>
+      <button id="float-disconnect" class="btn btn--danger" type="button">断开</button>
+    </div>
+  </body>
+</html>
