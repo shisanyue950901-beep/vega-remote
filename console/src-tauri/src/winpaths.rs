@@ -6,6 +6,9 @@
 //!
 //! - 目录一律由 `SHGetKnownFolderPath` 取（`FOLDERID_ProgramFiles`、
 //!   `FOLDERID_ProgramFilesX86`、`FOLDERID_System`、`FOLDERID_Windows`）；
+//! - `Program Files` 根不接受「canonicalize 过就信」：必须正好等于
+//!   `<系统盘根>\Program Files` / `<系统盘根>\Program Files (x86)`，根自身不能
+//!   是重解析点（junction），且其卷根必须就是系统卷（`GetSystemDirectoryW` 所在卷）；
 //! - 目录与可执行文件都先 `canonicalize`，再确认最终路径仍在对应根目录下；
 //! - 调用方拿到的就是校验通过的那条路径，启动时不再二次解析；
 //! - 非 Windows 一律返回 `None`，不加载任何系统 API。
@@ -19,9 +22,9 @@ fn is_inside(root: &Path, candidate: &Path) -> bool {
     candidate != root && candidate.starts_with(root)
 }
 
-/// 把已知文件夹解析成规范化目录；目录不存在或拿不到就返回 `None`。
+/// 已知文件夹的原始路径（不规范化、不跟随重解析点）；拿不到就返回 `None`。
 #[cfg(windows)]
-fn known_folder(id: &windows::core::GUID) -> Option<PathBuf> {
+fn known_folder_raw(id: &windows::core::GUID) -> Option<PathBuf> {
     use core::ffi::c_void;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::Com::CoTaskMemFree;
@@ -41,22 +44,51 @@ fn known_folder(id: &windows::core::GUID) -> Option<PathBuf> {
         if text.is_empty() {
             return None;
         }
-        let dir = std::fs::canonicalize(PathBuf::from(text)).ok()?;
-        dir.is_dir().then_some(dir)
+        Some(PathBuf::from(text))
     }
 }
 
-/// 系统 `Program Files` 与 `Program Files (x86)`（规范化、去重、顺序固定）。
+/// 把已知文件夹解析成规范化目录；目录不存在或拿不到就返回 `None`。
+#[cfg(windows)]
+fn known_folder(id: &windows::core::GUID) -> Option<PathBuf> {
+    let raw = known_folder_raw(id)?;
+    let dir = std::fs::canonicalize(raw).ok()?;
+    dir.is_dir().then_some(dir)
+}
+
+/// 系统 `Program Files` 与 `Program Files (x86)`（先验根、再规范化、去重、顺序固定）。
+///
+/// 每个候选都按顺序过四关：根自身不是重解析点 → 规范化 → 等于
+/// `<系统卷根>\Program Files[(x86)]` → 卷根与系统卷一致。任何一关不过就跳过，
+/// 不做「canonicalize 过就信任」。
 #[cfg(windows)]
 pub(crate) fn program_files_dirs() -> Vec<PathBuf> {
     use windows::Win32::UI::Shell::{FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86};
 
+    // 系统盘根取自 GetSystemDirectoryW 所在卷；拿不到就没有可信任的根。
+    let Some(system_volume) = system_volume_root() else {
+        return Vec::new();
+    };
     let mut roots: Vec<PathBuf> = Vec::new();
     for id in [&FOLDERID_ProgramFiles, &FOLDERID_ProgramFilesX86] {
-        if let Some(dir) = known_folder(id) {
-            if !roots.contains(&dir) {
-                roots.push(dir);
-            }
+        let Some(raw) = known_folder_raw(id) else {
+            continue;
+        };
+        // 先验根自身：junction / 挂载点会把后续 canonicalize 引到别处。
+        if is_reparse_point(&raw) {
+            continue;
+        }
+        let Ok(dir) = std::fs::canonicalize(&raw) else {
+            continue;
+        };
+        if !dir.is_dir() || !is_system_program_files_root(&dir, &system_volume) {
+            continue;
+        }
+        if !same_volume_root(volume_root(&dir), Some(system_volume.clone())) {
+            continue;
+        }
+        if !roots.contains(&dir) {
+            roots.push(dir);
         }
     }
     roots
@@ -96,6 +128,29 @@ pub(crate) fn windows_dir() -> Option<PathBuf> {
 #[cfg(not(windows))]
 pub(crate) fn windows_dir() -> Option<PathBuf> {
     None
+}
+
+/// 去掉末尾的路径分隔符（卷根 `C:\` 归一成 `C:` 便于拼接比较）。
+fn trim_separators(path: &str) -> &str {
+    path.trim_end_matches(['\\', '/'])
+}
+
+/// `Program Files` 根是否正好是 `<系统卷根>\Program Files` 或 `(x86)`。
+///
+/// 纯字符串比较：Windows 路径大小写不敏感；不做前缀匹配，`Program Files Evil`
+/// 或更深一层的目录都不算根。
+fn is_system_program_files_root(root: &Path, system_volume: &Path) -> bool {
+    let (Some(root), Some(volume)) = (root.to_str(), system_volume.to_str()) else {
+        return false;
+    };
+    let volume = trim_separators(volume);
+    if volume.is_empty() {
+        return false;
+    }
+    let root = trim_separators(root);
+    ["Program Files", "Program Files (x86)"]
+        .iter()
+        .any(|name| root.eq_ignore_ascii_case(&format!("{volume}\\{name}")))
 }
 
 /// 两个卷根是否一致。Windows 路径不区分大小写；任一侧拿不到都算不一致。
@@ -142,26 +197,68 @@ fn volume_root(_path: &Path) -> Option<PathBuf> {
     None
 }
 
-/// `Program Files` 根是否和系统目录在同一个卷（比较卷根，不比较整条路径）。
+/// 系统盘根：`GetSystemDirectoryW`（`C:\Windows\System32`）所在卷的根（`C:\`）。
 ///
-/// 只靠 `starts_with` 不够：Program Files 可以被重定向到别的卷/挂载点，
-/// 那时「在 Program Files 下」就不再等于「系统自己装的程序」。
-fn program_files_on_system_volume(root: &Path) -> bool {
-    same_volume_root(volume_root(root), system32_dir().as_deref().and_then(volume_root))
+/// 拿不到就返回 `None`：调用方把「拿不到」当成「没有可信任的 Program Files」。
+#[cfg(windows)]
+fn system_volume_root() -> Option<PathBuf> {
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    let mut buffer = [0u16; 260];
+    // SAFETY: 缓冲区长度按元素个数传入；返回实际长度（不含结尾 NUL），
+    // 只有落在这个范围内才读缓冲。
+    let len = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+    if len == 0 || len as usize >= buffer.len() {
+        return None;
+    }
+    let dir = PathBuf::from(String::from_utf16_lossy(&buffer[..len as usize]));
+    volume_root(&dir)
 }
 
-/// 在受信任的 `Program Files` 根下找可执行文件：逐个根独立校验
-/// （根与系统目录同卷）、逐段拼接、规范化，最后确认规范化后的路径仍在
-/// 根目录内，返回的就是可以直接启动的路径。
+#[cfg(not(windows))]
+fn system_volume_root() -> Option<PathBuf> {
+    None
+}
+
+/// 路径自身是否带重解析点属性（junction / 符号链接 / 挂载点）。
+///
+/// 先验根再 canonicalize：否则 junction 在规范化后已经「看起来正常」。
+/// 拿不到属性一律当重解析点，宁可不信任。
+#[cfg(windows)]
+fn is_reparse_point(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileAttributesW, FILE_ATTRIBUTE_REPARSE_POINT, INVALID_FILE_ATTRIBUTES,
+    };
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `wide` 以 NUL 结尾，API 只读该字符串。
+    let attributes = unsafe { GetFileAttributesW(wide.as_ptr()) };
+    if attributes == INVALID_FILE_ATTRIBUTES {
+        return true;
+    }
+    attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_path: &Path) -> bool {
+    // 非 Windows 上不做任何信任判断。
+    true
+}
+
+/// 在受信任的 `Program Files` 根下找可执行文件：根由 `program_files_dirs`
+/// 逐条验过（非重解析点、等于系统盘下的标准目录、同卷），这里再逐段拼接、
+/// 规范化，确认最终文件仍在根内且仍在系统卷上，返回可直接启动的路径。
 pub(crate) fn trusted_install_exe(parts: &[&str]) -> Option<PathBuf> {
     if parts.is_empty() {
         return None;
     }
+    let system_volume = system_volume_root()?;
     for root in program_files_dirs() {
-        // 不同卷的「Program Files」不是受信任根：直接跳过这个根。
-        if !program_files_on_system_volume(&root) {
-            continue;
-        }
         let mut candidate = root.clone();
         for part in parts {
             candidate.push(part);
@@ -169,7 +266,10 @@ pub(crate) fn trusted_install_exe(parts: &[&str]) -> Option<PathBuf> {
         let Ok(full) = std::fs::canonicalize(&candidate) else {
             continue;
         };
-        if is_inside(&root, &full) && full.is_file() {
+        if is_inside(&root, &full)
+            && full.is_file()
+            && same_volume_root(volume_root(&full), Some(system_volume.clone()))
+        {
             return Some(full);
         }
     }
@@ -235,12 +335,57 @@ mod tests {
         assert!(!same_volume_root(None, None));
     }
 
+    #[test]
+    fn program_files_root_must_equal_system_drive_standard_dirs() {
+        let system = Path::new("C:\\");
+        assert!(is_system_program_files_root(
+            Path::new("C:\\Program Files"),
+            system
+        ));
+        // 大小写不敏感，末尾分隔符不影响。
+        assert!(is_system_program_files_root(
+            Path::new("c:\\program files (x86)\\"),
+            system
+        ));
+        // 系统卷根写成不带反斜杠也要能拼出同样的根。
+        assert!(is_system_program_files_root(
+            Path::new("C:\\Program Files"),
+            Path::new("C:")
+        ));
+        // 别的卷、前缀相近、更深一层、伪造的 (x64) 都不算根。
+        assert!(!is_system_program_files_root(
+            Path::new("D:\\Program Files"),
+            system
+        ));
+        assert!(!is_system_program_files_root(
+            Path::new("C:\\Program Files Evil"),
+            system
+        ));
+        assert!(!is_system_program_files_root(
+            Path::new("C:\\Program Files\\RustDesk"),
+            system
+        ));
+        assert!(!is_system_program_files_root(
+            Path::new("C:\\Program Files (x86) (x64)"),
+            system
+        ));
+        // 卷根为空 / 非 UTF-8 可用路径：一律不信任。
+        assert!(!is_system_program_files_root(
+            Path::new("C:\\Program Files"),
+            Path::new("")
+        ));
+        assert!(!is_system_program_files_root(
+            Path::new("Program Files"),
+            system
+        ));
+    }
+
     #[cfg(not(windows))]
     #[test]
-    fn program_files_volume_check_rejects_everything_off_windows() {
-        assert!(!program_files_on_system_volume(Path::new(
-            "C:\\Program Files"
-        )));
+    fn reparse_points_are_untrusted_off_windows() {
+        // 非 Windows 没有卷/属性 API：一律不认为根可信。
+        assert!(is_reparse_point(Path::new("C:\\Program Files")));
+        assert!(system_volume_root().is_none());
     }
 
     #[cfg(not(windows))]
