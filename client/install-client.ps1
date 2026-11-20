@@ -4,7 +4,7 @@
   Vega Remote - 主控端安装 / 卸载脚本。
 
 .DESCRIPTION
-  安装：Moonlight + Tailscale（可选 RustDesk）。
+  安装：Moonlight + Tailscale（RustDesk 需从官方发行页手动安装，脚本只应用中继配置）。
   卸载：按 %LOCALAPPDATA%\Vega\client-state.json 清单，用 -RemoveApps 卸载 Vega 装过的组件。
   已安装的组件自动跳过，可重复执行。
   兼容 Windows PowerShell 5.1 与 PowerShell 7。
@@ -13,13 +13,13 @@
   不安装 / 不卸载 Tailscale。
 
 .PARAMETER WithRustDesk
-  额外安装（卸载模式下额外卸载）RustDesk。
+  应用 RustDesk 中继配置（不再通过 winget 安装 RustDesk；请先从官方发行页手动安装）。
 
 .PARAMETER Uninstall
   卸载模式：配合 -RemoveApps 按清单卸载组件。
 
 .PARAMETER RemoveApps
-  用 winget 卸载清单里由 Vega 安装的 Moonlight / Tailscale / RustDesk。
+  用 winget 卸载清单里由 Vega 安装的 Moonlight / Tailscale。
 
 .PARAMETER Force
   已安装时仍重新执行 winget install。

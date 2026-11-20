@@ -52,7 +52,7 @@
   透传给安装脚本：不安装 Tailscale。
 
 .PARAMETER WithRustDesk
-  透传给安装脚本：额外安装 RustDesk。
+  透传给安装脚本：应用 RustDesk 中继配置（RustDesk 本体请从官方发行页手动安装）。
 
 .PARAMETER Force
   透传给安装脚本：强制重装组件。
