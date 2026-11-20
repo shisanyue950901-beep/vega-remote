@@ -7,8 +7,7 @@
 use std::io::Write;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::RecvTimeoutError;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -284,70 +283,126 @@ impl DiagnoseOutcome {
     }
 }
 
-/// 唯一的诊断路径：并发闸门 + 8 秒总预算。`run_doctor` 与导出都走这里，
-/// 导出不再自己重跑一套探测。
-fn diagnose_blocking() -> DiagnoseOutcome {
+/// worker 内部结局：闸门在闭包里取，只有 worker 真正退出才释放。
+enum WorkerOutcome {
+    Done(Vec<DoctorItem>),
+    Busy,
+    Panicked,
+}
+
+/// 一次完整诊断，在阻塞线程里跑。
+///
+/// 并发闸门放在闭包内部：IPC 层 `timeout` 提前返回时 worker 可能还在跑，
+/// 这时继续拒绝第二次诊断，直到它真正退出（guard 随闭包一起 drop）。
+fn diagnose_worker(deadline: Instant) -> WorkerOutcome {
     // 第二个并发调用直接返回，不再排队等一次完整诊断。
     if DOCTOR_RUNNING
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        return DiagnoseOutcome::Busy;
+        return WorkerOutcome::Busy;
     }
-    // 唯一的总 deadline 在投递 worker 之前就确定：排队时间也算进 8 秒。
-    let deadline = Instant::now() + DOCTOR_BUDGET;
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let spawned = std::thread::Builder::new()
-        .name("vega-doctor".to_string())
-        .spawn(move || {
-            // 闸门由 worker 自己释放：IPC 层超时返回时 worker 可能还在跑，
-            // 这时继续拒绝第二次诊断，直到它真正退出。
-            let _guard = DoctorGuard;
-            let items = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                doctor_items(deadline)
-            }));
-            if let Ok(items) = items {
-                // 发送失败说明调用方已经超时走了，直接丢弃这次结果。
-                let _ = sender.send(items);
-            }
-        });
-    if spawned.is_err() {
-        DOCTOR_RUNNING.store(false, Ordering::Release);
-        return DiagnoseOutcome::WorkerFailed;
-    }
-    // 等待也用同一个 deadline 算剩余预算：spawn 与调度耗时同样吃掉这 8 秒，
-    // 不能再开一个满额的 8 秒等待。
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    match receiver.recv_timeout(remaining) {
-        Ok(items) => DiagnoseOutcome::Done(items),
-        // worker panic 后 channel 断开：报告线程失败而不是超时。
-        Err(RecvTimeoutError::Disconnected) => DiagnoseOutcome::WorkerFailed,
-        Err(RecvTimeoutError::Timeout) => DiagnoseOutcome::Timeout,
+    let _guard = DoctorGuard;
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| doctor_items(deadline))) {
+        Ok(items) => WorkerOutcome::Done(items),
+        Err(_) => WorkerOutcome::Panicked,
     }
 }
 
-/// 最近一次「完成」的诊断快照。导出复用它，避免再跑一遍探测。
-static LAST_SNAPSHOT: Mutex<Option<Vec<DoctorItem>>> = Mutex::new(None);
+/// deadline 的剩余预算；调用方在命令入口就建好 deadline，不再各算一份。
+fn doctor_remaining(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
 
-fn store_snapshot(items: &[DoctorItem]) {
+/// 唯一的诊断路径：`run_doctor` 与导出的兜底都走这里。
+///
+/// deadline 由 IPC 命令入口传入（`Instant::now() + DOCTOR_BUDGET`），
+/// `tokio::time::timeout` 只用它的剩余预算等待阻塞线程，超时不杀 worker。
+async fn await_diagnosis(deadline: Instant) -> DiagnoseOutcome {
+    let budget = doctor_remaining(deadline);
+    if budget.is_zero() {
+        return DiagnoseOutcome::Timeout;
+    }
+    let join = tauri::async_runtime::spawn_blocking(move || diagnose_worker(deadline));
+    match tokio::time::timeout(budget, join).await {
+        Ok(Ok(WorkerOutcome::Done(items))) => DiagnoseOutcome::Done(items),
+        Ok(Ok(WorkerOutcome::Busy)) => DiagnoseOutcome::Busy,
+        Ok(Ok(WorkerOutcome::Panicked)) | Ok(Err(_)) => DiagnoseOutcome::WorkerFailed,
+        Err(_) => DiagnoseOutcome::Timeout,
+    }
+}
+
+/// 一次诊断的快照：`id` 每次诊断递增，前端据此确认导出的是屏幕上那次结果。
+struct Snapshot {
+    id: u64,
+    items: Vec<DoctorItem>,
+}
+
+static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(0);
+
+/// 最近一次「完成」的诊断快照；`None` 表示「本次无快照」（超时/忙/线程失败）。
+static LAST_SNAPSHOT: Mutex<Option<Snapshot>> = Mutex::new(None);
+
+fn next_snapshot_id() -> u64 {
+    NEXT_SNAPSHOT_ID.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+fn store_snapshot(snapshot_id: u64, items: &[DoctorItem]) {
     if let Ok(mut guard) = LAST_SNAPSHOT.lock() {
-        *guard = Some(items.to_vec());
+        *guard = Some(Snapshot {
+            id: snapshot_id,
+            items: items.to_vec(),
+        });
     }
 }
 
-fn cached_snapshot() -> Option<Vec<DoctorItem>> {
-    LAST_SNAPSHOT.lock().ok().and_then(|guard| guard.clone())
+/// 本次没拿到结果：旧快照一并作废，前端不能拿上一次的结果去导出。
+fn clear_snapshot() {
+    if let Ok(mut guard) = LAST_SNAPSHOT.lock() {
+        *guard = None;
+    }
+}
+
+fn matching_snapshot(snapshot_id: u64) -> Option<Vec<DoctorItem>> {
+    LAST_SNAPSHOT.lock().ok().and_then(|guard| {
+        guard
+            .as_ref()
+            .filter(|snapshot| snapshot.id == snapshot_id)
+            .map(|snapshot| snapshot.items.clone())
+    })
+}
+
+/// `run_doctor` 的返回值：结果 + 本次快照编号 + 本次是否真的产出了快照。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DoctorReport {
+    pub snapshot_id: u64,
+    pub snapshot_available: bool,
+    pub items: Vec<DoctorItem>,
 }
 
 #[tauri::command]
-pub async fn run_doctor() -> Vec<DoctorItem> {
-    let outcome = tauri::async_runtime::spawn_blocking(diagnose_blocking)
-        .await
-        .unwrap_or(DiagnoseOutcome::WorkerFailed);
-    if let DiagnoseOutcome::Done(items) = &outcome {
-        store_snapshot(items);
+pub async fn run_doctor() -> DoctorReport {
+    // 8 秒总预算从命令入口开始算：排队、spawn、调度都吃掉同一份预算。
+    let deadline = Instant::now() + DOCTOR_BUDGET;
+    let snapshot_id = next_snapshot_id();
+    let outcome = await_diagnosis(deadline).await;
+    let snapshot_available = match &outcome {
+        DiagnoseOutcome::Done(items) => {
+            store_snapshot(snapshot_id, items);
+            true
+        }
+        // 超时也占一个递增 id，但登记「本次无快照」。
+        _ => {
+            clear_snapshot();
+            false
+        }
+    };
+    DoctorReport {
+        snapshot_id,
+        snapshot_available,
+        items: outcome.into_items(),
     }
-    outcome.into_items()
 }
 
 /* ------------------------------------------------------------------ */
@@ -610,21 +665,31 @@ fn log_directory() -> PathBuf {
     root.join("Vega").join("logs")
 }
 
-/// 导出用的诊断结果：优先用最近一次完成的快照；没有快照时走与
-/// `run_doctor` 相同的并发闸门 + 8 秒预算路径。
-fn export_items() -> Vec<DoctorItem> {
-    if let Some(items) = cached_snapshot() {
-        return items;
+/// 导出没有匹配快照时的通用错误：不区分「id 不匹配」和「本次无快照」。
+const SNAPSHOT_MISMATCH: &str = "没有与当前诊断结果匹配的快照，请重新诊断后再导出";
+
+/// 只取与前端当前显示一致的快照。
+///
+/// - id 匹配：直接返回（导出不再重跑任何探测）。
+/// - 诊断还在跑（前端按钮此时是禁用的）：最多等到命令入口那个 deadline。
+/// - 不匹配 / 本次无快照：立刻返回 `None`，由调用方转成通用错误。
+fn snapshot_for(snapshot_id: u64, deadline: Instant) -> Option<Vec<DoctorItem>> {
+    loop {
+        if let Some(items) = matching_snapshot(snapshot_id) {
+            return Some(items);
+        }
+        let budget = doctor_remaining(deadline);
+        if !DOCTOR_RUNNING.load(Ordering::Acquire) || budget.is_zero() {
+            return None;
+        }
+        std::thread::sleep(budget.min(Duration::from_millis(25)));
     }
-    let outcome = diagnose_blocking();
-    if let DiagnoseOutcome::Done(items) = &outcome {
-        store_snapshot(items);
-    }
-    outcome.into_items()
 }
 
-fn export_blocking() -> Result<(), String> {
-    let items = export_items();
+fn export_blocking(deadline: Instant, snapshot_id: u64) -> Result<(), String> {
+    let Some(items) = snapshot_for(snapshot_id, deadline) else {
+        return Err(SNAPSHOT_MISMATCH.to_string());
+    };
     let redacted: Vec<DoctorItem> = items
         .into_iter()
         .map(|entry| DoctorItem {
@@ -669,21 +734,28 @@ fn export_blocking() -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn export_doctor_log() -> crate::rustdesk::OpResult {
-    let result = tauri::async_runtime::spawn_blocking(export_blocking).await;
+pub async fn export_doctor_log(snapshot_id: u64) -> crate::rustdesk::OpResult {
+    // 与 `run_doctor` 一样，8 秒预算从命令入口开始算；导出本身最多等到同一
+    // 个 deadline，不会因为等快照而挂住前端。
+    let deadline = Instant::now() + DOCTOR_BUDGET;
+    let budget = doctor_remaining(deadline);
+    if budget.is_zero() {
+        return crate::rustdesk::OpResult {
+            ok: false,
+            message: SNAPSHOT_MISMATCH.to_string(),
+        };
+    }
+    let join = tauri::async_runtime::spawn_blocking(move || export_blocking(deadline, snapshot_id));
+    let result = match tokio::time::timeout(budget, join).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) | Err(_) => Err("导出脱敏日志失败".to_string()),
+    };
     match result {
-        Ok(Ok(())) => crate::rustdesk::OpResult {
+        Ok(()) => crate::rustdesk::OpResult {
             ok: true,
             message: "脱敏日志已导出并打开所在目录".to_string(),
         },
-        Ok(Err(message)) => crate::rustdesk::OpResult {
-            ok: false,
-            message,
-        },
-        Err(_) => crate::rustdesk::OpResult {
-            ok: false,
-            message: "导出脱敏日志失败".to_string(),
-        },
+        Err(message) => crate::rustdesk::OpResult { ok: false, message },
     }
 }
 

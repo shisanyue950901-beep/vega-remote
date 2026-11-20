@@ -81,6 +81,13 @@ interface DoctorItem {
   advice: string;
 }
 
+/** `run_doctor` 的返回值：本次结果 + 快照编号 + 本次是否产出快照。 */
+interface DoctorReport {
+  snapshotId: number;
+  snapshotAvailable: boolean;
+  items: DoctorItem[];
+}
+
 let currentDeviceCode = "";
 
 /** 串流页与 doctor 的跨区动作；由各自 setup 设置。 */
@@ -643,27 +650,65 @@ function setupSettingsPage(): void {
     }
   };
 
+  // 导出只认「当前屏幕上那次诊断」的快照编号；一开始没有结果，先禁用。
+  let currentSnapshotId: number | null = null;
+  let doctorGeneration = 0;
+  exportButton.disabled = true;
+
   const runDoctor = (): void => {
     runDoctorButton.disabled = true;
+    // 新诊断一开始，旧快照就作废：导出等这次结果。
+    currentSnapshotId = null;
+    exportButton.disabled = true;
     setStatus(doctorStatus, "正在诊断（最多 8 秒）…");
-    void invoke<DoctorItem[]>("run_doctor").then((items) => {
-      runDoctorButton.disabled = false;
-      if (!items) {
-        setStatus(doctorStatus, "浏览器预览：命令不可用", "warn");
-        return;
-      }
-      renderDoctor(items);
-      setStatus(doctorStatus, `诊断完成：${items.length} 项`, "ok");
-    });
+    const generation = ++doctorGeneration;
+    void invoke<DoctorReport>("run_doctor")
+      .then((report) => {
+        if (generation !== doctorGeneration) {
+          return;
+        }
+        runDoctorButton.disabled = false;
+        if (!report) {
+          setStatus(doctorStatus, "浏览器预览：命令不可用", "warn");
+          return;
+        }
+        renderDoctor(report.items);
+        // 超时也算本次结果，但没有快照：导出保持禁用。
+        currentSnapshotId = report.snapshotAvailable ? report.snapshotId : null;
+        exportButton.disabled = currentSnapshotId === null;
+        setStatus(
+          doctorStatus,
+          currentSnapshotId === null
+            ? `诊断完成：${report.items.length} 项（本次无快照，导出已禁用）`
+            : `诊断完成：${report.items.length} 项`,
+          currentSnapshotId === null ? "warn" : "ok",
+        );
+      })
+      .catch(() => {
+        if (generation !== doctorGeneration) {
+          return;
+        }
+        runDoctorButton.disabled = false;
+        currentSnapshotId = null;
+        exportButton.disabled = true;
+        setStatus(doctorStatus, "诊断失败，请重试", "error");
+      });
   };
   runDoctorAction = runDoctor;
   runDoctorButton.addEventListener("click", runDoctor);
 
   exportButton.addEventListener("click", () => {
+    const snapshotId = currentSnapshotId;
+    if (snapshotId === null) {
+      exportButton.disabled = true;
+      setStatus(doctorStatus, "本次没有可导出的诊断快照，请先重新诊断", "warn");
+      return;
+    }
     exportButton.disabled = true;
     setStatus(doctorStatus, "正在导出脱敏日志…");
-    void invoke<OpResult>("export_doctor_log").then((result) => {
-      exportButton.disabled = false;
+    void invoke<OpResult>("export_doctor_log", { snapshotId }).then((result) => {
+      // 只有快照仍然对得上时才恢复按钮（诊断期间它会变成新的编号）。
+      exportButton.disabled = currentSnapshotId === null || currentSnapshotId !== snapshotId;
       if (!result) {
         setStatus(doctorStatus, "浏览器预览：命令不可用", "warn");
         return;
