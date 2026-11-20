@@ -63,6 +63,23 @@ if (-not (Test-Path -LiteralPath $modulePath)) {
 }
 Import-Module $modulePath -Force
 
+# 控制台的「安装 RustDesk」只认管理员目录里的脚本：提权前不再读取
+# %VEGA_HOST_SCRIPT% 或仓库 checkout，避免普通用户可写的路径被 UAC 提权执行。
+# 安装模式下把本脚本与共享模块固定发布到 %ProgramData%\Vega\host（该目录
+# 继承 ProgramData ACL，只有管理员可写）。
+if (-not $Uninstall) {
+    try {
+        $publishRoot = Join-Path (Join-Path $env:ProgramData 'Vega') 'host'
+        $publishLib = Join-Path $publishRoot 'lib'
+        $null = New-Item -ItemType Directory -Path $publishLib -Force
+        Copy-Item -LiteralPath $PSCommandPath -Destination (Join-Path $publishRoot 'install-host.ps1') -Force
+        Copy-Item -LiteralPath $modulePath -Destination (Join-Path $publishLib 'Vega.Common.psm1') -Force
+    }
+    catch {
+        Write-Host "警告：未能发布安装脚本到 %ProgramData%\Vega\host，控制台内的「安装 RustDesk」将不可用：$($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
 $result = $null
 try {
     if ($Uninstall) {
