@@ -69,7 +69,7 @@ fn main() {
                             let _ = window.set_focus();
                         }
                     }
-                    // 复制设备码要跑子进程（--get-id）和 PowerShell，绝不能占用
+                    // 复制设备码要跑子进程（--get-id）并写系统剪贴板，绝不能占用
                     // 托盘事件线程：丢到独立 worker 里，失败只影响这一次复制。
                     "copy-code" => {
                         std::thread::spawn(|| {
