@@ -61,12 +61,12 @@ TODO 见工作流注释，联网生成后改为 `npm ci` + `--locked`。
 
 | 命令 | 作用 |
 |---|---|
-| `get_device_id` | 定位 `Program Files\RustDesk\rustdesk.exe`（再找 PATH），`--get-id` 超时 5 秒、`CREATE_NO_WINDOW`，返回 9/10 位设备码 |
+| `get_device_id` | 定位 `Program Files\RustDesk\rustdesk.exe`（再找 PATH），`--get-id` 超时 5 秒、`CREATE_NO_WINDOW`；stdout/stderr 各由读线程排空，超时直接 kill，失败只回固定文本（不回传 stderr），返回 9/10 位设备码 |
 | `get_server_config` | 读 `%APPDATA%\RustDesk\config\RustDesk2.toml` 的 `[options]`，公钥只回前 8 位指纹 |
-| `set_server_config` | 校验 `host[:port]` 与 44 位 base64 公钥；跨实例锁 + `create_new` 临时文件 + rename 原子写，保留其他键；只有 `NotFound` 才当空文件，读失败中止；留空公钥表示沿用 |
-| `connect_peer` / `get_recent_peers` | 只接受 9-10 位 ASCII 数字与 `control`/`file` 模式；`--connect` / `--file-transfer`，最近 10 条存 app config 目录 JSON，无密钥 |
+| `set_server_config` | 校验 `host[:port]` 与 44 位 base64 公钥；OS 文件锁（Windows `LockFileEx` / Unix `flock`，经 fs2，超时 3 秒）跨读-合并-rename 全程持有，锁文件常驻、不删陈旧锁；`create_new` 临时文件 + rename 原子写，保留其他键；只有 `NotFound` 才当空文件，读失败中止；留空公钥表示沿用，留空中继就写空串（不抄 ID 服务器） |
+| `connect_peer` / `get_recent_peers` | 设备码只接受 9-10 位数字或 3-3-3 / 3-3-4 分组（`123456789`、`123 456 789`、`123-456-789`），整串匹配、分隔符一致，IPC 只发数字；模式限 `control`/`file`；`--connect` / `--file-transfer`，最近 10 条存 app config 目录 JSON，无密钥 |
 | `open_rustdesk_window` | 不带参数启动 RustDesk，用户自己看临时密码 |
-| `get_rustdesk_status` / `install_rustdesk` | 进程与服务状态；只从安装包资源目录（`bundle.resources` → Program Files）或 `%ProgramData%\Vega\host`（管理员可写）取 `install-host.ps1`，经 `ShellExecuteExW` + `runas` 调系统 PowerShell 的 `-File "绝对路径" -WithRustDesk`，参数里无密钥；UAC 取消会回显 |
+| `get_rustdesk_status` | 进程与服务状态。控制台<b>不再在应用内提权安装</b>：没有 `ShellExecuteExW`/`runas`，安装包不携带 host 脚本，也不发布到 `%ProgramData%`。界面只在未安装时提供「复制安装命令」，把 README 的一行命令写进剪贴板并提示到管理员 PowerShell 里运行 |
 | `test_server_connection` | Rust 侧 TCP connect `server:21116`；解析与所有连接尝试共用 3 秒 deadline，`spawn_blocking` 离开 UI 线程 |
 
 非 Windows 平台全部返回「未安装 RustDesk」，不 spawn 进程。纯函数（设备码、
@@ -76,7 +76,8 @@ TODO 见工作流注释，联网生成后改为 `npm ci` + `--locked`。
 
 - 临时密码、固定密码不进命令行、日志、state.json；「显示临时密码」只开 RustDesk 主窗口。
 - 服务器公钥不写日志，界面只显示前 8 位指纹。
-- 控制台不需要管理员常驻；装组件走现有 PowerShell 脚本单独 UAC 调起。
+- 控制台不需要管理员常驻，也不提权：装组件一律由用户在管理员 PowerShell 里运行
+  README 的一行安装命令；应用只负责复制命令文本。
 - Rust 侧不启用 shell / fs / http 插件；新增命令必须同时改 `build.rs` 的 `AppManifest::commands`
   与 `capabilities/default.json`。
 
