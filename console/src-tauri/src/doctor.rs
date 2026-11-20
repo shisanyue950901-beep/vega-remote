@@ -827,10 +827,14 @@ struct DoctorLog {
     items: Vec<DoctorItem>,
 }
 
-fn log_directory() -> PathBuf {
+/// 日志目录定位失败时的通用错误：不回显任何候选路径。
+const LOG_DIRECTORY_ERROR: &str = "无法定位日志目录";
+
+fn log_directory() -> Result<PathBuf, String> {
     // 由 `SHGetKnownFolderPath(FOLDERID_LocalAppData)` 解析，不读环境变量。
-    let root = local_app_data_dir().unwrap_or_else(std::env::temp_dir);
-    root.join("Vega").join("logs")
+    // 解析失败就返回通用错误，绝不回退到临时目录等其他位置。
+    let root = local_app_data_dir().ok_or_else(|| LOG_DIRECTORY_ERROR.to_string())?;
+    Ok(root.join("Vega").join("logs"))
 }
 
 /// 导出没有匹配快照时的通用错误：不区分「id 不匹配」和「本次无快照」。
@@ -948,7 +952,7 @@ fn export_blocking(
     if expired(deadline, &cancel) {
         return Err(EXPORT_TIMEOUT.to_string());
     }
-    let directory = log_directory();
+    let directory = log_directory()?;
     std::fs::create_dir_all(&directory)
         .map_err(|_| "创建日志目录失败".to_string())?;
     let (_path, mut file) = create_export_file(&directory, now_secs, now_millis)
@@ -1175,6 +1179,16 @@ mod tests {
             ..RedactionIdentity::default()
         };
         assert!(redact_with("user alice", &other).contains("alice"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn log_directory_has_no_temp_fallback_off_windows() {
+        // 非 Windows 拿不到 FOLDERID_LocalAppData：返回通用错误，不落到 temp。
+        let error = log_directory().unwrap_err();
+        assert_eq!(error, LOG_DIRECTORY_ERROR);
+        let temp = std::env::temp_dir();
+        assert!(!error.contains(&temp.to_string_lossy().to_string()));
     }
 
     #[test]
