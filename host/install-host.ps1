@@ -5,7 +5,9 @@
   Vega Remote - 被控端安装 / 卸载脚本。
 
 .DESCRIPTION
-  安装：Sunshine + Tailscale（可选 RustDesk），写入自适应配置，只放行串流端口，关闭插电睡眠。
+  安装：Sunshine + Tailscale，写入自适应配置，只放行串流端口，关闭插电睡眠。
+  RustDesk 不再由脚本安装（WinGet 源已下架）：用 -WithRustDesk 时脚本只打印官方下载页，
+  已安装的 RustDesk 仍会应用 -RustDeskServer / -RustDeskKey 的中继配置。
   管理密码不在脚本里设置：装完后在本机浏览器打开 https://localhost:47990，由 Sunshine
   页面引导首次设密。脚本会把管理页限制为本机访问（origin_web_ui_allowed = pc），
   不放行 47990，并禁用 Sunshine 安装器自带的对 47990 的放行规则。
@@ -17,7 +19,8 @@
   不安装（卸载模式下不卸载）Tailscale。
 
 .PARAMETER WithRustDesk
-  额外安装（卸载模式下额外卸载）RustDesk。
+  应用 RustDesk 中继配置（不再通过 winget 安装 RustDesk；请先从官方发行页手动安装）。
+  卸载模式下不再额外卸载 RustDesk。
 
 .PARAMETER Uninstall
   卸载模式：按状态清单回滚防火墙、配置和服务状态。
