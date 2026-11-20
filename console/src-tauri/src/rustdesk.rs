@@ -1120,10 +1120,14 @@ const CLIPBOARD_ERROR: &str = "写剪贴板失败，请重试";
 
 /// Win32 剪贴板写入（`CF_UNICODETEXT`），必须传主窗口 HWND。
 ///
+/// HWND 用 `isize` 传：Tauri 的 `window.hwnd()` 返回的 `HWND` 字段类型随
+/// `windows` crate 版本变（`*mut c_void` / `isize` 都出现过），转成整数再传
+/// 可以避免跟着上游版本改签名。
+///
 /// 不经过 PowerShell：那会走 PATH 解析、需要拼接命令行，还会把设备码放进
 /// 子进程参数（审计 P2）。这里直接调用 user32/kernel32。
 #[cfg(windows)]
-fn set_clipboard_text(hwnd: *mut std::ffi::c_void, text: &str) -> Result<(), String> {
+fn set_clipboard_text(hwnd: isize, text: &str) -> Result<(), String> {
     use std::ffi::c_void;
 
     const CF_UNICODETEXT: u32 = 13;
@@ -1155,7 +1159,7 @@ fn set_clipboard_text(hwnd: *mut std::ffi::c_void, text: &str) -> Result<(), Str
         // 不能用 OpenClipboard(NULL)：NULL 关联的是调用线程的隐藏窗口，
         // 而剪贴板归主线程（Tauri 事件循环）上的主窗口所有。这里显式传
         // 主窗口 HWND，并保证调用发生在主线程。
-        if OpenClipboard(hwnd) == 0 {
+        if OpenClipboard(hwnd as Handle) == 0 {
             return Err(CLIPBOARD_ERROR.to_string());
         }
         let result: Result<(), String> = (|| {
@@ -1209,7 +1213,7 @@ pub fn copy_device_id_to_clipboard(app: &tauri::AppHandle) -> Result<String, Str
                 Some(window) => window
                     .hwnd()
                     .map_err(|_| CLIPBOARD_ERROR.to_string())
-                    .and_then(|hwnd| set_clipboard_text(hwnd.0, &text)),
+                    .and_then(|hwnd| set_clipboard_text(hwnd.0 as isize, &text)),
                 None => Err(CLIPBOARD_ERROR.to_string()),
             };
             // 主线程只回传结果，不阻塞在 worker 的等待上。
