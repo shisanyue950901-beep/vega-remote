@@ -209,22 +209,26 @@ where
                 return Err(());
             }
             // SAFETY: 新建线程尚未初始化 COM；保留参数必须为空。
-            let initialized = unsafe {
+            let hr = unsafe {
                 CoInitializeEx(
                     std::ptr::null_mut(),
                     COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
                 )
-            } >= 0;
+            };
+            // S_OK(0) 与 S_FALSE(1，已按相同模式初始化，仍需配对反初始化) 都算成功；
+            // 其余（含 RPC_E_CHANGED_MODE / E_OUTOFMEMORY）直接返回通用错误，
+            // 不在未初始化的 COM 状态下调用 ShellExecuteW。
+            if hr < 0 {
+                return Err(());
+            }
             // ShellExecuteW 之前的最后一次检查：过期就不打开目录。
             let result = if should_abort() {
                 Err(())
             } else {
                 shell_execute_open(&path)
             };
-            if initialized {
-                // SAFETY: 只与上面成功的 CoInitializeEx 配对调用一次。
-                unsafe { CoUninitialize() };
-            }
+            // SAFETY: 与上面成功的 CoInitializeEx 严格配对调用一次。
+            unsafe { CoUninitialize() };
             result
         })
         .map_err(|_| ())?;
