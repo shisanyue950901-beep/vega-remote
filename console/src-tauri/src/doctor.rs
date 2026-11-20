@@ -1040,18 +1040,20 @@ mod tests {
     }
 
     #[test]
-    fn redaction_uses_explicit_identity_not_environment() {
-        // 夹具固定：结果与运行者的 USERNAME / COMPUTERNAME 无关。
+    fn redaction_masks_bare_profile_path_as_profile() {
+        // 裸 profile 路径（没有后续分隔符）替换成 `<profile>`。
         let identity = RedactionIdentity::fixture(Some("D:\\Home\\alice"));
-        let output = redact_with(
-            "user alice host DESKTOP-7Q2 domain WORKGROUP profile D:\\Home\\alice\\x.log",
-            &identity,
-        );
+        let output = redact_with("user alice host DESKTOP-7Q2 domain WORKGROUP profile D:\\Home\\alice", &identity);
         assert!(!output.contains("alice"), "{output}");
         assert!(!output.contains("DESKTOP-7Q2"), "{output}");
         assert!(!output.contains("WORKGROUP"), "{output}");
         assert!(output.contains("<已隐藏>"), "{output}");
         assert!(output.contains("<profile>"), "{output}");
+        // profile 下的文件路径整条按 path 处理，不能只留下末尾文件名。
+        let file_output = redact_with("profile D:\\Home\\alice\\x.log", &identity);
+        assert!(!file_output.contains("alice"), "{file_output}");
+        assert!(!file_output.contains("x.log"), "{file_output}");
+        assert!(file_output.contains("<path>"), "{file_output}");
 
         // 换一份夹具就换一套替换：证明没有偷偷回读环境变量。
         let other = RedactionIdentity {
