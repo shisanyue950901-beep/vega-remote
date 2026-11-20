@@ -44,7 +44,19 @@
     （修复 M2a 审计 r2 P3，含 `set_close_to_tray`）；Rust 纯函数带 `#[cfg(test)]` 单测
 - M2a 审计 r2 遗留修复：串流页配对输入框默认隐藏、打开配对后才显示且改 4 位 PIN；CI Node 24；
   `icon.ico` 离线无法重生成，保留占位并在 `icons/README.md` 记录待办
-- M2c：串流页对接 Sunshine/Moonlight，设置页 doctor 与脱敏日志
+- M2c 高性能串流页与设置页诊断（已完成）：
+  - `scm.rs`：`OpenSCManagerW`/`OpenServiceW`/`QueryServiceStatusEx` 四分类（运行中/已停止/未安装/无法查询），
+    Sunshine 与 RustDesk 服务检测共用；只有 `ERROR_SERVICE_DOES_NOT_EXIST` 算未安装（审计 r5 P3）
+  - `streaming.rs`：Sunshine 状态；DXGI `EnumAdapters1` 只读显卡列表（跳过软件适配器，按厂商/显存标核显独显与
+    NVENC/AMF/QSV）；Moonlight 安装检测（canonicalize 后必须在系统盘 Program Files 下）与无参启动；
+    「打开配对」/「打开 Sunshine 设置」用写死的 `https://localhost:47990`；安装按钮只复制 README 一行安装命令
+  - `doctor.rs`：8 秒总预算的 `run_doctor`（RustDesk、ID 服务器 TCP、Sunshine 服务、47990、公网 IPv6、
+    Tailscale、Moonlight），以及 `export_doctor_log`（app 版本 + Windows build，IPv4/IPv6/主机名/用户目录脱敏，
+    写 `%LOCALAPPDATA%\Vega\logs` 并打开目录）；状态映射与脱敏有单测
+  - 前端：串流页去掉假主机列表与内置 PIN 输入，改为真实状态/显卡/固定入口；设置页 doctor 与「诊断网络」跳转；
+    Assist/Settings 共用一份配置快照并在 focus 时重查设备码与安装状态；设置页探测复位结果并恢复按钮
+  - 旧清单 `RustDesk.RustDesk` 包按已下线处理：提示手动卸载、销账后继续回滚；host/client 各有 Pester 覆盖
+- 安装包冒烟测试仍延后：CI 继续只跑 `tauri build --no-bundle`，待总控另行安排
 
 ## M3 进阶（v1.0）
 - 虚拟显示器自动安装（无显示器被控端）
