@@ -538,7 +538,11 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
 /// 以无窗口方式启动进程（RustDesk / Moonlight 会自绘窗口，不需要控制台）。
 pub(crate) fn spawn_detached(exe: &Path, args: &[&str]) -> Result<(), String> {
     let mut command = Command::new(exe);
-    command.args(args).stdin(Stdio::null());
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
