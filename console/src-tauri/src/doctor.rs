@@ -409,18 +409,45 @@ pub async fn run_doctor() -> DoctorReport {
 /* 脱敏 + 导出                                                          */
 /* ------------------------------------------------------------------ */
 
+/// 在原始字符串上找 needle，只折叠 ASCII 大小写。
+///
+/// 命中位置一定落在 char 边界：只有单字节 ASCII 会被折叠，多字节序列必须
+/// 逐字节相同，所以不会出现「用小写副本的字节偏移去切原串、切出半个字符」。
+fn find_ascii_case_insensitive(haystack: &str, needle: &str, from: usize) -> Option<usize> {
+    if needle.is_empty() || from >= haystack.len() {
+        return None;
+    }
+    let hay = haystack.as_bytes();
+    let pattern = needle.as_bytes();
+    if pattern.len() > hay.len() {
+        return None;
+    }
+    let mut index = from;
+    while index + pattern.len() <= hay.len() {
+        if haystack.is_char_boundary(index)
+            && hay[index..index + pattern.len()]
+                .iter()
+                .zip(pattern)
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
+        {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
+}
+
 fn replace_case_insensitive(text: &str, needle: &str, replacement: &str) -> String {
     if needle.len() < 2 {
         return text.to_string();
     }
-    let lower_text = text.to_lowercase();
-    let lower_needle = needle.to_lowercase();
     let mut result = String::with_capacity(text.len());
     let mut cursor = 0usize;
-    while let Some(offset) = lower_text[cursor..].find(&lower_needle) {
-        let start = cursor + offset;
+    // 在原串上找、在原串上切：不用小写化副本的偏移，非 ASCII 行也不会切坏。
+    while let Some(start) = find_ascii_case_insensitive(text, needle, cursor) {
         result.push_str(&text[cursor..start]);
         result.push_str(replacement);
+        // 命中区间与 needle 等长（ASCII 折叠不改变字节数）。
         cursor = start + needle.len();
     }
     result.push_str(&text[cursor..]);
@@ -460,21 +487,36 @@ fn is_wrapper(c: char) -> bool {
     )
 }
 
+/// 冒号不是普通包裹标点：IPv6 的 `::`/`::1` 用冒号收尾（`(2001:db8::)`）。
+/// 先按这一组剥一层，地址才认得出来；剥不干净再退回 `is_wrapper`。
+fn is_wrapper_without_colon(c: char) -> bool {
+    is_wrapper(c) && c != ':'
+}
+
 /// 剥掉首尾包裹标点，返回 (前缀, 主体, 后缀)。主体为空表示整串都是标点。
-fn peel_wrapping(token: &str) -> (&str, &str, &str) {
+fn peel_with(token: &str, is_padding: fn(char) -> bool) -> (&str, &str, &str) {
     let leading = token
         .char_indices()
-        .find(|&(_, c)| !is_wrapper(c))
+        .find(|&(_, c)| !is_padding(c))
         .map(|(index, _)| index)
         .unwrap_or(token.len());
     let rest = &token[leading..];
     let trailing_index = rest
         .char_indices()
         .rev()
-        .find(|&(_, c)| !is_wrapper(c))
+        .find(|&(_, c)| !is_padding(c))
         .map(|(index, c)| index + c.len_utf8())
         .unwrap_or(0);
     (&token[..leading], &rest[..trailing_index], &rest[trailing_index..])
+}
+
+fn peel_wrapping(token: &str) -> (&str, &str, &str) {
+    peel_with(token, is_wrapper)
+}
+
+/// 保留尾部冒号的剥离：`(2001:db8::)` 的主体必须是 `2001:db8::`。
+fn peel_wrapping_keep_colons(token: &str) -> (&str, &str, &str) {
+    peel_with(token, is_wrapper_without_colon)
 }
 
 /// 赋值前缀：`relay=`、`key:`、`server =`（token 内无空格，所以只剩前两种）。
@@ -522,7 +564,7 @@ fn ip_from_token(token: &str) -> Option<IpAddr> {
     if host.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
-    let host = host.trim_matches(|c| c == '[' || c == ']');
+    let host = host.trim_matches(|c| matches!(c, '[' | ']' | '(' | ')'));
     host.parse::<IpAddr>().ok()
 }
 
@@ -572,6 +614,15 @@ fn redact_core(core: &str) -> String {
             }
         }
     }
+    // 先按「保留冒号」剥：`(2001:db8::)` 的 `::` 是地址本体，不是包裹标点。
+    let (leading, middle, trailing) = peel_wrapping_keep_colons(core);
+    if middle.len() != core.len() && !middle.is_empty() {
+        let inner = redact_core(middle);
+        if inner != middle {
+            return format!("{leading}{inner}{trailing}");
+        }
+    }
+    // 再按通用标点剥：`[1.2.3.4]:21116,` 这类残留冒号的情况。
     let (leading, middle, trailing) = peel_wrapping(core);
     if middle.len() != core.len() && !middle.is_empty() {
         let inner = redact_core(middle);
@@ -865,6 +916,33 @@ mod tests {
         // `key:` 是键名不是地址；冒号不能被当成 IPv6 分隔符。
         assert_eq!(redact_with("key:pc.example.com", None), "key:<host>");
         assert_eq!(redact_with("fe80::1", None), "<ip>");
+    }
+
+    #[test]
+    fn redaction_masks_ipv6_ending_with_double_colon() {
+        // `::` 是 IPv6 本体，不能当包裹标点剥掉：`(2001:db8::)` 必须认成地址。
+        assert_eq!(redact_with("(2001:db8::)", None), "(<ip>)");
+        assert_eq!(redact_with("(2001:db8::),", None), "(<ip>),");
+        assert_eq!(
+            redact_with("(2001:db8::) 🚀 192.168.1.5", None),
+            "(<ip>) 🚀 <ip>"
+        );
+    }
+
+    #[test]
+    fn non_ascii_lines_redact_without_panicking() {
+        // 中文 + emoji：大小写替换和标点剥离都不能按字节切坏原串。
+        let output = redact_with("用户目录 C:\\Users\\ALICE 🚀 192.168.1.5", Some("c:\\users\\alice"));
+        assert!(output.contains("<profile>"), "{output}");
+        assert!(!output.contains("ALICE"), "{output}");
+        assert!(output.contains("🚀"), "{output}");
+        assert!(output.contains("<ip>"), "{output}");
+
+        let mixed = redact_with("状态 🚀 (2001:db8::) 完成 ✓", None);
+        assert!(mixed.contains("🚀"), "{mixed}");
+        assert!(mixed.contains("✓"), "{mixed}");
+        assert!(!mixed.contains("2001:db8"), "{mixed}");
+        assert!(mixed.contains("<ip>"), "{mixed}");
     }
 
     #[test]
