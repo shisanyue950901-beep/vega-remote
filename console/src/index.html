@@ -205,66 +205,45 @@
               <div class="card">
                 <div class="card__head">
                   <h2 class="card__title">本机作为被控端</h2>
-                  <span class="tag tag--ok">Sunshine 运行中</span>
+                  <span id="sunshine-tag" class="tag">检测中…</span>
                 </div>
 
                 <div class="field">
                   <span class="field__label">显卡</span>
-                  <select id="stream-gpu" class="select">
-                    <option selected>自动识别：NVIDIA RTX 4060（独显）</option>
-                    <option>核显：Intel UHD Graphics 770</option>
-                    <option>手动选择…</option>
-                  </select>
+                  <ul id="gpu-list" class="gpu-list">
+                    <li class="field__hint">正在读取显卡信息…</li>
+                  </ul>
+                  <span class="field__hint">只读显示，不保存选择。编码器、分辨率和帧率请在 Sunshine 网页中设置。</span>
                 </div>
 
                 <div class="field">
-                  <span class="field__label">编码器</span>
-                  <select id="stream-encoder" class="select">
-                    <option selected>NVENC</option>
-                    <option>AMF</option>
-                    <option>QSV</option>
-                  </select>
+                  <button id="sunshine-pair" class="btn btn--primary" type="button">打开配对</button>
+                  <span class="field__hint">在 Sunshine 自己的页面输入被控端显示的 PIN；控制台不读取、不保存 PIN。</span>
                 </div>
 
                 <div class="field">
-                  <span class="field__label">分辨率与帧率</span>
-                  <select id="stream-mode" class="select">
-                    <option selected>跟随显示器</option>
-                    <option>1080p60</option>
-                    <option>1440p60</option>
-                    <option>1440p120</option>
-                  </select>
+                  <button id="sunshine-settings" class="btn btn--ghost" type="button">打开 Sunshine 设置</button>
+                  <button id="sunshine-install" class="btn btn--ghost" type="button">安装/修复 Sunshine</button>
+                  <span id="sunshine-hint" class="field__hint">请在管理员 PowerShell 中运行（会同时配置防火墙）</span>
                 </div>
-
-                <div class="field">
-                  <button id="sunshine-install" class="btn btn--primary" type="button">安装/修复 Sunshine</button>
-                  <button id="sunshine-pair" class="btn btn--ghost" type="button">打开配对</button>
-                  <input id="sunshine-pin" class="input input--pin is-hidden" type="text" inputmode="numeric" maxlength="4" placeholder="输入 4 位配对 PIN" />
-                  <button id="sunshine-pin-submit" class="btn btn--ghost is-hidden" type="button">提交 PIN</button>
-                </div>
+                <span id="sunshine-status" class="field__hint" role="status" aria-live="polite"></span>
               </div>
 
               <div class="card">
                 <div class="card__head">
                   <h2 class="card__title">本机作为控制端</h2>
+                  <span id="moonlight-tag" class="tag">检测中…</span>
                 </div>
-                <ul class="host-list">
-                  <li class="host">
-                    <span>客厅主机（Moonlight）</span>
-                    <span class="field__hint">上次串流 2024-06-08 22:15</span>
-                    <button class="btn btn--ghost" type="button">开始串流</button>
-                  </li>
-                  <li class="host">
-                    <span>工作站 4090</span>
-                    <span class="field__hint">上次串流 2024-05-30 20:02</span>
-                    <button class="btn btn--ghost" type="button">开始串流</button>
-                  </li>
-                </ul>
-                <button id="moonlight-install" class="btn btn--ghost" type="button">安装 Moonlight</button>
+                <div class="field">
+                  <button id="moonlight-start" class="btn btn--primary" type="button">开始串流</button>
+                  <button id="moonlight-install" class="btn btn--ghost" type="button">安装 Moonlight</button>
+                  <span id="moonlight-hint" class="field__hint">在 Moonlight 中选择已配对主机</span>
+                </div>
+                <span id="moonlight-status" class="field__hint" role="status" aria-live="polite"></span>
               </div>
 
               <div class="banner">
-                <span>串流需要 IPv6 直连或 Tailscale；连接不通时先跑诊断。</span>
+                <span>串流需要 IPv6 直连或 Tailscale。</span>
                 <button id="diagnose-net" class="link" type="button">诊断网络</button>
               </div>
             </div>
@@ -341,17 +320,16 @@
               <span class="field__hint">服务器地址请在 RustDesk 的 设置 → 网络 中修改。控制台只读取 <code>RustDesk2.toml</code> 显示当前值。</span>
             </div>
 
-            <div class="card">
+            <div class="card" id="doctor-card">
               <div class="card__head">
                 <h2 class="card__title">诊断</h2>
                 <button id="run-doctor" class="btn btn--ghost" type="button">运行 doctor</button>
               </div>
               <ul id="doctor-results" class="doctor">
-                <li class="doctor__item doctor__item--pass"><span class="tag tag--ok">通过</span>显卡与编码器：NVENC 可用（RTX 4060）</li>
-                <li class="doctor__item doctor__item--warn"><span class="tag tag--warn">警告</span>公网 IPv6：未检测到，建议启用 Tailscale</li>
-                <li class="doctor__item doctor__item--fail"><span class="tag tag--fail">失败</span>Sunshine 服务：未运行（建议：以管理员身份重新安装）</li>
+                <li class="doctor__item"><span class="field__hint">尚未运行。点击「运行 doctor」检查 RustDesk、Sunshine、IPv6、Tailscale 与 Moonlight。</span></li>
               </ul>
               <button id="export-log" class="btn btn--ghost" type="button">导出脱敏日志</button>
+              <span id="doctor-status" class="field__hint" role="status" aria-live="polite"></span>
             </div>
 
             <div class="card">
