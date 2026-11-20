@@ -25,7 +25,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'"
+      "csp": "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost"
     }
   },
   "bundle": {
@@ -33,6 +33,11 @@
     "targets": "all",
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.ico"],
     "shortDescription": "Vega 远程协助控制台",
-    "longDescription": "零登录、零广告的远程协助与串流控制台。"
+    "longDescription": "零登录、零广告的远程协助与串流控制台。",
+    "windows": {
+      "wix": {
+        "language": "zh-CN"
+      }
+    }
   }
 }
