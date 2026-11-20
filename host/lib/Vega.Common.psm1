@@ -301,14 +301,14 @@ function Get-VegaComponent {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('Sunshine', 'Tailscale', 'RustDesk', 'Moonlight')]
+        [ValidateSet('Sunshine', 'Tailscale', 'Moonlight')]
         [string]$Name
     )
 
+    # RustDesk 不在这里：WinGet 社区源已下架 RustDesk，只能从官方发行页手动安装。
     $components = @{
         Sunshine  = [pscustomobject]@{ Name = 'Sunshine'; PackageId = 'LizardByte.Sunshine' }
         Tailscale = [pscustomobject]@{ Name = 'Tailscale'; PackageId = 'Tailscale.Tailscale' }
-        RustDesk  = [pscustomobject]@{ Name = 'RustDesk'; PackageId = 'RustDesk.RustDesk' }
         Moonlight = [pscustomobject]@{ Name = 'Moonlight'; PackageId = 'MoonlightGameStreamingProject.Moonlight' }
     }
 
@@ -1097,7 +1097,6 @@ function Get-VegaAllowedPackageId {
     return @(
         'LizardByte.Sunshine',
         'Tailscale.Tailscale',
-        'RustDesk.RustDesk',
         'MoonlightGameStreamingProject.Moonlight'
     )
 }
@@ -1108,7 +1107,7 @@ function Test-VegaStateRecordAllowed {
         FirewallRule - 只能是 Vega 建的那几条规则名
         Service      - 只能是 SunshineService / sunshinesvc
         ConfigPath   - 只能指向 Sunshine 安装目录下的 config\sunshine.conf
-        Package      - 只能是已知 4 个包 ID
+        Package      - 只能是已知 3 个包 ID
     #>
     [CmdletBinding()]
     param(
@@ -5318,10 +5317,14 @@ function Invoke-VegaHostInstallCore {
     }
     $null = Save-VegaState -State $state -Path $StatePath
 
+    # RustDesk 不再走 winget：WinGet 社区源已下架 RustDesk，改成提示用户从官方页手动安装。
+    if ($WithRustDesk) {
+        Write-VegaStatus 'RustDesk 已从 WinGet 源下架，无法自动安装。请打开 https://github.com/rustdesk/rustdesk/releases/latest 下载并手动安装；已安装的 RustDesk 仍会应用中继配置。' -Level Warn
+    }
+
     $componentNames = New-Object System.Collections.Generic.List[string]
     $componentNames.Add('Sunshine')
     if (-not $SkipTailscale) { $componentNames.Add('Tailscale') }
-    if ($WithRustDesk) { $componentNames.Add('RustDesk') }
 
     foreach ($name in $componentNames) {
         $component = Get-VegaComponent -Name $name
@@ -5917,10 +5920,14 @@ function Invoke-VegaClientInstallCore {
 
     $state = Read-VegaState -Path $StatePath
 
+    # RustDesk 不再走 winget：WinGet 社区源已下架 RustDesk，改成提示用户从官方页手动安装。
+    if ($WithRustDesk) {
+        Write-VegaStatus 'RustDesk 已从 WinGet 源下架，无法自动安装。请打开 https://github.com/rustdesk/rustdesk/releases/latest 下载并手动安装；已安装的 RustDesk 仍会应用中继配置。' -Level Warn
+    }
+
     $componentNames = New-Object System.Collections.Generic.List[string]
     $componentNames.Add('Moonlight')
     if (-not $SkipTailscale) { $componentNames.Add('Tailscale') }
-    if ($WithRustDesk) { $componentNames.Add('RustDesk') }
 
     foreach ($name in $componentNames) {
         $component = Get-VegaComponent -Name $name
