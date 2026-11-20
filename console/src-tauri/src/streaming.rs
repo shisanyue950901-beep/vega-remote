@@ -7,10 +7,11 @@
 //! - 安装命令原样取自仓库 README 的一行安装，前端只复制、不执行。
 
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::rustdesk::{explorer_exe, spawn_detached, OpResult};
 use crate::scm::{query_service_state, ServiceState};
+use crate::winpaths::{program_files_dirs, trusted_install_exe};
 
 /// Sunshine 管理口只监听本机（安装脚本的 origin_web_ui_allowed = pc）。
 const SUNSHINE_PAIRING_URL: &str = "https://localhost:47990/pin";
@@ -31,59 +32,27 @@ fn readme_install_command() -> &'static str {
         .unwrap_or(FALLBACK_INSTALL_COMMAND)
 }
 
-/// 系统 `Program Files`：必须是系统盘上的 Program Files，避免被伪造的
-/// `ProgramFiles` 环境变量引到任意目录。
-pub(crate) fn program_files_dir() -> Option<PathBuf> {
-    let raw = std::env::var_os("ProgramFiles")?;
-    let dir = std::fs::canonicalize(PathBuf::from(raw)).ok()?;
-    let system_drive = std::env::var_os("SystemDrive").unwrap_or_else(|| "C:".into());
-    let expected_raw = PathBuf::from(system_drive).join("Program Files");
-    let expected = std::fs::canonicalize(expected_raw).ok()?;
-    if dir == expected {
-        Some(dir)
-    } else {
-        None
-    }
-}
-
-fn under_program_files(path: &Path) -> bool {
-    let Some(root) = program_files_dir() else {
-        return false;
-    };
-    let Ok(full) = std::fs::canonicalize(path) else {
-        return false;
-    };
-    full.starts_with(&root)
-}
-
 /// Moonlight 安装位置。`Err` 表示无法确认安全的 Program Files；
 /// `Ok(None)` 表示确实没装。
+///
+/// 路径来自 `winpaths`：已知文件夹 + 规范化 + 根目录包含校验，
+/// 返回的就是校验通过的 canonical 路径，调用方直接启动它。
 pub(crate) fn moonlight_exe() -> Result<Option<PathBuf>, String> {
     if !cfg!(windows) {
         return Ok(None);
     }
-    if program_files_dir().is_none() {
+    if program_files_dirs().is_empty() {
         return Err("无法确认系统 Program Files 目录".to_string());
     }
-    let candidate = program_files_dir()
-        .expect("上面已确认存在")
-        .join("Moonlight Game Streaming")
-        .join("Moonlight.exe");
-    if !candidate.is_file() {
-        return Ok(None);
+    match trusted_install_exe(&["Moonlight Game Streaming", "Moonlight.exe"]) {
+        Some(path) => Ok(Some(path)),
+        None => Ok(None),
     }
-    if !under_program_files(&candidate) {
-        return Err("Moonlight 路径不在系统 Program Files 下".to_string());
-    }
-    Ok(Some(candidate))
 }
 
 /// Tailscale 客户端是否安装在系统 Program Files 下（doctor 复用）。
 pub(crate) fn tailscale_installed() -> bool {
-    let Some(root) = program_files_dir() else {
-        return false;
-    };
-    root.join("Tailscale").join("tailscale.exe").is_file()
+    trusted_install_exe(&["Tailscale", "tailscale.exe"]).is_some()
 }
 
 #[derive(Serialize)]
@@ -224,7 +193,13 @@ pub async fn get_streaming_status() -> StreamingStatus {
 }
 
 fn open_fixed_url(url: &str, ok_message: &str) -> OpResult {
-    match spawn_detached(&explorer_exe(), &[url]) {
+    let Some(explorer) = explorer_exe() else {
+        return OpResult {
+            ok: false,
+            message: "找不到系统资源管理器，无法打开浏览器".to_string(),
+        };
+    };
+    match spawn_detached(&explorer, &[url]) {
         Ok(()) => OpResult {
             ok: true,
             message: ok_message.to_string(),
