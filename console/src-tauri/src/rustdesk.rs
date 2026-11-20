@@ -1205,11 +1205,14 @@ pub fn copy_device_id_to_clipboard(app: &tauri::AppHandle) -> Result<String, Str
         });
     }
     let text = info.formatted_id.clone();
+    // 两个克隆：`run_on_main_thread` 只需借用 `handle`，闭包 move 的是
+    // `main_handle`。同一个变量既被借用又被移进闭包会触发 E0505。
     let handle = app.clone();
+    let main_handle = handle.clone();
     let (sender, receiver) = mpsc::channel();
     handle
         .run_on_main_thread(move || {
-            let result = match handle.get_webview_window("main") {
+            let result = match main_handle.get_webview_window("main") {
                 Some(window) => window
                     .hwnd()
                     .map_err(|_| CLIPBOARD_ERROR.to_string())
