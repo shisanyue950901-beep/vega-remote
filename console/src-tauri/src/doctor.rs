@@ -1029,6 +1029,18 @@ pub async fn export_doctor_log(snapshot_id: u64) -> crate::rustdesk::OpResult {
 mod tests {
     use super::*;
 
+    /// `LAST_SNAPSHOT` 是进程级缓存，而 `cargo test` 默认多线程并行：
+    /// 一个测试的 `clear_snapshot()` 会把另一个测试刚放进去的夹具清掉。
+    /// 所有碰这个缓存的测试先取这把锁，串行执行。
+    static SNAPSHOT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn snapshot_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        // 同进程内其他测试 panic 不应该让这把锁永久失效。
+        SNAPSHOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn doctor_status_labels_are_chinese() {
         assert_eq!(DoctorStatus::Pass.label(), "通过");
@@ -1242,6 +1254,7 @@ mod tests {
 
     #[test]
     fn snapshot_for_rejects_cached_snapshot_after_deadline() {
+        let _guard = snapshot_test_lock();
         // 缓存里有匹配的快照，但导出已过期：不能把它当成合格结果。
         store_snapshot(9_999, &[item("诊断", DoctorStatus::Pass, "")]);
         let past = Instant::now() - Duration::from_secs(1);
@@ -1254,6 +1267,7 @@ mod tests {
 
     #[test]
     fn snapshot_for_rejects_cached_snapshot_after_cancel() {
+        let _guard = snapshot_test_lock();
         store_snapshot(9_998, &[item("诊断", DoctorStatus::Pass, "")]);
         let future = Instant::now() + Duration::from_secs(60);
         assert!(
