@@ -26,13 +26,31 @@ impl ServiceState {
     }
 }
 
-/// winsvc.h 里的 `SERVICE_*` 当前状态值。单测在非 Windows 上也能跑，
-/// 所以这里用字面量而不是 `windows-sys` 常量。
+/// winsvc.h 里的 `SERVICE_*` 当前状态值，与 windows crate
+/// (`windows::Win32::System::Services`) 的常量同名同值。`windows-sys` 只在
+/// Windows 目标下编译，而单测要在所有平台跑，所以这里保留具名常量。
+mod service_status {
+    pub const SERVICE_STOPPED: u32 = 0x0000_0001;
+    pub const SERVICE_START_PENDING: u32 = 0x0000_0002;
+    pub const SERVICE_STOP_PENDING: u32 = 0x0000_0003;
+    pub const SERVICE_RUNNING: u32 = 0x0000_0004;
+    pub const SERVICE_CONTINUE_PENDING: u32 = 0x0000_0005;
+    pub const SERVICE_PAUSE_PENDING: u32 = 0x0000_0006;
+    pub const SERVICE_PAUSED: u32 = 0x0000_0007;
+}
+
 fn map_current_state(current_state: u32) -> ServiceState {
+    use service_status::*;
     match current_state {
-        4 => ServiceState::Running, // SERVICE_RUNNING
-        // STOPPED / START_PENDING / STOP_PENDING / PAUSED / PAUSE_PENDING / CONTINUE_PENDING
-        1 | 2 | 3 | 6 | 7 | 8 => ServiceState::Stopped,
+        // 运行中，以及「继续挂起」：服务恢复运行前的过渡态，归入运行中/处理中。
+        SERVICE_RUNNING | SERVICE_CONTINUE_PENDING => ServiceState::Running,
+        // 已停止与其它过渡态。
+        SERVICE_STOPPED
+        | SERVICE_START_PENDING
+        | SERVICE_STOP_PENDING
+        | SERVICE_PAUSE_PENDING
+        | SERVICE_PAUSED => ServiceState::Stopped,
+        // 未定义值（例如 8）不能猜成「已停止」，只能报无法查询。
         _ => ServiceState::Unknown,
     }
 }
@@ -114,11 +132,26 @@ mod tests {
 
     #[test]
     fn service_state_mapping_covers_running_stopped_and_unknown() {
-        assert_eq!(map_current_state(4), ServiceState::Running);
-        assert_eq!(map_current_state(1), ServiceState::Stopped);
-        assert_eq!(map_current_state(2), ServiceState::Stopped);
-        assert_eq!(map_current_state(3), ServiceState::Stopped);
+        use service_status::*;
+        assert_eq!(map_current_state(SERVICE_RUNNING), ServiceState::Running);
+        assert_eq!(map_current_state(SERVICE_STOPPED), ServiceState::Stopped);
+        assert_eq!(map_current_state(SERVICE_START_PENDING), ServiceState::Stopped);
+        assert_eq!(map_current_state(SERVICE_STOP_PENDING), ServiceState::Stopped);
+        assert_eq!(map_current_state(SERVICE_PAUSE_PENDING), ServiceState::Stopped);
+        assert_eq!(map_current_state(SERVICE_PAUSED), ServiceState::Stopped);
         assert_eq!(map_current_state(99), ServiceState::Unknown);
+    }
+
+    #[test]
+    fn continue_pending_counts_as_running_and_undefined_value_is_unknown() {
+        // SERVICE_CONTINUE_PENDING(5)：服务正在恢复运行，算运行中/处理中。
+        assert_eq!(map_current_state(5), ServiceState::Running);
+        assert_eq!(
+            map_current_state(service_status::SERVICE_CONTINUE_PENDING),
+            ServiceState::Running
+        );
+        // 8 不是 SERVICE_* 定义的状态，不能归成已停止。
+        assert_eq!(map_current_state(8), ServiceState::Unknown);
     }
 
     #[test]
