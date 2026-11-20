@@ -1101,6 +1101,21 @@ function Get-VegaAllowedPackageId {
     )
 }
 
+function Test-VegaRetiredPackageId {
+    <#
+      已下线的 winget 包 ID：Legacy 清单里可能仍记录着 RustDesk.RustDesk。
+      WinGet 社区源已移除 RustDesk，旧记录不能当成白名单外对象报错；
+      调用方应提示用户手动卸载并把这笔记录销账（审计 r5 P2）。
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()]
+        [string]$PackageId
+    )
+
+    return [string]::Equals($PackageId, 'RustDesk.RustDesk', [System.StringComparison]::OrdinalIgnoreCase)
+}
+
 function Test-VegaStateRecordAllowed {
     <#
       纯函数：回滚前逐条校验。
@@ -5804,6 +5819,14 @@ function Invoke-VegaHostUninstallCore {
             if ($null -eq $package) { continue }
             if (-not [bool]$package.InstalledByVega) { continue }
             $packageId = [string]$package.PackageId
+            # 旧清单里的 RustDesk.RustDesk 已随 WinGet 下架：先销账并提示手动卸载，
+            # 不当作白名单违规，也不让回滚因此失败。
+            if (Test-VegaRetiredPackageId -PackageId $packageId) {
+                Write-VegaStatus "旧清单里的 RustDesk winget 包已下架，请从「设置 → 应用」手动卸载 RustDesk；该记录已标记为已处理。" -Level Warn
+                $state = Remove-VegaStatePackage -State $state -PackageId $packageId
+                $null = Save-VegaState -State $state -Path $StatePath
+                continue
+            }
             if (-not (Test-VegaStateRecordAllowed -Kind 'Package' -Value $packageId)) {
                 $failures.Add("清单里的包 ID 不在白名单，拒绝卸载：$packageId")
                 Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
@@ -6070,6 +6093,14 @@ function Invoke-VegaClientUninstallCore {
         if ($null -eq $package) { continue }
         if (-not [bool]$package.InstalledByVega) { continue }
         $packageId = [string]$package.PackageId
+        # 旧清单里的 RustDesk.RustDesk 已随 WinGet 下架：先销账并提示手动卸载，
+        # 不当作白名单违规，也不让回滚因此失败。
+        if (Test-VegaRetiredPackageId -PackageId $packageId) {
+            Write-VegaStatus "旧清单里的 RustDesk winget 包已下架，请从「设置 → 应用」手动卸载 RustDesk；该记录已标记为已处理。" -Level Warn
+            $state = Remove-VegaStatePackage -State $state -PackageId $packageId
+            $null = Save-VegaState -State $state -Path $StatePath
+            continue
+        }
         if (-not (Test-VegaStateRecordAllowed -Kind 'Package' -Value $packageId)) {
             $failures.Add("清单里的包 ID 不在白名单，拒绝卸载：$packageId")
             Write-VegaStatus $failures[$failures.Count - 1] -Level Warn
@@ -6158,6 +6189,7 @@ Export-ModuleMember -Function @(
     'Get-VegaAllowedFirewallRuleName',
     'Get-VegaAllowedServiceName',
     'Get-VegaAllowedPackageId',
+    'Test-VegaRetiredPackageId',
     'Test-VegaStateRecordAllowed',
     'Test-VegaStatePackage',
     'Add-VegaStatePackage',
