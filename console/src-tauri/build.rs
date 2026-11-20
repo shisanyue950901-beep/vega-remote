@@ -13,6 +13,12 @@ fn main() {
             "open_rustdesk_download_page",
             "get_rustdesk_status",
             "test_server_connection",
+            "get_streaming_status",
+            "open_sunshine_pairing",
+            "open_sunshine_settings",
+            "start_moonlight_stream",
+            "run_doctor",
+            "export_doctor_log",
         ])),
     )
     .expect("tauri-build 失败");
