@@ -41,8 +41,6 @@ interface ServerConfigView {
 interface OpResult {
   ok: boolean;
   message: string;
-  /** RustDesk 以 Windows 服务运行：配置要在 RustDesk 里改，用户 TOML 不生效。 */
-  serviceMode: boolean;
 }
 
 interface StatusView {
@@ -103,13 +101,6 @@ async function copyText(text: string): Promise<boolean> {
     return false;
   }
 }
-
-/**
- * RustDesk-only 安装命令。控制台只复制这一行，不在应用内提权或执行脚本；
- * 不再走通用 bootstrap（那会按角色装一堆无关组件却可能漏掉 RustDesk）。
- */
-const INSTALL_COMMAND =
-  "winget install --id RustDesk.RustDesk --exact --source winget";
 
 /**
  * 设备码解析：只接受 9/10 位纯数字，或控制台自己展示的 3-3-3 / 3-3-4 分组
@@ -212,12 +203,6 @@ function setupTabs(): void {
   });
 }
 
-/**
- * 设置页保存网络后调用：让远程协助页重读服务器并清掉旧探测结果。
- * 由 setupAssistPage 在启动时注册，避免设置页直接摸另一个页面的闭包。
- */
-let refreshAssistServer: (() => void) | null = null;
-
 /* ---------- 远程协助 ---------- */
 function setupAssistPage(): void {
   const codeEl = byId<HTMLSpanElement>("device-code");
@@ -230,10 +215,13 @@ function setupAssistPage(): void {
   const idStatusText = byId<HTMLSpanElement>("id-status-text");
   const idTestButton = byId<HTMLButtonElement>("id-test");
   let configuredServer = "";
+  // 探测代次：读配置或发起新探测都会 +1；过期结果（地址或代次变了）直接丢弃，
+  // 避免旧地址的结论被贴到刚切换的新服务器上。
+  let probeGeneration = 0;
   const serviceStatusRow = byId<HTMLDivElement>("service-status");
   const serviceDot = byId<HTMLSpanElement>("service-dot");
   const serviceStatusText = byId<HTMLSpanElement>("service-status-text");
-  const copyInstallButton = byId<HTMLButtonElement>("copy-install-command");
+  const openInstallPageButton = byId<HTMLButtonElement>("open-install-page");
   const installHint = byId<HTMLSpanElement>("install-hint");
   const peerInput = byId<HTMLInputElement>("peer-code");
   const recentList = byId<HTMLDataListElement>("recent-devices");
@@ -277,7 +265,9 @@ function setupAssistPage(): void {
   };
 
   const loadServerConfig = (): void => {
-    // 先清掉上一次的探测结论：设置页保存后旧地址的绿点不能留着。
+    // 先清掉上一次的探测结论，并作废在途探测：RustDesk 里改完地址后
+    // 旧地址的绿点不能留着。
+    probeGeneration += 1;
     configuredServer = "";
     idTestButton.classList.add("is-hidden");
     idTestButton.disabled = false;
@@ -298,7 +288,7 @@ function setupAssistPage(): void {
         idStatusText.textContent = `ID 服务器：${config.error}`;
         idDot.className = "dot dot--off";
       } else if (!server) {
-        idStatusText.textContent = "ID 服务器未配置（设置页可填写）";
+        idStatusText.textContent = "ID 服务器未配置（在 RustDesk 的 设置 → 网络 中填写）";
         idDot.className = "dot dot--off";
       } else {
         idStatusText.textContent = `ID 服务器已配置 ${server}${key}（尚未测试连通性）`;
@@ -307,7 +297,6 @@ function setupAssistPage(): void {
       }
     });
   };
-  refreshAssistServer = loadServerConfig;
 
   const loadStatus = (): void => {
     void invoke<StatusView>("get_rustdesk_status").then((status) => {
@@ -318,7 +307,7 @@ function setupAssistPage(): void {
       serviceStatusText.textContent = status.message;
       serviceDot.classList.toggle("dot--ok", status.running);
       serviceDot.classList.toggle("dot--off", !status.running);
-      copyInstallButton.classList.toggle("is-hidden", status.installed);
+      openInstallPageButton.classList.toggle("is-hidden", status.installed);
       installHint.classList.toggle("is-hidden", status.installed);
     });
 
@@ -326,12 +315,18 @@ function setupAssistPage(): void {
   };
 
   idTestButton.addEventListener("click", () => {
-    if (!configuredServer) {
+    const testedServer = configuredServer;
+    if (!testedServer) {
       return;
     }
+    const generation = ++probeGeneration;
     idTestButton.disabled = true;
-    idStatusText.textContent = `正在测试 ${configuredServer}:21116…`;
-    void invoke<TestResult>("test_server_connection", { server: configuredServer }).then((result) => {
+    idStatusText.textContent = `正在测试 ${testedServer}:21116…`;
+    void invoke<TestResult>("test_server_connection", { server: testedServer }).then((result) => {
+      // 回包晚于地址变更（重读配置或再次点击）就丢掉：绿点只能代表当前地址。
+      if (generation !== probeGeneration || testedServer !== configuredServer) {
+        return;
+      }
       idTestButton.disabled = false;
       if (!result) {
         idStatusText.textContent = "预览模式：命令不可用";
@@ -339,8 +334,8 @@ function setupAssistPage(): void {
         return;
       }
       idStatusText.textContent = result.ok
-        ? `ID 服务器 ${configuredServer} 连接成功（${result.latencyMs} ms）`
-        : `ID 服务器 ${configuredServer} 连接失败：${result.message}`;
+        ? `ID 服务器 ${testedServer} 连接成功（${result.latencyMs} ms）`
+        : `ID 服务器 ${testedServer} 连接失败：${result.message}`;
       idDot.className = `dot ${result.ok ? "dot--ok" : "dot--off"}`;
     });
   });
@@ -383,16 +378,16 @@ function setupAssistPage(): void {
     });
   });
 
-  copyInstallButton.addEventListener("click", () => {
-    // 不再在应用内 runas 提权执行脚本：只把 README 的一行命令塞进剪贴板，
-    // 由用户自己在管理员 PowerShell 里确认后运行。
-    void copyText(INSTALL_COMMAND).then((ok) => {
-      flashLabel(copyInstallButton, ok ? "已复制" : "复制失败");
-      setStatus(
-        serviceStatusText,
-        ok ? "已复制安装命令，请在管理员 PowerShell 中运行" : "复制失败，请到 README 手动复制安装命令",
-        ok ? "ok" : "error",
-      );
+  openInstallPageButton.addEventListener("click", () => {
+    // WinGet 已下架 RustDesk：不再复制安装命令，交给 Rust 侧用默认浏览器
+    // 打开写死的官方发行页，由用户手动安装。
+    setStatus(serviceStatusText, "正在打开 RustDesk 官方下载页…");
+    void invoke<OpResult>("open_rustdesk_download_page").then((result) => {
+      if (!result) {
+        setStatus(serviceStatusText, "浏览器预览：命令不可用", "warn");
+        return;
+      }
+      setStatus(serviceStatusText, result.message, result.ok ? "ok" : "error");
     });
   });
 
@@ -446,12 +441,10 @@ function setupAssistPage(): void {
 function setupSettingsPage(): void {
   const testButton = byId<HTMLButtonElement>("test-connection");
   const testResult = byId<HTMLSpanElement>("test-connection-result");
-  const saveButton = byId<HTMLButtonElement>("save-network");
   const openRustdeskNetworkButton = byId<HTMLButtonElement>("open-rustdesk-network");
   const networkStatus = byId<HTMLSpanElement>("network-status");
   const idServerInput = byId<HTMLInputElement>("set-id-server");
   const relayServerInput = byId<HTMLInputElement>("set-relay-server");
-  const keyInput = byId<HTMLTextAreaElement>("set-server-key");
   const fingerprint = byId<HTMLSpanElement>("server-key-fingerprint");
   const runDoctorButton = byId<HTMLButtonElement>("run-doctor");
   const exportButton = byId<HTMLButtonElement>("export-log");
@@ -465,8 +458,12 @@ function setupSettingsPage(): void {
     syncCloseToTray(trayCheckbox.checked);
   });
 
+  // 只读页：配置只显示 RustDesk2.toml 里的当前值，写入一律在 RustDesk 里做。
+  let probeGeneration = 0;
+
   const loadNetwork = (): void => {
-    openRustdeskNetworkButton.classList.add("is-hidden");
+    // 重读配置就作废在途探测，避免旧地址的结论落到新地址上。
+    probeGeneration += 1;
     setStatus(networkStatus, "正在读取 RustDesk 配置…");
     void invoke<ServerConfigView>("get_server_config").then((config) => {
       if (!config) {
@@ -475,7 +472,6 @@ function setupSettingsPage(): void {
       }
       idServerInput.value = config.server;
       relayServerInput.value = config.relay;
-      keyInput.value = "";
       if (config.keyPresent) {
         fingerprint.textContent = `${config.keyFingerprint}…（完整公钥不回显）`;
       } else {
@@ -485,56 +481,41 @@ function setupSettingsPage(): void {
     });
   };
 
-  saveButton.addEventListener("click", () => {
-    const server = idServerInput.value.trim();
-    const relay = relayServerInput.value.trim();
-    const key = keyInput.value.trim();
-    setStatus(networkStatus, "正在保存…");
-    saveButton.disabled = true;
-    void invoke<OpResult>("set_server_config", { server, key, relay }).then((result) => {
-      saveButton.disabled = false;
-      if (!result) {
-        setStatus(networkStatus, "浏览器预览：命令不可用", "warn");
-        return;
-      }
-      if (result.serviceMode) {
-        // 服务模式：用户 TOML 不是生效配置，不假装保存成功；
-        // 指向 RustDesk 自己的「网络」设置，并给出打开窗口的按钮。
-        setStatus(networkStatus, result.message, "warn");
-        openRustdeskNetworkButton.classList.remove("is-hidden");
-        return;
-      }
-      openRustdeskNetworkButton.classList.add("is-hidden");
-      setStatus(networkStatus, result.message, result.ok ? "ok" : "error");
-      if (result.ok) {
-        keyInput.value = "";
-        setStatus(testResult, "未测试");
-        loadNetwork();
-        // 远程协助页重读新服务器并丢掉旧地址的探测结论。
-        refreshAssistServer?.();
-      }
-    });
+  // 从 RustDesk 改完配置切回来时刷新一次显示。
+  window.addEventListener("focus", () => {
+    loadNetwork();
   });
 
+  // 修改入口：打开 RustDesk 主窗口，让用户在「设置 → 网络」里改。
   openRustdeskNetworkButton.addEventListener("click", () => {
+    setStatus(networkStatus, "正在打开 RustDesk…");
     void invoke<OpResult>("open_rustdesk_window").then((result) => {
       if (!result) {
         setStatus(networkStatus, "浏览器预览：命令不可用", "warn");
         return;
       }
-      setStatus(networkStatus, result.message, result.ok ? "ok" : "error");
+      setStatus(
+        networkStatus,
+        result.ok ? "已打开 RustDesk，请在 设置 → 网络 中修改服务器地址" : result.message,
+        result.ok ? "ok" : "error",
+      );
     });
   });
 
   testButton.addEventListener("click", () => {
-    const server = idServerInput.value.trim();
-    if (!server) {
-      setStatus(testResult, "先填 ID 服务器", "error");
+    const testedServer = idServerInput.value.trim();
+    if (!testedServer) {
+      setStatus(testResult, "还没有读到 ID 服务器地址", "error");
       return;
     }
+    const generation = ++probeGeneration;
     setStatus(testResult, "正在连接 21116…");
     testButton.disabled = true;
-    void invoke<TestResult>("test_server_connection", { server }).then((result) => {
+    void invoke<TestResult>("test_server_connection", { server: testedServer }).then((result) => {
+      // 地址或代次变了就丢结果：旧地址的「连接成功」不能贴到新地址上。
+      if (generation !== probeGeneration || testedServer !== idServerInput.value.trim()) {
+        return;
+      }
       testButton.disabled = false;
       if (!result) {
         setStatus(testResult, "浏览器预览：命令不可用", "warn");
