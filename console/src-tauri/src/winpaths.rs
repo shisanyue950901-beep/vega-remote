@@ -98,13 +98,70 @@ pub(crate) fn windows_dir() -> Option<PathBuf> {
     None
 }
 
-/// 在受信任的 `Program Files` 根下找可执行文件：逐段拼接、规范化，
-/// 最后确认规范化后的路径仍在根目录内，返回的就是可以直接启动的路径。
+/// 两个卷根是否一致。Windows 路径不区分大小写；任一侧拿不到都算不一致。
+fn same_volume_root(a: Option<PathBuf>, b: Option<PathBuf>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy()),
+        _ => false,
+    }
+}
+
+/// 规范化目录所在的卷根（`GetVolumePathNameW`，形如 `C:\`）。
+///
+/// 拿不到就返回 `None`：调用方把「拿不到」当成「不在同一卷」，宁可不信任。
+#[cfg(windows)]
+fn volume_root(path: &Path) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetVolumePathNameW;
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut buffer = [0u16; 260];
+    // SAFETY: `wide` 以 NUL 结尾，缓冲区长度按元素个数传入；返回非 0 才读缓冲。
+    let ok = unsafe {
+        GetVolumePathNameW(wide.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32)
+    };
+    if ok == 0 {
+        return None;
+    }
+    let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+    if len == 0 {
+        return None;
+    }
+    Some(PathBuf::from(String::from_utf16_lossy(&buffer[..len])))
+}
+
+#[cfg(not(windows))]
+fn volume_root(_path: &Path) -> Option<PathBuf> {
+    None
+}
+
+/// `Program Files` 根是否和系统目录在同一个卷（比较卷根，不比较整条路径）。
+///
+/// 只靠 `starts_with` 不够：Program Files 可以被重定向到别的卷/挂载点，
+/// 那时「在 Program Files 下」就不再等于「系统自己装的程序」。
+fn program_files_on_system_volume(root: &Path) -> bool {
+    same_volume_root(volume_root(root), system32_dir().as_deref().and_then(volume_root))
+}
+
+/// 在受信任的 `Program Files` 根下找可执行文件：逐个根独立校验
+/// （根与系统目录同卷）、逐段拼接、规范化，最后确认规范化后的路径仍在
+/// 根目录内，返回的就是可以直接启动的路径。
 pub(crate) fn trusted_install_exe(parts: &[&str]) -> Option<PathBuf> {
     if parts.is_empty() {
         return None;
     }
     for root in program_files_dirs() {
+        // 不同卷的「Program Files」不是受信任根：直接跳过这个根。
+        if !program_files_on_system_volume(&root) {
+            continue;
+        }
         let mut candidate = root.clone();
         for part in parts {
             candidate.push(part);
@@ -160,6 +217,30 @@ mod tests {
     #[test]
     fn trusted_lookup_without_parts_returns_none() {
         assert!(trusted_install_exe(&[]).is_none());
+    }
+
+    #[test]
+    fn volume_root_comparison_is_case_insensitive_and_strict() {
+        let c = || Some(PathBuf::from("C:\\"));
+        let d = || Some(PathBuf::from("D:\\"));
+        assert!(same_volume_root(c(), c()));
+        assert!(same_volume_root(
+            Some(PathBuf::from("c:\\")),
+            Some(PathBuf::from("C:\\"))
+        ));
+        assert!(!same_volume_root(c(), d()));
+        // 拿不到卷根一律当不同卷：宁可不信任。
+        assert!(!same_volume_root(None, c()));
+        assert!(!same_volume_root(c(), None));
+        assert!(!same_volume_root(None, None));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn program_files_volume_check_rejects_everything_off_windows() {
+        assert!(!program_files_on_system_volume(Path::new(
+            "C:\\Program Files"
+        )));
     }
 
     #[cfg(not(windows))]
