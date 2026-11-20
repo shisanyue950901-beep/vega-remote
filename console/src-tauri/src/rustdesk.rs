@@ -24,8 +24,6 @@ const CONFIG_TIMEOUT: Duration = Duration::from_secs(5);
 const TEST_TIMEOUT: Duration = Duration::from_secs(3);
 /// 跨实例写配置时等锁的上限；超时宁可报错也不覆盖别人刚写的文件。
 const LOCK_TIMEOUT: Duration = Duration::from_secs(3);
-/// 锁文件的陈旧判定：进程崩溃留下的锁超过这个时间视为可回收。
-const STALE_LOCK_AGE: Duration = Duration::from_secs(30);
 
 /// 原子写临时文件序号，保证同名写入之间不会互相覆盖临时文件。
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -247,15 +245,49 @@ fn decode_base64(data: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// IPC 入口：设备码只接受 9-10 位 ASCII 数字，不做任何字符清洗。
+const PEER_ID_ERROR: &str =
+    "设备码必须是 9-10 位数字，或 3-3-3 / 3-3-4 分组格式（如 123-456-789）";
+
+/// IPC 入口：设备码只接受 9-10 位 ASCII 数字，或控制台自己展示的分组写法
+/// （`123 456 789`、`123-456-789`、十位码的 3-3-4）。返回纯数字。
+/// 整串必须完全匹配：分隔符要一致，落单的分组直接拒绝，绝不做「删掉多余
+/// 字符」式清洗，否则粘错的码会被悄悄改成另一台设备。
 pub fn parse_peer_id(raw: &str) -> Result<String, String> {
     let value = raw.trim();
-    if !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()) {
-        if value.len() == 9 || value.len() == 10 {
-            return Ok(value.to_string());
-        }
+    if value.is_empty() {
+        return Err(PEER_ID_ERROR.into());
     }
-    Err("设备码必须是 9-10 位数字".into())
+    let digits = if value.chars().all(|c| c.is_ascii_digit()) {
+        value.to_string()
+    } else {
+        let separator = value
+            .chars()
+            .find(|c| !c.is_ascii_digit())
+            .filter(|c| *c == ' ' || *c == '-')
+            .ok_or_else(|| PEER_ID_ERROR.to_string())?;
+        if value
+            .chars()
+            .any(|c| !c.is_ascii_digit() && c != separator)
+        {
+            return Err(PEER_ID_ERROR.into());
+        }
+        let groups: Vec<&str> = value.split(separator).collect();
+        if groups.len() != 3
+            || groups[..2].iter().any(|group| group.len() != 3)
+            || !matches!(groups[2].len(), 3 | 4)
+            || groups
+                .iter()
+                .any(|group| !group.chars().all(|c| c.is_ascii_digit()))
+        {
+            return Err(PEER_ID_ERROR.into());
+        }
+        groups.concat()
+    };
+    if digits.len() == 9 || digits.len() == 10 {
+        Ok(digits)
+    } else {
+        Err(PEER_ID_ERROR.into())
+    }
 }
 
 /// 公钥指纹：只暴露前 8 位。
@@ -271,6 +303,16 @@ pub fn endpoint_from_server(server: &str) -> Result<(String, u16), String> {
         host.to_string(),
         port.unwrap_or(RUSTDESK_DEFAULT_PORT),
     ))
+}
+
+/// 中继地址：留空就保持为空，由 RustDesk 自己推导中继。
+/// 不能把 ID 服务器抄进 `relay-server`：ID 服务器常带 `:21116`，
+/// 抄过去会把中继流量指到 ID 端口。
+pub fn resolve_relay(relay_input: &str) -> Result<String, String> {
+    if relay_input.trim().is_empty() {
+        return Ok(String::new());
+    }
+    validate_server(relay_input).map_err(|e| format!("中继服务器：{e}"))
 }
 
 /* ------------------------------------------------------------------ */
@@ -418,7 +460,12 @@ pub fn locate_rustdesk() -> Option<PathBuf> {
     None
 }
 
-/// 运行命令并限时收集输出。超时会杀掉子进程并返回错误。
+/// 运行命令并限时收集输出。
+///
+/// stdout / stderr 各由一个读线程排空到 EOF：子进程写满管道缓冲区时不会
+/// 因为父进程还在 `try_wait` 而互相卡死，超时也能立刻 kill 并返回。
+/// 失败只回固定文本（退出码或超时），不把 stderr 原文透给前端——那里面
+/// 可能有路径、用户名、库版本等环境信息。
 fn run_capture(exe: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
     let mut command = Command::new(exe);
     command
@@ -436,34 +483,57 @@ fn run_capture(exe: &Path, args: &[&str], timeout: Duration) -> Result<String, S
     let mut child = command
         .spawn()
         .map_err(|e| format!("启动 {} 失败：{e}", exe.display()))?;
+    let (out_tx, out_rx) = mpsc::channel();
+    let (err_tx, err_rx) = mpsc::channel();
+    spawn_pipe_reader(child.stdout.take(), out_tx);
+    spawn_pipe_reader(child.stderr.take(), err_tx);
+
     let started = Instant::now();
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                let output = child
-                    .wait_with_output()
-                    .map_err(|e| format!("读取输出失败：{e}"))?;
-                let text = String::from_utf8_lossy(&output.stdout).to_string();
-                if status.success() {
-                    return Ok(text);
-                }
-                return Err(format!(
-                    "命令退出码 {:?}：{}",
-                    status.code(),
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ));
-            }
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if started.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
+                    // 读线程会在管道 EOF 后自行退出，这里不再等待。
                     return Err(format!("命令超时（{} 秒）", timeout.as_secs()));
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(20));
             }
-            Err(e) => return Err(format!("等待命令失败：{e}")),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("等待命令结束失败".to_string());
+            }
         }
+    };
+
+    // 进程已退出，管道随即关闭；给读线程 1 秒把尾部输出取完。
+    let drain = Duration::from_secs(1);
+    let stdout = out_rx.recv_timeout(drain).unwrap_or_default();
+    let _stderr = err_rx.recv_timeout(drain).unwrap_or_default();
+    if status.success() {
+        Ok(String::from_utf8_lossy(&stdout).to_string())
+    } else {
+        Err(format!("命令退出码 {:?}", status.code()))
     }
+}
+
+/// 独立线程里把管道读到 EOF。读完之后管道关闭，子进程不会被写阻塞。
+fn spawn_pipe_reader<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+    tx: mpsc::Sender<Vec<u8>>,
+) {
+    let Some(mut pipe) = pipe else {
+        let _ = tx.send(Vec::new());
+        return;
+    };
+    std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = pipe.read_to_end(&mut buffer);
+        let _ = tx.send(buffer);
+    });
 }
 
 /// 以无窗口方式启动进程（RustDesk 会自绘窗口，不需要控制台）。
@@ -542,47 +612,46 @@ fn read_existing_config(path: &Path) -> Result<String, String> {
     }
 }
 
-/// 跨进程配置锁：同目录 `*.vega-lock`，`create_new` 保证只有一个实例拿到。
+/// 跨进程配置锁：同目录常驻的 `*.vega-lock` 文件，用操作系统文件锁
+/// （Windows `LockFileEx`、Unix `flock`，经 fs2）独占。
+///
+/// 锁跟着句柄走：进程崩溃时由内核释放，所以不存在「陈旧锁」，
+/// 也绝不能删除锁文件——删锁本身就是两个写入方同时认为自己持锁的来源。
+/// 句柄在 `set_server_config_blocking` 里一直持有到 rename 完成。
 struct ConfigLock {
-    path: PathBuf,
+    file: std::fs::File,
 }
 
 impl Drop for ConfigLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let _ = fs2::FileExt::unlock(&self.file);
     }
+}
+
+fn lock_path(target: &Path) -> PathBuf {
+    let mut name = target.as_os_str().to_os_string();
+    name.push(".vega-lock");
+    PathBuf::from(name)
 }
 
 fn acquire_config_lock(target: &Path) -> Result<ConfigLock, String> {
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败：{e}"))?;
     }
-    let mut name = target.as_os_str().to_os_string();
-    name.push(".vega-lock");
-    let lock_path = PathBuf::from(name);
+    let path = lock_path(target);
+    // 锁文件只当锁的载体：内容为空，常驻，不承载任何状态。
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| format!("打开配置锁失败：{e}"))?;
     let started = Instant::now();
     loop {
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-        {
-            Ok(mut file) => {
-                let _ = writeln!(file, "{}", std::process::id());
-                return Ok(ConfigLock { path: lock_path });
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // 崩溃留下的陈旧锁：超过 STALE_LOCK_AGE 直接回收。
-                let stale = std::fs::metadata(&lock_path)
-                    .and_then(|meta| meta.modified())
-                    .ok()
-                    .and_then(|modified| modified.elapsed().ok())
-                    .map(|age| age > STALE_LOCK_AGE)
-                    .unwrap_or(false);
-                if stale {
-                    let _ = std::fs::remove_file(&lock_path);
-                    continue;
-                }
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => return Ok(ConfigLock { file }),
+            Err(e) if lock_contended(&e) => {
                 if started.elapsed() >= LOCK_TIMEOUT {
                     return Err(
                         "另一个 Vega 窗口正在保存 RustDesk 配置，请稍后重试".to_string()
@@ -590,9 +659,16 @@ fn acquire_config_lock(target: &Path) -> Result<ConfigLock, String> {
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return Err(format!("创建配置锁失败：{e}")),
+            Err(e) => return Err(format!("加配置锁失败：{e}")),
         }
     }
+}
+
+/// 区分「锁被别的进程/句柄占着」和真正的 I/O 错误：
+/// Windows 是 ERROR_LOCK_VIOLATION(33)，Unix 是 EWOULDBLOCK/EAGAIN(11)。
+fn lock_contended(error: &std::io::Error) -> bool {
+    matches!(error.kind(), std::io::ErrorKind::WouldBlock)
+        || matches!(error.raw_os_error(), Some(11) | Some(33))
 }
 
 /// 原子写：同目录临时文件 + rename。临时文件用 `create_new` 独占创建，
@@ -889,13 +965,9 @@ fn set_server_config_blocking(
         Err(e) => return OpResult::err(e),
     };
     let relay_input = relay.unwrap_or_default();
-    let relay = if relay_input.trim().is_empty() {
-        server.clone()
-    } else {
-        match validate_server(&relay_input) {
-            Ok(value) => value,
-            Err(e) => return OpResult::err(format!("中继服务器：{e}")),
-        }
+    let relay = match resolve_relay(&relay_input) {
+        Ok(value) => value,
+        Err(e) => return OpResult::err(e),
     };
 
     let Some(path) = user_config_path() else {
@@ -1153,7 +1225,8 @@ pub async fn test_server_connection(server: String) -> TestResult {
 /// 托盘「复制设备码」用：拿设备码写到剪贴板，不经过前端。
 #[cfg(windows)]
 pub fn copy_device_id_to_clipboard() -> Result<String, String> {
-    // 托盘回调本身已在非 UI 线程跑，直接调阻塞实现，不要 await 命令。
+    // 由托盘事件里 spawn 的 worker 线程调用：这里会等 --get-id 和 PowerShell，
+    // 绝不能放到 Tauri 的事件循环上。
     let info = get_device_id_blocking();
     if info.formatted_id.is_empty() {
         return Err(if info.error.is_empty() {
@@ -1351,14 +1424,58 @@ flag = true
     }
 
     #[test]
-    fn peer_id_requires_nine_or_ten_digits_without_cleaning() {
+    fn peer_id_accepts_plain_and_grouped_forms() {
         assert_eq!(parse_peer_id("123456789").unwrap(), "123456789");
         assert_eq!(parse_peer_id("1234567890").unwrap(), "1234567890");
-        assert!(parse_peer_id("12345678").is_err());
-        assert!(parse_peer_id("12345678901").is_err());
-        assert!(parse_peer_id("123 456 789").is_err());
-        assert!(parse_peer_id("12345678a").is_err());
-        assert!(parse_peer_id("").is_err());
+        // 控制台自己展示的两组分隔写法都要能原样粘回来，返回纯数字。
+        assert_eq!(parse_peer_id("123 456 789").unwrap(), "123456789");
+        assert_eq!(parse_peer_id("123-456-789").unwrap(), "123456789");
+        assert_eq!(parse_peer_id("123 456 7890").unwrap(), "1234567890");
+        assert_eq!(parse_peer_id("123-456-7890").unwrap(), "1234567890");
+        // 只去掉外层空白，不做别的清洗。
+        assert_eq!(parse_peer_id(" 123456789 ").unwrap(), "123456789");
+    }
+
+    #[test]
+    fn peer_id_rejects_mixed_or_malformed_grouping() {
+        for bad in [
+            "123-456 789",   // 混用分隔符
+            "123_456_789",   // 不支持的分隔符
+            "12 456 789",    // 首组不足三位
+            "123 45 789",    // 中组不足三位
+            "123 456 78",    // 末组不足三位
+            "123 456 78901", // 末组超过四位
+            "123 456",       // 只有两组
+            "123--456-789",  // 空分组
+            "12345678",      // 8 位
+            "12345678901",   // 11 位
+            "12345678a",
+            "",
+            "   ",
+        ] {
+            assert!(parse_peer_id(bad).is_err(), "应当拒绝 {bad:?}");
+        }
+    }
+
+    #[test]
+    fn empty_relay_stays_empty_instead_of_copying_id_server() {
+        // 留空中继 = 不指定，让 RustDesk 自己推导；不能抄 ID 服务器（可能带 :21116）。
+        assert_eq!(resolve_relay("").unwrap(), "");
+        assert_eq!(resolve_relay("   ").unwrap(), "");
+        assert_eq!(
+            resolve_relay(" relay.example.com:21117 ").unwrap(),
+            "relay.example.com:21117"
+        );
+        assert!(resolve_relay("bad host").is_err());
+    }
+
+    #[test]
+    fn toml_merge_keeps_relay_empty_when_not_configured() {
+        let merged =
+            merge_server_config("", "relay.example.com", &resolve_relay("").unwrap(), "KEY").unwrap();
+        let snapshot = read_server_config(&merged).unwrap();
+        assert_eq!(snapshot.server, "relay.example.com");
+        assert_eq!(snapshot.relay, "");
     }
 
     #[test]
@@ -1393,6 +1510,26 @@ flag = true
         let error = read_server_config(&text).unwrap_err();
         assert!(!error.contains(secret));
         assert!(error.contains("解析失败"));
+    }
+
+    #[test]
+    fn config_lock_is_exclusive_then_released_without_deleting_lock_file() {
+        let dir = temp_dir("lock");
+        let target = dir.join("RustDesk2.toml");
+        let first = acquire_config_lock(&target).unwrap();
+        let path = lock_path(&target);
+        assert!(path.is_file());
+
+        // 第二个持有者必须等第一个释放；释放后 lock 文件仍然存在。
+        let second = std::thread::spawn({
+            let target = target.clone();
+            move || acquire_config_lock(&target)
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        drop(first);
+        assert!(second.join().unwrap().is_ok());
+        assert!(path.is_file());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
