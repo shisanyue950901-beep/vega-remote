@@ -4,9 +4,10 @@
 //! 所有网络探测共用 8 秒总预算；结果里不放地址、主机名、用户名或用户目录路径。
 //! 导出日志再统一做一次脱敏，然后交给资源管理器打开目录。
 
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -22,6 +23,11 @@ const DOCTOR_BUDGET: Duration = Duration::from_secs(8);
 const SUNSHINE_SERVICE: &str = "SunshineService";
 const SUNSHINE_PORT: u16 = 47990;
 const TCP_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// 导出文件名的进程内递增序号：同一毫秒内的两次导出也不能互相覆盖。
+static EXPORT_SEQ: AtomicU64 = AtomicU64::new(0);
+/// 文件名冲突时最多尝试的次数。
+const EXPORT_NAME_ATTEMPTS: u64 = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DoctorStatus {
@@ -859,6 +865,47 @@ fn snapshot_for(
     }
 }
 
+/// 导出文件名：秒级时间戳 + 毫秒 + 进程内递增序号。
+fn export_file_name(timestamp_secs: u64, millis: u32, seq: u64) -> String {
+    format!("doctor-{timestamp_secs}-{millis:03}-{seq}.json")
+}
+
+/// 以 `create_new` 独占创建导出文件；遇到同名文件就换下一个序号，
+/// 最多 5 次。绝不截断已有报告。
+fn create_export_file_at(
+    directory: &Path,
+    timestamp_secs: u64,
+    millis: u32,
+    first_seq: u64,
+) -> std::io::Result<(PathBuf, File)> {
+    let mut last_error = None;
+    for attempt in 0..EXPORT_NAME_ATTEMPTS {
+        let path = directory.join(export_file_name(
+            timestamp_secs,
+            millis,
+            first_seq + attempt,
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.expect("at least one exclusive-create attempt runs"))
+}
+
+fn create_export_file(
+    directory: &Path,
+    timestamp_secs: u64,
+    millis: u32,
+) -> std::io::Result<(PathBuf, File)> {
+    // 预约一段序号，避免并发导出交错抢同一个后缀。
+    let first_seq = EXPORT_SEQ.fetch_add(EXPORT_NAME_ATTEMPTS, Ordering::Relaxed);
+    create_export_file_at(directory, timestamp_secs, millis, first_seq)
+}
+
 fn export_blocking(
     deadline: Instant,
     snapshot_id: u64,
@@ -883,14 +930,15 @@ fn export_blocking(
             advice: redact_text(&entry.advice, &identity),
         })
         .collect();
-    let now = SystemTime::now()
+    let since_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
+        .unwrap_or_default();
+    let now_secs = since_epoch.as_secs();
+    let now_millis = since_epoch.subsec_millis();
     let log = DoctorLog {
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         windows_build: windows_build(),
-        generated_at: now,
+        generated_at: now_secs,
         items: redacted,
     };
     let json = serde_json::to_string_pretty(&log)
@@ -903,8 +951,7 @@ fn export_blocking(
     let directory = log_directory();
     std::fs::create_dir_all(&directory)
         .map_err(|_| "创建日志目录失败".to_string())?;
-    let path = directory.join(format!("doctor-{now}.json"));
-    let mut file = std::fs::File::create(&path)
+    let (_path, mut file) = create_export_file(&directory, now_secs, now_millis)
         .map_err(|_| "写入脱敏日志失败".to_string())?;
     file.write_all(json.as_bytes())
         .map_err(|_| "写入脱敏日志失败".to_string())?;
@@ -1128,6 +1175,49 @@ mod tests {
             ..RedactionIdentity::default()
         };
         assert!(redact_with("user alice", &other).contains("alice"));
+    }
+
+    #[test]
+    fn export_file_name_includes_timestamp_millis_and_sequence() {
+        assert_eq!(
+            export_file_name(1_700_000_000, 7, 3),
+            "doctor-1700000000-007-3.json"
+        );
+        assert_eq!(
+            export_file_name(1_700_000_000, 123, 0),
+            "doctor-1700000000-123-0.json"
+        );
+    }
+
+    #[test]
+    fn export_creation_skips_existing_names_and_never_truncates() {
+        let dir = std::env::temp_dir().join(format!(
+            "vega-export-name-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 第一个候选名已被占用：必须换下一个序号，而不是截断旧文件。
+        let taken = dir.join(export_file_name(123, 4, 0));
+        std::fs::write(&taken, b"old report").unwrap();
+        let (path, mut file) = create_export_file_at(&dir, 123, 4, 0).unwrap();
+        assert_eq!(
+            path.file_name().unwrap().to_str().unwrap(),
+            export_file_name(123, 4, 1)
+        );
+        file.write_all(b"new report").unwrap();
+        drop(file);
+        assert_eq!(std::fs::read(&taken).unwrap(), b"old report");
+        assert_eq!(std::fs::read(&path).unwrap(), b"new report");
+
+        // 5 个候选全被占用：返回 AlreadyExists，不再无限重试。
+        for seq in 0..EXPORT_NAME_ATTEMPTS {
+            std::fs::write(dir.join(export_file_name(123, 4, seq)), b"x").unwrap();
+        }
+        let error = create_export_file_at(&dir, 123, 4, 0).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::AlreadyExists);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
