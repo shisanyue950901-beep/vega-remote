@@ -4,6 +4,7 @@ mod doctor;
 mod rustdesk;
 mod scm;
 mod streaming;
+mod winpaths;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
