@@ -10,6 +10,7 @@ interface TauriWindowHandle {
 
 interface TauriGlobal {
   window?: { getCurrentWindow(): TauriWindowHandle };
+  core?: { invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> };
   clipboardManager?: { writeText(text: string): Promise<void> };
 }
 
@@ -54,6 +55,17 @@ async function copyText(text: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/** 把「关闭到托盘」勾选状态同步给 Rust（Rust 侧默认 true）。 */
+function syncCloseToTray(enabled: boolean): void {
+  const core = window.__TAURI__?.core;
+  if (!core) {
+    return;
+  }
+  void core.invoke("set_close_to_tray", { enabled }).catch(() => {
+    /* 非 Tauri 环境或命令不可用时忽略：界面保持静态 */
+  });
 }
 
 function flashLabel(button: HTMLButtonElement, text: string): void {
@@ -108,6 +120,7 @@ function setupAssistPage(): void {
   const passwordEl = byId<HTMLSpanElement>("temp-password");
   const toggleButton = byId<HTMLButtonElement>("toggle-password");
   const refreshButton = byId<HTMLButtonElement>("refresh-password");
+  const refreshStatus = byId<HTMLSpanElement>("refresh-status");
   const copyCodeButton = byId<HTMLButtonElement>("copy-code");
   const copyShareButton = byId<HTMLButtonElement>("copy-share");
   const peerInput = byId<HTMLInputElement>("peer-code");
@@ -117,6 +130,16 @@ function setupAssistPage(): void {
 
   let revealed = false;
   let password = randomPassword(PASSWORD_LENGTH);
+  let refreshStatusTimer = 0;
+
+  // P3：刷新反馈写在按钮旁的状态元素，不动按钮内的 SVG 图标。
+  const showRefreshStatus = (text: string): void => {
+    refreshStatus.textContent = text;
+    window.clearTimeout(refreshStatusTimer);
+    refreshStatusTimer = window.setTimeout(() => {
+      refreshStatus.textContent = "";
+    }, 1600);
+  };
 
   const renderPassword = (): void => {
     passwordEl.textContent = revealed ? password : "●".repeat(PASSWORD_LENGTH);
@@ -136,7 +159,7 @@ function setupAssistPage(): void {
     password = randomPassword(PASSWORD_LENGTH);
     revealed = true;
     renderPassword();
-    flashLabel(refreshButton, "已刷新");
+    showRefreshStatus("已刷新");
   });
 
   copyCodeButton.addEventListener("click", () => {
@@ -179,6 +202,13 @@ function setupSettingsPage(): void {
   const exportButton = byId<HTMLButtonElement>("export-log");
   const fixedPasswordButton = byId<HTMLButtonElement>("save-fixed-password");
   const fixedPasswordInput = byId<HTMLInputElement>("set-fixed-password");
+  const trayCheckbox = byId<HTMLInputElement>("set-tray");
+
+  // 关闭到托盘：默认开启，启动时把当前勾选状态交给 Rust，变更时再同步。
+  syncCloseToTray(trayCheckbox.checked);
+  trayCheckbox.addEventListener("change", () => {
+    syncCloseToTray(trayCheckbox.checked);
+  });
 
   testButton.addEventListener("click", () => {
     testResult.textContent = "静态界面：M2b 接入后由 Rust 侧探测（未发起网络请求）";
@@ -252,17 +282,6 @@ function setupWindowControls(): void {
   bind("win-minimize", (win) => win.minimize());
   bind("win-maximize", (win) => win.toggleMaximize());
   bind("win-close", (win) => win.close());
-
-  const titlebar = document.querySelector<HTMLElement>(".titlebar");
-  titlebar?.addEventListener("dblclick", (event) => {
-    if (!current || !(event.target instanceof HTMLElement)) {
-      return;
-    }
-    if (event.target.closest(".winbtn")) {
-      return;
-    }
-    void current.toggleMaximize();
-  });
 }
 
 function main(): void {
