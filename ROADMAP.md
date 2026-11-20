@@ -24,14 +24,18 @@
   - 零网络请求、零遥测；`.github/workflows/console.yml` 在 `console/**` 变更时跑 Windows `tauri build --no-bundle`
 - M2b 控制台接入 RustDesk（done-in-progress，待 Codex 审计）：
   - Rust 侧拆出 `console/src-tauri/src/rustdesk.rs`：定位 `rustdesk.exe`（Program Files → PATH）、
-    `--get-id`（5 秒超时、`CREATE_NO_WINDOW`、3-3-3 展示）、`RustDesk2.toml [options]` 三个键用
-    toml crate 读写（临时文件 + rename 原子写、保留其他键、公钥只露前 8 位指纹、不写日志）
+    `--get-id`（总 deadline 5 秒、`CREATE_NO_WINDOW`、stderr 丢弃、stdout `recv_timeout`、超时 kill、
+    3-3-3 / 3-3-4 展示）、`RustDesk2.toml [options]` 三个键用 toml crate 读写（临时文件 + rename 原子写、
+    保留其他键、公钥只露前 8 位指纹、不写日志）
   - `connect_peer` 校验 9-10 位数字后 `--connect` / `--file-transfer`，最近 10 条存 app config 目录 JSON；
     临时密码不读不传，「显示临时密码」只无参启动 RustDesk 主窗口，界面去掉假的掩码密码
   - RustDesk 进程/服务状态行；未安装时不再在应用内提权安装（无 runas、无捆绑脚本），只提供「复制安装命令」——
-    把 README 一行命令写入剪贴板并提示到管理员 PowerShell 运行；审计 r2 的 P2（OS 文件锁、设备码分组、空中继、
-    get-id 管道线程/超时/脱敏、托盘 worker）已修
-  - 前端 `main.ts` 全部占位换成 invoke：加载/错误状态、最近设备码下拉、设置页网络读取/保存/测试
+    复制 `winget install --id RustDesk.RustDesk --exact --source winget` 并提示到 PowerShell 运行；
+    服务模式不写用户 TOML（提示在 RustDesk 的「网络」设置中修改并提供打开窗口按钮），写入后回读三键校验；
+    IPv6 保存前归一化为 `[addr]:port`（ID 21116 / 中继 21117）；「允许远程协助」开关禁用并指向 RustDesk；
+    保存后远程协助页重读服务器并清掉旧探测结果；审计 r2/r3 的 P2（OS 文件锁争用断言、设备码分组与往返测试、
+    空中继、托盘 worker）已修
+  - 前端 `main.ts` 全部占位换成 invoke：加载/错误状态、最近设备码下拉（3-3-3 / 3-3-4）、设置页网络读取/保存/测试
     （测试 = Rust 侧 TCP connect `server:21116` 超时 3 秒）
   - `build.rs` 用 `AppManifest::commands` 声明全部命令，`capabilities/default.json` 授权 `allow-*`
     （修复 M2a 审计 r2 P3，含 `set_close_to_tray`）；Rust 纯函数带 `#[cfg(test)]` 单测
@@ -44,8 +48,9 @@
 - 多设备管理面板、RustDesk 中继一键迁移国内 VPS
 - 英文文档
 
-## Backlog（M2b 审计 r2 未做项）
-- P3：CI 只跑 `tauri build --no-bundle`，没有安装包冒烟测试；需要 Windows bundle 冒烟并监听 `host/**`/`console/**` 资源变更（本轮按总控要求跳过）。
+## Backlog（M2b 审计 r3 未做项）
+- P3：CI 只跑 `tauri build --no-bundle`，没有安装包冒烟测试；需要 Windows bundle 冒烟并监听 `host/**`/`console/**` 资源变更。
+  本轮 r3 只记录待办、不新增安装包测试（按总控要求）。
 
 ## 团队分工
 - 规划、任务单、UI 设计、验收：Hark
