@@ -100,24 +100,34 @@ let runDoctorAction: (() => void) | null = null;
 type ConfigHandler = (config: ServerConfigView | null) => void;
 const configHandlers: ConfigHandler[] = [];
 let configRefreshInFlight = false;
+/** 读取进行中又来了焦点/重读请求：本轮结束后必须再补读一次，不能丢弃。 */
+let configRefreshPending = false;
 
 async function refreshSharedConfig(): Promise<void> {
   if (configRefreshInFlight) {
+    configRefreshPending = true;
     return;
   }
   configRefreshInFlight = true;
-  let config: ServerConfigView | null = null;
-  try {
-    config = await invoke<ServerConfigView>("get_server_config");
-  } catch {
-    // 读取失败也要通知每个页面：旧快照可能已经不成立，不能继续拿来测试。
-    config = null;
-  } finally {
-    configRefreshInFlight = false;
+  // 循环只在本轮读取期间没人再请求时退出；有请求就再读一次，
+  // 用最新快照覆盖远程协助页和设置页两个视图。
+  for (;;) {
+    configRefreshPending = false;
+    let config: ServerConfigView | null = null;
+    try {
+      config = await invoke<ServerConfigView>("get_server_config");
+    } catch {
+      // 读取失败也要通知每个页面：旧快照可能已经不成立，不能继续拿来测试。
+      config = null;
+    }
+    for (const handler of configHandlers) {
+      handler(config);
+    }
+    if (!configRefreshPending) {
+      break;
+    }
   }
-  for (const handler of configHandlers) {
-    handler(config);
-  }
+  configRefreshInFlight = false;
 }
 
 async function refreshOnFocus(): Promise<void> {
@@ -653,9 +663,16 @@ function setupSettingsPage(): void {
   // 导出只认「当前屏幕上那次诊断」的快照编号；一开始没有结果，先禁用。
   let currentSnapshotId: number | null = null;
   let doctorGeneration = 0;
+  // 设置页按钮与串流页快捷入口共用的运行标志：运行中再次触发直接忽略，
+  // 不发第二次请求、也不改按钮和状态文字。
+  let doctorRunning = false;
   exportButton.disabled = true;
 
   const runDoctor = (): void => {
+    if (doctorRunning) {
+      return;
+    }
+    doctorRunning = true;
     runDoctorButton.disabled = true;
     // 新诊断一开始，旧快照就作废：导出等这次结果。
     currentSnapshotId = null;
@@ -667,6 +684,7 @@ function setupSettingsPage(): void {
         if (generation !== doctorGeneration) {
           return;
         }
+        doctorRunning = false;
         runDoctorButton.disabled = false;
         if (!report) {
           setStatus(doctorStatus, "浏览器预览：命令不可用", "warn");
@@ -688,6 +706,7 @@ function setupSettingsPage(): void {
         if (generation !== doctorGeneration) {
           return;
         }
+        doctorRunning = false;
         runDoctorButton.disabled = false;
         currentSnapshotId = null;
         exportButton.disabled = true;
@@ -707,8 +726,12 @@ function setupSettingsPage(): void {
     exportButton.disabled = true;
     setStatus(doctorStatus, "正在导出脱敏日志…");
     void invoke<OpResult>("export_doctor_log", { snapshotId }).then((result) => {
-      // 只有快照仍然对得上时才恢复按钮（诊断期间它会变成新的编号）。
-      exportButton.disabled = currentSnapshotId === null || currentSnapshotId !== snapshotId;
+      // 发起导出时的快照已经不是当前显示的那次：整包丢弃，
+      // 不改按钮状态，也不覆盖状态文字。
+      if (currentSnapshotId !== snapshotId) {
+        return;
+      }
+      exportButton.disabled = false;
       if (!result) {
         setStatus(doctorStatus, "浏览器预览：命令不可用", "warn");
         return;
