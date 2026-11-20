@@ -640,10 +640,32 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
 /* 服务 / 进程状态                                                      */
 /* ------------------------------------------------------------------ */
 
+/// 系统目录下的固定绝对路径；不依赖 PATH 搜索。
+fn system32_exe(name: &str) -> PathBuf {
+    let root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("C:\\Windows"));
+    root.join("System32").join(name)
+}
+
+/// 默认浏览器/资源管理器入口：固定使用 `%SystemRoot%\explorer.exe`。
+pub(crate) fn explorer_exe() -> PathBuf {
+    let root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("C:\\Windows"));
+    let candidate = root.join("explorer.exe");
+    if candidate.is_file() {
+        candidate
+    } else {
+        PathBuf::from("C:\\Windows\\explorer.exe")
+    }
+}
+
 #[cfg(windows)]
 fn rustdesk_process_running() -> bool {
+    let tasklist = system32_exe("tasklist.exe");
     match run_capture(
-        Path::new("tasklist"),
+        &tasklist,
         &["/FI", "IMAGENAME eq rustdesk.exe", "/NH"],
         CONFIG_TIMEOUT,
     ) {
@@ -931,7 +953,7 @@ pub fn open_rustdesk_download_page() -> OpResult {
     if !cfg!(windows) {
         return OpResult::err("只有 Windows 控制台能打开下载页");
     }
-    match spawn_detached(Path::new("explorer.exe"), &[RUSTDESK_DOWNLOAD_URL]) {
+    match spawn_detached(&explorer_exe(), &[RUSTDESK_DOWNLOAD_URL]) {
         Ok(()) => OpResult::ok("已在默认浏览器中打开 RustDesk 官方下载页，请手动安装"),
         Err(e) => OpResult::err(format!("打开浏览器失败：{e}")),
     }

@@ -9,7 +9,7 @@
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
-use crate::rustdesk::{spawn_detached, OpResult};
+use crate::rustdesk::{explorer_exe, spawn_detached, OpResult};
 use crate::scm::{query_service_state, ServiceState};
 
 /// Sunshine 管理口只监听本机（安装脚本的 origin_web_ui_allowed = pc）。
@@ -224,7 +224,7 @@ pub async fn get_streaming_status() -> StreamingStatus {
 }
 
 fn open_fixed_url(url: &str, ok_message: &str) -> OpResult {
-    match spawn_detached(Path::new("explorer.exe"), &[url]) {
+    match spawn_detached(&explorer_exe(), &[url]) {
         Ok(()) => OpResult {
             ok: true,
             message: ok_message.to_string(),

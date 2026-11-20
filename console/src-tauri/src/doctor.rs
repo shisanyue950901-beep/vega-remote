@@ -6,12 +6,14 @@
 
 use std::io::Write;
 use std::net::{Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-use crate::rustdesk::{get_server_config, locate_rustdesk, probe_server_with_timeout, spawn_detached};
+use crate::rustdesk::{
+    explorer_exe, get_server_config, locate_rustdesk, probe_server_with_timeout, spawn_detached,
+};
 use crate::scm::{query_service_state, ServiceState};
 use crate::streaming::{moonlight_exe, tailscale_installed};
 
@@ -461,7 +463,7 @@ fn export_blocking() -> Result<(), String> {
 
     if cfg!(windows) {
         let directory_text = directory.display().to_string();
-        spawn_detached(Path::new("explorer.exe"), &[directory_text.as_str()])
+        spawn_detached(&explorer_exe(), &[directory_text.as_str()])
             .map_err(|_| "日志已导出，但打开目录失败".to_string())?;
     }
     Ok(())
