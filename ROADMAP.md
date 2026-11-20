@@ -103,3 +103,10 @@
 - P2 同一秒导出互相覆盖（doctor.rs:880）→ 唯一后缀 + create_new
 - P3 已知文件夹失败时回落到 temp（doctor.rs:823）→ 返回通用错误
 - P3 ShellExecuteW 在未初始化 COM 的 worker 上（winpaths.rs:162）→ STA 线程 + CoInitializeEx
+
+## M2c r7 遗留（Codex m2c-r7 PASS）
+- **P2 — Doctor lost the three-second RustDesk probe limit.** DNS and TCP can consume the full eight-second doctor budget, preventing later checks from running and leaving no exportable snapshot. Use the earlier of the original doctor deadline and a three-second probe deadline. 
+- **P2 — DNS can still start after expiry.** The resolver thread can be scheduled after the caller’s check, and the receive timeout uses a duration captured before spawning. Check the deadline and cancellation inside the resolver thread before lookup, and compute the remaining wait immediately before receiving. 
+- **P2 — Export can still write or open Explorer after timing out.** Folder resolution and creation can run past the last pre-write check. The STA thread can also start late. Recheck before publishing the report and inside the STA thread immediately before `ShellExecuteW`. Stage the JSON and publish it with a no-overwrite move so failed writes leave no partial report. 
+- **P2 — The new snapshot tests can fail in parallel CI.** Both mutate `LAST_SNAPSHOT`, so either can replace or clear the fixture before the other asserts it exists. Give each test its own cache. 
+- **P3 — Folder opening proceeds if COM initialization fails.** Return the existing generic folder-open error on a failed `CoInitializeEx` before calling `ShellExecuteW`. 
