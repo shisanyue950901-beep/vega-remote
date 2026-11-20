@@ -829,14 +829,25 @@ fn log_directory() -> PathBuf {
 
 /// 导出没有匹配快照时的通用错误：不区分「id 不匹配」和「本次无快照」。
 const SNAPSHOT_MISMATCH: &str = "没有与当前诊断结果匹配的快照，请重新诊断后再导出";
+/// 导出被 deadline 或取消标志截断时的通用错误。
+const EXPORT_TIMEOUT: &str = "导出脱敏日志超时，请重试";
 
 /// 只取与前端当前显示一致的快照。
 ///
+/// - 已过期/已取消：不再接受任何快照（包括仍在缓存里的旧结果）。
 /// - id 匹配：直接返回（导出不再重跑任何探测）。
 /// - 诊断还在跑（前端按钮此时是禁用的）：最多等到命令入口那个 deadline。
 /// - 不匹配 / 本次无快照：立刻返回 `None`，由调用方转成通用错误。
-fn snapshot_for(snapshot_id: u64, deadline: Instant) -> Option<Vec<DoctorItem>> {
+fn snapshot_for(
+    snapshot_id: u64,
+    deadline: Instant,
+    cancel: &AtomicBool,
+) -> Option<Vec<DoctorItem>> {
     loop {
+        // 先查过期：超时后才到的 worker 不能把已缓存的快照当成合格结果。
+        if expired(deadline, cancel) {
+            return None;
+        }
         if let Some(items) = matching_snapshot(snapshot_id) {
             return Some(items);
         }
@@ -848,10 +859,20 @@ fn snapshot_for(snapshot_id: u64, deadline: Instant) -> Option<Vec<DoctorItem>> 
     }
 }
 
-fn export_blocking(deadline: Instant, snapshot_id: u64) -> Result<(), String> {
-    let Some(items) = snapshot_for(snapshot_id, deadline) else {
+fn export_blocking(
+    deadline: Instant,
+    snapshot_id: u64,
+    cancel: Arc<AtomicBool>,
+) -> Result<(), String> {
+    if expired(deadline, &cancel) {
+        return Err(EXPORT_TIMEOUT.to_string());
+    }
+    let Some(items) = snapshot_for(snapshot_id, deadline, &cancel) else {
         return Err(SNAPSHOT_MISMATCH.to_string());
     };
+    if expired(deadline, &cancel) {
+        return Err(EXPORT_TIMEOUT.to_string());
+    }
     // 身份只在生产入口读一次，随后整份日志共用同一份夹具。
     let identity = RedactionIdentity::from_env();
     let redacted: Vec<DoctorItem> = items
@@ -875,6 +896,10 @@ fn export_blocking(deadline: Instant, snapshot_id: u64) -> Result<(), String> {
     let json = serde_json::to_string_pretty(&log)
         .map_err(|_| "生成脱敏日志失败".to_string())?;
 
+    // 写文件前最后确认：已过期/已取消就不再落盘（不留下半份报告）。
+    if expired(deadline, &cancel) {
+        return Err(EXPORT_TIMEOUT.to_string());
+    }
     let directory = log_directory();
     std::fs::create_dir_all(&directory)
         .map_err(|_| "创建日志目录失败".to_string())?;
@@ -887,6 +912,10 @@ fn export_blocking(deadline: Instant, snapshot_id: u64) -> Result<(), String> {
         .map_err(|_| "写入脱敏日志失败".to_string())?;
 
     if cfg!(windows) {
+        // 打开资源管理器前再查一次：超时的导出不该再弹窗。
+        if expired(deadline, &cancel) {
+            return Err(EXPORT_TIMEOUT.to_string());
+        }
         // 直接 ShellExecuteW(verb=open, lpFile=目录)，不拼 explorer.exe 命令行。
         open_directory(&directory)
             .map_err(|_| "日志已导出，但打开目录失败".to_string())?;
@@ -906,10 +935,29 @@ pub async fn export_doctor_log(snapshot_id: u64) -> crate::rustdesk::OpResult {
             message: SNAPSHOT_MISMATCH.to_string(),
         };
     }
-    let join = tauri::async_runtime::spawn_blocking(move || export_blocking(deadline, snapshot_id));
-    let result = match tokio::time::timeout(budget, join).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) | Err(_) => Err("导出脱敏日志失败".to_string()),
+    // 与诊断一样等命令入口的同一个绝对 deadline；超时置取消标志，
+    // worker 在写文件/打开目录前会看到，不会留下迟到的导出副作用。
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    let join = tauri::async_runtime::spawn_blocking(move || {
+        export_blocking(deadline, snapshot_id, worker_cancel)
+    });
+    let deadline_at = tokio::time::Instant::from_std(deadline);
+    let result = match tokio::time::timeout_at(deadline_at, join).await {
+        Ok(Ok(result)) => {
+            // join 恰好赶在计时器之前返回也可能已经过了 deadline：整包丢弃。
+            if expired(deadline, &cancel) {
+                cancel.store(true, Ordering::Release);
+                Err(EXPORT_TIMEOUT.to_string())
+            } else {
+                result
+            }
+        }
+        Ok(Err(_)) => Err("导出脱敏日志失败".to_string()),
+        Err(_) => {
+            cancel.store(true, Ordering::Release);
+            Err(EXPORT_TIMEOUT.to_string())
+        }
     };
     match result {
         Ok(()) => crate::rustdesk::OpResult {
@@ -1080,6 +1128,28 @@ mod tests {
             ..RedactionIdentity::default()
         };
         assert!(redact_with("user alice", &other).contains("alice"));
+    }
+
+    #[test]
+    fn snapshot_for_rejects_cached_snapshot_after_deadline() {
+        // 缓存里有匹配的快照，但导出已过期：不能把它当成合格结果。
+        store_snapshot(9_999, &[item("诊断", DoctorStatus::Pass, "")]);
+        let past = Instant::now() - Duration::from_secs(1);
+        assert!(snapshot_for(9_999, past, &AtomicBool::new(false)).is_none());
+        // 未过期时同一快照仍可取到。
+        let future = Instant::now() + Duration::from_secs(60);
+        assert!(snapshot_for(9_999, future, &AtomicBool::new(false)).is_some());
+        clear_snapshot();
+    }
+
+    #[test]
+    fn snapshot_for_rejects_cached_snapshot_after_cancel() {
+        store_snapshot(9_998, &[item("诊断", DoctorStatus::Pass, "")]);
+        let future = Instant::now() + Duration::from_secs(60);
+        assert!(
+            snapshot_for(9_998, future, &AtomicBool::new(true)).is_none()
+        );
+        clear_snapshot();
     }
 
     #[test]
