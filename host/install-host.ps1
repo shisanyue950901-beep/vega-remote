@@ -81,6 +81,12 @@ if (-not $Uninstall) {
         if ($modulePath -ne $publishModule) {
             Copy-Item -LiteralPath $modulePath -Destination $publishModule -Force
         }
+        # 去掉继承，只留管理员/系统可写、普通用户可读执行；用 SID 避免系统语言差异。
+        $null = & icacls.exe $publishRoot /inheritance:r `
+            /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw 'icacls 设置 %ProgramData%\Vega\host 权限失败。'
+        }
     }
     catch {
         Write-Host "警告：未能发布安装脚本到 %ProgramData%\Vega\host，控制台内的「安装 RustDesk」将不可用：$($_.Exception.Message)" -ForegroundColor Yellow
