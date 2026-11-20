@@ -183,22 +183,28 @@ fn shell_execute_open(path: &Path) -> Result<(), ()> {
 #[cfg(windows)]
 pub(crate) fn open_directory(path: &Path) -> Result<(), ()> {
     use std::ffi::c_void;
-    use windows::Win32::System::Com::{
-        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
-    };
+
+    // 直接用 ole32 的 ABI，不依赖 windows crate 里可选参数的类型细节。
+    // `COINIT_APARTMENTTHREADED` = 0x2，`COINIT_DISABLE_OLE1DDE` = 0x4。
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoInitializeEx(pv_reserved: *mut c_void, co_init: u32) -> i32;
+        fn CoUninitialize();
+    }
+    const COINIT_APARTMENTTHREADED: u32 = 0x2;
+    const COINIT_DISABLE_OLE1DDE: u32 = 0x4;
 
     let path = path.to_path_buf();
     let handle = std::thread::Builder::new()
         .name("vega-open-directory".to_string())
         .spawn(move || {
-            // SAFETY: 新建线程尚未初始化 COM；`None` 是保留参数，必须为空。
+            // SAFETY: 新建线程尚未初始化 COM；保留参数必须为空。
             let initialized = unsafe {
                 CoInitializeEx(
-                    None::<*const c_void>,
+                    std::ptr::null_mut(),
                     COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
                 )
-            }
-            .is_ok();
+            } >= 0;
             let result = shell_execute_open(&path);
             if initialized {
                 // SAFETY: 只与上面成功的 CoInitializeEx 配对调用一次。
