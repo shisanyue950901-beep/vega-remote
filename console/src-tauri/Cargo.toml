@@ -15,8 +15,6 @@ tauri = { version = "2", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-# 跨进程配置锁：Windows 走 LockFileEx，Unix 走 flock，句柄关闭即释放。
-fs2 = "0.4"
 
 [profile.release]
 opt-level = "s"
