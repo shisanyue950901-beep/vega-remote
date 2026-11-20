@@ -1,0 +1,21 @@
+[package]
+name = "vega-console"
+version = "0.5.0"
+description = "Vega 远程协助控制台（Tauri 2 外壳）"
+authors = ["Vega Remote"]
+license = "MIT"
+edition = "2021"
+rust-version = "1.77"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
