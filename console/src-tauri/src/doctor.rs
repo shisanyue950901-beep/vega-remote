@@ -144,7 +144,7 @@ fn probe_local_port(port: u16, timeout: Duration) -> bool {
 /* ------------------------------------------------------------------ */
 
 /// `None` 表示本次诊断已过期（deadline 到点或被取消），结果不能当快照。
-fn doctor_items(deadline: Instant, cancel: &AtomicBool) -> Option<Vec<DoctorItem>> {
+fn doctor_items(deadline: Instant, cancel: &Arc<AtomicBool>) -> Option<Vec<DoctorItem>> {
     let mut items = Vec::new();
     if expired(deadline, cancel) {
         return None;
@@ -190,7 +190,8 @@ fn doctor_items(deadline: Instant, cancel: &AtomicBool) -> Option<Vec<DoctorItem
             if expired(deadline, cancel) {
                 return None;
             }
-            let result = probe_server_with_timeout(&config.server, deadline, Some(cancel));
+            let result =
+                probe_server_with_timeout(&config.server, deadline, Some(Arc::clone(cancel)));
             items.push(if result.ok {
                 item("RustDesk ID 服务器", DoctorStatus::Pass, "")
             } else {

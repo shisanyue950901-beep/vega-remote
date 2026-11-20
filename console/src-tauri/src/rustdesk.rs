@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tauri::Manager;
@@ -1023,34 +1024,51 @@ fn lookup_stopped(deadline: Instant, cancel: Option<&AtomicBool>) -> bool {
 /// DNS 解析放在独立线程里，用 channel 等到调用方给的原始 deadline：
 /// `to_socket_addrs` 本身没有超时参数，直接调用可能把命令拖住很久。
 ///
-/// 启动线程前先查 deadline 和取消标志；已过期/已取消就直接返回超时，
-/// 不再为一次注定被丢弃的解析创建线程。
+/// 三层保护：
+/// 1. 启动线程前先查 deadline 和取消标志；已过期/已取消就直接返回超时，
+///    不再为一次注定被丢弃的解析创建线程。
+/// 2. 线程被调度起来后再查一次 —— 它可能在调用方的检查之后才被调度，
+///    此时预算已经用光/已被取消，直接不解析、不回包。
+/// 3. 解析返回时再查一次，迟到结果丢弃；等待时长在真正 `recv_timeout`
+///    之前现算，用 spawn 前捕获的旧快照会多等。
 fn resolve_with_timeout(
     host: &str,
     port: u16,
     deadline: Instant,
-    cancel: Option<&AtomicBool>,
+    cancel: Option<Arc<AtomicBool>>,
 ) -> Result<Vec<SocketAddr>, String> {
-    if lookup_stopped(deadline, cancel) {
-        return Err(format!("解析 {host}:{port} 超时"));
-    }
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return Err(format!("解析 {host}:{port} 超时"));
+    let timeout_message = format!("解析 {host}:{port} 超时");
+    if lookup_stopped(deadline, cancel.as_deref()) {
+        return Err(timeout_message);
     }
     let (tx, rx) = mpsc::channel();
     let lookup_host = host.to_string();
+    let thread_deadline = deadline;
+    let thread_cancel = cancel.clone();
     std::thread::spawn(move || {
+        // 线程内部第一件事：线程可能在调用方的检查之后才被调度。
+        if lookup_stopped(thread_deadline, thread_cancel.as_deref()) {
+            return;
+        }
         let result = (lookup_host.as_str(), port)
             .to_socket_addrs()
             .map(|iter| iter.collect::<Vec<_>>())
             .map_err(|e| e.to_string());
+        // 解析结果迟到（已过期/已取消）：丢弃，不回包。
+        if lookup_stopped(thread_deadline, thread_cancel.as_deref()) {
+            return;
+        }
         let _ = tx.send(result);
     });
+    // 剩余等待在真正 recv 前现算，不用 spawn 之前捕获的时长。
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(timeout_message);
+    }
     match rx.recv_timeout(remaining) {
         Ok(Ok(addrs)) => Ok(addrs),
         Ok(Err(e)) => Err(format!("解析 {host}:{port} 失败：{e}")),
-        Err(_) => Err(format!("解析 {host}:{port} 超时")),
+        Err(_) => Err(timeout_message),
     }
 }
 
@@ -1060,7 +1078,7 @@ fn resolve_with_timeout(
 pub(crate) fn probe_server_with_timeout(
     server: &str,
     deadline: Instant,
-    cancel: Option<&AtomicBool>,
+    cancel: Option<Arc<AtomicBool>>,
 ) -> TestResult {
     let started = Instant::now();
     let (host, port) = match endpoint_from_server(server) {
@@ -1073,7 +1091,8 @@ pub(crate) fn probe_server_with_timeout(
             }
         }
     };
-    let addrs = match resolve_with_timeout(&host, port, deadline, cancel) {
+    let cancel_flag = cancel.as_deref();
+    let addrs = match resolve_with_timeout(&host, port, deadline, cancel.clone()) {
         Ok(addrs) => addrs,
         Err(e) => {
             return TestResult {
@@ -1092,7 +1111,7 @@ pub(crate) fn probe_server_with_timeout(
     }
     let mut last_error = String::new();
     for addr in addrs {
-        if lookup_stopped(deadline, cancel) {
+        if lookup_stopped(deadline, cancel_flag) {
             last_error = "总超时已用完".to_string();
             break;
         }
@@ -1278,10 +1297,10 @@ mod tests {
     #[test]
     fn resolve_returns_timeout_before_spawning_when_cancelled() {
         // 取消标志优先于还很远的 deadline：同样不能启动解析线程。
-        let cancel = AtomicBool::new(true);
+        let cancel = Arc::new(AtomicBool::new(true));
         let future = Instant::now() + Duration::from_secs(60);
         let started = Instant::now();
-        let result = resolve_with_timeout("host.invalid", 21116, future, Some(&cancel));
+        let result = resolve_with_timeout("host.invalid", 21116, future, Some(cancel));
         assert!(result.is_err());
         assert!(started.elapsed() < Duration::from_secs(1));
     }
