@@ -7,9 +7,11 @@
 //! - 非 Windows 平台一律返回「未安装 RustDesk」，不 spawn 任何进程。
 
 use serde::Serialize;
+use std::io::Write;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tauri::Manager;
@@ -18,6 +20,13 @@ const RUSTDESK_EXE: &str = "rustdesk.exe";
 const NOT_INSTALLED: &str = "未安装 RustDesk";
 const CONFIG_TIMEOUT: Duration = Duration::from_secs(5);
 const TEST_TIMEOUT: Duration = Duration::from_secs(3);
+/// 跨实例写配置时等锁的上限；超时宁可报错也不覆盖别人刚写的文件。
+const LOCK_TIMEOUT: Duration = Duration::from_secs(3);
+/// 锁文件的陈旧判定：进程崩溃留下的锁超过这个时间视为可回收。
+const STALE_LOCK_AGE: Duration = Duration::from_secs(30);
+
+/// 原子写临时文件序号，保证同名写入之间不会互相覆盖临时文件。
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// RustDesk 默认 ID/中继端口（hbbs 21116）。
 const RUSTDESK_DEFAULT_PORT: u16 = 21116;
 const RECENT_LIMIT: usize = 10;
@@ -101,6 +110,10 @@ fn split_host_port(value: &str) -> Result<(&str, Option<u16>), String> {
             .find(']')
             .ok_or_else(|| "IPv6 地址缺少右方括号".to_string())?;
         let host = &rest[..end];
+        // 方括号只允许包 IPv6：`[example.com]` 不是合法写法。
+        if host.parse::<Ipv6Addr>().is_err() {
+            return Err("方括号里必须是合法的 IPv6 地址".to_string());
+        }
         let tail = &rest[end + 1..];
         if tail.is_empty() {
             return Ok((host, None));
@@ -140,24 +153,36 @@ fn validate_host(host: &str) -> Result<(), String> {
     if host.parse::<Ipv4Addr>().is_ok() || host.parse::<Ipv6Addr>().is_ok() {
         return Ok(());
     }
-    if host.starts_with('-')
-        || host.ends_with('-')
-        || host.starts_with('.')
-        || host.ends_with('.')
-        || host.contains("..")
-    {
-        return Err("主机名格式无效".into());
+    // 逐标签按 DNS 规则校验：1-63 字符，字母/数字/连字符，首尾不能是连字符。
+    let labels: Vec<&str> = host.split('.').collect();
+    for label in &labels {
+        if label.is_empty() {
+            return Err("主机名包含空标签".into());
+        }
+        if label.len() > 63 {
+            return Err("主机名单个标签过长（上限 63 字符）".into());
+        }
+        if !label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            return Err("主机名标签只能包含字母、数字和连字符".into());
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err("主机名标签不能以连字符开头或结尾".into());
+        }
     }
-    if !host
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_')
+    // 全数字的标签组合只可能是 IPv4；解析失败说明是个伪 IP（如 999.1.1.1）。
+    if labels
+        .iter()
+        .all(|label| label.chars().all(|c| c.is_ascii_digit()))
     {
-        return Err("主机名只能包含字母、数字、点和连字符".into());
+        return Err("IPv4 地址格式无效".into());
     }
     Ok(())
 }
 
-/// 公钥必须是 44 个 base64 字符（允许末尾 1~2 个 `=`）。返回清洗后的公钥。
+/// 公钥必须是 44 个 base64 字符（末尾恰好 1 个 `=`），解码后正好 32 字节。
 pub fn validate_key(input: &str) -> Result<String, String> {
     let key: String = input
         .chars()
@@ -175,10 +200,60 @@ pub fn validate_key(input: &str) -> Result<String, String> {
     {
         return Err("公钥包含非 base64 字符".into());
     }
-    if key.trim_end_matches('=').len() < 42 || key.contains('=') && !key.ends_with('=') {
+    // 只允许末尾一个填充符：中间的 `=` 或不填充都拒绝。
+    let body = key.strip_suffix('=').unwrap_or("");
+    if body.is_empty() || body.len() != 43 || body.contains('=') {
         return Err("公钥 base64 填充位置无效".into());
     }
+    let decoded = decode_base64(body.as_bytes())
+        .ok_or_else(|| "公钥不是合法的 base64".to_string())?;
+    if decoded.len() != 32 {
+        return Err(format!(
+            "公钥必须是 32 字节（解码后 {} 字节）",
+            decoded.len()
+        ));
+    }
     Ok(key)
+}
+
+/// 严格 base64 解码：拒绝非法字符、非零填充位。43 字符应得到 32 字节。
+fn decode_base64(data: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(data.len() * 3 / 4);
+    let mut buffer: u32 = 0;
+    let mut bits: u32 = 0;
+    for &byte in data {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        buffer = (buffer << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buffer >> bits) & 0xff) as u8);
+            buffer &= (1 << bits) - 1;
+        }
+    }
+    // 剩余不足一字节的位必须为 0，否则不是规范编码。
+    if bits > 0 && buffer != 0 {
+        return None;
+    }
+    Some(out)
+}
+
+/// IPC 入口：设备码只接受 9-10 位 ASCII 数字，不做任何字符清洗。
+pub fn parse_peer_id(raw: &str) -> Result<String, String> {
+    let value = raw.trim();
+    if !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()) {
+        if value.len() == 9 || value.len() == 10 {
+            return Ok(value.to_string());
+        }
+    }
+    Err("设备码必须是 9-10 位数字".into())
 }
 
 /// 公钥指纹：只暴露前 8 位。
