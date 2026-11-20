@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 use crate::rustdesk::{get_server_config, locate_rustdesk, probe_server_with_timeout};
-use crate::winpaths::{local_app_data_dir, open_directory};
+use crate::winpaths::{local_app_data_dir, open_directory_unless};
 use crate::scm::{query_service_state, ServiceState};
 use crate::streaming::{moonlight_exe, tailscale_installed};
 
@@ -880,23 +880,27 @@ fn export_file_name(timestamp_secs: u64, millis: u32, seq: u64) -> String {
     format!("doctor-{timestamp_secs}-{millis:03}-{seq}.json")
 }
 
-/// 以 `create_new` 独占创建导出文件；遇到同名文件就换下一个序号，
-/// 最多 5 次。绝不截断已有报告。
-fn create_export_file_at(
+/// 暂存文件名：与正式报告同目录、同序号，加 `.part` 后缀。
+fn export_temp_name(timestamp_secs: u64, millis: u32, seq: u64) -> String {
+    format!("doctor-{timestamp_secs}-{millis:03}-{seq}.json.part")
+}
+
+/// 以 `create_new` 独占创建**暂存**文件；遇到同名暂存文件就换下一个序号，
+/// 最多 5 次。返回 `(暂存路径, 正式路径, 可写文件)`：正式路径此刻还不存在，
+/// 所以中途失败不会留下半份正式报告。
+fn create_staged_export_at(
     directory: &Path,
     timestamp_secs: u64,
     millis: u32,
     first_seq: u64,
-) -> std::io::Result<(PathBuf, File)> {
+) -> std::io::Result<(PathBuf, PathBuf, File)> {
     let mut last_error = None;
     for attempt in 0..EXPORT_NAME_ATTEMPTS {
-        let path = directory.join(export_file_name(
-            timestamp_secs,
-            millis,
-            first_seq + attempt,
-        ));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => return Ok((path, file)),
+        let seq = first_seq + attempt;
+        let temp = directory.join(export_temp_name(timestamp_secs, millis, seq));
+        let report = directory.join(export_file_name(timestamp_secs, millis, seq));
+        match OpenOptions::new().write(true).create_new(true).open(&temp) {
+            Ok(file) => return Ok((temp, report, file)),
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                 last_error = Some(error);
             }
@@ -906,14 +910,77 @@ fn create_export_file_at(
     Err(last_error.expect("at least one exclusive-create attempt runs"))
 }
 
-fn create_export_file(
+/// 无覆盖发布：`hard_link` 在正式名已存在时失败，绝不替换已有报告；
+/// 链接成功后删掉暂存文件。`rename` 在 Windows 上会覆盖同名文件，这里不用。
+fn publish_staged_export(temp: &Path, report: &Path) -> std::io::Result<()> {
+    std::fs::hard_link(temp, report)?;
+    let _ = std::fs::remove_file(temp);
+    Ok(())
+}
+
+/// 暂存 → 写入 → 发布：整份 JSON 先落到 `.part`，写完再以无覆盖方式发布。
+/// `should_abort` 在写入之后、发布之前再查一次：过期就不发布（也不会留残片）。
+/// 返回 `Ok(None)` 表示因过期/取消放弃发布。
+fn write_export_report(
     directory: &Path,
     timestamp_secs: u64,
     millis: u32,
-) -> std::io::Result<(PathBuf, File)> {
+    json: &str,
+    should_abort: &dyn Fn() -> bool,
+) -> Result<Option<PathBuf>, String> {
     // 预约一段序号，避免并发导出交错抢同一个后缀。
     let first_seq = EXPORT_SEQ.fetch_add(EXPORT_NAME_ATTEMPTS, Ordering::Relaxed);
-    create_export_file_at(directory, timestamp_secs, millis, first_seq)
+    write_export_report_from(
+        directory,
+        timestamp_secs,
+        millis,
+        first_seq,
+        json,
+        should_abort,
+    )
+}
+
+/// 与 `write_export_report` 相同，但序号显式给出（测试用它固定候选名）。
+fn write_export_report_from(
+    directory: &Path,
+    timestamp_secs: u64,
+    millis: u32,
+    first_seq: u64,
+    json: &str,
+    should_abort: &dyn Fn() -> bool,
+) -> Result<Option<PathBuf>, String> {
+    const WRITE_ERROR: &str = "写入脱敏日志失败";
+    for attempt in 0..EXPORT_NAME_ATTEMPTS {
+        let (temp, report, mut file) =
+            create_staged_export_at(directory, timestamp_secs, millis, first_seq + attempt)
+                .map_err(|_| WRITE_ERROR.to_string())?;
+        let written = file
+            .write_all(json.as_bytes())
+            .and_then(|()| file.write_all(b"\n"))
+            .and_then(|()| file.flush());
+        // 先关句柄再发布：Windows 上打开中的文件不能被移动/删除。
+        drop(file);
+        if written.is_err() {
+            let _ = std::fs::remove_file(&temp);
+            return Err(WRITE_ERROR.to_string());
+        }
+        if should_abort() {
+            let _ = std::fs::remove_file(&temp);
+            return Ok(None);
+        }
+        match publish_staged_export(&temp, &report) {
+            Ok(()) => return Ok(Some(report)),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                // 正式名被别的导出抢走：删掉暂存，换下一个序号重来。
+                let _ = std::fs::remove_file(&temp);
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(&temp);
+                return Err(WRITE_ERROR.to_string());
+            }
+        }
+    }
+    Err(WRITE_ERROR.to_string())
 }
 
 fn export_blocking(
@@ -959,22 +1026,33 @@ fn export_blocking(
         return Err(EXPORT_TIMEOUT.to_string());
     }
     let directory = log_directory()?;
-    std::fs::create_dir_all(&directory)
-        .map_err(|_| "创建日志目录失败".to_string())?;
-    let (_path, mut file) = create_export_file(&directory, now_secs, now_millis)
-        .map_err(|_| "写入脱敏日志失败".to_string())?;
-    file.write_all(json.as_bytes())
-        .map_err(|_| "写入脱敏日志失败".to_string())?;
-    file.write_all(b"\n")
-        .map_err(|_| "写入脱敏日志失败".to_string())?;
+    std::fs::create_dir_all(&directory).map_err(|_| "创建日志目录失败".to_string())?;
+    // 定位/创建目录本身也可能被磁盘卡住：落盘前再查一次，超时就不写。
+    if expired(deadline, &cancel) {
+        return Err(EXPORT_TIMEOUT.to_string());
+    }
+    // 暂存写入后再查一次（发布前），过期就放弃发布并清掉暂存文件。
+    let write_abort = {
+        let cancel = Arc::clone(&cancel);
+        move || expired(deadline, &cancel)
+    };
+    match write_export_report(&directory, now_secs, now_millis, &json, &write_abort)? {
+        Some(_) => {}
+        None => return Err(EXPORT_TIMEOUT.to_string()),
+    };
 
     if cfg!(windows) {
         // 打开资源管理器前再查一次：超时的导出不该再弹窗。
         if expired(deadline, &cancel) {
             return Err(EXPORT_TIMEOUT.to_string());
         }
+        // STA 线程里在 ShellExecuteW 之前还会再查一次（线程可能晚起）。
+        let open_abort = {
+            let cancel = Arc::clone(&cancel);
+            move || expired(deadline, &cancel)
+        };
         // 直接 ShellExecuteW(verb=open, lpFile=目录)，不拼 explorer.exe 命令行。
-        open_directory(&directory)
+        open_directory_unless(&directory, open_abort)
             .map_err(|_| "日志已导出，但打开目录失败".to_string())?;
     }
     Ok(())
@@ -1222,33 +1300,66 @@ mod tests {
     }
 
     #[test]
-    fn export_creation_skips_existing_names_and_never_truncates() {
+    fn export_publishes_without_overwriting_existing_names() {
+        // 唯一目录名：并行测试互不干扰。
         let dir = std::env::temp_dir().join(format!(
-            "vega-export-name-test-{}",
-            std::process::id()
+            "vega-export-name-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
 
         // 第一个候选名已被占用：必须换下一个序号，而不是截断旧文件。
         let taken = dir.join(export_file_name(123, 4, 0));
         std::fs::write(&taken, b"old report").unwrap();
-        let (path, mut file) = create_export_file_at(&dir, 123, 4, 0).unwrap();
-        assert_eq!(
-            path.file_name().unwrap().to_str().unwrap(),
-            export_file_name(123, 4, 1)
-        );
-        file.write_all(b"new report").unwrap();
-        drop(file);
+        let published = write_export_report_from(&dir, 123, 4, 0, "new report", &|| false)
+            .unwrap()
+            .expect("not aborted");
+        // 序号 0 已被占用，发布必须换到序号 1；旧的报告一个字节都没动。
         assert_eq!(std::fs::read(&taken).unwrap(), b"old report".to_vec());
-        assert_eq!(std::fs::read(&path).unwrap(), b"new report".to_vec());
+        assert_eq!(std::fs::read(&published).unwrap(), b"new report\n".to_vec());
+        // 暂存文件不残留。
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.ends_with(".part"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
 
-        // 5 个候选全被占用：返回 AlreadyExists，不再无限重试。
+        // 5 个候选正式名全被占用：无覆盖发布必然失败，不会改写任何一份。
         for seq in 0..EXPORT_NAME_ATTEMPTS {
             std::fs::write(dir.join(export_file_name(123, 4, seq)), b"x").unwrap();
         }
-        let error = create_export_file_at(&dir, 123, 4, 0).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::AlreadyExists);
+        let error = write_export_report_from(&dir, 123, 4, 0, "clobbered", &|| false).unwrap_err();
+        assert_eq!(error, "写入脱敏日志失败");
+        for seq in 0..EXPORT_NAME_ATTEMPTS {
+            assert_eq!(
+                std::fs::read(dir.join(export_file_name(123, 4, seq))).unwrap(),
+                b"x".to_vec()
+            );
+        }
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn staged_export_stays_unpublished_when_aborted() {
+        // 过期检查命中：暂存写完也不发布，目录里不留正式报告和残片。
+        let dir = std::env::temp_dir().join(format!(
+            "vega-export-abort-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let aborted = write_export_report_from(&dir, 321, 7, 0, "payload", &|| true).unwrap();
+        assert!(aborted.is_none());
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(names.is_empty(), "{names:?}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

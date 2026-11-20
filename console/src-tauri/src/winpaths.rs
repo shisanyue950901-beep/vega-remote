@@ -180,8 +180,14 @@ fn shell_execute_open(path: &Path) -> Result<(), ()> {
 ///
 /// 不借用调用方（阻塞 worker）的 COM 状态：worker 可能根本没初始化 COM，
 /// 或已处于 MTA。专用线程结束即释放，调用方同步等结果。
+///
+/// `should_abort` 在 STA 线程里、紧挨着 `ShellExecuteW` 之前被调用一次 ——
+/// 线程可能晚于调用方的检查才被调度，返回 `true` 就不再弹资源管理器。
 #[cfg(windows)]
-pub(crate) fn open_directory(path: &Path) -> Result<(), ()> {
+pub(crate) fn open_directory_unless<F>(path: &Path, should_abort: F) -> Result<(), ()>
+where
+    F: Fn() -> bool + Send + 'static,
+{
     use std::ffi::c_void;
 
     // 直接用 ole32 的 ABI，不依赖 windows crate 里可选参数的类型细节。
@@ -198,6 +204,10 @@ pub(crate) fn open_directory(path: &Path) -> Result<(), ()> {
     let handle = std::thread::Builder::new()
         .name("vega-open-directory".to_string())
         .spawn(move || {
+            // 线程刚起来就可能已经过期：连 COM 都不初始化。
+            if should_abort() {
+                return Err(());
+            }
             // SAFETY: 新建线程尚未初始化 COM；保留参数必须为空。
             let initialized = unsafe {
                 CoInitializeEx(
@@ -205,7 +215,12 @@ pub(crate) fn open_directory(path: &Path) -> Result<(), ()> {
                     COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
                 )
             } >= 0;
-            let result = shell_execute_open(&path);
+            // ShellExecuteW 之前的最后一次检查：过期就不打开目录。
+            let result = if should_abort() {
+                Err(())
+            } else {
+                shell_execute_open(&path)
+            };
             if initialized {
                 // SAFETY: 只与上面成功的 CoInitializeEx 配对调用一次。
                 unsafe { CoUninitialize() };
@@ -217,7 +232,10 @@ pub(crate) fn open_directory(path: &Path) -> Result<(), ()> {
 }
 
 #[cfg(not(windows))]
-pub(crate) fn open_directory(_path: &Path) -> Result<(), ()> {
+pub(crate) fn open_directory_unless<F>(_path: &Path, _should_abort: F) -> Result<(), ()>
+where
+    F: Fn() -> bool + Send + 'static,
+{
     Err(())
 }
 
@@ -601,6 +619,6 @@ mod tests {
     #[test]
     fn opening_a_directory_fails_off_windows() {
         // 非 Windows 不加载 shell32/COM：直接返回错误，不 pretend 成功。
-        assert!(open_directory(Path::new("C:\\Vega\\logs")).is_err());
+        assert!(open_directory_unless(Path::new("C:\\Vega\\logs"), || false).is_err());
     }
 }
