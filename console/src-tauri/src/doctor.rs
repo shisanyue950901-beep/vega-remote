@@ -283,7 +283,7 @@ fn looks_like_hostname(core: &str) -> bool {
 fn split_edge_punctuation(token: &str) -> (&str, &str, &str) {
     let leading = token
         .char_indices()
-        .find(|(_, c)| {
+        .find(|&(_, c)| {
             !c.is_ascii_punctuation()
                 || matches!(c, '[' | '(' | '{' | '"' | '\'')
         })
@@ -293,7 +293,7 @@ fn split_edge_punctuation(token: &str) -> (&str, &str, &str) {
     let trailing = rest
         .char_indices()
         .rev()
-        .find(|(_, c)| {
+        .find(|&(_, c)| {
             !c.is_ascii_punctuation()
                 || matches!(c, ']' | ')' | '}' | '"' | '\'')
         })
