@@ -29,6 +29,45 @@ BeforeAll {
             param([string]$PolicyStore)
             $null = $PolicyStore
         }
+        'Get-NetFirewallRule' = {
+            [CmdletBinding()]
+            param(
+                [string]$Name,
+                [string]$PolicyStore,
+                [string]$Direction,
+                [string]$Action
+            )
+            $null = $Name
+            $null = $PolicyStore
+            $null = $Direction
+            $null = $Action
+        }
+        'Remove-NetFirewallRule' = {
+            [CmdletBinding(SupportsShouldProcess)]
+            param([string]$Name)
+            $null = $Name
+        }
+        'New-NetFirewallRule' = {
+            [CmdletBinding(SupportsShouldProcess)]
+            param(
+                [string]$Name,
+                [string]$DisplayName,
+                [string]$Direction,
+                [string]$Action,
+                [string]$Protocol,
+                [string[]]$LocalPort,
+                [string]$Program,
+                [string]$PolicyStore
+            )
+            $null = $Name
+            $null = $DisplayName
+            $null = $Direction
+            $null = $Action
+            $null = $Protocol
+            $null = $LocalPort
+            $null = $Program
+            $null = $PolicyStore
+        }
         'Get-NetConnectionProfile' = {
             [CmdletBinding()]
             param()
@@ -320,6 +359,14 @@ Describe 'Invoke-VegaHostInstall（mock）' {
 
         Mock -ModuleName $script:ModuleName Write-VegaStatus { }
         Mock -ModuleName $script:ModuleName Uninstall-VegaPackage { throw '不该被调用' }
+        # 卸载会走真实的防火墙/服务回滚；这里和相邻的 -RemoveApps 用例一样把
+        # 包装函数 Mock 掉，免得在 Linux 上真的去调 NetFirewall/服务 cmdlet。
+        Mock -ModuleName $script:ModuleName Remove-VegaLegacyFirewallRule { @() }
+        Mock -ModuleName $script:ModuleName Remove-VegaFirewallRuleByName { $true }
+        Mock -ModuleName $script:ModuleName Enable-VegaSunshineInstallerFirewallRule { @('Sunshine') }
+        Mock -ModuleName $script:ModuleName Restore-VegaSunshineServiceState {
+            [pscustomobject]@{ Success = $true; Message = 'ok' }
+        }
 
         $result = Invoke-VegaHostUninstall -StatePath $script:statePath -RemoveApps -Confirm:$false
 
