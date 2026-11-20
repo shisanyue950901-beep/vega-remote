@@ -66,7 +66,7 @@ TODO 见工作流注释，联网生成后改为 `npm ci` + `--locked`。
 | `set_server_config` | 校验 `host[:port]` 与 44 位 base64 公钥；跨实例锁 + `create_new` 临时文件 + rename 原子写，保留其他键；只有 `NotFound` 才当空文件，读失败中止；留空公钥表示沿用 |
 | `connect_peer` / `get_recent_peers` | 只接受 9-10 位 ASCII 数字与 `control`/`file` 模式；`--connect` / `--file-transfer`，最近 10 条存 app config 目录 JSON，无密钥 |
 | `open_rustdesk_window` | 不带参数启动 RustDesk，用户自己看临时密码 |
-| `get_rustdesk_status` / `install_rustdesk` | 进程与服务状态；只从 `%ProgramData%\Vega\host\install-host.ps1`（管理员可写）提权，经 `ShellExecuteExW` + `runas` 调系统 PowerShell 的 `-File "绝对路径" -WithRustDesk`，参数里无密钥；UAC 取消会回显 |
+| `get_rustdesk_status` / `install_rustdesk` | 进程与服务状态；只从安装包资源目录（`bundle.resources` → Program Files）或 `%ProgramData%\Vega\host`（管理员可写）取 `install-host.ps1`，经 `ShellExecuteExW` + `runas` 调系统 PowerShell 的 `-File "绝对路径" -WithRustDesk`，参数里无密钥；UAC 取消会回显 |
 | `test_server_connection` | Rust 侧 TCP connect `server:21116`；解析与所有连接尝试共用 3 秒 deadline，`spawn_blocking` 离开 UI 线程 |
 
 非 Windows 平台全部返回「未安装 RustDesk」，不 spawn 进程。纯函数（设备码、
