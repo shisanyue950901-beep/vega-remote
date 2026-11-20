@@ -168,6 +168,10 @@ fn doctor_items(deadline: Instant, cancel: &AtomicBool) -> Option<Vec<DoctorItem
         ));
     } else {
         let config = get_server_config();
+        // 读配置也可能被磁盘/COM 卡住：读完再查一次，过期就不进网络探测。
+        if expired(deadline, cancel) {
+            return None;
+        }
         if config.server.trim().is_empty() {
             items.push(item(
                 "RustDesk ID 服务器",
@@ -176,6 +180,10 @@ fn doctor_items(deadline: Instant, cancel: &AtomicBool) -> Option<Vec<DoctorItem
             ));
         } else {
             let budget = remaining(deadline).min(Duration::from_secs(3));
+            // DNS 解析前最后确认：预算已耗尽或已取消时不再发起解析。
+            if budget.is_zero() || expired(deadline, cancel) {
+                return None;
+            }
             let result = probe_server_with_timeout(&config.server, budget);
             items.push(if result.ok {
                 item("RustDesk ID 服务器", DoctorStatus::Pass, "")
@@ -258,6 +266,10 @@ fn doctor_items(deadline: Instant, cancel: &AtomicBool) -> Option<Vec<DoctorItem
         Err(error) => item("Moonlight", DoctorStatus::Warn, &error),
     });
 
+    // 最后一项探测（Moonlight）跑完也要查：迟到的结果不能当快照返回。
+    if expired(deadline, cancel) {
+        return None;
+    }
     Some(items)
 }
 
@@ -358,7 +370,8 @@ fn doctor_remaining(deadline: Instant) -> Duration {
 /// 唯一的诊断路径：`run_doctor` 与导出的兜底都走这里。
 ///
 /// deadline 由 IPC 命令入口传入（`Instant::now() + DOCTOR_BUDGET`），
-/// `tokio::time::timeout` 只用它的剩余预算等待阻塞线程，超时不杀 worker。
+/// `tokio::time::timeout_at` 直接等同一个绝对 deadline，超时不杀 worker；
+/// 超时后 worker 若仍返回结果，按迟到快照丢弃。
 async fn await_diagnosis(deadline: Instant) -> DiagnoseOutcome {
     let budget = doctor_remaining(deadline);
     if budget.is_zero() {
@@ -369,8 +382,18 @@ async fn await_diagnosis(deadline: Instant) -> DiagnoseOutcome {
     let worker_cancel = Arc::clone(&cancel);
     let join =
         tauri::async_runtime::spawn_blocking(move || diagnose_worker(deadline, worker_cancel));
-    match tokio::time::timeout(budget, join).await {
-        Ok(Ok(WorkerOutcome::Done(items))) => DiagnoseOutcome::Done(items),
+    // 等到命令入口定下的同一个绝对 deadline，而不是再从当前时间数一份预算。
+    let deadline_at = tokio::time::Instant::from_std(deadline);
+    match tokio::time::timeout_at(deadline_at, join).await {
+        Ok(Ok(WorkerOutcome::Done(items))) => {
+            // join 恰好赶在计时器之前返回也可能已经过了 deadline：迟到快照丢弃。
+            if expired(deadline, &cancel) {
+                cancel.store(true, Ordering::Release);
+                DiagnoseOutcome::Timeout
+            } else {
+                DiagnoseOutcome::Done(items)
+            }
+        }
         Ok(Ok(WorkerOutcome::Busy)) => DiagnoseOutcome::Busy,
         Ok(Ok(WorkerOutcome::Cancelled)) => DiagnoseOutcome::Timeout,
         Ok(Ok(WorkerOutcome::Panicked)) | Ok(Err(_)) => DiagnoseOutcome::WorkerFailed,
