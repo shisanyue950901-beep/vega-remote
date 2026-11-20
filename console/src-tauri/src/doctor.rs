@@ -8,7 +8,7 @@ use std::io::Write;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -59,6 +59,13 @@ fn item(name: &str, status: DoctorStatus, advice: &str) -> DoctorItem {
 
 fn remaining(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
+}
+
+/// 本次诊断是否已经过期：deadline 到点，或被 IPC 层超时置了取消标志。
+///
+/// worker 在开始前和每个探测前都查一次；过期就立即退出，不再占并发闸门。
+fn expired(deadline: Instant, cancel: &AtomicBool) -> bool {
+    cancel.load(Ordering::Acquire) || Instant::now() >= deadline
 }
 
 /* ------------------------------------------------------------------ */
@@ -131,8 +138,12 @@ fn probe_local_port(port: u16, timeout: Duration) -> bool {
 /* doctor 主流程                                                        */
 /* ------------------------------------------------------------------ */
 
-fn doctor_items(deadline: Instant) -> Vec<DoctorItem> {
+/// `None` 表示本次诊断已过期（deadline 到点或被取消），结果不能当快照。
+fn doctor_items(deadline: Instant, cancel: &AtomicBool) -> Option<Vec<DoctorItem>> {
     let mut items = Vec::new();
+    if expired(deadline, cancel) {
+        return None;
+    }
 
     let rustdesk_installed = locate_rustdesk().is_some();
     items.push(if rustdesk_installed {
@@ -146,6 +157,9 @@ fn doctor_items(deadline: Instant) -> Vec<DoctorItem> {
     });
 
     // RustDesk ID 服务器：复用现有 TCP 探测，最多 3 秒，并受总预算约束。
+    if expired(deadline, cancel) {
+        return None;
+    }
     if !rustdesk_installed {
         items.push(item(
             "RustDesk ID 服务器",
@@ -175,6 +189,9 @@ fn doctor_items(deadline: Instant) -> Vec<DoctorItem> {
         }
     }
 
+    if expired(deadline, cancel) {
+        return None;
+    }
     let sunshine = query_service_state(SUNSHINE_SERVICE);
     items.push(match sunshine {
         ServiceState::Running => item("Sunshine 服务", DoctorStatus::Pass, ""),
@@ -195,10 +212,16 @@ fn doctor_items(deadline: Instant) -> Vec<DoctorItem> {
         ),
     });
 
+    if expired(deadline, cancel) {
+        return None;
+    }
     let port_reachable = probe_local_port(SUNSHINE_PORT, remaining(deadline).min(TCP_PROBE_TIMEOUT));
     let (port_status, port_advice) = port_47990_status(port_reachable, sunshine);
     items.push(item("Sunshine 管理页 47990", port_status, port_advice));
 
+    if expired(deadline, cancel) {
+        return None;
+    }
     items.push(if has_global_ipv6() {
         item("公网 IPv6", DoctorStatus::Pass, "")
     } else {
@@ -209,6 +232,9 @@ fn doctor_items(deadline: Instant) -> Vec<DoctorItem> {
         )
     });
 
+    if expired(deadline, cancel) {
+        return None;
+    }
     items.push(if tailscale_installed() {
         item("Tailscale", DoctorStatus::Pass, "")
     } else {
@@ -219,6 +245,9 @@ fn doctor_items(deadline: Instant) -> Vec<DoctorItem> {
         )
     });
 
+    if expired(deadline, cancel) {
+        return None;
+    }
     items.push(match moonlight_exe() {
         Ok(Some(_)) => item("Moonlight", DoctorStatus::Pass, ""),
         Ok(None) => item(
@@ -229,7 +258,7 @@ fn doctor_items(deadline: Instant) -> Vec<DoctorItem> {
         Err(error) => item("Moonlight", DoctorStatus::Warn, &error),
     });
 
-    items
+    Some(items)
 }
 
 /// doctor 并发闸门：同一时间只允许一个诊断在跑。
@@ -287,6 +316,7 @@ impl DiagnoseOutcome {
 enum WorkerOutcome {
     Done(Vec<DoctorItem>),
     Busy,
+    Cancelled,
     Panicked,
 }
 
@@ -294,7 +324,11 @@ enum WorkerOutcome {
 ///
 /// 并发闸门放在闭包内部：IPC 层 `timeout` 提前返回时 worker 可能还在跑，
 /// 这时继续拒绝第二次诊断，直到它真正退出（guard 随闭包一起 drop）。
-fn diagnose_worker(deadline: Instant) -> WorkerOutcome {
+fn diagnose_worker(deadline: Instant, cancel: Arc<AtomicBool>) -> WorkerOutcome {
+    // 排队期间就已经过期/被取消：不取闸门，直接退出。
+    if expired(deadline, &cancel) {
+        return WorkerOutcome::Cancelled;
+    }
     // 第二个并发调用直接返回，不再排队等一次完整诊断。
     if DOCTOR_RUNNING
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -303,8 +337,15 @@ fn diagnose_worker(deadline: Instant) -> WorkerOutcome {
         return WorkerOutcome::Busy;
     }
     let _guard = DoctorGuard;
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| doctor_items(deadline))) {
-        Ok(items) => WorkerOutcome::Done(items),
+    // 取到闸门后再查一次：等闸门期间过期就立即退出，guard 随作用域释放。
+    if expired(deadline, &cancel) {
+        return WorkerOutcome::Cancelled;
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        doctor_items(deadline, &cancel)
+    })) {
+        Ok(Some(items)) => WorkerOutcome::Done(items),
+        Ok(None) => WorkerOutcome::Cancelled,
         Err(_) => WorkerOutcome::Panicked,
     }
 }
@@ -323,12 +364,21 @@ async fn await_diagnosis(deadline: Instant) -> DiagnoseOutcome {
     if budget.is_zero() {
         return DiagnoseOutcome::Timeout;
     }
-    let join = tauri::async_runtime::spawn_blocking(move || diagnose_worker(deadline));
+    // 取消标志交给 worker：IPC 层超时后置位，排队中的 worker 不会再启动占闸门。
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    let join =
+        tauri::async_runtime::spawn_blocking(move || diagnose_worker(deadline, worker_cancel));
     match tokio::time::timeout(budget, join).await {
         Ok(Ok(WorkerOutcome::Done(items))) => DiagnoseOutcome::Done(items),
         Ok(Ok(WorkerOutcome::Busy)) => DiagnoseOutcome::Busy,
+        Ok(Ok(WorkerOutcome::Cancelled)) => DiagnoseOutcome::Timeout,
         Ok(Ok(WorkerOutcome::Panicked)) | Ok(Err(_)) => DiagnoseOutcome::WorkerFailed,
-        Err(_) => DiagnoseOutcome::Timeout,
+        Err(_) => {
+            // 超时不是终态：通知 worker 尽快收手，它退出时才释放闸门。
+            cancel.store(true, Ordering::Release);
+            DiagnoseOutcome::Timeout
+        }
     }
 }
 
@@ -637,18 +687,58 @@ fn redact_token(token: &str) -> String {
     redact_core(token)
 }
 
-fn redact_with(input: &str, profile: Option<&str>) -> String {
+/// 脱敏要用的身份字段：由调用方显式传入，测试用固定夹具。
+///
+/// 生产入口只在 `export_blocking` 里读一次环境变量（`from_env`），
+/// 脱敏函数本身不再碰环境，测试结果不随运行者的 USERNAME 变化。
+#[derive(Default)]
+struct RedactionIdentity {
+    profile: Option<String>,
+    user: Option<String>,
+    computer: Option<String>,
+    domain: Option<String>,
+}
+
+impl RedactionIdentity {
+    /// 生产入口：唯一读环境变量的地方。
+    fn from_env() -> Self {
+        fn var(key: &str) -> Option<String> {
+            std::env::var(key)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        }
+        Self {
+            profile: var("USERPROFILE"),
+            user: var("USERNAME"),
+            computer: var("COMPUTERNAME"),
+            domain: var("USERDOMAIN"),
+        }
+    }
+
+    #[cfg(test)]
+    fn fixture(profile: Option<&str>) -> Self {
+        Self {
+            profile: profile.map(str::to_string),
+            user: Some("alice".to_string()),
+            computer: Some("DESKTOP-7Q2".to_string()),
+            domain: Some("WORKGROUP".to_string()),
+        }
+    }
+}
+
+fn redact_with(input: &str, identity: &RedactionIdentity) -> String {
     let mut text = input.to_string();
-    if let Some(profile) = profile {
+    if let Some(profile) = identity.profile.as_deref() {
         if profile.len() >= 3 {
             text = replace_case_insensitive(&text, profile, "<profile>");
         }
     }
-    for key in ["USERNAME", "COMPUTERNAME", "USERDOMAIN"] {
-        if let Ok(value) = std::env::var(key) {
-            if value.len() >= 2 {
-                text = replace_case_insensitive(&text, &value, "<已隐藏>");
-            }
+    for value in [&identity.user, &identity.computer, &identity.domain]
+        .into_iter()
+        .flatten()
+    {
+        if value.len() >= 2 {
+            text = replace_case_insensitive(&text, value, "<已隐藏>");
         }
     }
     text.split_whitespace()
@@ -657,9 +747,8 @@ fn redact_with(input: &str, profile: Option<&str>) -> String {
         .join(" ")
 }
 
-fn redact_text(input: &str) -> String {
-    let profile = std::env::var("USERPROFILE").ok();
-    redact_with(input, profile.as_deref())
+fn redact_text(input: &str, identity: &RedactionIdentity) -> String {
+    redact_with(input, identity)
 }
 
 #[cfg(windows)]
@@ -741,12 +830,14 @@ fn export_blocking(deadline: Instant, snapshot_id: u64) -> Result<(), String> {
     let Some(items) = snapshot_for(snapshot_id, deadline) else {
         return Err(SNAPSHOT_MISMATCH.to_string());
     };
+    // 身份只在生产入口读一次，随后整份日志共用同一份夹具。
+    let identity = RedactionIdentity::from_env();
     let redacted: Vec<DoctorItem> = items
         .into_iter()
         .map(|entry| DoctorItem {
-            item: redact_text(&entry.item),
-            status: redact_text(&entry.status),
-            advice: redact_text(&entry.advice),
+            item: redact_text(&entry.item, &identity),
+            status: redact_text(&entry.status, &identity),
+            advice: redact_text(&entry.advice, &identity),
         })
         .collect();
     let now = SystemTime::now()
@@ -862,7 +953,7 @@ mod tests {
     #[test]
     fn redaction_masks_addresses_hostnames_and_paths() {
         let input = "IPv4 192.168.1.20 IPv6 2001:4860:4860::8888 host pc.example.com profile C:\\Users\\alice file C:\\Users\\alice\\AppData\\x.log";
-        let output = redact_with(input, Some("C:\\Users\\alice"));
+        let output = redact_with(input, &RedactionIdentity::fixture(Some("C:\\Users\\alice")));
         assert!(!output.contains("192.168.1.20"));
         assert!(!output.contains("2001:4860"));
         assert!(!output.contains("pc.example.com"));
@@ -898,33 +989,33 @@ mod tests {
             "2001:db8::1]:21117",
             "(2001:db8::1)",
         ] {
-            let output = redact_with(input, None);
+            let output = redact_with(input, &RedactionIdentity::default());
             assert!(!output.contains("2001:db8"), "{input} -> {output}");
             assert!(output.contains("<ip>"), "{input} -> {output}");
         }
         // 赋值前缀与包裹标点要原样保留，只换掉地址本体。
-        let comma = redact_with("relay=[2001:db8::1]:21117,", None);
+        let comma = redact_with("relay=[2001:db8::1]:21117,", &RedactionIdentity::default());
         assert!(!comma.contains("2001:db8"), "{comma}");
         assert!(comma.starts_with("relay="), "{comma}");
         assert!(comma.ends_with(','), "{comma}");
-        assert_eq!(redact_with("(2001:db8::1)", None), "(<ip>)");
-        assert_eq!(redact_with("key:1.2.3.4", None), "key:<ip>");
+        assert_eq!(redact_with("(2001:db8::1)", &RedactionIdentity::default()), "(<ip>)");
+        assert_eq!(redact_with("key:1.2.3.4", &RedactionIdentity::default()), "key:<ip>");
     }
 
     #[test]
     fn redaction_keeps_key_name_but_masks_host_value() {
         // `key:` 是键名不是地址；冒号不能被当成 IPv6 分隔符。
-        assert_eq!(redact_with("key:pc.example.com", None), "key:<host>");
-        assert_eq!(redact_with("fe80::1", None), "<ip>");
+        assert_eq!(redact_with("key:pc.example.com", &RedactionIdentity::default()), "key:<host>");
+        assert_eq!(redact_with("fe80::1", &RedactionIdentity::default()), "<ip>");
     }
 
     #[test]
     fn redaction_masks_ipv6_ending_with_double_colon() {
         // `::` 是 IPv6 本体，不能当包裹标点剥掉：`(2001:db8::)` 必须认成地址。
-        assert_eq!(redact_with("(2001:db8::)", None), "(<ip>)");
-        assert_eq!(redact_with("(2001:db8::),", None), "(<ip>),");
+        assert_eq!(redact_with("(2001:db8::)", &RedactionIdentity::default()), "(<ip>)");
+        assert_eq!(redact_with("(2001:db8::),", &RedactionIdentity::default()), "(<ip>),");
         assert_eq!(
-            redact_with("(2001:db8::) 🚀 192.168.1.5", None),
+            redact_with("(2001:db8::) 🚀 192.168.1.5", &RedactionIdentity::default()),
             "(<ip>) 🚀 <ip>"
         );
     }
@@ -932,13 +1023,16 @@ mod tests {
     #[test]
     fn non_ascii_lines_redact_without_panicking() {
         // 中文 + emoji：大小写替换和标点剥离都不能按字节切坏原串。
-        let output = redact_with("用户目录 C:\\Users\\ALICE 🚀 192.168.1.5", Some("c:\\users\\alice"));
+        let output = redact_with(
+            "用户目录 C:\\Users\\ALICE 🚀 192.168.1.5",
+            &RedactionIdentity::fixture(Some("c:\\users\\alice")),
+        );
         assert!(output.contains("<profile>"), "{output}");
         assert!(!output.contains("ALICE"), "{output}");
         assert!(output.contains("🚀"), "{output}");
         assert!(output.contains("<ip>"), "{output}");
 
-        let mixed = redact_with("状态 🚀 (2001:db8::) 完成 ✓", None);
+        let mixed = redact_with("状态 🚀 (2001:db8::) 完成 ✓", &RedactionIdentity::default());
         assert!(mixed.contains("🚀"), "{mixed}");
         assert!(mixed.contains("✓"), "{mixed}");
         assert!(!mixed.contains("2001:db8"), "{mixed}");
@@ -946,14 +1040,49 @@ mod tests {
     }
 
     #[test]
+    fn redaction_uses_explicit_identity_not_environment() {
+        // 夹具固定：结果与运行者的 USERNAME / COMPUTERNAME 无关。
+        let identity = RedactionIdentity::fixture(Some("D:\\Home\\alice"));
+        let output = redact_with(
+            "user alice host DESKTOP-7Q2 domain WORKGROUP profile D:\\Home\\alice\\x.log",
+            &identity,
+        );
+        assert!(!output.contains("alice"), "{output}");
+        assert!(!output.contains("DESKTOP-7Q2"), "{output}");
+        assert!(!output.contains("WORKGROUP"), "{output}");
+        assert!(output.contains("<已隐藏>"), "{output}");
+        assert!(output.contains("<profile>"), "{output}");
+
+        // 换一份夹具就换一套替换：证明没有偷偷回读环境变量。
+        let other = RedactionIdentity {
+            user: Some("bob".to_string()),
+            ..RedactionIdentity::default()
+        };
+        assert!(redact_with("user alice", &other).contains("alice"));
+    }
+
+    #[test]
+    fn expired_checks_deadline_and_cancel_flag() {
+        // cancel 一旦置位，即使 deadline 未到也算过期。
+        let cancel = AtomicBool::new(false);
+        let future = Instant::now() + Duration::from_secs(60);
+        assert!(!expired(future, &cancel));
+        cancel.store(true, Ordering::Release);
+        assert!(expired(future, &cancel));
+        // 没有 cancel 时 deadline 到点也算过期（用已过去的时间点）。
+        let past = Instant::now() - Duration::from_secs(1);
+        assert!(expired(past, &AtomicBool::new(false)));
+    }
+
+    #[test]
     fn redaction_keeps_plain_versions_and_status_text() {
-        let output = redact_with("版本 0.5.0 状态 通过", None);
+        let output = redact_with("版本 0.5.0 状态 通过", &RedactionIdentity::default());
         assert_eq!(output, "版本 0.5.0 状态 通过");
     }
 
     #[test]
     fn redaction_masks_host_port_and_bracketed_ipv6() {
-        let output = redact_with("server 192.0.2.1:21116 relay [2001:db8::1]:21117", None);
+        let output = redact_with("server 192.0.2.1:21116 relay [2001:db8::1]:21117", &RedactionIdentity::default());
         assert!(!output.contains("192.0.2.1"));
         assert!(!output.contains("2001:db8"));
         assert_eq!(output.matches("<ip>").count(), 2);
