@@ -170,6 +170,8 @@ function setupAssistPage(): void {
   const passwordStatus = byId<HTMLSpanElement>("password-status");
   const idDot = byId<HTMLSpanElement>("id-dot");
   const idStatusText = byId<HTMLSpanElement>("id-status-text");
+  const idTestButton = byId<HTMLButtonElement>("id-test");
+  let configuredServer = "";
   const serviceStatusRow = byId<HTMLDivElement>("service-status");
   const serviceDot = byId<HTMLSpanElement>("service-dot");
   const serviceStatusText = byId<HTMLSpanElement>("service-status-text");
@@ -231,16 +233,49 @@ function setupAssistPage(): void {
       if (!config) {
         idStatusText.textContent = "预览模式：无法读取 RustDesk 配置";
         idDot.className = "dot dot--off";
+        idTestButton.classList.add("is-hidden");
         return;
       }
-      const server = config.server || "未配置";
+      const server = config.server.trim();
+      configuredServer = server;
       const key = config.keyFingerprint ? ` · 公钥 ${config.keyFingerprint}…` : " · 无公钥";
-      idStatusText.textContent = config.error
-        ? `ID 服务器：${config.error}`
-        : `ID 服务器 ${server}${key}`;
-      idDot.className = `dot ${config.error ? "dot--off" : "dot--ok"}`;
+      // 绿点只代表「已配置且测试连通」；读到了空白地址或还没测连通性时
+      // 分别显示未配置 / 待测试，不能拿「TOML 解析成功」冒充在线。
+      if (config.error) {
+        idStatusText.textContent = `ID 服务器：${config.error}`;
+        idDot.className = "dot dot--off";
+        idTestButton.classList.add("is-hidden");
+      } else if (!server) {
+        idStatusText.textContent = "ID 服务器未配置（设置页可填写）";
+        idDot.className = "dot dot--off";
+        idTestButton.classList.add("is-hidden");
+      } else {
+        idStatusText.textContent = `ID 服务器已配置 ${server}${key}（尚未测试连通性）`;
+        idDot.className = "dot dot--busy";
+        idTestButton.classList.remove("is-hidden");
+      }
     });
   };
+
+  idTestButton.addEventListener("click", () => {
+    if (!configuredServer) {
+      return;
+    }
+    idTestButton.disabled = true;
+    idStatusText.textContent = `正在测试 ${configuredServer}:21116…`;
+    void invoke<TestResult>("test_server_connection", { server: configuredServer }).then((result) => {
+      idTestButton.disabled = false;
+      if (!result) {
+        idStatusText.textContent = "预览模式：命令不可用";
+        idDot.className = "dot dot--off";
+        return;
+      }
+      idStatusText.textContent = result.ok
+        ? `ID 服务器 ${configuredServer} 连接成功（${result.latencyMs} ms）`
+        : `ID 服务器 ${configuredServer} 连接失败：${result.message}`;
+      idDot.className = `dot ${result.ok ? "dot--ok" : "dot--off"}`;
+    });
+  });
 
   copyCodeButton.addEventListener("click", () => {
     if (!currentDeviceCode) {
@@ -292,13 +327,24 @@ function setupAssistPage(): void {
   });
 
   peerInput.addEventListener("input", () => {
-    const digits = peerInput.value.replace(/\D/g, "").slice(0, 10);
-    peerInput.value = formatDeviceCode(digits);
+    // 只提示、不悄悄删字符或截断：用户输错 11 位或带非法字符时要看到原因，
+    // 而不是被前端「修正」成另一个可连接设备码。
+    const raw = peerInput.value;
+    if (!/^[\d\s]*$/.test(raw)) {
+      setStatus(connectStatus, "设备码只能包含数字（可带分隔空格）", "error");
+      return;
+    }
+    const digits = raw.replace(/\s/g, "");
+    if (digits.length > 10) {
+      setStatus(connectStatus, "设备码最多 10 位", "error");
+      return;
+    }
+    setStatus(connectStatus, "");
   });
 
   connectButton.addEventListener("click", () => {
-    const digits = peerInput.value.replace(/\D/g, "");
-    if (digits.length !== 9 && digits.length !== 10) {
+    const digits = peerInput.value.replace(/\s/g, "");
+    if (!/^\d{9,10}$/.test(digits)) {
       setStatus(connectStatus, "请输入 9-10 位设备码", "error");
       return;
     }
