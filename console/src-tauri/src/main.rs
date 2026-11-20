@@ -1,6 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod doctor;
 mod rustdesk;
+mod scm;
+mod streaming;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -37,6 +40,12 @@ fn main() {
             rustdesk::open_rustdesk_download_page,
             rustdesk::get_rustdesk_status,
             rustdesk::test_server_connection,
+            streaming::get_streaming_status,
+            streaming::open_sunshine_pairing,
+            streaming::open_sunshine_settings,
+            streaming::start_moonlight_stream,
+            doctor::run_doctor,
+            doctor::export_doctor_log,
         ])
         .setup(|app| {
             // 托盘菜单：显示主窗口 / 复制设备码 / 断开当前会话 / 退出
