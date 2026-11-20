@@ -246,6 +246,29 @@ Describe 'Invoke-VegaHostInstall（mock）' {
         $entry.OriginalStatus | Should -Be 'Stopped'
     }
 
+    It '-WithRustDesk 不再调用 winget 安装 RustDesk，只提示官方下载页' {
+        # WinGet 社区源已下架 RustDesk：安装流程只能装 Sunshine/Tailscale/Moonlight，
+        # RustDesk 变成「打印官方下载页 + 已安装则应用中继配置」。
+        Mock -ModuleName $script:ModuleName Get-VegaSunshineInstall { $script:sunshine }
+        Mock -ModuleName $script:ModuleName Write-VegaStatus { }
+        Mock -ModuleName $script:ModuleName Install-VegaPackage {
+            param($PackageId, $DisplayName, [switch]$Force)
+            $null = $DisplayName
+            $null = $Force
+            [pscustomobject]@{ PackageId = $PackageId; Installed = $true; PreExisting = $false }
+        }
+
+        $result = Invoke-VegaHostInstall -StatePath $script:statePath -TemplatePath $script:TemplatePath `
+            -SkipTailscale -WithRustDesk
+        $result.ExitCode | Should -Be 0
+
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Install-VegaPackage -Times 1 -Exactly
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Install-VegaPackage -Times 0 -Exactly `
+            -ParameterFilter { $PackageId -match 'RustDesk' }
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Write-VegaStatus -Times 1 -Exactly `
+            -ParameterFilter { $Message -match 'rustdesk/releases/latest' }
+    }
+
     It '检测到旧版清单时打印警告' {
         Mock -ModuleName $script:ModuleName Get-VegaSunshineInstall { $script:sunshine }
         Mock -ModuleName $script:ModuleName Install-VegaPackage {
@@ -695,5 +718,16 @@ Describe '主控端入口（mock）' {
         $result = Invoke-VegaClientUninstall -StatePath $statePath -RemoveApps -Confirm:$false
         $result.ExitCode | Should -Be 0
         Should -Invoke -ModuleName $script:ModuleName -CommandName Uninstall-VegaPackage -Times 0 -Exactly
+    }
+}
+
+Describe '组件清单' {
+    It '不再包含 RustDesk（WinGet 社区源已下架）' {
+        # RustDesk 只能从官方发行页手动安装；清单里留着包 ID 会让安装步骤
+        # 去 winget 找一个已下架的包。
+        { Get-VegaComponent -Name 'RustDesk' } | Should -Throw
+        (Get-VegaComponent -Name 'Sunshine').PackageId | Should -Be 'LizardByte.Sunshine'
+        (Get-VegaComponent -Name 'Tailscale').PackageId | Should -Be 'Tailscale.Tailscale'
+        (Get-VegaComponent -Name 'Moonlight').PackageId | Should -Be 'MoonlightGameStreamingProject.Moonlight'
     }
 }
