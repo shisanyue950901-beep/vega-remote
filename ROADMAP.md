@@ -28,7 +28,9 @@
     toml crate 读写（临时文件 + rename 原子写、保留其他键、公钥只露前 8 位指纹、不写日志）
   - `connect_peer` 校验 9-10 位数字后 `--connect` / `--file-transfer`，最近 10 条存 app config 目录 JSON；
     临时密码不读不传，「显示临时密码」只无参启动 RustDesk 主窗口，界面去掉假的掩码密码
-  - RustDesk 进程/服务状态行；未安装时按钮调现有 `host/install-host.ps1 -WithRustDesk`（UAC，参数无密钥）
+  - RustDesk 进程/服务状态行；未安装时不再在应用内提权安装（无 runas、无捆绑脚本），只提供「复制安装命令」——
+    把 README 一行命令写入剪贴板并提示到管理员 PowerShell 运行；审计 r2 的 P2（OS 文件锁、设备码分组、空中继、
+    get-id 管道线程/超时/脱敏、托盘 worker）已修
   - 前端 `main.ts` 全部占位换成 invoke：加载/错误状态、最近设备码下拉、设置页网络读取/保存/测试
     （测试 = Rust 侧 TCP connect `server:21116` 超时 3 秒）
   - `build.rs` 用 `AppManifest::commands` 声明全部命令，`capabilities/default.json` 授权 `allow-*`
@@ -41,6 +43,9 @@
 - 虚拟显示器自动安装（无显示器被控端）
 - 多设备管理面板、RustDesk 中继一键迁移国内 VPS
 - 英文文档
+
+## Backlog（M2b 审计 r2 未做项）
+- P3：CI 只跑 `tauri build --no-bundle`，没有安装包冒烟测试；需要 Windows bundle 冒烟并监听 `host/**`/`console/**` 资源变更（本轮按总控要求跳过）。
 
 ## 团队分工
 - 规划、任务单、UI 设计、验收：Hark
