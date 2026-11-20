@@ -674,26 +674,33 @@ fn rustdesk_service_state() -> Option<String> {
 /* 提权安装（复用现有 host 脚本，参数里不带任何密钥）                    */
 /* ------------------------------------------------------------------ */
 
-/// 定位安装脚本：只认 `%ProgramData%\Vega\host\install-host.ps1`。
-/// 这里不再读 `VEGA_HOST_SCRIPT`，也不从可执行文件所在目录往上找仓库 checkout：
-/// 那些路径的写权限在普通用户手里，等于把提权入口递给非管理员。
-pub fn locate_host_script() -> Option<PathBuf> {
-    let program_data = std::env::var_os("ProgramData")?;
-    let root = PathBuf::from(program_data).join("Vega").join("host");
+/// 校验一个安装目录：脚本与模块都在，且目录本身不是重解析点。
+fn verify_host_dir(root: &Path) -> Option<PathBuf> {
     let candidate = root.join("install-host.ps1");
-    if !candidate.is_file() {
+    if !candidate.is_file() || !root.join("lib").join("Vega.Common.psm1").is_file() {
         return None;
     }
-    // 脚本与模块都必须在这个管理员目录里，且目录不能是重解析点。
-    if !root.join("lib").join("Vega.Common.psm1").is_file() {
-        return None;
-    }
-    if let Ok(meta) = std::fs::symlink_metadata(&root) {
+    if let Ok(meta) = std::fs::symlink_metadata(root) {
         if meta.file_type().is_symlink() {
             return None;
         }
     }
     Some(candidate)
+}
+
+/// 定位安装脚本：只认两个管理员可写位置——
+/// 1. 安装包资源目录（Tauri `bundle.resources`，装到 Program Files）；
+/// 2. `%ProgramData%\Vega\host`（install-host.ps1 自己发布的副本）。
+/// 不再读 `VEGA_HOST_SCRIPT`，也不搜索仓库 checkout：那些路径普通用户可写，
+/// 等于把提权入口递给非管理员。
+pub fn locate_host_script(app: &tauri::AppHandle) -> Option<PathBuf> {
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        if let Some(path) = verify_host_dir(&resource_dir.join("host")) {
+            return Some(path);
+        }
+    }
+    let program_data = std::env::var_os("ProgramData")?;
+    verify_host_dir(&PathBuf::from(program_data).join("Vega").join("host"))
 }
 
 #[cfg(windows)]
@@ -1195,18 +1202,18 @@ fn get_rustdesk_status_blocking() -> StatusView {
 }
 
 #[tauri::command]
-pub async fn install_rustdesk() -> OpResult {
+pub async fn install_rustdesk(app: tauri::AppHandle) -> OpResult {
     // ShellExecuteExW 会等到用户处理 UAC 才返回，必须离开 UI 线程。
-    tauri::async_runtime::spawn_blocking(install_rustdesk_blocking)
+    tauri::async_runtime::spawn_blocking(move || install_rustdesk_blocking(&app))
         .await
         .unwrap_or_else(|e| OpResult::err(format!("调起安装线程失败：{e}")))
 }
 
-fn install_rustdesk_blocking() -> OpResult {
+fn install_rustdesk_blocking(app: &tauri::AppHandle) -> OpResult {
     if !cfg!(windows) {
         return OpResult::err(NOT_INSTALLED);
     }
-    let Some(script) = locate_host_script() else {
+    let Some(script) = locate_host_script(app) else {
         return OpResult::err(
             "未找到管理员目录里的安装脚本（%ProgramData%\\Vega\\host\\install-host.ps1），请先用一行安装脚本部署",
         );
