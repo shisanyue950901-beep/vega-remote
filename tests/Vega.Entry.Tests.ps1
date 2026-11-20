@@ -311,6 +311,27 @@ Describe 'Invoke-VegaHostInstall（mock）' {
         Should -Invoke -ModuleName $script:ModuleName -CommandName Uninstall-VegaPackage -Times 0 -Exactly
     }
 
+    It '旧版清单里的 RustDesk.RustDesk 包按已下线处理，不阻断 -RemoveApps 回滚' {
+        # WinGet 社区源已下架 RustDesk，旧清单仍可能记录着这个包 ID。
+        # 它既不该被当成白名单违规，也不该让回滚失败；提示手动卸载并销账。
+        $state = Get-VegaEmptyState
+        $state = Add-VegaStatePackage -State $state -PackageId 'RustDesk.RustDesk' -Name 'RustDesk'
+        $null = Write-VegaState -State $state -Path $script:statePath -Confirm:$false
+
+        Mock -ModuleName $script:ModuleName Write-VegaStatus { }
+        Mock -ModuleName $script:ModuleName Uninstall-VegaPackage { throw '不该被调用' }
+
+        $result = Invoke-VegaHostUninstall -StatePath $script:statePath -RemoveApps -Confirm:$false
+
+        $result.ExitCode | Should -Be 0
+        @($result.Failures).Count | Should -Be 0
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Uninstall-VegaPackage -Times 0 -Exactly
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Write-VegaStatus -ParameterFilter {
+            $Message -match '手动卸载'
+        } -Times 1 -Exactly
+        Test-Path -LiteralPath $script:statePath | Should -BeFalse
+    }
+
     It '安装前阻断规则强制包含 47990，安装完成后再按实际端口计算' {
         Mock -ModuleName $script:ModuleName Get-VegaSunshineInstall { $script:sunshine }
         Mock -ModuleName $script:ModuleName Install-VegaPackage {
@@ -708,6 +729,27 @@ Describe '主控端入口（mock）' {
         Should -Invoke -ModuleName $script:ModuleName -CommandName Uninstall-VegaPackage -Times 1 -Exactly
         Should -Invoke -ModuleName $script:ModuleName -CommandName Uninstall-VegaPackage -Times 1 -Exactly `
             -ParameterFilter { $PackageId -eq 'MoonlightGameStreamingProject.Moonlight' }
+    }
+
+    It '旧版清单里的 RustDesk.RustDesk 包按已下线处理，不阻断 -RemoveApps 回滚' {
+        $statePath = Join-Path $TestDrive 'client-legacy-rustdesk.json'
+        $state = Get-VegaEmptyState
+        $state = Add-VegaStatePackage -State $state -PackageId 'RustDesk.RustDesk' -Name 'RustDesk'
+        $null = Write-VegaState -State $state -Path $statePath -Confirm:$false
+
+        Mock -ModuleName $script:ModuleName Test-VegaWingetAvailable { $true }
+        Mock -ModuleName $script:ModuleName Write-VegaStatus { }
+        Mock -ModuleName $script:ModuleName Uninstall-VegaPackage { throw '不该被调用' }
+
+        $result = Invoke-VegaClientUninstall -StatePath $statePath -RemoveApps -Confirm:$false
+
+        $result.ExitCode | Should -Be 0
+        @($result.Failures).Count | Should -Be 0
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Uninstall-VegaPackage -Times 0 -Exactly
+        Should -Invoke -ModuleName $script:ModuleName -CommandName Write-VegaStatus -ParameterFilter {
+            $Message -match '手动卸载'
+        } -Times 1 -Exactly
+        Test-Path -LiteralPath $statePath | Should -BeFalse
     }
 
     It '没有状态清单时不动系统，退出码为 0' {
