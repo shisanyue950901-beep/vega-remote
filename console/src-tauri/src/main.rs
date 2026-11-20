@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod rustdesk;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
@@ -25,7 +27,18 @@ fn set_close_to_tray(enabled: bool, state: State<'_, CloseToTray>) {
 fn main() {
     tauri::Builder::default()
         .manage(CloseToTray::default())
-        .invoke_handler(tauri::generate_handler![set_close_to_tray])
+        .invoke_handler(tauri::generate_handler![
+            set_close_to_tray,
+            rustdesk::get_device_id,
+            rustdesk::get_server_config,
+            rustdesk::set_server_config,
+            rustdesk::connect_peer,
+            rustdesk::get_recent_peers,
+            rustdesk::open_rustdesk_window,
+            rustdesk::get_rustdesk_status,
+            rustdesk::install_rustdesk,
+            rustdesk::test_server_connection,
+        ])
         .setup(|app| {
             // 托盘菜单：显示主窗口 / 复制设备码 / 断开当前会话 / 退出
             let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
@@ -47,9 +60,12 @@ fn main() {
                             let _ = window.set_focus();
                         }
                     }
-                    // M2b：读取 RustDesk 设备码后写入手剪贴板（需 clipboard-manager 插件）
-                    "copy-code" => {}
-                    // M2b：结束当前 RustDesk 会话
+                    // 直接由 Rust 读设备码写剪贴板，不经过前端。
+                    "copy-code" => {
+                        let _ = rustdesk::copy_device_id_to_clipboard();
+                    }
+                    // 「断开」当前仍是 RustDesk 窗口自己的挂断按钮；M2c 接入会话事件后
+                    // 才能在这里自动化，先保持禁用。
                     "disconnect" => {}
                     // 托盘「退出」是唯一真正退出的入口（关闭窗口只隐藏）。
                     "quit" => app.exit(0),

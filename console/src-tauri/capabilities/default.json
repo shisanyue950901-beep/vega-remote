@@ -1,13 +1,23 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "控制台最小权限：仅窗口控制与标题栏双击最大化，不开放文件系统、Shell、网络与托盘插件。",
+  "description": "控制台最小权限：窗口控制 + 全部 RustDesk 集成命令（build.rs AppManifest 声明），不开放文件系统、Shell、网络与托盘插件。",
   "windows": ["main"],
   "permissions": [
     "core:window:allow-minimize",
     "core:window:allow-toggle-maximize",
     "core:window:allow-internal-toggle-maximize",
     "core:window:allow-close",
-    "core:window:allow-start-dragging"
+    "core:window:allow-start-dragging",
+    "allow-set-close-to-tray",
+    "allow-get-device-id",
+    "allow-get-server-config",
+    "allow-set-server-config",
+    "allow-connect-peer",
+    "allow-get-recent-peers",
+    "allow-open-rustdesk-window",
+    "allow-get-rustdesk-status",
+    "allow-install-rustdesk",
+    "allow-test-server-connection"
   ]
 }
