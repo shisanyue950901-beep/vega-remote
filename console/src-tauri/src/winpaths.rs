@@ -134,7 +134,7 @@ pub(crate) fn local_app_data_dir() -> Option<PathBuf> {
 /// 不走 `explorer.exe` 命令行：路径里的空格/引号不需要拼 shell 参数，
 /// 也不会把用户目录当成命令行文本解释。返回 `HINSTANCE > 32` 才算成功。
 #[cfg(windows)]
-pub(crate) fn open_directory(path: &Path) -> Result<(), ()> {
+fn shell_execute_open(path: &Path) -> Result<(), ()> {
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
 
@@ -173,6 +173,41 @@ pub(crate) fn open_directory(path: &Path) -> Result<(), ()> {
     } else {
         Err(())
     }
+}
+
+/// 在专用 STA 线程里打开目录：线程内先 `CoInitializeEx`（APARTMENTTHREADED，
+/// 关闭 OLE1DDE），`ShellExecuteW` 返回后 `CoUninitialize`。
+///
+/// 不借用调用方（阻塞 worker）的 COM 状态：worker 可能根本没初始化 COM，
+/// 或已处于 MTA。专用线程结束即释放，调用方同步等结果。
+#[cfg(windows)]
+pub(crate) fn open_directory(path: &Path) -> Result<(), ()> {
+    use std::ffi::c_void;
+    use windows::Win32::System::Com::{
+        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+    };
+
+    let path = path.to_path_buf();
+    let handle = std::thread::Builder::new()
+        .name("vega-open-directory".to_string())
+        .spawn(move || {
+            // SAFETY: 新建线程尚未初始化 COM；`None` 是保留参数，必须为空。
+            let initialized = unsafe {
+                CoInitializeEx(
+                    None::<*const c_void>,
+                    COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
+                )
+            }
+            .is_ok();
+            let result = shell_execute_open(&path);
+            if initialized {
+                // SAFETY: 只与上面成功的 CoInitializeEx 配对调用一次。
+                unsafe { CoUninitialize() };
+            }
+            result
+        })
+        .map_err(|_| ())?;
+    handle.join().unwrap_or(Err(()))
 }
 
 #[cfg(not(windows))]
@@ -554,5 +589,12 @@ mod tests {
         assert!(system32_exe("tasklist.exe").is_none());
         assert!(explorer_exe().is_none());
         assert!(trusted_install_exe(&["RustDesk", "rustdesk.exe"]).is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn opening_a_directory_fails_off_windows() {
+        // 非 Windows 不加载 shell32/COM：直接返回错误，不 pretend 成功。
+        assert!(open_directory(Path::new("C:\\Vega\\logs")).is_err());
     }
 }
