@@ -41,6 +41,8 @@ interface ServerConfigView {
 interface OpResult {
   ok: boolean;
   message: string;
+  /** RustDesk 以 Windows 服务运行：配置要在 RustDesk 里改，用户 TOML 不生效。 */
+  serviceMode: boolean;
 }
 
 interface StatusView {
@@ -102,16 +104,19 @@ async function copyText(text: string): Promise<boolean> {
   }
 }
 
-/** README 的一行安装命令。控制台只复制文本，不在应用内提权执行任何脚本。 */
+/**
+ * RustDesk-only 安装命令。控制台只复制这一行，不在应用内提权或执行脚本；
+ * 不再走通用 bootstrap（那会按角色装一堆无关组件却可能漏掉 RustDesk）。
+ */
 const INSTALL_COMMAND =
-  "irm https://raw.githubusercontent.com/shisanyue950901-beep/vega-remote/main/bootstrap.ps1 | iex";
+  "winget install --id RustDesk.RustDesk --exact --source winget";
 
 /**
  * 设备码解析：只接受 9/10 位纯数字，或控制台自己展示的 3-3-3 / 3-3-4 分组
  * （空格或连字符，整串分隔符必须一致）。返回纯数字，供 IPC 使用。
  * 不做「删掉多余字符」式清洗：粘错的码会被拒绝，而不是被改成另一台设备。
  */
-function parsePeerId(raw: string): string | null {
+export function parsePeerId(raw: string): string | null {
   const value = raw.trim();
   if (!value) {
     return null;
@@ -153,10 +158,20 @@ function flashLabel(button: HTMLButtonElement, text: string): void {
   }, 1600);
 }
 
-/** 设备码分组：9 位 3-3-3，10 位 3-3-4。 */
-function formatDeviceCode(digits: string): string {
-  const groups = digits.match(/.{1,3}/g) ?? [];
-  return groups.join(" ");
+/**
+ * 设备码分组：9 位 3-3-3，10 位 3-3-4。
+ * 不能用 `.{1,3}` 硬切：10 位会被切成 3-3-3-1，parsePeerId 不认。
+ * 与 Rust 侧 format_device_id 保持一致。
+ */
+export function formatDeviceCode(digits: string): string {
+  const value = digits.trim();
+  if (/^\d{9}$/.test(value)) {
+    return `${value.slice(0, 3)} ${value.slice(3, 6)} ${value.slice(6, 9)}`;
+  }
+  if (/^\d{10}$/.test(value)) {
+    return `${value.slice(0, 3)} ${value.slice(3, 6)} ${value.slice(6)}`;
+  }
+  return value;
 }
 
 /* ---------- 左栏导航 ---------- */
@@ -196,6 +211,12 @@ function setupTabs(): void {
     });
   });
 }
+
+/**
+ * 设置页保存网络后调用：让远程协助页重读服务器并清掉旧探测结果。
+ * 由 setupAssistPage 在启动时注册，避免设置页直接摸另一个页面的闭包。
+ */
+let refreshAssistServer: (() => void) | null = null;
 
 /* ---------- 远程协助 ---------- */
 function setupAssistPage(): void {
@@ -255,6 +276,39 @@ function setupAssistPage(): void {
     });
   };
 
+  const loadServerConfig = (): void => {
+    // 先清掉上一次的探测结论：设置页保存后旧地址的绿点不能留着。
+    configuredServer = "";
+    idTestButton.classList.add("is-hidden");
+    idTestButton.disabled = false;
+    idDot.className = "dot dot--off";
+    idStatusText.textContent = "正在读取 ID 服务器配置…";
+    void invoke<ServerConfigView>("get_server_config").then((config) => {
+      if (!config) {
+        idStatusText.textContent = "预览模式：无法读取 RustDesk 配置";
+        idDot.className = "dot dot--off";
+        return;
+      }
+      const server = config.server.trim();
+      configuredServer = server;
+      const key = config.keyFingerprint ? ` · 公钥 ${config.keyFingerprint}…` : " · 无公钥";
+      // 绿点只代表「已配置且测试连通」；读到了空白地址或还没测连通性时
+      // 分别显示未配置 / 待测试，不能拿「TOML 解析成功」冒充在线。
+      if (config.error) {
+        idStatusText.textContent = `ID 服务器：${config.error}`;
+        idDot.className = "dot dot--off";
+      } else if (!server) {
+        idStatusText.textContent = "ID 服务器未配置（设置页可填写）";
+        idDot.className = "dot dot--off";
+      } else {
+        idStatusText.textContent = `ID 服务器已配置 ${server}${key}（尚未测试连通性）`;
+        idDot.className = "dot dot--busy";
+        idTestButton.classList.remove("is-hidden");
+      }
+    });
+  };
+  refreshAssistServer = loadServerConfig;
+
   const loadStatus = (): void => {
     void invoke<StatusView>("get_rustdesk_status").then((status) => {
       if (!status) {
@@ -268,32 +322,7 @@ function setupAssistPage(): void {
       installHint.classList.toggle("is-hidden", status.installed);
     });
 
-    void invoke<ServerConfigView>("get_server_config").then((config) => {
-      if (!config) {
-        idStatusText.textContent = "预览模式：无法读取 RustDesk 配置";
-        idDot.className = "dot dot--off";
-        idTestButton.classList.add("is-hidden");
-        return;
-      }
-      const server = config.server.trim();
-      configuredServer = server;
-      const key = config.keyFingerprint ? ` · 公钥 ${config.keyFingerprint}…` : " · 无公钥";
-      // 绿点只代表「已配置且测试连通」；读到了空白地址或还没测连通性时
-      // 分别显示未配置 / 待测试，不能拿「TOML 解析成功」冒充在线。
-      if (config.error) {
-        idStatusText.textContent = `ID 服务器：${config.error}`;
-        idDot.className = "dot dot--off";
-        idTestButton.classList.add("is-hidden");
-      } else if (!server) {
-        idStatusText.textContent = "ID 服务器未配置（设置页可填写）";
-        idDot.className = "dot dot--off";
-        idTestButton.classList.add("is-hidden");
-      } else {
-        idStatusText.textContent = `ID 服务器已配置 ${server}${key}（尚未测试连通性）`;
-        idDot.className = "dot dot--busy";
-        idTestButton.classList.remove("is-hidden");
-      }
-    });
+    loadServerConfig();
   };
 
   idTestButton.addEventListener("click", () => {
@@ -418,6 +447,7 @@ function setupSettingsPage(): void {
   const testButton = byId<HTMLButtonElement>("test-connection");
   const testResult = byId<HTMLSpanElement>("test-connection-result");
   const saveButton = byId<HTMLButtonElement>("save-network");
+  const openRustdeskNetworkButton = byId<HTMLButtonElement>("open-rustdesk-network");
   const networkStatus = byId<HTMLSpanElement>("network-status");
   const idServerInput = byId<HTMLInputElement>("set-id-server");
   const relayServerInput = byId<HTMLInputElement>("set-relay-server");
@@ -436,6 +466,7 @@ function setupSettingsPage(): void {
   });
 
   const loadNetwork = (): void => {
+    openRustdeskNetworkButton.classList.add("is-hidden");
     setStatus(networkStatus, "正在读取 RustDesk 配置…");
     void invoke<ServerConfigView>("get_server_config").then((config) => {
       if (!config) {
@@ -466,11 +497,32 @@ function setupSettingsPage(): void {
         setStatus(networkStatus, "浏览器预览：命令不可用", "warn");
         return;
       }
+      if (result.serviceMode) {
+        // 服务模式：用户 TOML 不是生效配置，不假装保存成功；
+        // 指向 RustDesk 自己的「网络」设置，并给出打开窗口的按钮。
+        setStatus(networkStatus, result.message, "warn");
+        openRustdeskNetworkButton.classList.remove("is-hidden");
+        return;
+      }
+      openRustdeskNetworkButton.classList.add("is-hidden");
       setStatus(networkStatus, result.message, result.ok ? "ok" : "error");
       if (result.ok) {
         keyInput.value = "";
+        setStatus(testResult, "未测试");
         loadNetwork();
+        // 远程协助页重读新服务器并丢掉旧地址的探测结论。
+        refreshAssistServer?.();
       }
+    });
+  });
+
+  openRustdeskNetworkButton.addEventListener("click", () => {
+    void invoke<OpResult>("open_rustdesk_window").then((result) => {
+      if (!result) {
+        setStatus(networkStatus, "浏览器预览：命令不可用", "warn");
+        return;
+      }
+      setStatus(networkStatus, result.message, result.ok ? "ok" : "error");
     });
   });
 
