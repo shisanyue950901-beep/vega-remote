@@ -96,3 +96,10 @@
   最终 exe 规范化后仍在根内且 GetVolumePathNameW 卷根与系统卷一致，并补纯函数单测
 - P3 脱敏测试依赖运行者 USERNAME，改为显式身份夹具 ✅ 已修（doctor.rs:640/906）：
   脱敏接收 RedactionIdentity（用户名/计算机名/域/主目录），环境变量只在生产入口 export_blocking 读一次
+
+### M2c r6 遗留（Codex m2c-r6 PASS，2026-11-20）
+- P2 DNS 探测用相对预算重建 deadline，零剩余仍会起解析线程（rustdesk.rs:1037）→ 透传原 deadline 与取消标志
+- P2 超时的导出仍可能写文件并打开目录（doctor.rs:837/908）→ timeout_at + 写前查过期
+- P2 同一秒导出互相覆盖（doctor.rs:880）→ 唯一后缀 + create_new
+- P3 已知文件夹失败时回落到 temp（doctor.rs:823）→ 返回通用错误
+- P3 ShellExecuteW 在未初始化 COM 的 worker 上（winpaths.rs:162）→ STA 线程 + CoInitializeEx
