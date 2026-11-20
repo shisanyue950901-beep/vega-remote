@@ -223,8 +223,7 @@ pub fn read_server_config(text: &str) -> Result<ServerSnapshot, String> {
     if text.trim().is_empty() {
         return Ok(ServerSnapshot::default());
     }
-    let doc: toml::Table = text
-        .parse()
+    let doc: toml::Table = toml::from_str(text)
         .map_err(|e| format!("RustDesk2.toml 解析失败：{e}"))?;
     let options = match doc.get("options").and_then(|v| v.as_table()) {
         Some(table) => table,
@@ -254,7 +253,7 @@ pub fn merge_server_config(
     let mut doc: toml::Table = if text.trim().is_empty() {
         toml::Table::new()
     } else {
-        text.parse()
+        toml::from_str(text)
             .map_err(|e| format!("RustDesk2.toml 解析失败：{e}"))?
     };
 
@@ -829,7 +828,14 @@ pub fn get_rustdesk_status() -> StatusView {
     let running = rustdesk_process_running();
     let service_state = rustdesk_service_state().unwrap_or_default();
     let message = if running {
-        format!("RustDesk 正在运行（服务：{}）", if service_state.is_empty() { "未安装" } else { &service_state })
+        format!(
+            "RustDesk 正在运行（服务：{}）",
+            if service_state.is_empty() {
+                "未安装"
+            } else {
+                service_state.as_str()
+            }
+        )
     } else if !service_state.is_empty() {
         format!("RustDesk 已安装，服务状态 {service_state}，进程未运行")
     } else {
@@ -905,6 +911,7 @@ pub fn test_server_connection(server: String) -> TestResult {
 }
 
 /// 托盘「复制设备码」用：拿设备码写到剪贴板，不经过前端。
+#[cfg(windows)]
 pub fn copy_device_id_to_clipboard() -> Result<String, String> {
     let info = get_device_id();
     if info.formatted_id.is_empty() {
@@ -914,23 +921,21 @@ pub fn copy_device_id_to_clipboard() -> Result<String, String> {
             info.error
         });
     }
-    #[cfg(windows)]
-    {
-        let value = info.formatted_id.replace('\'', "''");
-        let command = format!("Set-Clipboard -Value '{value}'");
-        let mut cmd = Command::new("powershell.exe");
-        use std::os::windows::process::CommandExt;
-        cmd.args(["-NoProfile", "-NonInteractive", "-Command", &command])
-            .stdin(Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW);
-        cmd.spawn()
-            .map_err(|e| format!("写剪贴板失败：{e}"))?;
-        Ok(info.formatted_id)
-    }
-    #[cfg(not(windows))]
-    {
-        Err(NOT_INSTALLED.to_string())
-    }
+    let value = info.formatted_id.replace('\'', "''");
+    let command = format!("Set-Clipboard -Value '{value}'");
+    let mut cmd = Command::new("powershell.exe");
+    use std::os::windows::process::CommandExt;
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", &command])
+        .stdin(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW);
+    cmd.spawn()
+        .map_err(|e| format!("写剪贴板失败：{e}"))?;
+    Ok(info.formatted_id)
+}
+
+#[cfg(not(windows))]
+pub fn copy_device_id_to_clipboard() -> Result<String, String> {
+    Err(NOT_INSTALLED.to_string())
 }
 
 /* ------------------------------------------------------------------ */
@@ -1040,12 +1045,12 @@ flag = true
         assert_eq!(snapshot.relay, "relay.example.com:21117");
         assert_eq!(snapshot.key, key);
 
-        let reparsed: toml::Table = merged.parse().unwrap();
+        let reparsed: toml::Table = toml::from_str(&merged).unwrap();
         let options = reparsed.get("options").unwrap().as_table().unwrap();
         assert_eq!(options.get("other").unwrap().as_str().unwrap(), "keep");
         assert_eq!(options.get("password").unwrap().as_str().unwrap(), "not-managed");
         let other = reparsed.get("other-section").unwrap().as_table().unwrap();
-        assert_eq!(other.get("flag").unwrap().as_bool().unwrap(), true);
+        assert!(other.get("flag").unwrap().as_bool().unwrap());
     }
 
     #[test]
@@ -1069,7 +1074,7 @@ flag = true
             push_recent_peer(&mut list, id);
         }
         push_recent_peer(&mut list, "222222222");
-        assert_eq!(list.first().unwrap(), "222222222");
+        assert_eq!(list.first().unwrap().as_str(), "222222222");
         assert_eq!(list.len(), 3);
 
         for i in 0..15 {

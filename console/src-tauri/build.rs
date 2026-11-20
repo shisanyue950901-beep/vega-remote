@@ -5,15 +5,15 @@ fn main() {
     tauri_build::try_build(
         tauri_build::Attributes::new().app_manifest(tauri_build::AppManifest::new().commands(&[
             "set_close_to_tray",
-            "rustdesk::get_device_id",
-            "rustdesk::get_server_config",
-            "rustdesk::set_server_config",
-            "rustdesk::connect_peer",
-            "rustdesk::get_recent_peers",
-            "rustdesk::open_rustdesk_window",
-            "rustdesk::get_rustdesk_status",
-            "rustdesk::install_rustdesk",
-            "rustdesk::test_server_connection",
+            "get_device_id",
+            "get_server_config",
+            "set_server_config",
+            "connect_peer",
+            "get_recent_peers",
+            "open_rustdesk_window",
+            "get_rustdesk_status",
+            "install_rustdesk",
+            "test_server_connection",
         ])),
     )
     .expect("tauri-build 失败");
