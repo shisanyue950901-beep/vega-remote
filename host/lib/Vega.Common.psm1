@@ -6783,6 +6783,21 @@ function Invoke-VegaRustDeskRollback {
     }
 }
 
+function Test-VegaRustDeskClientRunning {
+    <#
+      t3-fix7 P1：RustDesk 客户端进程是否正在运行。
+      服务未注册（用户在客户端里停用了服务）时，运行中的客户端持有内存里的旧中继配置：
+      之后在该窗口里启用服务，RustDesk 会先把内存配置写回 RustDesk2.toml、再导入服务，
+      刚写入的新中继值会被旧值覆盖。所以服务未注册分支必须先探测进程，再决定是否写配置。
+      只按进程名匹配（rustdesk.exe），查不到进程视为未运行。
+    #>
+    [CmdletBinding()]
+    param()
+
+    $processes = @(Get-Process -Name 'rustdesk' -ErrorAction SilentlyContinue)
+    return ($processes.Count -gt 0)
+}
+
 function Invoke-VegaRustDeskBootstrap {
     <#
       安装包的一键安装/配置流程：
@@ -6793,13 +6808,17 @@ function Invoke-VegaRustDeskBootstrap {
         4. 用钩子解析好的交互用户（SID + Roaming AppData）同时写用户级与服务级
            RustDesk2.toml（P1-5）。服务级写入的前提是 RustDesk 服务已注册：
              已注册但停止 → Start-Service 启动并在 60s 内等 Running；
-             未注册 → 不注册服务，只写用户级配置并回读，服务级跳过（降级，ExitCode=2）。
+              未注册 → 不注册服务；若 rustdesk.exe 正在运行（t3-fix7 P1）则不写任何
+                       配置，直接以 ExitCode=2 停止并说明原因；进程没在跑时只写用户级
+                       配置并回读，服务级跳过（降级，ExitCode=2）。
            服务已注册时成功判定要求**服务级**写入并回读一致；用户级路径读/写失败或
            取不到用户上下文时只降级（Degraded=$true、ExitCode=2），
            不再把整单安装判成失败（t3-fix5 P1-2、t3-fix6 P1-2）；
         5. 把该用户的 SID / AppData / 配置路径与是否已写入记进 state.json，回滚按 SID 走同一路径；
         6. 重启运行中的服务并确认 Running（P1-5）。
       任何一步失败都返回 Success=$false（ExitCode=1），由调用方提示但不阻断安装。
+      服务未注册且 RustDesk 正在运行时是“降级停止”：Success=$false、Degraded=$true、
+      ExitCode=2，且不写任何配置（t3-fix7 P1）。
       降级（服务级成功、用户级未写；或服务未注册、只写用户级）返回
       Success=$true、Degraded=$true、ExitCode=2，与入口脚本的进程退出码一致（t3-fix5 P3）。
     #>
@@ -6863,15 +6882,20 @@ function Invoke-VegaRustDeskBootstrap {
         param(
             [string]$Message,
             [bool]$Installed = $false,
-            [bool]$Configured = $false
+            [bool]$Configured = $false,
+            # t3-fix7 P1：降级停止用 ExitCode=2（与成功降级同一语义），日志记 WARN，
+            # 安装包完成页据此显示具体原因而不是笼统的失败文案。
+            [int]$ExitCode = 1,
+            [bool]$Degraded = $false
         )
-        Write-VegaSetupLog -Path $LogFile -Message ("FAIL {0}" -f $Message)
+        $level = $(if ($Degraded) { 'WARN' } else { 'FAIL' })
+        Write-VegaSetupLog -Path $LogFile -Message ("{0} {1}" -f $level, $Message)
         return [pscustomobject]@{
             Success    = $false
-            ExitCode   = 1
+            ExitCode   = $ExitCode
             Installed  = $Installed
             Configured = $Configured
-            Degraded   = $false
+            Degraded   = $Degraded
             UserConfigWritten = $false
             Messages   = $messages.ToArray()
             Error      = $Message
@@ -6972,14 +6996,24 @@ function Invoke-VegaRustDeskBootstrap {
         # P1-5：已装 RustDesk 的机器也要确认服务真的在，否则写进服务级配置也不会生效。
         # t3-fix6 P1-2：区分“服务已注册但停止”和“服务未注册”。
         #   - 已注册但停止：用 Start-Service 启动，再在有界时间内等 Running（60s）；
-        #   - 未注册（RustDesk 官方允许移除服务并保留客户端）：不替用户注册服务，
-        #     仍写用户级配置并回读，服务级跳过，结果标记降级（ExitCode=2），
+        #   - 未注册（RustDesk 官方允许移除服务并保留客户端）：不替用户注册服务；
+        #     rustdesk.exe 还在运行（t3-fix7 P1）就一行都不写，直接降级停止（ExitCode=2）；
+        #     进程没在跑才写用户级配置并回读，服务级跳过，结果标记降级（ExitCode=2），
         #     并提示用户在 RustDesk 里启用服务后重跑。
         $serviceRegistered = $true
         if (-not $installedByVega) {
             $service = Get-Service -Name 'RustDesk' -ErrorAction SilentlyContinue
             if ($null -eq $service) {
                 $serviceRegistered = $false
+                # t3-fix7 P1：服务未注册 + 客户端还开着时，绝不能写用户级配置。
+                # 运行中的 RustDesk 持有内存里的旧中继配置，用户在客户端里启用服务时
+                # 它会先写回旧值再导入服务，刚写入的新值随之丢失。这里不猜用户意图，
+                # 直接降级停止（ExitCode=2），要求完全退出客户端、启用服务后重跑。
+                if (Test-VegaRustDeskClientRunning) {
+                    $message = '检测到 RustDesk 正在运行且服务未启用：请完全退出 RustDesk（托盘右键退出），在 RustDesk 里启用服务后重新运行 Vega 安装'
+                    $messages.Add($message)
+                    return (& $fail -Message $message -Installed $installedByVega -ExitCode 2 -Degraded $true)
+                }
                 $message = 'RustDesk 服务未注册（客户端里停用了服务），跳过服务级配置，只写用户级配置（已降级）。请在 RustDesk 客户端里启用服务后重新运行安装以写入服务级配置。'
                 $messages.Add($message)
                 Write-VegaSetupLog -Path $LogFile -Message ("WARN {0}" -f $message)
