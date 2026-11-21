@@ -424,15 +424,15 @@ Describe 'Invoke-VegaRustDeskBootstrap' {
     }
 
     It 'P1-5 服务没出现时返回非零，不把失败当成功' {
-        & (Get-Module $script:ModuleName) { $script:VegaProbeCount = 0 }
+        & (Get-Module $script:ModuleName) { $script:VegaSilentDone = $false }
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall {
-            $script:VegaProbeCount += 1
-            if ($script:VegaProbeCount -le 1) { '' } else { 'C:\Program Files\RustDesk\rustdesk.exe' }
+            if ($script:VegaSilentDone) { 'C:\Program Files\RustDesk\rustdesk.exe' } else { '' }
         }
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstaller {
             [pscustomobject]@{ Success = $true; Path = 'C:\temp\rustdesk.exe'; Sha256 = ('a' * 64); Lock = $null; Error = '' }
         }
         Mock -ModuleName $script:ModuleName Install-VegaRustDeskSilently {
+            $script:VegaSilentDone = $true
             [pscustomobject]@{ Success = $true; ExitCode = 0; Error = '' }
         }
         Mock -ModuleName $script:ModuleName Wait-VegaRustDeskService { [pscustomobject]@{ Found = $true; Running = $false; Status = 'Stopped' } }
