@@ -1365,7 +1365,9 @@ exit [int]$result.ExitCode
             '-ServiceConfigPath', $serviceConfig,
             '-Sid', 'S-1-5-21-1111111111-2222222222-3333333333-1001',
             '-AppData', (Join-Path $TestDrive 'Users/张三/AppData/Roaming'),
-            '-UserConfigPath', '',
+            # t3-fix12 P2-2：powershell.exe -File 会丢掉 '' 这个实参，留下缺值的
+            # -UserConfigPath 让子进程在参数绑定阶段就报错。父进程调用是参数数组、
+            # 没有引号可保，空值一律直接省略（-ServiceOnly 下该参数本来也不参与）。
             '-ServiceOnly'
         )
         $output = & $script:HarnessPowerShell @arguments 2>&1
