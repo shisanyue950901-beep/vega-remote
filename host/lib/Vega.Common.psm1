@@ -1691,7 +1691,7 @@ function Set-VegaStateRustDeskUserConfig {
       取不到用户上下文时 Written=$false、PromptPending=$true，由完成页提示用户手动处理。
       回滚时按记录的 Path 作为预期路径校验用户级基线。
     #>
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
         $State,
@@ -5489,7 +5489,7 @@ function Get-VegaProgramFilesRegistryRoot {
     return $roots.ToArray()
 }
 
-function Get-VegaRustDeskRegistryInstallCandidates {
+function Get-VegaRustDeskRegistryInstallCandidate {
     <#
       P1-2（T3-fix4）：显式打开 Registry64 与 Registry32 两个视图的 Uninstall 项，
       读 DisplayName 精确等于 RustDesk 的 InstallLocation / DisplayIcon；再读 RustDesk
@@ -5790,7 +5790,7 @@ function Get-VegaRustDeskInstall {
     if (-not $explicitRoots) {
         # t3-fix4：已有安装可能不在默认 Program Files 布局里（自定义目录 / MSI）。
         # 注册表卸载项与服务映像路径命中即视为已安装，只配置、不重装。
-        foreach ($registryCandidate in @(Get-VegaRustDeskRegistryInstallCandidates)) {
+        foreach ($registryCandidate in @(Get-VegaRustDeskRegistryInstallCandidate)) {
             if ([string]::IsNullOrWhiteSpace($registryCandidate)) { continue }
             if (-not $candidates.Contains($registryCandidate)) { $candidates.Add($registryCandidate) }
         }
@@ -6190,7 +6190,7 @@ function New-VegaSecureDirectory {
       - 拒绝父路径/新目录是重解析点，避免提权写入被重定向到用户可写位置；
       - 所有者不是 Administrators/SYSTEM 时拒绝使用。
     #>
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
         [string]$Parent
@@ -6255,7 +6255,7 @@ function Remove-VegaSecureDirectory {
     <#
       P1-3：finally 清理。先释放保护安装包的读句柄，再删目录；删不掉只吞掉错误。
     #>
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [AllowEmptyString()]
         [string]$Path = '',
@@ -6512,7 +6512,7 @@ function New-VegaServiceDeadline {
       用 Stopwatch 而不是 Get-Date：系统时间被调整时截止时间不会跟着漂。
       -Clock 是给测试注入的可控时钟（返回从创建时刻起经过的秒数）；不传就用 Stopwatch。
     #>
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [int]$TimeoutSeconds = 60,
 
@@ -6526,7 +6526,7 @@ function New-VegaServiceDeadline {
     }
 }
 
-function Get-VegaServiceDeadlineRemainingSeconds {
+function Get-VegaServiceDeadlineRemainder {
     <#
       t3-fix8 P2：截止点剩余秒数（可能为负，表示预算已耗尽）。
       只读同一份预算，不会因为调用时机不同重建一个新的截止时间。
@@ -6578,7 +6578,7 @@ function Wait-VegaRustDeskService {
 
     $last = $null
     while ($true) {
-        $remaining = Get-VegaServiceDeadlineRemainingSeconds -Deadline $Deadline
+        $remaining = Get-VegaServiceDeadlineRemainder -Deadline $Deadline
         if ($remaining -le 0) { break }
 
         $last = Get-Service -Name 'RustDesk' -ErrorAction SilentlyContinue
@@ -6586,7 +6586,7 @@ function Wait-VegaRustDeskService {
             $status = [string]$last.Status
             if ($status -eq 'Running') {
                 # t3-fix9 P2：查询可能跨过截止点；读完 Status 再判一次预算，超时不接受。
-                if ((Get-VegaServiceDeadlineRemainingSeconds -Deadline $Deadline) -gt 0) {
+                if ((Get-VegaServiceDeadlineRemainder -Deadline $Deadline) -gt 0) {
                     return [pscustomobject]@{ Found = $true; Running = $true; Status = $status }
                 }
                 break
@@ -6594,7 +6594,7 @@ function Wait-VegaRustDeskService {
         }
 
         # 查询本身也花时间：休眠前重新算，避免睡过截止点。
-        $remaining = Get-VegaServiceDeadlineRemainingSeconds -Deadline $Deadline
+        $remaining = Get-VegaServiceDeadlineRemainder -Deadline $Deadline
         if ($remaining -le 0) { break }
         # t3-fix9 P2：向下取整，绝不把休眠拉到剩余预算之外；不足 1 毫秒直接收工。
         $sleepMilliseconds = [int][Math]::Floor([Math]::Min($interval, $remaining) * 1000)
@@ -6944,7 +6944,7 @@ function Start-VegaRustDeskServiceNonBlocking {
       总耗时可远超上限）。因此：有 -NoWait（PowerShell 6+）就用它；没有就退回
       ServiceController.Start()，同样立即返回，由调用方在同一个截止时间里轮询状态。
     #>
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param()
 
     $supportsNoWait = $false
@@ -8435,7 +8435,7 @@ Export-ModuleMember -Function @(
     'Get-VegaUserRoamingAppData',
     'Resolve-VegaSetupInteractiveUser',
     'Get-VegaProgramFilesRegistryRoot',
-    'Get-VegaRustDeskRegistryInstallCandidates',
+    'Get-VegaRustDeskRegistryInstallCandidate',
     'ConvertTo-VegaRustDeskExePath',
     'ConvertTo-VegaRustDeskInstallLocationPath',
     'ConvertTo-VegaRustDeskDisplayIconPath',
@@ -8445,7 +8445,7 @@ Export-ModuleMember -Function @(
     'Install-VegaRustDeskSilently',
     'Wait-VegaRustDeskService',
     'New-VegaServiceDeadline',
-    'Get-VegaServiceDeadlineRemainingSeconds',
+    'Get-VegaServiceDeadlineRemainder',
     'Start-VegaRustDeskServiceNonBlocking',
     'Test-VegaServiceAlreadyRunningError',
     'Test-VegaRustDeskClientRunning',
