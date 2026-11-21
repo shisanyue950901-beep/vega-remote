@@ -12,10 +12,10 @@
     - 已装 RustDesk 就跳过安装，只写中继配置；
     - 未装时从官方 GitHub Release 下载固定版本（AGPL：不内嵌二进制），
       校验 SHA256 后以 --silent-install 静默安装，等待 RustDesk 服务出现；
-    - 复用 Vega.Common 里 T2 的 RustDesk2.toml 写入逻辑（ACL 校验、原子写入），
-      只写 LocalService 服务级配置：安装包可能由另一个管理员账户提权运行，进程里的
-      %APPDATA% 不是发起安装的用户。用户级配置由控制台首次启动时按 state.json 记录的
-      SID 提示写入；
+    - 复用 Vega.Common 里 T2 的 RustDesk2.toml 写入逻辑（ACL 校验、原子写入）：
+      NSIS 钩子把当前登录交互用户的 SID / Roaming AppData 传进来，只写该用户自己的
+      用户级配置 + LocalService 服务级配置，两处回读一致才算成功；取不到交互用户时
+      退回只写服务级，并让完成页提示。绝不写提权账户的 %APPDATA%；
     - 若这次是 Vega 装的，把安装记录写进 host-state.json，卸载时据此回滚。
 
   回滚（-Uninstall）：
@@ -43,6 +43,15 @@
 .PARAMETER ServiceStatePath
   服务模式清单路径，默认 %ProgramData%\Vega\state.json。
 
+.PARAMETER InteractiveUserSid
+  当前登录交互用户（explorer.exe 所有者或活动会话用户）的 SID，由 NSIS 钩子解析后传入。
+  用于把用户级 RustDesk2.toml 写到该用户自己的 Roaming AppData，而不是提权账户。
+
+.PARAMETER InteractiveUserAppData
+  该交互用户的 Roaming AppData 路径（HKU\<SID>\...\Shell Folders\AppData 或
+  ProfileList 的 ProfileImagePath\AppData\Roaming），与 -InteractiveUserSid 一起传入。
+  取不到时脚本只写服务级配置，并在完成页提示。
+
 .EXAMPLE
   .\install-rustdesk.ps1 -DefaultsFile .\resources\vega-defaults.json
 
@@ -56,7 +65,9 @@ param(
     [switch]$Uninstall,
     [switch]$KeepRustDesk,
     [string]$StatePath = '',
-    [string]$ServiceStatePath = ''
+    [string]$ServiceStatePath = '',
+    [string]$InteractiveUserSid = '',
+    [string]$InteractiveUserAppData = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -93,7 +104,7 @@ if ([string]::IsNullOrWhiteSpace($ServiceStatePath)) { $ServiceStatePath = Get-V
 try {
     if ($Uninstall) {
         $rollback = Invoke-VegaRustDeskRollback -HostStatePath $StatePath -ServiceStatePath $ServiceStatePath `
-            -KeepRustDesk:$KeepRustDesk -Confirm:$false
+            -InteractiveUserAppData $InteractiveUserAppData -KeepRustDesk:$KeepRustDesk -Confirm:$false
 
         foreach ($message in @($rollback.Messages)) {
             Write-Host $message
@@ -107,7 +118,8 @@ try {
     }
 
     $result = Invoke-VegaRustDeskBootstrap -DefaultsFile $DefaultsFile -HostStatePath $StatePath `
-        -ServiceStatePath $ServiceStatePath -LogFile $LogFile -Confirm:$false
+        -ServiceStatePath $ServiceStatePath -InteractiveUserSid $InteractiveUserSid `
+        -InteractiveUserAppData $InteractiveUserAppData -LogFile $LogFile -Confirm:$false
 
     foreach ($message in @($result.Messages)) {
         Write-Host $message

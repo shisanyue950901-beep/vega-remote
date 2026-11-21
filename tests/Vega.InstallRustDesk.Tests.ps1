@@ -303,12 +303,13 @@ Describe 'Invoke-VegaRustDeskBootstrap' {
             [pscustomobject]@{
                 Name           = 'TEST\alice'
                 Sid            = $script:testSid
+                AppDataPath    = 'C:\Users\alice\AppData\Roaming'
                 UserConfigPath = 'C:\Users\alice\AppData\Roaming\RustDesk\config\RustDesk2.toml'
             }
         }
     }
 
-    It '已安装时跳过下载与安装，只写服务级配置并记录 SID' {
+    It '已安装时跳过下载与安装，写用户级与服务级配置并记录 SID' {
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstaller { throw '已安装时不应下载' }
         Mock -ModuleName $script:ModuleName Install-VegaRustDeskSilently { throw '已安装时不应安装' }
@@ -324,14 +325,16 @@ Describe 'Invoke-VegaRustDeskBootstrap' {
         Should -Invoke -CommandName Get-VegaRustDeskInstaller -ModuleName $script:ModuleName -Times 0 -Exactly
         Should -Invoke -CommandName Install-VegaRustDeskSilently -ModuleName $script:ModuleName -Times 0 -Exactly
 
-        # P1-8：安装阶段不写用户级配置，避免把配置写到提权账户的 %APPDATA%。
-        Test-Path -LiteralPath $script:userConfig | Should -BeFalse
+        # P1-5：用户级 + 服务级两处都写，且都以写入后的回读为准。
+        Test-Path -LiteralPath $script:userConfig | Should -BeTrue
+        (Get-Content -LiteralPath $script:userConfig -Raw -Encoding UTF8) | Should -Match 'custom-rendezvous-server = "60\.205\.95\.98"'
         (Get-Content -LiteralPath $script:serviceConfig -Raw -Encoding UTF8) | Should -Match 'relay-server = "60\.205\.95\.98:21117"'
         @((Read-VegaState -Path $script:statePath).RustDeskInstalls).Count | Should -Be 0
 
         $serviceState = Read-VegaState -Path $script:serviceStatePath
         $serviceState.RustDeskUserConfig.Sid | Should -Be $script:testSid
-        $serviceState.RustDeskUserConfig.PromptPending | Should -BeTrue
+        $serviceState.RustDeskUserConfig.Written | Should -BeTrue
+        $serviceState.RustDeskUserConfig.PromptPending | Should -BeFalse
         @($serviceState.RustDeskConfigKeys).Count | Should -Be 3
     }
 
@@ -372,7 +375,7 @@ Describe 'Invoke-VegaRustDeskBootstrap' {
         Should -Invoke -CommandName Install-VegaRustDeskSilently -ModuleName $script:ModuleName -Times 0 -Exactly
     }
 
-    It '未安装时下载、静默安装、只写服务级配置并记录到 state.json' {
+    It '未安装时下载、静默安装、写用户级与服务级配置并记录到 state.json' {
         & (Get-Module $script:ModuleName) { $script:VegaProbeCount = 0 }
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall {
             $script:VegaProbeCount += 1
@@ -394,8 +397,9 @@ Describe 'Invoke-VegaRustDeskBootstrap' {
         $result.Installed | Should -BeTrue
         Should -Invoke -CommandName Install-VegaRustDeskSilently -ModuleName $script:ModuleName -Times 1 -Exactly
 
-        # P1-8：只写服务级配置。
-        Test-Path -LiteralPath $script:userConfig | Should -BeFalse
+        # P1-5：用户级配置写到交互用户路径，服务级写到 LocalService 路径。
+        Test-Path -LiteralPath $script:userConfig | Should -BeTrue
+        (Get-Content -LiteralPath $script:userConfig -Raw -Encoding UTF8) | Should -Match 'custom-rendezvous-server = "60\.205\.95\.98"'
         (Get-Content -LiteralPath $script:serviceConfig -Raw -Encoding UTF8) | Should -Match 'custom-rendezvous-server = "60\.205\.95\.98"'
 
         $saved = Read-VegaState -Path $script:statePath
@@ -407,6 +411,11 @@ Describe 'Invoke-VegaRustDeskBootstrap' {
         $serviceState = Read-VegaState -Path $script:serviceStatePath
         @($serviceState.RustDeskConfigKeys).Count | Should -Be 3
         @($serviceState.RustDeskConfigKeys | ForEach-Object { [string]$_.Path } | Select-Object -Unique) | Should -Contain $script:serviceConfig
+        $serviceState.RustDeskUserConfig.Written | Should -BeTrue
+
+        # 用户级基线落在 host-state（与安装记录同一份清单），回滚按 SID 记录的路径校验。
+        $hostState = Read-VegaState -Path $script:statePath
+        @($hostState.RustDeskConfigKeys | ForEach-Object { [string]$_.Path } | Select-Object -Unique) | Should -Contain $script:userConfig
     }
 
     It 'P1-5 服务没出现时返回非零，不把失败当成功' {
@@ -434,6 +443,52 @@ Describe 'Invoke-VegaRustDeskBootstrap' {
         Test-Path -LiteralPath $script:serviceConfig | Should -BeFalse
     }
 }
+
+    It 'P1-5 钩子传来的交互用户 SID + AppData 决定用户级写入路径' {
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
+        Mock -ModuleName $script:ModuleName Get-Service { [pscustomobject]@{ Name = 'RustDesk'; Status = 'Running' } }
+        Mock -ModuleName $script:ModuleName Get-VegaInteractiveUserContext { throw '钩子已给参数时不应再解析上下文' }
+
+        $appData = Join-Path $TestDrive ('appdata-' + [guid]::NewGuid().ToString('N'))
+        $hookUserConfig = Join-Path $appData 'RustDesk/config/RustDesk2.toml'
+
+        $result = Invoke-VegaRustDeskBootstrap -DefaultsFile $script:defaults -HostStatePath $script:statePath `
+            -ServiceStatePath $script:serviceStatePath -ServiceConfigPath $script:serviceConfig `
+            -DownloadDirectory $script:downloadDir -InteractiveUserSid $script:testSid `
+            -InteractiveUserAppData $appData -Confirm:$false
+
+        $result.Success | Should -BeTrue
+        Test-Path -LiteralPath $hookUserConfig | Should -BeTrue
+        (Get-Content -LiteralPath $hookUserConfig -Raw -Encoding UTF8) | Should -Match 'relay-server = "60\.205\.95\.98:21117"'
+
+        $serviceState = Read-VegaState -Path $script:serviceStatePath
+        $serviceState.RustDeskUserConfig.Sid | Should -Be $script:testSid
+        $serviceState.RustDeskUserConfig.AppDataPath | Should -Be $appData
+        $serviceState.RustDeskUserConfig.Path | Should -Be $hookUserConfig
+        $serviceState.RustDeskUserConfig.Written | Should -BeTrue
+        $serviceState.RustDeskUserConfig.PromptPending | Should -BeFalse
+    }
+
+    It 'P1-5 取不到交互用户时只写服务级，并标记完成页提示' {
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
+        Mock -ModuleName $script:ModuleName Get-Service { [pscustomobject]@{ Name = 'RustDesk'; Status = 'Running' } }
+        Mock -ModuleName $script:ModuleName Get-VegaInteractiveUserContext {
+            [pscustomobject]@{ Name = ''; Sid = ''; AppDataPath = ''; UserConfigPath = '' }
+        }
+
+        $result = Invoke-VegaRustDeskBootstrap -DefaultsFile $script:defaults -HostStatePath $script:statePath `
+            -ServiceStatePath $script:serviceStatePath -ServiceConfigPath $script:serviceConfig `
+            -DownloadDirectory $script:downloadDir -Confirm:$false
+
+        $result.Success | Should -BeTrue
+        Test-Path -LiteralPath $script:userConfig | Should -BeFalse
+        (Get-Content -LiteralPath $script:serviceConfig -Raw -Encoding UTF8) | Should -Match 'custom-rendezvous-server = "60\.205\.95\.98"'
+
+        $serviceState = Read-VegaState -Path $script:serviceStatePath
+        $serviceState.RustDeskUserConfig.Written | Should -BeFalse
+        $serviceState.RustDeskUserConfig.PromptPending | Should -BeTrue
+        ($result.Messages -join "`n") | Should -Match '完成页'
+    }
 
 Describe 'Invoke-VegaRustDeskRollback' {
     BeforeEach {
@@ -528,6 +583,7 @@ Describe 'install-rustdesk.ps1 入口（真实子进程）' {
         $conf = Get-Content -LiteralPath (Join-Path (Join-Path $repo 'console/src-tauri') 'tauri.conf.json') -Raw -Encoding UTF8 | ConvertFrom-Json
         $resources = $conf.bundle.resources
         $resources.'../../host/install-rustdesk.ps1' | Should -Be 'resources/host/install-rustdesk.ps1'
+        $resources.'../../host/resolve-interactive-user.ps1' | Should -Be 'resources/host/resolve-interactive-user.ps1'
         $resources.'../../host/lib/Vega.Common.psm1' | Should -Be 'resources/host/lib/Vega.Common.psm1'
         $resources.'resources/vega-defaults.json' | Should -Be 'resources/vega-defaults.json'
 
@@ -587,5 +643,91 @@ Describe 'install-rustdesk.ps1 静态约束' {
         $script:ScriptText | Should -Match '\[string\]\$DefaultsFile'
         $script:ScriptText | Should -Match '\[switch\]\$Uninstall'
         $script:ScriptText | Should -Match 'exit 1'
+    }
+}
+
+Describe 'P1-5 回滚按 SID 记录的用户配置路径校验' {
+    It '把 state.json 里记录的用户级路径作为 -ExpectedPath 传给恢复逻辑' {
+        $hostStatePath = Join-Path $TestDrive ('u-' + [guid]::NewGuid().ToString('N') + '.json')
+        $serviceStatePath = Join-Path $TestDrive ('us-' + [guid]::NewGuid().ToString('N') + '.json')
+        $userConfig = 'C:\Users\alice\AppData\Roaming\RustDesk\config\RustDesk2.toml'
+
+        $hostState = Get-VegaEmptyState
+        $hostState.RustDeskConfigKeys = @(
+            [pscustomobject]@{ Path = $userConfig; Key = 'key'; Existed = $true; OriginalValue = 'old'; Restored = $false }
+        )
+        $null = Save-VegaState -State $hostState -Path $hostStatePath
+
+        $serviceState = Get-VegaEmptyState
+        $serviceState = Set-VegaStateRustDeskUserConfig -State $serviceState -Sid 'S-1-5-21-1-2-3-1001' `
+            -Path $userConfig -AppDataPath 'C:\Users\alice\AppData\Roaming' -Written $true -PromptPending $false
+        $null = Save-VegaState -State $serviceState -Path $serviceStatePath
+
+        Mock -ModuleName $script:ModuleName Test-VegaRustDeskManagedConfigPath { $true }
+        Mock -ModuleName $script:ModuleName Restore-VegaRustDeskState {
+            [pscustomobject]@{ State = $State; Failures = @(); Messages = @('ok') }
+        }
+
+        $null = Invoke-VegaRustDeskRollback -HostStatePath $hostStatePath -ServiceStatePath $serviceStatePath -KeepRustDesk -Confirm:$false
+        Should -Invoke -CommandName Restore-VegaRustDeskState -ModuleName $script:ModuleName -Times 1 -Exactly -ParameterFilter {
+            $ExpectedPath -eq $userConfig
+        }
+    }
+}
+
+Describe 'P1-2 / P1-4 / P1-5 / P1-8 安装包钩子静态约束' {
+    BeforeAll {
+        $repoRoot = Join-Path $PSScriptRoot '..'
+        $script:Hooks = Get-Content -LiteralPath (Join-Path (Join-Path $repoRoot 'console/src-tauri/windows') 'hooks.nsh') -Raw -Encoding UTF8
+        $script:ModuleText = Get-Content -LiteralPath (Join-Path $repoRoot 'host/lib/Vega.Common.psm1') -Raw -Encoding UTF8
+        $script:ResolverText = Get-Content -LiteralPath (Join-Path $repoRoot 'host/resolve-interactive-user.ps1') -Raw -Encoding UTF8
+    }
+
+    It 'P1-2 WOW64 下优先用 Sysnative 的 64 位 PowerShell' {
+        $script:Hooks | Should -Match 'Sysnative\\WindowsPowerShell\\v1\.0\\powershell\.exe'
+        $script:Hooks | Should -Match 'VegaSelectPowerShell'
+        # Sysnative 不存在时才回落 $SYSDIR，顺序不能反。
+        $native = $script:Hooks.IndexOf('Sysnative\WindowsPowerShell')
+        $fallback = $script:Hooks.IndexOf('StrCpy $vegaPowerShell "$SYSDIR\WindowsPowerShell')
+        $native | Should -BeGreaterThan -1
+        $fallback | Should -BeGreaterThan $native
+    }
+
+    It 'P1-2 RustDesk 探测同时看 ProgramW6432 / ProgramFiles 与注册表两个视图' {
+        $script:ModuleText | Should -Match 'ProgramW6432'
+        $script:ModuleText | Should -Match 'WOW6432Node'
+        $script:ModuleText | Should -Match 'ProgramFilesDir \(x86\)'
+        $script:ModuleText | Should -Match 'Get-VegaProgramFilesRegistryRoot'
+    }
+
+    It 'P1-4 icacls 用绝对路径、检查退出码、失败跳过文件日志' {
+        $script:Hooks | Should -Match '\$SYSDIR\\icacls\.exe'
+        $script:Hooks | Should -Not -Match "nsExec::ExecToStack 'icacls"
+        $script:Hooks | Should -Match 'StrCmp \$0 "0" vega_log_ok'
+        $script:Hooks | Should -Match 'vegaLogUsable'
+        $script:Hooks | Should -Match 'StrCmp \$vegaLogUsable "1"'
+    }
+
+    It 'P1-5 钩子把交互用户 SID 与 Roaming AppData 传给脚本' {
+        $script:Hooks | Should -Match '-InteractiveUserSid "\$vegaUserSid"'
+        $script:Hooks | Should -Match '-InteractiveUserAppData "\$vegaUserAppData"'
+        # 用 -File 调独立解析脚本（避免 NSIS 单引号嵌套），字段分开取。
+        $script:Hooks | Should -Match 'resolve-interactive-user\.ps1" -Field Sid'
+        $script:Hooks | Should -Match 'resolve-interactive-user\.ps1" -Field AppDataPath'
+        $script:ResolverText | Should -Match 'Get-VegaInteractiveUserContextValue -Field \$Field'
+        # 解析只认交互用户，不能把提权账户当用户。
+        $script:ModuleText | Should -Match 'SkipProcessFallback'
+    }
+
+    It 'P1-8 回滚失败保留重试脚本，成功后才删除' {
+        $script:Hooks | Should -Match 'VegaPreserveRetryScript'
+        $script:Hooks | Should -Match 'retry\\host\\install-rustdesk\.ps1'
+        $preserve = $script:Hooks.IndexOf('!insertmacro VegaPreserveRetryScript')
+        $uninstall = $script:Hooks.IndexOf('-File "$INSTDIR\resources\host\install-rustdesk.ps1" -Uninstall')
+        $remove = $script:Hooks.IndexOf('StrCmp $0 "0" 0 vega_unsetup_failed')
+        $preserve | Should -BeGreaterThan -1
+        $uninstall | Should -BeGreaterThan $preserve
+        $remove | Should -BeGreaterThan $uninstall
+        $script:Hooks | Should -Match 'vega_unsetup_failed:[\s\S]*可重试'
     }
 }
