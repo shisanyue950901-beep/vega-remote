@@ -61,7 +61,7 @@ Describe 'RustDesk 部署脚本：公网 IP 探测' {
         $script:IpDetect | Should -Match 'classify_detected_ipv4'
         $script:IpDetect | Should -Match 'sanitize_detected_ipv4'
         # 最终输出前必须过滤，而不是只靠元数据/HTTP 分支。
-        $script:IpDetect | Should -Match 'ip=\$\(sanitize_detected_ipv4 "\$ip"\\)'
+        $script:IpDetect | Should -Match ([regex]::Escape('ip=$(sanitize_detected_ipv4 "$ip")'))
         $script:ServerScript | Should -Match 'detect_public_ip'
         $script:ServerScript | Should -Match 'warn_if_private_ipv4'
         $script:StaticTest | Should -Match 'FAKE_ROUTE_IP'
