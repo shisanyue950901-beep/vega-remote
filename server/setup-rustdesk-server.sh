@@ -405,9 +405,28 @@ EOF
 EOF
 }
 
+is_private_ipv4() {
+  local ip="$1"
+  [[ -z "$ip" ]] && return 1
+  [[ "$ip" =~ ^10\. ]] && return 0
+  [[ "$ip" =~ ^192\.168\. ]] && return 0
+  [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]] && return 0
+  # 169.254/16 是链路本地地址，同样不能当公网 IP 给用户填。
+  [[ "$ip" =~ ^169\.254\. ]] && return 0
+  return 1
+}
+
 detect_public_ip() {
   local ip=""
   if command -v curl >/dev/null 2>&1; then
+    # 阿里云 ECS 先查元数据里的弹性公网 IP：没有绑定 EIP 的实例直接问 ifconfig.me
+    # 只能拿到 VPC 内网地址，用户会把它填进 RustDesk 后连不上。
+    ip=$(curl -fsS --max-time 2 http://100.100.100.200/latest/meta-data/eipv4 2>/dev/null || true)
+    if is_private_ipv4 "$ip"; then
+      ip=""
+    fi
+  fi
+  if [[ -z "$ip" ]] && command -v curl >/dev/null 2>&1; then
     ip=$(curl -fsS4 --max-time 5 https://ifconfig.me 2>/dev/null || true)
     if [[ -z "$ip" ]]; then
       ip=$(curl -fsS4 --max-time 5 https://api.ipify.org 2>/dev/null || true)
@@ -423,6 +442,10 @@ detect_public_ip() {
 }
 
 IP=$(detect_public_ip | tr -d '[:space:]')
+if is_private_ipv4 "$IP"; then
+  echo "警告: 自动探测到的是内网地址 $IP（阿里云实例未绑定 EIP 时常见），不能直接给客户端使用。" >&2
+  echo "      请在云控制台绑定弹性公网 IP，或手动填写服务器公网 IP/域名。" >&2
+fi
 
 CLEANED=true
 

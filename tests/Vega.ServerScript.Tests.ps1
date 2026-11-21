@@ -31,6 +31,18 @@ Describe 'RustDesk 部署脚本：只支持全新部署' {
     }
 }
 
+Describe 'RustDesk 部署脚本：公网 IP 探测' {
+    It '先查阿里云元数据 eipv4，避免回落成 VPC 内网 IP' {
+        $script:ServerScript | Should -Match '100\.100\.100\.200/latest/meta-data/eipv4'
+        $script:ServerScript | Should -Match 'is_private_ipv4'
+    }
+
+    It 'RFC1918 结果打印警告' {
+        $script:ServerScript | Should -Match '自动探测到的是内网地址'
+        $script:ServerScript | Should -Match '\^172\\\.\(1\[6-9\]'
+    }
+}
+
 Describe 'RustDesk 部署脚本：端口与失败清理' {
     It '启动前用 ss -lntup 检查 21115-21119' {
         $script:ServerScript | Should -Match 'ss -lntup'
