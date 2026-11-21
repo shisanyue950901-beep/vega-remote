@@ -1042,3 +1042,42 @@ Describe 't3-fix5 用户级配置读取失败时降级到服务级并返回退�
         $serviceState.RustDeskUserConfig.PromptPending | Should -BeTrue
     }
 }
+
+Describe 't3-fix5 显式空上下文走 -ServiceOnly 时不再解析交互用户' {
+    It '钩子显式传空（入口置 -ServiceOnly）时不调用 Get-VegaInteractiveUserContext' {
+        $statePath = Join-Path $TestDrive ('h-' + [guid]::NewGuid().ToString('N') + '.json')
+        $serviceStatePath = Join-Path $TestDrive ('s-' + [guid]::NewGuid().ToString('N') + '.json')
+        $defaults = Join-Path $TestDrive 'vega-defaults.json'
+        $json = @{ rustdesk = @{ idServer = '60.205.95.98'; relayServer = '60.205.95.98'; key = $script:Key } } | ConvertTo-Json
+        Set-Content -LiteralPath $defaults -Value $json -Encoding UTF8
+
+        $serviceConfig = Join-Path $TestDrive 'ProgramData/RustDesk/config/RustDesk2.toml'
+        $script:CapturedServiceOnly = $false
+
+        Mock -ModuleName $script:ModuleName Get-VegaInteractiveUserContext { throw '显式空上下文时不应再解析交互用户' }
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
+        Mock -ModuleName $script:ModuleName Get-Service { [pscustomobject]@{ Name = 'RustDesk'; Status = 'Running' } }
+        Mock -ModuleName $script:ModuleName Wait-VegaRustDeskService { [pscustomobject]@{ Found = $true; Running = $true; Status = 'Running' } }
+        Mock -ModuleName $script:ModuleName Restart-VegaRustDeskService { [pscustomobject]@{ Found = $true; WasRunning = $true; Restarted = $true; Status = 'Running'; Message = 'ok' } }
+        Mock -ModuleName $script:ModuleName Set-VegaRustDeskConfig {
+            param($Server, $Key, $RelayServer, $State, $StatePath, $UserConfigPath, $ServiceConfigPath, $ServiceStatePath, $ForceService, $ServiceOnly, $ContinueOnUserFailure, $Confirm)
+            if ($ServiceOnly) { $script:CapturedServiceOnly = $true }
+            [pscustomobject]@{
+                Applied        = @([pscustomobject]@{ Path = $ServiceConfigPath; Changed = $true })
+                Warnings       = @()
+                ServicePresent = $true
+                Values         = @{}
+                State          = $State
+            }
+        }
+
+        $result = Invoke-VegaRustDeskBootstrap -DefaultsFile $defaults -HostStatePath $statePath `
+            -ServiceStatePath $serviceStatePath -ServiceConfigPath $serviceConfig -ServiceOnly -Confirm:$false
+
+        $result.Success | Should -BeTrue
+        $result.Degraded | Should -BeTrue
+        $result.ExitCode | Should -Be 2
+        $script:CapturedServiceOnly | Should -BeTrue
+        Should -Invoke -CommandName Get-VegaInteractiveUserContext -ModuleName $script:ModuleName -Times 0 -Exactly
+    }
+}
