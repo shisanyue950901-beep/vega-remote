@@ -6201,6 +6201,9 @@ function New-VegaSecureDirectory {
         [string]$Parent
     )
 
+    # 真建目录/改 ACL：-WhatIf 下不落地，返回空路径由调用方按“没有可信目录”处理。
+    if (-not $PSCmdlet.ShouldProcess($Parent, '创建仅 Administrators/SYSTEM 可写的随机下载目录')) { return '' }
+
     if (-not (Test-Path -LiteralPath $Parent)) {
         try { $null = New-Item -ItemType Directory -Path $Parent -Force -ErrorAction Stop }
         catch { throw "无法创建受信父目录：$Parent（$($_.Exception.Message)）" }
@@ -6274,6 +6277,8 @@ function Remove-VegaSecureDirectory {
         catch { $null = $_ }
     }
     if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    # 句柄先释放（上面已经做过），再决定是否真删目录：-WhatIf 下不删。
+    if (-not $PSCmdlet.ShouldProcess($Path, '删除临时下载目录')) { return }
     try {
         if (Test-Path -LiteralPath $Path) {
             Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
