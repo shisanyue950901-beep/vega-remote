@@ -5085,7 +5085,10 @@ function Set-VegaRustDeskConfig {
       只记警告并继续写服务级配置，由调用方把结果标记为降级。
       当前用户路径的记录写调用方给的清单（host-state / client-state）；
       LocalService 路径的记录只写管理员清单 %ProgramData%\Vega\state.json。
-      只为实际变化的键登记基线，写入并回读确认后才保存（标记为待回滚）。
+      基线顺序（t3-fix6 P3）：读取现有配置成功之后、替换文件之前，只为实际变化的键
+      保存基线（标记为待回滚）；随后写入并回读校验。回读失败时基线仍保留在清单里，
+      卸载/重跑都能恢复原值。读取失败（拒绝访问/共享冲突/编码异常）会直接终止该目标，
+      不保存任何基线——避免把读不到的文件误记成“原本没有该键”。
       返回 { Applied, Warnings, ServicePresent, Values, State }。
     #>
     [CmdletBinding(SupportsShouldProcess)]
