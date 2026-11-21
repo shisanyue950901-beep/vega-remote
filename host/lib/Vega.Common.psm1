@@ -5815,11 +5815,13 @@ function Get-VegaRustDeskInstaller {
 
 function Wait-VegaRustDeskService {
     <#
-      安装完成后等 RustDesk 服务出现（最多 TimeoutSeconds 秒）。服务可能稍晚注册。
+      P1-6：安装完成后在有界时间内等服务真正达到 Running，而不是“看到服务对象就算成功”。
+      服务可能稍晚注册，也可能注册后仍是 StartPending / Stopped：只有 Running 才返回
+      Running=$true；超时返回最后的 Found / Status 交给调用方判失败。
     #>
     [CmdletBinding()]
     param(
-        [int]$TimeoutSeconds = 120,
+        [int]$TimeoutSeconds = 60,
 
         [int]$IntervalSeconds = 2
     )
@@ -5829,13 +5831,19 @@ function Wait-VegaRustDeskService {
     while ($true) {
         $last = Get-Service -Name 'RustDesk' -ErrorAction SilentlyContinue
         if ($null -ne $last) {
-            return [pscustomobject]@{ Found = $true; Status = [string]$last.Status }
+            $status = [string]$last.Status
+            if ($status -eq 'Running') {
+                return [pscustomobject]@{ Found = $true; Running = $true; Status = $status }
+            }
         }
         if ((Get-Date) -ge $deadline) { break }
         Start-Sleep -Seconds ([Math]::Max(1, $IntervalSeconds))
     }
 
-    return [pscustomobject]@{ Found = $false; Status = '' }
+    $found = ($null -ne $last)
+    $status = ''
+    if ($found) { $status = [string]$last.Status }
+    return [pscustomobject]@{ Found = $found; Running = $false; Status = $status }
 }
 
 function Install-VegaRustDeskSilently {
@@ -6226,11 +6234,13 @@ function Invoke-VegaRustDeskBootstrap {
             $state = Add-VegaStateRustDeskInstall -State $state -Path $newExe -Version $releaseVersion -InstalledByVega $true
             $null = Save-VegaState -State $state -Path $HostStatePath
 
-            $wait = Wait-VegaRustDeskService
-            if (-not $wait.Found) {
-                return (& $fail -Message 'RustDesk 服务在 120 秒内没有出现。' -Installed $true)
+            # P1-6：只“看到服务对象”不算成功，有界等它真的 Running。
+            $wait = Wait-VegaRustDeskService -TimeoutSeconds 60
+            if (-not $wait.Running) {
+                $statusText = $(if ([string]::IsNullOrWhiteSpace([string]$wait.Status)) { '服务未注册' } else { "状态 $($wait.Status)" })
+                return (& $fail -Message ("RustDesk 服务在 60 秒内没有达到 Running（{0}）。" -f $statusText) -Installed $true)
             }
-            $messages.Add("RustDesk 服务已出现（$($wait.Status)）")
+            $messages.Add("RustDesk 服务已就绪（$($wait.Status)）")
         }
         else {
             $messages.Add("已安装 RustDesk，跳过安装：$existing")
@@ -6239,9 +6249,9 @@ function Invoke-VegaRustDeskBootstrap {
         # P1-5：已装 RustDesk 的机器也要确认服务真的在，否则写进服务级配置也不会生效。
         # 这一步放在写配置之前：服务不在就干脆别写，免得留下一条永远不生效的记录。
         if (-not $installedByVega) {
-            $await = Wait-VegaRustDeskService
-            if (-not $await.Found) {
-                return (& $fail -Message 'RustDesk 服务不存在，服务级配置暂时不会生效。' -Installed $false)
+            $await = Wait-VegaRustDeskService -TimeoutSeconds 60
+            if (-not $await.Running) {
+                return (& $fail -Message 'RustDesk 服务 60 秒内没有达到 Running，服务级配置暂时不会生效。' -Installed $false)
             }
             $messages.Add("RustDesk 服务已就绪（$($await.Status)）")
         }

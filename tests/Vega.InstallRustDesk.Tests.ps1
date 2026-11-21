@@ -249,6 +249,31 @@ Describe 'Install-VegaRustDeskSilently' {
     }
 }
 
+Describe 'Wait-VegaRustDeskService' {
+    It 'P1-6 服务注册后仍是 Stopped：有界等待后返回 Running=false' {
+        Mock -ModuleName $script:ModuleName Get-Service { [pscustomobject]@{ Name = 'RustDesk'; Status = 'Stopped' } }
+
+        $result = Wait-VegaRustDeskService -TimeoutSeconds 1 -IntervalSeconds 1
+        $result.Found | Should -BeTrue
+        $result.Running | Should -BeFalse
+        $result.Status | Should -Be 'Stopped'
+    }
+
+    It 'P1-6 StartPending 之后变成 Running 时等到 Running' {
+        & (Get-Module $script:ModuleName) { $script:VegaWaitCalls = 0 }
+        Mock -ModuleName $script:ModuleName Get-Service {
+            $script:VegaWaitCalls += 1
+            if ($script:VegaWaitCalls -le 1) { [pscustomobject]@{ Name = 'RustDesk'; Status = 'StartPending' } }
+            else { [pscustomobject]@{ Name = 'RustDesk'; Status = 'Running' } }
+        }
+
+        $result = Wait-VegaRustDeskService -TimeoutSeconds 10 -IntervalSeconds 1
+        $result.Running | Should -BeTrue
+        $result.Status | Should -Be 'Running'
+        $script:VegaWaitCalls | Should -BeGreaterOrEqual 2
+    }
+}
+
 Describe 'Invoke-VegaRustDeskBootstrap' {
     BeforeEach {
         $script:statePath = Join-Path $TestDrive ('host-state-' + [guid]::NewGuid().ToString('N') + '.json')
@@ -265,7 +290,7 @@ Describe 'Invoke-VegaRustDeskBootstrap' {
             [pscustomobject]@{ Found = $true; WasRunning = $true; Restarted = $true; Status = 'Running'; Message = 'RustDesk 服务已重启' }
         }
         Mock -ModuleName $script:ModuleName Wait-VegaRustDeskService {
-            [pscustomobject]@{ Found = $true; Status = 'Running' }
+            [pscustomobject]@{ Found = $true; Running = $true; Status = 'Running' }
         }
         # P1-3：下载目录的 ACL/所有权检查只在 Windows 真机上有效，这里换成 TestDrive 临时目录。
         Mock -ModuleName $script:ModuleName New-VegaSecureDirectory {
@@ -396,7 +421,7 @@ Describe 'Invoke-VegaRustDeskBootstrap' {
         Mock -ModuleName $script:ModuleName Install-VegaRustDeskSilently {
             [pscustomobject]@{ Success = $true; ExitCode = 0; Error = '' }
         }
-        Mock -ModuleName $script:ModuleName Wait-VegaRustDeskService { [pscustomobject]@{ Found = $false; Status = '' } }
+        Mock -ModuleName $script:ModuleName Wait-VegaRustDeskService { [pscustomobject]@{ Found = $true; Running = $false; Status = 'Stopped' } }
         Mock -ModuleName $script:ModuleName Get-Service { $null }
 
         $result = Invoke-VegaRustDeskBootstrap -DefaultsFile $script:defaults -HostStatePath $script:statePath `
