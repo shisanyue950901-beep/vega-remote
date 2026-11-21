@@ -5158,67 +5158,70 @@ function Set-VegaRustDeskConfig {
     $warnings = New-Object System.Collections.Generic.List[string]
 
     foreach ($target in $targets) {
-        # 安装写入与回滚共用同一校验：从 %APPDATA%（或 LocalService Roaming）起
-        # 逐级拒绝重解析点，避免用户侧目录联接把提权写入重定向到服务配置。
-        if (-not (Test-VegaRustDeskManagedConfigPath -Path $target -ExpectedPath $target)) {
-            $message = "RustDesk 配置路径包含重解析点或位置异常，拒绝写入：$target"
-            if ([string]::Equals($target, $UserConfigPath, [StringComparison]::OrdinalIgnoreCase) -and -not $ContinueOnUserFailure) { throw $message }
-            $warnings.Add($message)
-            Write-Warning $message
-            continue
-        }
-
-        $existingText = ''
-        if (Test-Path -LiteralPath $target -PathType Leaf) {
-            $existingText = Get-Content -LiteralPath $target -Raw -Encoding UTF8
-        }
-
-        $isServiceTarget = [string]::Equals($target, $ServiceConfigPath, [StringComparison]::OrdinalIgnoreCase)
-        $targetState = $State
-        $targetStatePath = $StatePath
-        if ($isServiceTarget) {
-            $targetStatePath = $ServiceStatePath
-            if ([string]::IsNullOrWhiteSpace($targetStatePath)) {
-                # 没有机器级清单（%ProgramData% 取不到）就不动服务配置：
-                # 写了也没地方记基线，卸载时无从回滚。
-                $message = '无法确定服务模式记录清单（%ProgramData% 未设置），跳过服务配置。'
+        # t3-fix5 P1-2：路径校验、读取、合并、写入、回读全部放进单个目标的 try。
+        # 用户级文件读不了（拒绝访问/共享冲突/编码异常）时只记警告，继续写服务级配置，
+        # 不再因为入口的 ErrorActionPreference='Stop' 把整单安装判成失败。
+        try {
+            # 安装写入与回滚共用同一校验：从 %APPDATA%（或 LocalService Roaming）起
+            # 逐级拒绝重解析点，避免用户侧目录联接把提权写入重定向到服务配置。
+            if (-not (Test-VegaRustDeskManagedConfigPath -Path $target -ExpectedPath $target)) {
+                $message = "RustDesk 配置路径包含重解析点或位置异常，拒绝写入：$target"
+                if ([string]::Equals($target, $UserConfigPath, [StringComparison]::OrdinalIgnoreCase) -and -not $ContinueOnUserFailure) { throw $message }
                 $warnings.Add($message)
                 Write-Warning $message
                 continue
             }
-            if (-not [string]::Equals($targetStatePath, $StatePath, [StringComparison]::OrdinalIgnoreCase)) {
-                try {
-                    $targetState = Read-VegaState -Path $targetStatePath
-                }
-                catch {
-                    # 管理员清单不可信/读不了：不动服务配置，也不把它记进用户清单。
-                    $message = "读取服务模式记录清单失败，跳过服务配置：$($_.Exception.Message)"
+
+            $existingText = ''
+            if (Test-Path -LiteralPath $target -PathType Leaf) {
+                $existingText = Get-Content -LiteralPath $target -Raw -Encoding UTF8
+            }
+
+            $isServiceTarget = [string]::Equals($target, $ServiceConfigPath, [StringComparison]::OrdinalIgnoreCase)
+            $targetState = $State
+            $targetStatePath = $StatePath
+            if ($isServiceTarget) {
+                $targetStatePath = $ServiceStatePath
+                if ([string]::IsNullOrWhiteSpace($targetStatePath)) {
+                    # 没有机器级清单（%ProgramData% 取不到）就不动服务配置：
+                    # 写了也没地方记基线，卸载时无从回滚。
+                    $message = '无法确定服务模式记录清单（%ProgramData% 未设置），跳过服务配置。'
                     $warnings.Add($message)
                     Write-Warning $message
                     continue
                 }
-            }
-        }
-
-        $changed = $null
-        if ($null -ne $targetState) {
-            $snapshot = Get-VegaRustDeskConfigKeySnapshot -Text $existingText -Keys $managedKeys
-            # 只登记实际变化的键：值相同、写入失败的键都不该留下待回滚记录。
-            $changed = [ordered]@{}
-            foreach ($managedKey in $managedKeys) {
-                $item = $snapshot[$managedKey]
-                if ($null -eq $item) { continue }
-                if (-not [bool]$item.Existed -or -not [string]::Equals([string]$item.OriginalValue, [string]$values[$managedKey], [StringComparison]::Ordinal)) {
-                    $changed[$managedKey] = $item
+                if (-not [string]::Equals($targetStatePath, $StatePath, [StringComparison]::OrdinalIgnoreCase)) {
+                    try {
+                        $targetState = Read-VegaState -Path $targetStatePath
+                    }
+                    catch {
+                        # 管理员清单不可信/读不了：不动服务配置，也不把它记进用户清单。
+                        $message = "读取服务模式记录清单失败，跳过服务配置：$($_.Exception.Message)"
+                        $warnings.Add($message)
+                        Write-Warning $message
+                        continue
+                    }
                 }
             }
-        }
 
-        $merged = Merge-VegaRustDeskConfigText -ExistingText $existingText -Values $values
+            $changed = $null
+            if ($null -ne $targetState) {
+                $snapshot = Get-VegaRustDeskConfigKeySnapshot -Text $existingText -Keys $managedKeys
+                # 只登记实际变化的键：值相同、写入失败的键都不该留下待回滚记录。
+                $changed = [ordered]@{}
+                foreach ($managedKey in $managedKeys) {
+                    $item = $snapshot[$managedKey]
+                    if ($null -eq $item) { continue }
+                    if (-not [bool]$item.Existed -or -not [string]::Equals([string]$item.OriginalValue, [string]$values[$managedKey], [StringComparison]::Ordinal)) {
+                        $changed[$managedKey] = $item
+                    }
+                }
+            }
 
-        if (-not $PSCmdlet.ShouldProcess($target, '写入 RustDesk 中继配置')) { continue }
+            $merged = Merge-VegaRustDeskConfigText -ExistingText $existingText -Values $values
 
-        try {
+            if (-not $PSCmdlet.ShouldProcess($target, '写入 RustDesk 中继配置')) { continue }
+
             # P1-6：改文件前先把可恢复基线落盘。这样即使写入成功但进程被杀、
             # 或回读失败抛异常，清单里也有原值，卸载/重跑都能回滚。
             if ($null -ne $targetState -and $null -ne $changed -and $changed.Count -gt 0) {
@@ -5247,7 +5250,7 @@ function Set-VegaRustDeskConfig {
         }
         catch {
             # 主控端通常不是管理员：服务模式路径写不了只警告，不影响当前用户配置。
-            # 安装包（-ContinueOnUserFailure）反过来：用户级路径写失败只降级，服务级必须继续写。
+            # 安装包（-ContinueOnUserFailure）反过来：用户级路径读/写失败只降级，服务级必须继续写。
             $message = "写入 $target 失败：$($_.Exception.Message)"
             if ([string]::Equals($target, $UserConfigPath, [StringComparison]::OrdinalIgnoreCase) -and -not $ContinueOnUserFailure) { throw $message }
             $warnings.Add($message)
