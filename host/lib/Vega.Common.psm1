@@ -6555,6 +6555,9 @@ function Wait-VegaRustDeskService {
       t3-fix8 P2：不再自己重建截止时间。传 -Deadline（New-VegaServiceDeadline 造的单调
       截止点）时与调用方的启动共用同一份预算；每次休眠不超过剩余预算，预算耗尽后不再
       接受 Running（先判预算，再查状态）。-TimeoutSeconds 只在没传 -Deadline 时用来造截止点。
+      t3-fix9 P2：读取 Status 后重新检查截止点——查询本身可能跨过截止时间，超时后即使
+      服务返回 Running 也不接受；休眠毫秒数向下取整，剩余不足 1 毫秒时不再休眠，避免
+      Start-Sleep 睡过预算或空转。
       -Clock 是给测试注入的可控时钟。
     #>
     [CmdletBinding()]
@@ -6582,15 +6585,21 @@ function Wait-VegaRustDeskService {
         if ($null -ne $last) {
             $status = [string]$last.Status
             if ($status -eq 'Running') {
-                return [pscustomobject]@{ Found = $true; Running = $true; Status = $status }
+                # t3-fix9 P2：查询可能跨过截止点；读完 Status 再判一次预算，超时不接受。
+                if ((Get-VegaServiceDeadlineRemainingSeconds -Deadline $Deadline) -gt 0) {
+                    return [pscustomobject]@{ Found = $true; Running = $true; Status = $status }
+                }
+                break
             }
         }
 
         # 查询本身也花时间：休眠前重新算，避免睡过截止点。
         $remaining = Get-VegaServiceDeadlineRemainingSeconds -Deadline $Deadline
         if ($remaining -le 0) { break }
-        $sleepSeconds = [Math]::Min($interval, $remaining)
-        Start-Sleep -Milliseconds ([int][Math]::Max(1, [Math]::Ceiling($sleepSeconds * 1000)))
+        # t3-fix9 P2：向下取整，绝不把休眠拉到剩余预算之外；不足 1 毫秒直接收工。
+        $sleepMilliseconds = [int][Math]::Floor([Math]::Min($interval, $remaining) * 1000)
+        if ($sleepMilliseconds -lt 1) { break }
+        Start-Sleep -Milliseconds $sleepMilliseconds
     }
 
     $found = ($null -ne $last)
