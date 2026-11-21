@@ -1,15 +1,17 @@
 name: Console
 
-# 只在控制台目录或本工作流变更时触发，脚本 CI 不受影响。
+# 只在控制台/被控端脚本或本工作流变更时触发，其他脚本 CI 不受影响。
 on:
   push:
     branches: [main]
     paths:
       - "console/**"
+      - "host/**"
       - ".github/workflows/console.yml"
   pull_request:
     paths:
       - "console/**"
+      - "host/**"
       - ".github/workflows/console.yml"
 
 permissions:
@@ -17,7 +19,7 @@ permissions:
 
 jobs:
   build:
-    name: Tauri 构建（Windows，不打包安装器）
+    name: Tauri 构建（Windows，NSIS 安装包）
     runs-on: windows-latest
     defaults:
       run:
@@ -48,12 +50,31 @@ jobs:
           fi
 
       # TODO(m2b): Cargo.lock 提交后追加 --locked，保证依赖可复现。
-      - name: 构建（--no-bundle）
-        run: npm run tauri build -- --no-bundle
+      # tauri.conf.json 里 bundle.targets = ["nsis"]，perMachine 只提权一次；
+      # 安装包会带上 host/install-rustdesk.ps1 与 resources/vega-defaults.json。
+      - name: 构建（NSIS 安装包）
+        run: npm run tauri build -- --bundles nsis
 
-      # 上面已生成 ../dist，cargo test 的 build.rs（generate_context!）才有前端资源可用。
+      # cargo test 的 build.rs（generate_context!）需要 ../dist，上面构建已生成。
       - name: Rust 单元测试
         run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: 重命名安装包为 Vega-Setup.exe
+        shell: bash
+        run: |
+          set -euo pipefail
+          src=$(ls src-tauri/target/release/bundle/nsis/*-setup.exe | head -n 1)
+          mkdir -p "$RUNNER_TEMP/vega"
+          cp "$src" "$RUNNER_TEMP/vega/Vega-Setup.exe"
+          ls -l "$RUNNER_TEMP/vega/Vega-Setup.exe"
+
+      - name: 上传 Vega-Setup.exe（真机试跑用安装包）
+        uses: actions/upload-artifact@v4
+        with:
+          name: vega-setup-windows
+          path: ${{ runner.temp }}/vega/Vega-Setup.exe
+          if-no-files-found: error
+          retention-days: 14
 
       - name: 上传控制台 exe（供真机试跑）
         uses: actions/upload-artifact@v4
