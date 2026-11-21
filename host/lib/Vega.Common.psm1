@@ -5352,10 +5352,9 @@ function Get-VegaRustDeskRelease {
     [CmdletBinding()]
     param()
 
-    # TODO(架构师): 填 RustDesk 官方 Release 资产的真实 SHA256（64 位小写十六进制）。
-    # 下面这串全 0 是占位值：校验会失败并中止安装，提醒发布流程确实填过。
-    $sha256 = '0000000000000000000000000000000000000000000000000000000000000000'
-    $version = '1.3.9'
+    # 架构师 2026-11-21 填入：GitHub Release API 给出的官方资产 digest。
+    $sha256 = '523ba0efbf62a21739961b62c7daaffb44d3da86139c546b364fd4e1333ed249'
+    $version = '1.5.3'
 
     return [pscustomobject]@{
         Version  = $version
