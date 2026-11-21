@@ -6072,6 +6072,40 @@ function Write-VegaSetupLog {
     }
 }
 
+function Write-VegaSetupResultFile {
+    <#
+      t3-fix8 P1-1：把本次运行的降级/失败原因写成一行，UTF-16LE（带 BOM）。
+      NSIS 钩子的 FileRead 走 ANSI 代码页，读 UTF-8 日志里的中文会乱码；结果文件用
+      FileReadUTF16LE 读，所以这里必须显式写 BOM。多行原因折成一行：完成页只显示一行。
+      写失败不影响安装结果，也不抛错（结果文件只是完成页的提示来源）。
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()]
+        [string]$Path = '',
+
+        [AllowEmptyString()]
+        [string]$Message = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    $line = (([string]$Message) -replace '[\r\n]+', ' ').Trim()
+    if ([string]::IsNullOrWhiteSpace($line)) { return }
+
+    try {
+        $directory = Split-Path -Path $Path -Parent
+        if (-not [string]::IsNullOrWhiteSpace($directory) -and -not (Test-Path -LiteralPath $directory)) {
+            $null = New-Item -ItemType Directory -Path $directory -Force
+        }
+        # 构造函数 (bigEndian, byteOrderMark)：小端 + 写 BOM，NSIS FileReadUTF16LE 才能正确解码。
+        $encoding = New-Object System.Text.UnicodeEncoding($false, $true)
+        [System.IO.File]::WriteAllText($Path, $line + "`r`n", $encoding)
+    }
+    catch {
+        $null = $_
+    }
+}
+
 function Get-VegaRustDeskDefaultConfig {
     <#
       读取随安装包发布的 vega-defaults.json（idServer / relayServer / key）。
@@ -8260,6 +8294,7 @@ Export-ModuleMember -Function @(
     'Get-VegaRustDeskDeviceId',
     'Invoke-VegaRustDeskSetup',
     'Write-VegaSetupLog',
+    'Write-VegaSetupResultFile',
     'Get-VegaRustDeskDefaultConfig',
     'Get-VegaRustDeskRelease',
     'Get-VegaRustDeskInstaller',
