@@ -56,7 +56,7 @@
   - 前端：串流页去掉假主机列表与内置 PIN 输入，改为真实状态/显卡/固定入口；设置页 doctor 与「诊断网络」跳转；
     Assist/Settings 共用一份配置快照并在 focus 时重查设备码与安装状态；设置页探测复位结果并恢复按钮
   - 旧清单 `RustDesk.RustDesk` 包按已下线处理：提示手动卸载、销账后继续回滚；host/client 各有 Pester 覆盖
-- 安装包冒烟测试仍延后：CI 继续只跑 `tauri build --no-bundle`，待总控另行安排
+- 安装包冒烟测试仍延后：M2c 阶段 CI 只跑 `tauri build --no-bundle`；T3 起改为产出 `Vega-Setup.exe`，真机检查项见 `docs/testing/windows-smoke.md`
 
 ## T3 一键安装包（v0.6，Vega-Setup.exe）
 - 打包：`console/src-tauri/tauri.conf.json` 的 `bundle.targets` 改为 `["nsis"]`，`installMode = "perMachine"`（启动时 UAC 提权一次），
@@ -87,6 +87,7 @@
 ## Backlog（M2b 审计 r3/r4 未做项）
 - P3：CI 只跑 `tauri build --no-bundle`，没有安装包冒烟测试；需要 Windows bundle 冒烟并监听 `host/**`/`console/**` 资源变更。
   本轮 r3/r4 只记录待办、不新增安装包测试（按总控要求）。
+  T3 已完成构建 `Vega-Setup.exe` 并监听 `host/**`，自动化安装冒烟仍未做。
 - RustDesk 改为手动安装（2026-03 起 WinGet 社区源移除 RustDesk）：控制台与 host 脚本都不再调用 winget 安装，
   只给出官方下载页 `https://github.com/rustdesk/rustdesk/releases/latest`；已安装的 RustDesk 仍应用中继配置。
   是否要在安装包冒烟测试里一并验证「未安装 RustDesk 时只显示下载页按钮」留待 M2c。
