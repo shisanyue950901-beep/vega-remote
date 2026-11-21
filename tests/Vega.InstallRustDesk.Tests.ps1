@@ -762,7 +762,7 @@ Describe 't3-fix6 已有安装的服务状态分支' {
         Should -Invoke -CommandName Set-VegaRustDeskConfig -ModuleName $script:ModuleName -Times 0 -Exactly
         Should -Invoke -CommandName Set-VegaStateRustDeskUserConfig -ModuleName $script:ModuleName -Times 0 -Exactly
 
-        # 降级停止在日志里记 WARN（完成页读最后一条 WARN 显示具体原因），不记 FAIL。
+        # 降级停止在日志里记 WARN（完成页的原因来自入口写进 -ResultFile 的那一行），不记 FAIL。
         $logText = Get-Content -LiteralPath $log -Raw -Encoding UTF8
         $logText | Should -Match 'WARN 检测到 RustDesk 正在运行且服务未启用'
         $logText | Should -Not -Match 'FAIL 检测到 RustDesk 正在运行'
@@ -857,6 +857,59 @@ Describe 't3-fix7 服务等待的有界语义' {
         $global:VegaClockElapsed | Should -BeLessOrEqual 1.0
     }
 
+    It 't3-fix9 P2 查询状态跨过截止点：即使返回 Running 也不接受' {
+        Mock -ModuleName $script:ModuleName Get-Service {
+            # 查询本身吃掉全部预算（模拟慢查询），再返回 Running。
+            $global:VegaClockElapsed = 61.0
+            [pscustomobject]@{ Name = 'RustDesk'; Status = 'Running' }
+        }
+        Mock -ModuleName $script:ModuleName Start-Sleep { throw '超时后不应再休眠' }
+
+        $global:VegaClockElapsed = 0.0
+        $deadline = New-VegaServiceDeadline -TimeoutSeconds 60 -Clock { $global:VegaClockElapsed }
+
+        $wait = Wait-VegaRustDeskService -Deadline $deadline
+
+        $wait.Found | Should -BeTrue
+        $wait.Running | Should -BeFalse
+        $wait.Status | Should -Be 'Running'
+        Should -Invoke -CommandName Get-Service -ModuleName $script:ModuleName -Times 1 -Exactly
+        Should -Invoke -CommandName Start-Sleep -ModuleName $script:ModuleName -Times 0 -Exactly
+    }
+
+    It 't3-fix9 P2 剩余不足 1 毫秒：向下取整为 0，不休眠直接按超时返回' {
+        Mock -ModuleName $script:ModuleName Get-Service { [pscustomobject]@{ Name = 'RustDesk'; Status = 'StartPending' } }
+        Mock -ModuleName $script:ModuleName Start-Sleep { throw '剩余不足 1 毫秒时不应休眠' }
+
+        $global:VegaClockElapsed = 0.9995
+        $deadline = New-VegaServiceDeadline -TimeoutSeconds 1 -Clock { $global:VegaClockElapsed }
+
+        $wait = Wait-VegaRustDeskService -Deadline $deadline
+
+        $wait.Running | Should -BeFalse
+        $wait.Status | Should -Be 'StartPending'
+        Should -Invoke -CommandName Start-Sleep -ModuleName $script:ModuleName -Times 0 -Exactly
+    }
+
+    It 't3-fix9 P2 休眠毫秒向下取整：500.9ms 传 500，不向上取整成 501' {
+        Mock -ModuleName $script:ModuleName Get-Service { [pscustomobject]@{ Name = 'RustDesk'; Status = 'StartPending' } }
+        $global:VegaClockElapsed = 0.0
+        $global:VegaSleeps = New-Object System.Collections.ArrayList
+        Mock -ModuleName $script:ModuleName Start-Sleep {
+            $null = $global:VegaSleeps.Add($Milliseconds)
+            $global:VegaClockElapsed += ($Milliseconds / 1000.0)
+        }
+
+        $deadline = New-VegaServiceDeadline -TimeoutSeconds 1 -Clock { $global:VegaClockElapsed }
+        $wait = Wait-VegaRustDeskService -Deadline $deadline -IntervalSeconds 0.5009
+
+        $wait.Running | Should -BeFalse
+        $global:VegaSleeps.Count | Should -BeGreaterThan 0
+        $global:VegaSleeps[0] | Should -Be 500
+        @($global:VegaSleeps | Where-Object { $_ -gt 500 }).Count | Should -Be 0
+        $global:VegaClockElapsed | Should -BeLessOrEqual 1.0
+    }
+
     It 'P2 有 -NoWait 时用它启动，不阻塞等 Running' -Skip:($PSVersionTable.PSVersion.Major -lt 6) {
         # Windows PowerShell 5.1 的 Start-Service 根本没有 -NoWait，只能走回退分支。
         Mock -ModuleName $script:ModuleName Get-Command { [pscustomobject]@{ Parameters = @{ NoWait = $true } } }
@@ -931,7 +984,7 @@ Describe 't3-fix8 P1-1 结果文件（UTF-16LE + BOM）' {
         $script:HooksText | Should -Match 'VegaPrepareResultFile'
         $script:HooksText | Should -Match 'GetTempFileName \$vegaResultFile'
         $script:HooksText | Should -Match '-ResultFile "\$vegaResultFile"'
-        # 结果文件必须用 UTF-16LE 读取；日志 WARN 扫描（ANSI FileRead）只作为兜底。
+        # 结果文件必须用 UTF-16LE 读取。
         $script:HooksText | Should -Match 'FileReadUTF16LE \$2 \$3'
         $script:HooksText | Should -Match 'VegaReadResultFile'
         $readMacro = $script:HooksText.IndexOf('!macro VegaReadResultFile')
@@ -943,13 +996,21 @@ Describe 't3-fix8 P1-1 结果文件（UTF-16LE + BOM）' {
         $delete = $script:HooksText.IndexOf('Delete "$vegaResultFile"', $read)
         $read | Should -BeGreaterThan -1
         $delete | Should -BeGreaterThan $read
-        # 退出码 2 与失败分支都用结果文件；日志 WARN 只作为兜底。
+        # t3-fix9 P1：非零退出只在分流前展开一次结果文件读取宏（同段不能有重名标签）。
+        ([regex]::Matches($script:HooksText, '!insertmacro VegaReadResultFile install')).Count | Should -Be 1
+        $nonzero = $script:HooksText.IndexOf('StrCmp $0 "0" vega_install_finish_done')
+        $read = $script:HooksText.IndexOf('!insertmacro VegaReadResultFile install')
         $degraded = $script:HooksText.IndexOf('vega_install_degraded:')
         $failed = $script:HooksText.IndexOf('vega_install_failed:')
-        $script:HooksText.IndexOf('!insertmacro VegaReadResultFile install', $degraded) | Should -BeGreaterThan $degraded
-        $script:HooksText.IndexOf('!insertmacro VegaReadResultFile install', $failed) | Should -BeGreaterThan $failed
-        $script:HooksText.IndexOf('!insertmacro VegaReadDegradedReason install', $degraded) |
-            Should -BeGreaterThan $degraded
+        $branch = $script:HooksText.IndexOf('StrCmp $0 "2" vega_install_degraded 0')
+        $read | Should -BeGreaterThan $nonzero
+        $read | Should -BeLessThan $degraded
+        $read | Should -BeLessThan $failed
+        $branch | Should -BeGreaterThan $read
+        # t3-fix9 P2：日志兜底解析已删除，结果文件缺失走固定中文指引。
+        $script:HooksText | Should -Not -Match 'VegaReadDegradedReason'
+        $script:HooksText | Should -Not -Match 'VegaRememberLogOffset'
+        $script:HooksText | Should -Match 'VEGA_RESULT_MISSING_GUIDE'
         # 准备/传参顺序：先建结果文件，再调用脚本。
         $prepare = $script:HooksText.IndexOf('!insertmacro VegaPrepareResultFile install')
         $run = $script:HooksText.IndexOf('-ResultFile "$vegaResultFile"')
@@ -1433,21 +1494,24 @@ Describe 'P1-2 / P1-4 / P1-5 / P1-8 安装包钩子静态约束' {
         $script:Hooks | Should -Match 'vega_unsetup_failed:[\s\S]*可重试'
     }
 
-    It 't3-fix7 P1 完成页按退出码 2 显示本次运行最后一条 WARN，不再写死“服务级已写入”' {
+    It 't3-fix9 P2 结果文件缺失时显示固定中文指引，不再扫描日志 WARN' {
         $script:Hooks | Should -Not -Match '服务级中继配置，但用户级配置未写入'
         # 文案赋值里不能再宣称“服务级已写入”（注释里说明“不写死”是允许的）。
         $script:Hooks | Should -Not -Match 'StrCpy \$vegaFinishText[^\r\n]*服务级已写入'
-        $script:Hooks | Should -Match 'VegaRememberLogOffset'
-        $script:Hooks | Should -Match 'VegaReadDegradedReason'
-        # 只从调用前记下的偏移开始扫，避免把上一次运行的 WARN 当成原因。
-        $offset = $script:Hooks.IndexOf('!insertmacro VegaRememberLogOffset install')
-        $install = $script:Hooks.IndexOf('-File "$INSTDIR\resources\host\install-rustdesk.ps1" -DefaultsFile')
-        $degraded = $script:Hooks.IndexOf('!insertmacro VegaReadDegradedReason install')
-        $offset | Should -BeGreaterThan -1
-        $install | Should -BeGreaterThan $offset
-        $degraded | Should -BeGreaterThan $install
-        $script:Hooks | Should -Match 'StrCmp \$4 "WARN " 0 vega_reason_loop'
-        # t3-fix8 P1-1：完成页文案改为显示结果文件里的原因（$vegaResultReason）。
+        # t3-fix9 P2：日志兜底解析整体删除，不再按行首 "WARN " 找原因。
+        $script:Hooks | Should -Not -Match 'VegaRememberLogOffset'
+        $script:Hooks | Should -Not -Match 'VegaReadDegradedReason'
+        $script:Hooks | Should -Not -Match 'StrCmp \$4 "WARN "'
+        $script:Hooks | Should -Not -Match 'FileRead \$2 \$3'
+        # 固定指引：完全退出 RustDesk、启用服务后重跑，并给出日志路径。
+        $guide = [regex]::Match($script:Hooks, '!define VEGA_RESULT_MISSING_GUIDE "([^"]+)"')
+        $guide.Success | Should -BeTrue
+        $guide.Groups[1].Value | Should -Match '^安装未完全成功，请完全退出 RustDesk、在 RustDesk 中启用服务后重新运行 Vega 安装；详细日志见 \$COMMONPROGRAMDATA\\Vega\\logs\\setup\.log。$'
+        $missing = $script:Hooks.IndexOf('vega_install_degraded_missing:')
+        $missing | Should -BeGreaterThan -1
+        $script:Hooks.IndexOf('StrCpy $vegaResultReason "${VEGA_RESULT_MISSING_GUIDE}"') | Should -BeGreaterThan $missing
+        # 结果文件有原因时仍显示该原因（退出码 2 前缀 + 完成页文案）。
+        $script:Hooks | Should -Match 'StrCpy \$vegaResultReason "RustDesk 中继配置没有完全生效：\$vegaResultReason"'
         $script:Hooks | Should -Match 'StrCpy \$vegaFinishText "\$\(MUI_TEXT_FINISH_INFO_TEXT\)\$\\r\$\\n\$\\r\$\\n\$vegaResultReason"'
         # 退出码 2 前脚本必须知道原因文件位置：降级停止在日志里写的是 WARN。
         $script:ModuleText | Should -Match "'WARN' \} else \{ 'FAIL' \}"
@@ -1871,5 +1935,104 @@ Describe 't3-fix5 原始带空格的注册表值能被探测命中' {
         Should -Invoke -CommandName Get-VegaRustDeskRelease -ModuleName $script:ModuleName -Times 0 -Exactly
         Should -Invoke -CommandName Get-VegaRustDeskInstaller -ModuleName $script:ModuleName -Times 0 -Exactly
         Should -Invoke -CommandName Install-VegaRustDeskSilently -ModuleName $script:ModuleName -Times 0 -Exactly
+    }
+}
+
+Describe 't3-fix9 P1 NSIS 宏展开后标签唯一' {
+    BeforeAll {
+        $script:RepoRoot = Join-Path $PSScriptRoot '..'
+        $script:HooksText = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'console/src-tauri/windows/hooks.nsh') -Raw -Encoding UTF8
+
+        function Get-VegaNsisMacroTable {
+            param([string]$Text)
+            $table = @{}
+            $pattern = '(?ms)^[ \t]*!macro[ \t]+([A-Za-z0-9_]+)([^\r\n]*)\r?\n(.*?)^[ \t]*!macroend[ \t]*$'
+            foreach ($match in [regex]::Matches($Text, $pattern)) {
+                $params = @()
+                $paramText = $match.Groups[2].Value.Trim()
+                if ($paramText) { $params = @($paramText -split '\s+') }
+                $table[$match.Groups[1].Value] = @{ Params = $params; Body = $match.Groups[3].Value }
+            }
+            return $table
+        }
+
+        function Expand-VegaNsisMacroBody {
+            param(
+                [hashtable]$Macros,
+                [string]$Body,
+                [string[]]$Arguments = @(),
+                [string[]]$Params = @(),
+                [int]$Depth = 0
+            )
+            if ($Depth -gt 32) { throw '宏展开超过 32 层' }
+            $text = $Body
+            for ($i = 0; $i -lt $Params.Count; $i++) {
+                $value = ''
+                if ($i -lt $Arguments.Count) { $value = [string]$Arguments[$i] }
+                $text = $text.Replace('${' + $Params[$i] + '}', $value)
+            }
+            # 逐个展开 !insertmacro（含嵌套），不做脚本块回调，避免作用域问题。
+            $insertPattern = '(?m)^[ \t]*!insertmacro[ \t]+([A-Za-z0-9_]+)([^\r\n]*)$'
+            for ($pass = 0; $pass -lt 200; $pass++) {
+                $match = [regex]::Match($text, $insertPattern)
+                if (-not $match.Success) { break }
+                $name = $match.Groups[1].Value
+                if (-not $Macros.ContainsKey($name)) { break }
+                $arguments = @()
+                $argumentText = $match.Groups[2].Value.Trim()
+                if ($argumentText) { $arguments = @($argumentText -split '\s+') }
+                $replacement = Expand-VegaNsisMacroBody -Macros $Macros -Body $Macros[$name].Body `
+                    -Arguments $arguments -Params $Macros[$name].Params -Depth ($Depth + 1)
+                $text = $text.Substring(0, $match.Index) + $replacement + $text.Substring($match.Index + $match.Length)
+            }
+            return $text
+        }
+
+        function Get-VegaNsisLabel {
+            param([string]$Text)
+            # 行首标签；排除 nsExec:: 这类双冒号调用。
+            return @([regex]::Matches($Text, '(?m)^[ \t]*([A-Za-z0-9_]+):(?!:)') | ForEach-Object { $_.Groups[1].Value })
+        }
+    }
+
+    It '展开后每个 Section/Function（NSIS_HOOK_*）内标签不重复' {
+        $macros = Get-VegaNsisMacroTable -Text $script:HooksText
+        $hookNames = @($macros.Keys | Where-Object { $_ -like 'NSIS_HOOK_*' })
+        $hookNames.Count | Should -BeGreaterThan 0
+
+        foreach ($hookName in $hookNames) {
+            $expanded = Expand-VegaNsisMacroBody -Macros $macros -Body $macros[$hookName].Body -Params $macros[$hookName].Params
+            $labels = Get-VegaNsisLabel -Text $expanded
+            $labels.Count | Should -BeGreaterThan 0 -Because "$hookName 展开后应有标签"
+            $duplicates = @($labels | Group-Object | Where-Object { $_.Count -gt 1 } |
+                ForEach-Object { '{0} x{1}' -f $_.Name, $_.Count })
+            ($duplicates -join ', ') | Should -Be '' -Because "$hookName 内标签必须唯一"
+        }
+    }
+
+    It '安装钩子只展开一次结果文件读取宏，退出码分流都在读取之后' {
+        $macros = Get-VegaNsisMacroTable -Text $script:HooksText
+        $expanded = Expand-VegaNsisMacroBody -Macros $macros -Body $macros['NSIS_HOOK_POSTINSTALL'].Body -Params @()
+
+        ([regex]::Matches($expanded, 'vega_result_read_done_install:')).Count | Should -Be 1
+        $expanded | Should -Match 'vega_install_degraded:'
+        $expanded | Should -Match 'vega_install_failed:'
+        $read = $expanded.IndexOf('vega_result_read_done_install:')
+        $branch = $expanded.IndexOf('StrCmp $0 "2" vega_install_degraded 0')
+        $read | Should -BeGreaterThan -1
+        $branch | Should -BeGreaterThan $read
+        # 固定指引与结果文件写入/删除都应出现在展开结果里。
+        $expanded | Should -Match 'vega_install_degraded_missing:'
+        $expanded | Should -Match ([regex]::Escape('${VEGA_RESULT_MISSING_GUIDE}'))
+        $expanded | Should -Match 'vega_result_delete_done_install:'
+    }
+
+    It '卸载钩子展开后没有重名标签' {
+        $macros = Get-VegaNsisMacroTable -Text $script:HooksText
+        $expanded = Expand-VegaNsisMacroBody -Macros $macros -Body $macros['NSIS_HOOK_PREUNINSTALL'].Body -Params @()
+        $expanded | Should -Match 'vega_unsetup_failed:'
+        $labels = Get-VegaNsisLabel -Text $expanded
+        $duplicates = @($labels | Group-Object | Where-Object { $_.Count -gt 1 } | ForEach-Object { $_.Name })
+        ($duplicates -join ', ') | Should -Be ''
     }
 }
