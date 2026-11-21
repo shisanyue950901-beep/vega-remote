@@ -5214,7 +5214,8 @@ function Set-VegaRustDeskConfig {
             $changed = $null
             if ($null -ne $targetState) {
                 $snapshot = Get-VegaRustDeskConfigKeySnapshot -Text $existingText -Keys $managedKeys
-                # 只登记实际变化的键：值相同、写入失败的键都不该留下待回滚记录。
+                # t3-fix7 P3：只登记实际变化的键；基线在替换文件前落盘（见下方 P1-6），
+                # 所以后续写入或回读失败时这些键的记录仍留在清单里，卸载/重跑都能恢复原值。
                 $changed = [ordered]@{}
                 foreach ($managedKey in $managedKeys) {
                     $item = $snapshot[$managedKey]
