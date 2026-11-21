@@ -260,17 +260,19 @@ Describe 'Wait-VegaRustDeskService' {
     }
 
     It 'P1-6 StartPending 之后变成 Running 时等到 Running' {
-        & (Get-Module $script:ModuleName) { $script:VegaWaitCalls = 0 }
+        # 计数器放全局：Mock 的脚本块在不同作用域求值，用 $script: 会写到另一个变量上，
+        # 回读永远是 0。全局变量在两边看到的是同一个。
+        $global:VegaWaitCalls = 0
         Mock -ModuleName $script:ModuleName Get-Service {
-            $script:VegaWaitCalls += 1
-            if ($script:VegaWaitCalls -le 1) { [pscustomobject]@{ Name = 'RustDesk'; Status = 'StartPending' } }
+            $global:VegaWaitCalls += 1
+            if ($global:VegaWaitCalls -le 1) { [pscustomobject]@{ Name = 'RustDesk'; Status = 'StartPending' } }
             else { [pscustomobject]@{ Name = 'RustDesk'; Status = 'Running' } }
         }
 
         $result = Wait-VegaRustDeskService -TimeoutSeconds 10 -IntervalSeconds 1
         $result.Running | Should -BeTrue
         $result.Status | Should -Be 'Running'
-        (& (Get-Module $script:ModuleName) { $script:VegaWaitCalls }) | Should -BeGreaterOrEqual 2
+        $global:VegaWaitCalls | Should -BeGreaterOrEqual 2
     }
 }
 
