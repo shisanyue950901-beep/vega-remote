@@ -502,6 +502,39 @@ Describe 'Invoke-VegaRustDeskBootstrap' {
         $serviceState.RustDeskUserConfig.PromptPending | Should -BeFalse
     }
 
+    It 't3-fix12 P2-3 只给 SID + AppData：路径由模块推导，断言真实落盘位置' -Skip:($env:OS -ne 'Windows_NT') {
+        # 双击入口（install-rustdesk.ps1）只传 SID 与 AppData，RustDesk2.toml 由模块推导。
+        # 显式传 -UserConfigPath 会走覆盖分支，即使推导坏掉这条用例也照样通过，
+        # 所以这里必须不传它：只断言 <AppData>\RustDesk\config\RustDesk2.toml 真的落盘。
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
+        Mock -ModuleName $script:ModuleName Get-Service { [pscustomobject]@{ Name = 'RustDesk'; Status = 'Running' } }
+        Mock -ModuleName $script:ModuleName Get-VegaInteractiveUserContext { throw '钩子已给 SID + AppData 时不应再解析上下文' }
+
+        $appData = Join-Path $TestDrive ('appdata-derived-' + [guid]::NewGuid().ToString('N'))
+        $derivedUserConfig = Join-Path $appData 'RustDesk\config\RustDesk2.toml'
+
+        $result = Invoke-VegaRustDeskBootstrap -DefaultsFile $script:defaults -HostStatePath $script:statePath `
+            -ServiceStatePath $script:serviceStatePath -ServiceConfigPath $script:serviceConfig `
+            -DownloadDirectory $script:downloadDir -InteractiveUserSid $script:testSid `
+            -InteractiveUserAppData $appData -Confirm:$false
+
+        $result.Success | Should -BeTrue
+        $result.ExitCode | Should -Be 0
+        $result.Configured | Should -BeTrue
+
+        Test-Path -LiteralPath $derivedUserConfig | Should -BeTrue
+        (Get-Content -LiteralPath $derivedUserConfig -Raw -Encoding UTF8) |
+            Should -Match 'custom-rendezvous-server = "60\.205\.95\.98"'
+        (Get-Content -LiteralPath $derivedUserConfig -Raw -Encoding UTF8) |
+            Should -Match 'relay-server = "60\.205\.95\.98:21117"'
+
+        $serviceState = Read-VegaState -Path $script:serviceStatePath
+        $serviceState.RustDeskUserConfig.Sid | Should -Be $script:testSid
+        $serviceState.RustDeskUserConfig.AppDataPath | Should -Be $appData
+        $serviceState.RustDeskUserConfig.Path | Should -Be $derivedUserConfig
+        $serviceState.RustDeskUserConfig.Written | Should -BeTrue
+    }
+
     It 'P1-5 取不到交互用户时只写服务级，并标记完成页提示' {
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
         Mock -ModuleName $script:ModuleName Get-Service { [pscustomobject]@{ Name = 'RustDesk'; Status = 'Running' } }
