@@ -736,7 +736,7 @@ Describe 'P1-2 / P1-4 / P1-5 / P1-8 安装包钩子静态约束' {
 
     It 'P2/t3-fix4 icacls 失败时钩子传 -NoFileLog' {
         $script:Hooks | Should -Match 'VegaSelectLogArgument'
-        $script:Hooks | Should -Match "\$vegaLogArgument = '-NoFileLog'|StrCpy \$vegaLogArgument '-NoFileLog'"
+        $script:Hooks | Should -Match 'StrCpy \$vegaLogArgument .-NoFileLog.'
         $script:Hooks | Should -Match '\$vegaLogArgument -InteractiveUserContextB64'
         # 安装与卸载两处都必须用条件参数，而不是写死 -LogFile。
         ([regex]::Matches($script:Hooks, '\$vegaLogArgument -')).Count | Should -BeGreaterThan 1
@@ -800,7 +800,8 @@ Describe 't3-fix4 已有 RustDesk 装在自定义目录时不重装' {
         $exe = Join-Path $dir 'rustdesk.exe'
         Set-Content -LiteralPath $exe -Value 'stub' -Encoding UTF8
 
-        Mock -ModuleName $script:ModuleName Get-VegaRustDeskRegistryInstallCandidates { @($exe) }
+        $script:CustomExe = $exe
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskRegistryInstallCandidates { @($script:CustomExe) }
         (Get-VegaRustDeskInstall) | Should -Be $exe
     }
 
@@ -810,7 +811,8 @@ Describe 't3-fix4 已有 RustDesk 装在自定义目录时不重装' {
         $exe = Join-Path $dir 'rustdesk.exe'
         Set-Content -LiteralPath $exe -Value 'stub' -Encoding UTF8
 
-        Mock -ModuleName $script:ModuleName Get-VegaRustDeskRegistryInstallCandidates { @($exe) }
+        $script:ChineseExe = $exe
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskRegistryInstallCandidates { @($script:ChineseExe) }
         (Get-VegaRustDeskInstall) | Should -Be $exe
     }
 
