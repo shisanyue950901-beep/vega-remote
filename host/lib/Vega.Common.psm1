@@ -5479,6 +5479,15 @@ function New-VegaSecureDirectory {
     }
     if (Test-VegaReparsePoint -Path $Parent) { throw "下载目录父路径是重解析点，拒绝使用：$Parent" }
 
+    if (Test-VegaWindowsPlatform) {
+        # 父目录必须归 Administrators/SYSTEM：标准用户可占位的目录里，随机名也挡不住
+        # “先占住同名目录、再让提权进程写进去”的替换。
+        $parentOwner = Get-VegaPathOwnerSid -Path $Parent
+        if (@('S-1-5-32-544', 'S-1-5-18') -notcontains $parentOwner) {
+            throw "下载目录父路径不归 Administrators/SYSTEM 所有，拒绝使用：$Parent"
+        }
+    }
+
     $directory = Join-Path $Parent ('dl-' + [System.Guid]::NewGuid().ToString('N'))
     try {
         # -Force 会把“已存在”吞掉，这里不能用：GUID 撞名就说明有人在抢先放东西。
