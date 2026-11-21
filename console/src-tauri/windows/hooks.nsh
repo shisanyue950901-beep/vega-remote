@@ -140,7 +140,11 @@ vega_log_arg_done_${ID}:
   Pop $1
   StrCpy $vegaSetupExitCode $0
 
-  StrCpy $vegaSetupLogLine "install-rustdesk.ps1 exit code: $0 (user context: $vegaUserContextB64)"
+  ; 不把 Base64 上下文（含用户名/路径）写进日志，只记录是否取到。
+  StrCpy $vegaSetupLogLine "install-rustdesk.ps1 exit code: $0"
+  StrCmp $vegaUserContextB64 "" vega_install_log_done
+    StrCpy $vegaSetupLogLine "install-rustdesk.ps1 exit code: $0 (interactive user context provided)"
+vega_install_log_done:
   !insertmacro VegaAppendSetupLog install
 
   ; 退出码 2 = 服务级已写入、用户级降级；不能当成失败，也不能当成完整成功。
