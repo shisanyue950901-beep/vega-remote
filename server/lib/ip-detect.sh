@@ -8,8 +8,11 @@
 #     拿不到令牌就不发无令牌请求（该实例要求令牌，无令牌请求只会失败/误导）。
 #   - 元数据请求必须 --noproxy '*'：经过用户配置的代理会把 100.100.100.200 解析到别处。
 #   - 只接受请求成功且通过 IPv4 正则的完整响应；失败时的部分输出/HTML 一律丢弃。
-#   - 路由/hostname 回退可能拿到 100.64/10、回环、组播等不可路由地址：最终输出前统一
-#     分类。RFC1918 保留并由调用方打印警告；CGNAT/回环/链路本地/组播/保留段直接丢弃。
+#   - 路由/hostname 回退可能拿到 100.64/10、回环、组播等不可路由地址：每个候选
+#     来源单独分类（P2，t3-fix5），public / RFC1918 才采用，discard 就丢掉并继续
+#     下一个来源。RFC1918 保留并由调用方打印警告；CGNAT/回环/链路本地/组播/保留段、
+#     198.18/15 基准测试网段与 RFC 5737 文档网段（192.0.2/24、198.51.100/24、
+#     203.0.113/24）直接丢弃。
 #   - 本文件只定义函数，不执行任何动作。
 
 is_valid_ipv4() {
@@ -48,10 +51,23 @@ is_private_ipv4() {
   return 1
 }
 
+is_documentation_ipv4() {
+  local ip="$1"
+  is_valid_ipv4 "$ip" || return 1
+  # 198.18/15（RFC 2544）是基准测试网段：真实公网里不会出现，出现就是本机基准/隧道残留。
+  [[ "$ip" =~ ^198\.(18|19)\. ]] && return 0
+  # RFC 5737 文档网段，只用于示例与测试，不能当服务器公网地址给用户填。
+  [[ "$ip" =~ ^192\.0\.2\. ]] && return 0
+  [[ "$ip" =~ ^198\.51\.100\. ]] && return 0
+  [[ "$ip" =~ ^203\.0\.113\. ]] && return 0
+  return 1
+}
+
 is_public_ipv4() {
   local ip="$1"
   is_valid_ipv4 "$ip" || return 1
   is_private_ipv4 "$ip" && return 1
+  is_documentation_ipv4 "$ip" && return 1
 
   local first second
   IFS='.' read -r first second _ _ <<<"$ip"
@@ -139,27 +155,37 @@ fetch_public_ip_http() {
 }
 
 detect_public_ip() {
-  local ip=""
+  local candidate=""
 
+  # P2（t3-fix5）：逐来源分类。每个候选来源先过 sanitize，discard 就丢掉并继续
+  # 探测下一个来源，而不是先挑一个来源再分类——否则路由拿到 CGNAT 时就直接空结果，
+  # 后面可用的 hostname 回退永远没机会执行。
   if command -v curl >/dev/null 2>&1; then
-    ip=$(fetch_aliyun_eip 2>/dev/null || true)
-    if [[ -z "$ip" ]]; then
-      ip=$(fetch_public_ip_http 2>/dev/null || true)
+    candidate=$(fetch_aliyun_eip 2>/dev/null || true)
+    if candidate=$(sanitize_detected_ipv4 "$candidate"); then
+      printf '%s' "$candidate"
+      return 0
+    fi
+    candidate=$(fetch_public_ip_http 2>/dev/null || true)
+    if candidate=$(sanitize_detected_ipv4 "$candidate"); then
+      printf '%s' "$candidate"
+      return 0
     fi
   fi
-  if [[ -z "$ip" ]]; then
-    ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit }}') || ip=""
-  fi
-  if [[ -z "$ip" ]]; then
-    ip=$(hostname -I 2>/dev/null | awk '{print $1}') || ip=""
+
+  candidate=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit }}') || candidate=""
+  if candidate=$(sanitize_detected_ipv4 "$candidate"); then
+    printf '%s' "$candidate"
+    return 0
   fi
 
-  # 本地回退可能是内网地址（保留给调用方打印警告），但 CGNAT/回环/链路本地/组播
-  # 这类不可路由地址必须在这里丢弃，不能打印成服务器地址。
-  if [[ -n "$ip" ]]; then
-    ip=$(sanitize_detected_ipv4 "$ip") || ip=""
+  candidate=$(hostname -I 2>/dev/null | awk '{print $1}') || candidate=""
+  if candidate=$(sanitize_detected_ipv4 "$candidate"); then
+    printf '%s' "$candidate"
+    return 0
   fi
-  printf '%s' "$ip"
+
+  printf '%s' ""
 }
 
 # 打印 RFC1918/链路本地地址警告；是内网地址返回 0。
