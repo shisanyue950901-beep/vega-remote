@@ -1119,16 +1119,16 @@ Describe 't3-fix5 原始带空格的注册表值能被探测命中' {
         Set-Content -LiteralPath $exe -Value 'stub' -Encoding UTF8
 
         # 与 RustDesk 官方写入注册表的形态一致：目录未加引号、路径含空格、DisplayIcon 带 ,0。
-        $rawInstallLocation = $dir
-        $rawDisplayIcon = '{0},0' -f $exe
-        $parsed = @(
-            (ConvertTo-VegaRustDeskInstallLocationPath -Value $rawInstallLocation)
-            (ConvertTo-VegaRustDeskDisplayIconPath -Value $rawDisplayIcon)
-        )
-        $parsed | Should -Contain $exe
+        # t3-fix6 P2：注入的是注册表**原始**字段值（含引号内索引），解析由被测函数自己做，
+        # 不再先解析再塞候选——否则解析回归会被测试自己掩盖。
+        $rawEntry = @{
+            InstallLocation = $dir
+            DisplayIcon     = ('"{0},0"' -f $exe)
+        }
+        $script:RawCandidates = @(Get-VegaRustDeskRegistryInstallCandidates -RawEntry @($rawEntry))
+        $script:RawCandidates | Should -Contain $exe
 
-        $script:ParsedCandidates = $parsed
-        Mock -ModuleName $script:ModuleName Get-VegaRustDeskRegistryInstallCandidates { @($script:ParsedCandidates) }
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskRegistryInstallCandidates { @($script:RawCandidates) }
         (Get-VegaRustDeskInstall) | Should -Be $exe
     }
 
@@ -1138,8 +1138,13 @@ Describe 't3-fix5 原始带空格的注册表值能被探测命中' {
         $exe = Join-Path $dir 'rustdesk.exe'
         Set-Content -LiteralPath $exe -Value 'stub' -Encoding UTF8
 
-        $script:ParsedCandidates = @((ConvertTo-VegaRustDeskInstallLocationPath -Value $dir))
-        Mock -ModuleName $script:ModuleName Get-VegaRustDeskRegistryInstallCandidates { @($script:ParsedCandidates) }
+        # t3-fix6 P2：同样注入原始注册表值（引号外索引），候选由真实解析器生成。
+        $script:RawCandidates = @(Get-VegaRustDeskRegistryInstallCandidates -RawEntry @(@{
+                    InstallLocation = $dir
+                    DisplayIcon     = ('"{0}",0' -f $exe)
+                }))
+        $script:RawCandidates | Should -Contain $exe
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskRegistryInstallCandidates { @($script:RawCandidates) }
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskRelease { throw '命中后不应查询 Release' }
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstaller { throw '命中后不应下载' }
         Mock -ModuleName $script:ModuleName Install-VegaRustDeskSilently { throw '命中后不应静默安装' }
