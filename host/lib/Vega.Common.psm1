@@ -7127,6 +7127,20 @@ function Invoke-VegaRustDeskBootstrap {
             catch {
                 return (& $fail -Message $_.Exception.Message)
             }
+            # -WhatIf：New-VegaSecureDirectory 不落地并返回空路径，这里不再下载/安装。
+            if ([string]::IsNullOrWhiteSpace($secureDirectory)) {
+                $messages.Add('已跳过（WhatIf：未创建下载目录）')
+                return [pscustomobject]@{
+                    Success    = $true
+                    ExitCode   = 0
+                    Installed  = $false
+                    Configured = $false
+                    Degraded   = $false
+                    UserConfigWritten = $false
+                    Messages   = $messages.ToArray()
+                    Error      = ''
+                }
+            }
 
             $download = Get-VegaRustDeskInstaller -DestinationDirectory $secureDirectory -Release $release
             if (-not $download.Success) {
