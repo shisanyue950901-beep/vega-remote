@@ -135,6 +135,9 @@ vega_log_arg_done_${ID}:
   DetailPrint "正在安装并配置 RustDesk（自建中继）…"
   ; -WindowStyle Hidden 兜底：nsExec 本身不弹控制台，但 Windows PowerShell 启动器
   ; 仍可能闪一下窗口。
+  ; t3-fix5 P2：-InteractiveUserContextB64 总是显式传（取不到时是空串）。脚本用
+  ; PSBoundParameters 区分“钩子确认没有交互用户”（直接只写服务级，退出码 2）与
+  ; “手动调用省略参数”（才回退解析），所以这里不要去条件拼接这个参数。
   nsExec::ExecToStack '"$vegaPowerShell" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "$INSTDIR\resources\host\install-rustdesk.ps1" -DefaultsFile "$INSTDIR\resources\vega-defaults.json" $vegaLogArgument -InteractiveUserContextB64 "$vegaUserContextB64"'
   Pop $0
   Pop $1
