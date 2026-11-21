@@ -1510,6 +1510,11 @@ Describe 'P1-2 / P1-4 / P1-5 / P1-8 安装包钩子静态约束' {
         $missing = $script:Hooks.IndexOf('vega_install_degraded_missing:')
         $missing | Should -BeGreaterThan -1
         $script:Hooks.IndexOf('StrCpy $vegaResultReason "${VEGA_RESULT_MISSING_GUIDE}"') | Should -BeGreaterThan $missing
+        # 失败分支（非 2 退出码）结果文件缺失时也要给同一段固定指引，不能只留笼统失败文案。
+        $failedMissing = $script:Hooks.IndexOf('vega_install_failed_missing:')
+        $failedMissing | Should -BeGreaterThan -1
+        $script:Hooks.IndexOf('StrCpy $vegaFinishText "$vegaFinishText$\r$\n$\r$\n${VEGA_RESULT_MISSING_GUIDE}"') |
+            Should -BeGreaterThan $failedMissing
         # 结果文件有原因时仍显示该原因（退出码 2 前缀 + 完成页文案）。
         $script:Hooks | Should -Match 'StrCpy \$vegaResultReason "RustDesk 中继配置没有完全生效：\$vegaResultReason"'
         $script:Hooks | Should -Match 'StrCpy \$vegaFinishText "\$\(MUI_TEXT_FINISH_INFO_TEXT\)\$\\r\$\\n\$\\r\$\\n\$vegaResultReason"'

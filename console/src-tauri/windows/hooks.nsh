@@ -246,8 +246,12 @@ vega_install_failed:
     ; 交互模式只改完成页文案；/S 与 /P 不弹模态框，只留日志和 DetailPrint。
     DetailPrint "RustDesk 未装好（退出码 $0），继续完成 Vega 安装。"
     StrCpy $vegaFinishText "Vega 已安装，但 RustDesk 未装好（退出码 $0）。请打开 Vega，按设置页提示手动安装，或到 https://rustdesk.com/download 下载安装。"
-    StrCmp $vegaResultReason "" vega_install_finish_done
+    ; t3-fix9 P2：结果文件缺失同样给固定指引（不再靠日志猜原因）。
+    StrCmp $vegaResultReason "" vega_install_failed_missing
       StrCpy $vegaFinishText "$vegaFinishText$\r$\n$\r$\n$vegaResultReason"
+      Goto vega_install_finish_done
+vega_install_failed_missing:
+      StrCpy $vegaFinishText "$vegaFinishText$\r$\n$\r$\n${VEGA_RESULT_MISSING_GUIDE}"
 vega_install_finish_done:
     ; 成功时脚本不写原因；统一清理占位/残留结果文件。
     !insertmacro VegaDeleteResultFile install
