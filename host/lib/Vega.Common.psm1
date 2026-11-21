@@ -5557,7 +5557,10 @@ function Uninstall-VegaRustDeskRecorded {
         }
     }
 
-    return [pscustomobject]@{ Success = $false; Message = '未找到 RustDesk 的卸载命令，请在「设置 → 应用」中手动卸载。' }
+    return [pscustomobject]@{
+        Success = $false
+        Message = ("未找到 RustDesk 的卸载命令（记录：{0}），请在「设置 → 应用」中手动卸载。" -f [string]$Record.Path)
+    }
 }
 
 function Invoke-VegaRustDeskRollback {
