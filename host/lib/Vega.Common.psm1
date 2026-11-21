@@ -642,7 +642,7 @@ function Write-VegaLegacyStateWarning {
     # 新版管理员清单也用 %ProgramData%\Vega\state.json 记录 LocalService 的 RustDesk
     # 受管键；带 SchemaVersion >= 2 的文件不是 v0.1 旧清单，不能误报。
     try {
-        $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+        $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop
         if (-not [string]::IsNullOrWhiteSpace($raw)) {
             $data = $raw | ConvertFrom-Json
             if ($null -ne $data -and $null -ne $data.PSObject.Properties['SchemaVersion'] -and [int]$data.SchemaVersion -ge 2) {
@@ -903,7 +903,7 @@ function Read-VegaState {
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $state }
 
-    $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+    $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop
     if ([string]::IsNullOrWhiteSpace($raw)) { return $state }
 
     try {
@@ -953,7 +953,7 @@ function Test-VegaLegacyStateFile {
     }
 
     try {
-        $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+        $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop
         if ([string]::IsNullOrWhiteSpace($raw)) { return $true }
         $data = $raw | ConvertFrom-Json
         if ($null -ne $data -and $null -ne $data.PSObject.Properties['SchemaVersion'] -and [int]$data.SchemaVersion -ge 2) {
@@ -2116,7 +2116,7 @@ function Restore-VegaManagedConfig {
         return [pscustomobject]@{ Restored = $true; Changed = $false; Message = "没有受管键需要回滚：$Path" }
     }
 
-    $current = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+    $current = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop
     $merged = Merge-VegaSunshineConfigText -ExistingText $current -Values $values -RemoveKeys $remove.ToArray()
     if ($merged -eq $current) {
         return [pscustomobject]@{ Restored = $true; Changed = $false; Message = "受管键已是原始值：$Path" }
@@ -2474,7 +2474,7 @@ function Get-VegaSunshineBasePort {
     if ([string]::IsNullOrWhiteSpace($ConfigPath)) { return 47989 }
     if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { return 47989 }
 
-    $text = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8
+    $text = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 -ErrorAction Stop
     $raw = Get-VegaSunshineRawValue -Text $text -Key 'port'
     if ($null -eq $raw) { return 47989 }
 
@@ -4528,7 +4528,7 @@ function Resolve-VegaRustDeskSetting {
         }
         if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { return $null }
 
-        $raw = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8
+        $raw = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 -ErrorAction Stop
         if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
 
         try {
@@ -5174,7 +5174,11 @@ function Set-VegaRustDeskConfig {
 
             $existingText = ''
             if (Test-Path -LiteralPath $target -PathType Leaf) {
-                $existingText = Get-Content -LiteralPath $target -Raw -Encoding UTF8
+                # t3-fix6 P1-1：显式 -ErrorAction Stop。入口脚本的
+                # $ErrorActionPreference='Stop' 不会传进模块作用域，共享冲突/拒绝访问时
+                # Get-Content 默认只是非终止错误并返回空串，读不到的文件会被当成空配置，
+                # 从而把原有中继键记成 Existed=$false（卸载时删掉用户的原值）。
+                $existingText = Get-Content -LiteralPath $target -Raw -Encoding UTF8 -ErrorAction Stop
             }
 
             $isServiceTarget = [string]::Equals($target, $ServiceConfigPath, [StringComparison]::OrdinalIgnoreCase)
@@ -5238,7 +5242,9 @@ function Set-VegaRustDeskConfig {
             $null = Write-VegaTextFileAtomic -Path $target -Text $merged
 
             # 回读确认：三个键都真的落到文件里；不一致就抛错，基线仍保留在清单里。
-            $verifyText = Get-Content -LiteralPath $target -Raw -Encoding UTF8
+            # t3-fix6 P1-1：回读也必须终止错误，否则读失败会被当成空内容/不一致的偶然结果，
+            # 掩盖真实的共享冲突，而基线已经落盘。
+            $verifyText = Get-Content -LiteralPath $target -Raw -Encoding UTF8 -ErrorAction Stop
             $verified = ConvertFrom-VegaRustDeskConfigText -Text $verifyText
             foreach ($managedKey in $managedKeys) {
                 if (-not $verified.Contains($managedKey) -or -not [string]::Equals([string]$verified[$managedKey], [string]$values[$managedKey], [StringComparison]::Ordinal)) {
@@ -5313,7 +5319,9 @@ function Restore-VegaRustDeskConfig {
         return [pscustomobject]@{ Restored = $true; Changed = $false; Message = "没有受管键需要回滚：$Path" }
     }
 
-    $current = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+    # t3-fix6 P1-1：回滚读不到原文件必须终止，不能把“读失败”当成“内容已是原值”
+    # 而跳过恢复（那样清单会被当成已处理，原有中继键就永久丢了）。
+    $current = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop
     $merged = Merge-VegaRustDeskConfigText -ExistingText $current -Values $values -RemoveKeys $remove.ToArray()
     if ([string]::Equals($merged, $current, [StringComparison]::Ordinal)) {
         return [pscustomobject]@{ Restored = $true; Changed = $false; Message = "受管键已是原始值：$Path" }
@@ -6036,7 +6044,7 @@ function Get-VegaRustDeskDefaultConfig {
         throw "缺少默认配置：$Path"
     }
 
-    $text = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+    $text = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop
     if ([string]::IsNullOrWhiteSpace($text)) { throw "默认配置是空文件：$Path" }
 
     try {
@@ -7323,7 +7331,7 @@ function Invoke-VegaHostInstallCore {
         throw "缺少配置模板：$TemplatePath"
     }
 
-    $templateText = Get-Content -LiteralPath $TemplatePath -Raw -Encoding UTF8
+    $templateText = Get-Content -LiteralPath $TemplatePath -Raw -Encoding UTF8 -ErrorAction Stop
     $defaults = ConvertFrom-VegaSunshineConfigText -Text $templateText
 
     $values = [ordered]@{}
@@ -7336,7 +7344,7 @@ function Invoke-VegaHostInstallCore {
 
     $existingText = ''
     if (Test-Path -LiteralPath $sunshine.Config -PathType Leaf) {
-        $existingText = Get-Content -LiteralPath $sunshine.Config -Raw -Encoding UTF8
+        $existingText = Get-Content -LiteralPath $sunshine.Config -Raw -Encoding UTF8 -ErrorAction Stop
     }
 
     # 首次安装只记录受管键的原值；重跑不覆盖已有基线
