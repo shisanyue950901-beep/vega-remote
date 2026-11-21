@@ -1691,7 +1691,12 @@ function Set-VegaStateRustDeskUserConfig {
       取不到用户上下文时 Written=$false、PromptPending=$true，由完成页提示用户手动处理。
       回滚时按记录的 Path 作为预期路径校验用户级基线。
     #>
-    [CmdletBinding(SupportsShouldProcess)]
+    # 纯内存函数：只把字段塞进传入的 state 对象并返回，不落盘、不改系统状态
+    # （落盘由调用方 Save-VegaState 负责），所以不声明 SupportsShouldProcess。
+    # PSSA 只按 Set- 动词判状态变更，这里显式说明理由。
+    [CmdletBinding()]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = '纯内存函数：只在传入的 state 对象上写属性并返回，不落盘、不改系统状态；落盘由调用方 Save-VegaState 负责。')]
     param(
         [Parameter(Mandatory)]
         $State,
@@ -6512,7 +6517,11 @@ function New-VegaServiceDeadline {
       用 Stopwatch 而不是 Get-Date：系统时间被调整时截止时间不会跟着漂。
       -Clock 是给测试注入的可控时钟（返回从创建时刻起经过的秒数）；不传就用 Stopwatch。
     #>
-    [CmdletBinding(SupportsShouldProcess)]
+    # 纯内存函数：只构造并返回一个截止点对象（预算秒数 + Stopwatch + 注入的时钟），
+    # 不碰服务、文件或任何系统状态，所以不声明 SupportsShouldProcess。
+    [CmdletBinding()]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = '纯内存函数：只构造并返回截止点对象，不启动服务、不写文件、不改系统状态。')]
     param(
         [int]$TimeoutSeconds = 60,
 
@@ -6946,6 +6955,9 @@ function Start-VegaRustDeskServiceNonBlocking {
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param()
+
+    # 真改系统状态（向 SCM 发起启动）：-WhatIf 下只打印计划，不动服务。
+    if (-not $PSCmdlet.ShouldProcess('RustDesk', '启动 RustDesk 服务（不阻塞等待 Running）')) { return }
 
     $supportsNoWait = $false
     $command = Get-Command -Name 'Start-Service' -ErrorAction SilentlyContinue
