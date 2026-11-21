@@ -31,6 +31,7 @@
   退出码（安装模式）：
     0 = 用户级 + 服务级都写入成功；
     2 = 成功但降级（只写了服务级配置、用户级写入失败，或 RustDesk 服务未注册时只写用户级配置）；
+        或降级停止（服务未注册且 RustDesk 正在运行：一行配置都没写，需完全退出后端重跑，t3-fix7）；
     1 = 失败。
 
 .PARAMETER DefaultsFile
@@ -188,6 +189,12 @@ try {
 
     if (-not $result.Success) {
         Write-Host $result.Error -ForegroundColor Yellow
+        if ($result.ExitCode -eq 2) {
+            # t3-fix7 P1：服务未注册且 RustDesk 正在运行是“降级停止”，不是失败：
+            # 一行配置都没写，退出码 2 让完成页显示脚本给出的具体原因。
+            Write-Host '处理后重新运行 Vega 安装即可写入中继配置。' -ForegroundColor Yellow
+            exit 2
+        }
         Write-Host '也可以打开 https://rustdesk.com/download 手动下载安装，装完回到 Vega 设置页查看配置。'
         Write-VegaLog "FAIL $($result.Error)"
         exit 1
