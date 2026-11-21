@@ -1694,9 +1694,9 @@ function Set-VegaStateRustDeskUserConfig {
     # 纯内存函数：只把字段塞进传入的 state 对象并返回，不落盘、不改系统状态
     # （落盘由调用方 Save-VegaState 负责），所以不声明 SupportsShouldProcess。
     # PSSA 只按 Set- 动词判状态变更，这里显式说明理由。
-    [CmdletBinding()]
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
         Justification = '纯内存函数：只在传入的 state 对象上写属性并返回，不落盘、不改系统状态；落盘由调用方 Save-VegaState 负责。')]
+    [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
         $State,
@@ -6524,9 +6524,9 @@ function New-VegaServiceDeadline {
     #>
     # 纯内存函数：只构造并返回一个截止点对象（预算秒数 + Stopwatch + 注入的时钟），
     # 不碰服务、文件或任何系统状态，所以不声明 SupportsShouldProcess。
-    [CmdletBinding()]
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '',
         Justification = '纯内存函数：只构造并返回截止点对象，不启动服务、不写文件、不改系统状态。')]
+    [CmdletBinding()]
     param(
         [int]$TimeoutSeconds = 60,
 
