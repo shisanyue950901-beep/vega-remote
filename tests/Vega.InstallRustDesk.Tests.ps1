@@ -1060,8 +1060,8 @@ Describe 't3-fix8 P1-2 服务状态：StartPending 只等、1056 视为正常' {
         $result.ExitCode | Should -Be 0
         ($result.Messages -join "`n") | Should -Match '1056'
         Should -Invoke -CommandName Wait-VegaRustDeskService -ModuleName $script:ModuleName -Times 1 -Exactly
-        (Microsoft.PowerShell.Management\Get-Content -LiteralPath $serviceConfig -Raw -Encoding UTF8) |
-            Should -Match 'custom-rendezvous-server = "60\.205\.95\.98"'
+        # 1056 不能挡住后续配置写入。
+        Should -Invoke -CommandName Set-VegaRustDeskConfig -ModuleName $script:ModuleName -Times 1 -Exactly
     }
 
     It '启动失败但错误码不是 1056：仍按失败返回退出码 1' {
