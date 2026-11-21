@@ -69,6 +69,12 @@
   t3-fix5：钩子总是显式传这个参数；显式传空串表示“确认没有交互用户”，
   脚本据此直接只写服务级，不再回退解析（用 PSBoundParameters 区分省略参数）。
 
+.PARAMETER ResultFile
+  t3-fix8 P1-1：本次运行专用的结果文件路径（由 NSIS 钩子生成并传入）。
+  退出码 2（降级 / 降级停止）或失败时，脚本把一行原因以 UTF-16LE（带 BOM）写进该文件，
+  钩子用 FileReadUTF16LE 读取后显示在完成页并删除。日志是 UTF-8 且行首带时间戳，
+  ANSI 的 FileRead 读中文会乱码，所以原因单独走这个文件。留空则不写。
+
 .EXAMPLE
   .\install-rustdesk.ps1 -DefaultsFile .\resources\vega-defaults.json
 
@@ -86,7 +92,8 @@ param(
     [string]$ServiceStatePath = '',
     [string]$InteractiveUserSid = '',
     [string]$InteractiveUserAppData = '',
-    [string]$InteractiveUserContextB64 = ''
+    [string]$InteractiveUserContextB64 = '',
+    [string]$ResultFile = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -107,6 +114,16 @@ if ([string]::IsNullOrWhiteSpace($DefaultsFile)) {
 
 $modulePath = Join-Path (Join-Path $PSScriptRoot 'lib') 'Vega.Common.psm1'
 if (-not (Test-Path -LiteralPath $modulePath)) {
+    # 模块都没了，拿不到 Write-VegaSetupResultFile：直接按同一编码写一行，供完成页显示。
+    if (-not [string]::IsNullOrWhiteSpace($ResultFile)) {
+        try {
+            $encoding = New-Object System.Text.UnicodeEncoding($false, $true)
+            [System.IO.File]::WriteAllText($ResultFile, "缺少共享模块：$modulePath`r`n", $encoding)
+        }
+        catch {
+            $null = $_
+        }
+    }
     Write-Host "缺少共享模块：$modulePath" -ForegroundColor Red
     exit 1
 }
@@ -119,12 +136,20 @@ function Write-VegaLog {
     Write-VegaSetupLog -Path $LogFile -Message $Message
 }
 
+function Write-VegaResult {
+    # t3-fix8 P1-1：降级/失败原因写给 NSIS 完成页（UTF-16LE + BOM，一行）。写失败不影响退出码。
+    param([AllowEmptyString()][string]$Message = '')
+
+    Write-VegaSetupResultFile -Path $ResultFile -Message $Message
+}
+
 Write-VegaLog ("开始：Uninstall={0} DefaultsFile={1}" -f [bool]$Uninstall, $DefaultsFile)
 
 if (-not (Test-VegaProcessElevated)) {
     # 安装包调用时一定是提权的；手动运行时给出可执行的原因，而不是等到写配置才报错。
     Write-Host '需要管理员权限：请右键以管理员身份运行，或由 Vega-Setup.exe 调用。' -ForegroundColor Red
     Write-VegaLog 'FAIL 当前进程未提权'
+    Write-VegaResult '当前进程未提权，无法写入 RustDesk 中继配置。请以管理员身份重新运行 Vega 安装。'
     exit 1
 }
 
@@ -174,6 +199,10 @@ try {
             Write-Host $failure -ForegroundColor Yellow
             Write-VegaLog "FAIL $failure"
         }
+        if ($rollback.ExitCode -ne 0) {
+            # t3-fix8 P1-1：回滚失败同样留一行原因给完成页/重试入口。
+            Write-VegaResult (@($rollback.Failures | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }) -join ' ')
+        }
         exit $rollback.ExitCode
     }
 
@@ -189,6 +218,9 @@ try {
 
     if (-not $result.Success) {
         Write-Host $result.Error -ForegroundColor Yellow
+        # t3-fix8 P1-1：降级停止与失败都先把一行原因写进结果文件（UTF-16LE），
+        # 钩子退出码非 0 时读取并显示，读完删除。
+        Write-VegaResult $result.Error
         if ($result.ExitCode -eq 2) {
             # t3-fix7 P1：服务未注册且 RustDesk 正在运行是“降级停止”，不是失败：
             # 一行配置都没写，退出码 2 让完成页显示脚本给出的具体原因。
@@ -205,6 +237,14 @@ try {
         # 或者服务未注册（只写用户级）。具体原因已由模块逐条打印，这里不再假设方向。
         Write-Host 'RustDesk 自建中继配置已写入，但有降级项（原因见上方提示），请按提示处理。' -ForegroundColor Yellow
         Write-VegaLog '完成（降级：详见上方提示）'
+        # t3-fix8 P1-1：退出码 2 的完成页要显示具体原因，不写死“服务级已写入”。
+        # 原因就是模块这次打印的降级消息（最后一条提到“降级”的 message）。
+        $degradedReason = ''
+        foreach ($message in @($result.Messages)) {
+            if ([string]$message -match '降级') { $degradedReason = [string]$message }
+        }
+        if ([string]::IsNullOrWhiteSpace($degradedReason)) { $degradedReason = 'RustDesk 中继配置只写入了一部分，请按安装日志处理。' }
+        Write-VegaResult $degradedReason
     }
     else {
         Write-Host 'RustDesk 已安装并写入自建中继配置。' -ForegroundColor Green
@@ -218,5 +258,6 @@ try {
 catch {
     Write-Host $_.Exception.Message -ForegroundColor Red
     Write-VegaLog "FAIL 未捕获异常：$($_.Exception.Message)"
+    Write-VegaResult ("未捕获异常：{0}" -f $_.Exception.Message)
     exit 1
 }
