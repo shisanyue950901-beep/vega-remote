@@ -7019,10 +7019,14 @@ function Invoke-VegaRustDeskBootstrap {
                 Write-VegaSetupLog -Path $LogFile -Message ("WARN {0}" -f $message)
             }
             else {
+                # t3-fix7 P2：Start-Service 默认会阻塞到 Running 才返回，那段等待不在
+                # 后面的 60 秒轮询里，服务卡在 StartPending 时总耗时可以远超上限。
+                # 改成 -NoWait 立即返回，启动与状态确认共用同一个 60 秒截止时间。
+                $serviceDeadline = (Get-Date).AddSeconds(60)
                 if ([string]$service.Status -ne 'Running') {
                     # 已注册但停止：先启动，再交给有界等待确认 Running。
                     try {
-                        Start-Service -Name 'RustDesk' -ErrorAction Stop
+                        Start-Service -Name 'RustDesk' -NoWait -ErrorAction Stop
                         $message = "RustDesk 服务处于 $($service.Status)，已通过 Start-Service 启动。"
                         $messages.Add($message)
                         Write-VegaSetupLog -Path $LogFile -Message $message
@@ -7031,7 +7035,8 @@ function Invoke-VegaRustDeskBootstrap {
                         return (& $fail -Message ("RustDesk 服务已注册但启动失败：{0}" -f $_.Exception.Message) -Installed $false)
                     }
                 }
-                $await = Wait-VegaRustDeskService -TimeoutSeconds 60
+                $remainingSeconds = [int][Math]::Max(1, [Math]::Ceiling(($serviceDeadline - (Get-Date)).TotalSeconds))
+                $await = Wait-VegaRustDeskService -TimeoutSeconds $remainingSeconds
                 if (-not $await.Running) {
                     return (& $fail -Message 'RustDesk 服务 60 秒内没有达到 Running，服务级配置暂时不会生效。' -Installed $false)
                 }
