@@ -693,6 +693,8 @@ function Test-VegaManagedServiceStatePath {
 
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
     $expected = Get-VegaRustDeskServiceStatePath
+    # 取不到 %ProgramData% 时没有机器级清单，任何路径都不按服务模式清单对待。
+    if ([string]::IsNullOrWhiteSpace($expected)) { return $false }
     try {
         return ([System.IO.Path]::GetFullPath($Path) -eq [System.IO.Path]::GetFullPath($expected))
     }
@@ -3984,12 +3986,16 @@ function Get-VegaRustDeskServiceStatePath {
     <#
       LocalService（服务模式）RustDesk 配置的清单只能写管理员专用清单：
       %ProgramData%\Vega\state.json。用户可写的 client-state.json 不允许记录服务路径。
+      取不到 %ProgramData% 时（非 Windows 跑 Pester）返回空串：绝不能退到系统临时
+      目录 —— 临时目录是所有本地用户可写的共享位置，既不能当机器级记录信任，也会
+      让上一次运行留下的 state.json 污染这一次的安装/卸载。调用方见到空串就不再
+      读写服务模式清单。
     #>
     [CmdletBinding()]
     param()
 
     $root = $env:ProgramData
-    if ([string]::IsNullOrWhiteSpace($root)) { $root = [System.IO.Path]::GetTempPath() }
+    if ([string]::IsNullOrWhiteSpace($root)) { return '' }
     return (Join-Path (Join-Path $root 'Vega') 'state.json')
 }
 
@@ -4833,6 +4839,14 @@ function Set-VegaRustDeskConfig {
         $targetStatePath = $StatePath
         if ($isServiceTarget) {
             $targetStatePath = $ServiceStatePath
+            if ([string]::IsNullOrWhiteSpace($targetStatePath)) {
+                # 没有机器级清单（%ProgramData% 取不到）就不动服务配置：
+                # 写了也没地方记基线，卸载时无从回滚。
+                $message = '无法确定服务模式记录清单（%ProgramData% 未设置），跳过服务配置。'
+                $warnings.Add($message)
+                Write-Warning $message
+                continue
+            }
             if (-not [string]::Equals($targetStatePath, $StatePath, [StringComparison]::OrdinalIgnoreCase)) {
                 try {
                     $targetState = Read-VegaState -Path $targetStatePath
@@ -6042,7 +6056,7 @@ function Invoke-VegaRustDeskRollback {
             $messages.Add("没有用户清单，跳过：$HostStatePath")
         }
 
-        if (Test-Path -LiteralPath $ServiceStatePath -PathType Leaf) {
+        if ((-not [string]::IsNullOrWhiteSpace($ServiceStatePath)) -and (Test-Path -LiteralPath $ServiceStatePath -PathType Leaf)) {
             try {
                 $serviceState = Read-VegaState -Path $ServiceStatePath
                 $serviceRestore = Restore-VegaRustDeskState -State $serviceState -StatePath $ServiceStatePath -ServiceMode -Confirm:$false
@@ -6131,6 +6145,15 @@ function Invoke-VegaRustDeskBootstrap {
             Messages   = $messages.ToArray()
             Error      = $Message
         }
+    }
+
+    # 服务模式记录只能写机器级清单：取不到 %ProgramData%（或解析不出服务级配置路径）
+    # 就没有可信位置，直接失败，不退到系统临时目录（见 Get-VegaRustDeskServiceStatePath）。
+    if ([string]::IsNullOrWhiteSpace($ServiceStatePath)) {
+        return (& $fail -Message '无法确定服务模式记录清单（%ProgramData% 未设置），跳过 RustDesk 服务级配置。')
+    }
+    if ([string]::IsNullOrWhiteSpace($ServiceConfigPath)) {
+        return (& $fail -Message '无法解析 RustDesk 服务级配置路径，跳过服务级配置。')
     }
 
     try {
@@ -6859,7 +6882,7 @@ function Invoke-VegaHostUninstallCore {
     # LocalService（服务模式）记录只能在管理员清单 state.json 里，并且只按精确路径回滚。
     Write-VegaStatus '回滚 RustDesk 服务模式配置（管理员清单）'
     $serviceStatePath = Get-VegaRustDeskServiceStatePath
-    if (Test-Path -LiteralPath $serviceStatePath -PathType Leaf) {
+    if (-not [string]::IsNullOrWhiteSpace($serviceStatePath) -and (Test-Path -LiteralPath $serviceStatePath -PathType Leaf)) {
         try {
             $serviceState = Read-VegaState -Path $serviceStatePath
             $serviceRestore = Restore-VegaRustDeskState -State $serviceState -StatePath $serviceStatePath -ServiceMode -Confirm:$false
@@ -6875,7 +6898,12 @@ function Invoke-VegaHostUninstallCore {
         }
     }
     else {
-        Write-VegaStatus "没有服务模式 RustDesk 记录：$serviceStatePath"
+        if ([string]::IsNullOrWhiteSpace($serviceStatePath)) {
+            Write-VegaStatus '取不到 %ProgramData%，跳过服务模式 RustDesk 记录（不读临时目录里他人可写的清单）。'
+        }
+        else {
+            Write-VegaStatus "没有服务模式 RustDesk 记录：$serviceStatePath"
+        }
     }
 
     Write-VegaStatus '恢复 Sunshine 服务状态'
@@ -7166,8 +7194,9 @@ function Invoke-VegaClientUninstallCore {
 
     # 服务模式记录只从管理员清单读取；非管理员不改机器级配置。
     $serviceStatePath = Get-VegaRustDeskServiceStatePath
+    $hasServiceState = (-not [string]::IsNullOrWhiteSpace($serviceStatePath)) -and (Test-Path -LiteralPath $serviceStatePath -PathType Leaf)
     if (Test-VegaProcessElevated) {
-        if (Test-Path -LiteralPath $serviceStatePath -PathType Leaf) {
+        if ($hasServiceState) {
             try {
                 $serviceState = Read-VegaState -Path $serviceStatePath
                 $serviceRestore = Restore-VegaRustDeskState -State $serviceState -StatePath $serviceStatePath -ServiceMode -Confirm:$false
@@ -7183,7 +7212,7 @@ function Invoke-VegaClientUninstallCore {
             }
         }
     }
-    elseif (Test-Path -LiteralPath $serviceStatePath -PathType Leaf) {
+    elseif ($hasServiceState) {
         Write-VegaStatus '检测到服务模式 RustDesk 记录；非管理员不回滚机器级配置，请以管理员身份卸载。' -Level Warn
     }
 
