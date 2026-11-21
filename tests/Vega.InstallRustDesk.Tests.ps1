@@ -324,6 +324,9 @@ Describe 'Invoke-VegaRustDeskBootstrap' {
         $result.Success | Should -BeTrue
         $result.Installed | Should -BeFalse
         $result.Configured | Should -BeTrue
+        # t3-fix5 P3：完整成功（用户级 + 服务级）退出码 0。
+        $result.ExitCode | Should -Be 0
+        $result.Degraded | Should -BeFalse
         Should -Invoke -CommandName Get-VegaRustDeskInstaller -ModuleName $script:ModuleName -Times 0 -Exactly
         Should -Invoke -CommandName Install-VegaRustDeskSilently -ModuleName $script:ModuleName -Times 0 -Exactly
 
@@ -887,6 +890,8 @@ Describe 't3-fix4 用户级配置写失败时降级而不是整单失败' {
         $result.Configured | Should -BeTrue
         $result.Degraded | Should -BeTrue
         $result.UserConfigWritten | Should -BeFalse
+        # t3-fix5 P3：降级统一退出码 2，与入口脚本透传值一致。
+        $result.ExitCode | Should -Be 2
         ($result.Messages -join "`n") | Should -Match '降级'
 
         $serviceState = Read-VegaState -Path $serviceStatePath
