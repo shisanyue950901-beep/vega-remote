@@ -1,0 +1,69 @@
+/* ============================================================
+   01-tokens — 设计变量（v0.2 星光）
+   ============================================================ */
+
+:root {
+  /* 品牌 */
+  --accent: #6c5ce7;
+  --accent-2: #8e7cff;
+  --accent-3: #4fc3f7;
+  --aurora: linear-gradient(135deg, #6c5ce7 0%, #8e7cff 45%, #4fc3f7 100%);
+
+  /* iOS 系统色 */
+  --ok: #30d158;
+  --warn: #ff9f0a;
+  --danger: #ff453a;
+
+  /* 浅色 */
+  --bg: #f2f2f7;
+  --card: rgba(255, 255, 255, 0.72);
+  --card-solid: #ffffff;
+  --card-hover: rgba(255, 255, 255, 0.9);
+  --text: #1c1c1e;
+  --text-2: #8e8e93;
+  --text-3: #c7c7cc;
+  --sep: rgba(60, 60, 67, 0.14);
+  --fill: rgba(120, 120, 128, 0.12);
+  --fill-2: rgba(120, 120, 128, 0.2);
+  --accent-soft: rgba(108, 92, 231, 0.12);
+  --glass-blur: blur(24px) saturate(180%);
+
+  /* 度量 */
+  --radius-card: 18px;
+  --radius-input: 14px;
+  --radius-pill: 999px;
+  --row-h: 52px;
+  --sidebar-w: 220px;
+  --content-max: 680px;
+  --shadow-card: 0 1px 0 rgba(0, 0, 0, 0.04), 0 8px 24px rgba(0, 0, 0, 0.06);
+  --shadow-pop: 0 12px 40px rgba(0, 0, 0, 0.18);
+
+  /* 字体 */
+  --font: "Segoe UI Variable Display", "Segoe UI Variable", "PingFang SC",
+    "Microsoft YaHei UI", system-ui, sans-serif;
+  --font-mono: "Cascadia Mono", "SF Mono", "Consolas", monospace;
+
+  /* 动效 */
+  --ease: cubic-bezier(0.32, 0.72, 0, 1);
+  --dur: 220ms;
+
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #000000;
+    --card: rgba(28, 28, 30, 0.72);
+    --card-solid: #1c1c1e;
+    --card-hover: rgba(44, 44, 46, 0.85);
+    --text: #f2f2f7;
+    --text-2: #8e8e93;
+    --text-3: #48484a;
+    --sep: rgba(84, 84, 88, 0.5);
+    --fill: rgba(120, 120, 128, 0.24);
+    --fill-2: rgba(120, 120, 128, 0.36);
+    --accent-soft: rgba(108, 92, 231, 0.22);
+    --shadow-card: 0 1px 0 rgba(255, 255, 255, 0.04), 0 8px 24px rgba(0, 0, 0, 0.4);
+    --shadow-pop: 0 16px 48px rgba(0, 0, 0, 0.6);
+  }
+}
