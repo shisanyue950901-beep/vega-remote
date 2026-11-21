@@ -794,6 +794,28 @@ Describe 't3-fix4 ASCII Base64 交互用户上下文' {
 }
 
 Describe 't3-fix4 已有 RustDesk 装在自定义目录时不重装' {
+    BeforeEach {
+        # 隔离真实机器上的 Program Files / LOCALAPPDATA / 注册表，确保命中的是测试候选。
+        $script:EnvBackup = @{
+            ProgramW6432 = $env:ProgramW6432
+            ProgramFiles = $env:ProgramFiles
+            ProgramFilesX86 = ${env:ProgramFiles(x86)}
+            LocalAppData = $env:LOCALAPPDATA
+        }
+        $env:ProgramW6432 = Join-Path $TestDrive 'no-pf-64'
+        $env:ProgramFiles = Join-Path $TestDrive 'no-pf'
+        ${env:ProgramFiles(x86)} = Join-Path $TestDrive 'no-pf-x86'
+        $env:LOCALAPPDATA = Join-Path $TestDrive 'no-localappdata'
+        Mock -ModuleName $script:ModuleName Get-VegaProgramFilesRegistryRoot { @() }
+    }
+
+    AfterEach {
+        $env:ProgramW6432 = $script:EnvBackup.ProgramW6432
+        $env:ProgramFiles = $script:EnvBackup.ProgramFiles
+        ${env:ProgramFiles(x86)} = $script:EnvBackup.ProgramFilesX86
+        $env:LOCALAPPDATA = $script:EnvBackup.LocalAppData
+    }
+
     It 'Registry64/32 候选命中 ASCII 自定义目录即视为已安装' {
         $dir = Join-Path $TestDrive 'CustomApps/RustDesk'
         $null = New-Item -ItemType Directory -Path $dir -Force
