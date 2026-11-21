@@ -3894,9 +3894,9 @@ function Get-VegaInteractiveUserContext {
         # 目录名可能带后缀，按用户名硬拼会记录错路径。
         if (-not [string]::IsNullOrWhiteSpace($sid) -and (Test-VegaWindowsPlatform)) {
             try {
-                $profile = Get-CimInstance -ClassName Win32_UserProfile -Filter ("SID='{0}'" -f $sid) -ErrorAction Stop
-                if ($null -ne $profile -and -not [string]::IsNullOrWhiteSpace([string]$profile.LocalPath)) {
-                    $configPath = Join-Path ([string]$profile.LocalPath) 'AppData\Roaming\RustDesk\config\RustDesk2.toml'
+                $userProfile = Get-CimInstance -ClassName Win32_UserProfile -Filter ("SID='{0}'" -f $sid) -ErrorAction Stop
+                if ($null -ne $userProfile -and -not [string]::IsNullOrWhiteSpace([string]$userProfile.LocalPath)) {
+                    $configPath = Join-Path ([string]$userProfile.LocalPath) 'AppData\Roaming\RustDesk\config\RustDesk2.toml'
                 }
             }
             catch {
