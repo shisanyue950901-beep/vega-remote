@@ -1081,3 +1081,91 @@ Describe 't3-fix5 显式空上下文走 -ServiceOnly 时不再解析交互用户
         Should -Invoke -CommandName Get-VegaInteractiveUserContext -ModuleName $script:ModuleName -Times 0 -Exactly
     }
 }
+
+Describe 't3-fix5 原始带空格的注册表值能被探测命中' {
+    BeforeEach {
+        # 隔离真实 Program Files / LOCALAPPDATA / 注册表，确保命中的只能是解析后的候选。
+        $script:EnvBackup = @{
+            ProgramW6432 = $env:ProgramW6432
+            ProgramFiles = $env:ProgramFiles
+            ProgramFilesX86 = ${env:ProgramFiles(x86)}
+            LocalAppData = $env:LOCALAPPDATA
+        }
+        $env:ProgramW6432 = Join-Path $TestDrive 'no-pf-64'
+        $env:ProgramFiles = Join-Path $TestDrive 'no-pf'
+        ${env:ProgramFiles(x86)} = Join-Path $TestDrive 'no-pf-x86'
+        $env:LOCALAPPDATA = Join-Path $TestDrive 'no-localappdata'
+        Mock -ModuleName $script:ModuleName Get-VegaProgramFilesRegistryRoot { @() }
+    }
+
+    AfterEach {
+        $env:ProgramW6432 = $script:EnvBackup.ProgramW6432
+        $env:ProgramFiles = $script:EnvBackup.ProgramFiles
+        ${env:ProgramFiles(x86)} = $script:EnvBackup.ProgramFilesX86
+        $env:LOCALAPPDATA = $script:EnvBackup.LocalAppData
+    }
+
+    It 'InstallLocation / DisplayIcon 的原始值（含空格）解析后命中真实 EXE' -Skip:($env:OS -ne 'Windows_NT') {
+        $dir = Join-Path $TestDrive 'Remote Tools/RustDesk'
+        $null = New-Item -ItemType Directory -Path $dir -Force
+        $exe = Join-Path $dir 'rustdesk.exe'
+        Set-Content -LiteralPath $exe -Value 'stub' -Encoding UTF8
+
+        # 与 RustDesk 官方写入注册表的形态一致：目录未加引号、路径含空格、DisplayIcon 带 ,0。
+        $rawInstallLocation = $dir
+        $rawDisplayIcon = '{0},0' -f $exe
+        $parsed = @(
+            (ConvertTo-VegaRustDeskInstallLocationPath -Value $rawInstallLocation)
+            (ConvertTo-VegaRustDeskDisplayIconPath -Value $rawDisplayIcon)
+        )
+        $parsed | Should -Contain $exe
+
+        $script:ParsedCandidates = $parsed
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskRegistryInstallCandidates { @($script:ParsedCandidates) }
+        (Get-VegaRustDeskInstall) | Should -Be $exe
+    }
+
+    It '探测命中后不下载、不静默安装（复用上面的候选）' -Skip:($env:OS -ne 'Windows_NT') {
+        $dir = Join-Path $TestDrive 'Remote Tools/RustDesk'
+        $null = New-Item -ItemType Directory -Path $dir -Force
+        $exe = Join-Path $dir 'rustdesk.exe'
+        Set-Content -LiteralPath $exe -Value 'stub' -Encoding UTF8
+
+        $script:ParsedCandidates = @((ConvertTo-VegaRustDeskInstallLocationPath -Value $dir))
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskRegistryInstallCandidates { @($script:ParsedCandidates) }
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskRelease { throw '命中后不应查询 Release' }
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstaller { throw '命中后不应下载' }
+        Mock -ModuleName $script:ModuleName Install-VegaRustDeskSilently { throw '命中后不应静默安装' }
+
+        $statePath = Join-Path $TestDrive ('h-' + [guid]::NewGuid().ToString('N') + '.json')
+        $serviceStatePath = Join-Path $TestDrive ('s-' + [guid]::NewGuid().ToString('N') + '.json')
+        $defaults = Join-Path $TestDrive 'vega-defaults.json'
+        $json = @{ rustdesk = @{ idServer = '60.205.95.98'; relayServer = '60.205.95.98'; key = $script:Key } } | ConvertTo-Json
+        Set-Content -LiteralPath $defaults -Value $json -Encoding UTF8
+        $serviceConfig = Join-Path $TestDrive 'ProgramData/RustDesk/config/RustDesk2.toml'
+
+        Mock -ModuleName $script:ModuleName Get-Service { [pscustomobject]@{ Name = 'RustDesk'; Status = 'Running' } }
+        Mock -ModuleName $script:ModuleName Wait-VegaRustDeskService { [pscustomobject]@{ Found = $true; Running = $true; Status = 'Running' } }
+        Mock -ModuleName $script:ModuleName Restart-VegaRustDeskService { [pscustomobject]@{ Found = $true; WasRunning = $true; Restarted = $true; Status = 'Running'; Message = 'ok' } }
+        Mock -ModuleName $script:ModuleName Set-VegaRustDeskConfig {
+            param($Server, $Key, $RelayServer, $State, $StatePath, $UserConfigPath, $ServiceConfigPath, $ServiceStatePath, $ForceService, $ServiceOnly, $ContinueOnUserFailure, $Confirm)
+            [pscustomobject]@{
+                Applied        = @([pscustomobject]@{ Path = $ServiceConfigPath; Changed = $true })
+                Warnings       = @()
+                ServicePresent = $true
+                Values         = @{}
+                State          = $State
+            }
+        }
+
+        $result = Invoke-VegaRustDeskBootstrap -DefaultsFile $defaults -HostStatePath $statePath `
+            -ServiceStatePath $serviceStatePath -ServiceConfigPath $serviceConfig -ServiceOnly -Confirm:$false
+
+        $result.Success | Should -BeTrue
+        $result.Installed | Should -BeFalse
+        ($result.Messages -join "`n") | Should -Match ([regex]::Escape($exe))
+        Should -Invoke -CommandName Get-VegaRustDeskRelease -ModuleName $script:ModuleName -Times 0 -Exactly
+        Should -Invoke -CommandName Get-VegaRustDeskInstaller -ModuleName $script:ModuleName -Times 0 -Exactly
+        Should -Invoke -CommandName Install-VegaRustDeskSilently -ModuleName $script:ModuleName -Times 0 -Exactly
+    }
+}
