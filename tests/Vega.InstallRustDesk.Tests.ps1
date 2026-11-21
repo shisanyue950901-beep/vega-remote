@@ -193,6 +193,18 @@ Describe 'Invoke-VegaHttpsDownload' {
         Test-Path -LiteralPath $out | Should -BeFalse
     }
 
+    It 'P1-1 截止时间是 DateTime（不是 Nullable），过期后按剩余时间判超时' {
+        # 不 mock 时间运算：真的传一个 [datetime] 过去，走剩余时间减法。
+        (Get-Command -Name Invoke-VegaHttpsDownload).Parameters['Deadline'].ParameterType.FullName |
+            Should -Be ([datetime]).FullName
+
+        $out = Join-Path $TestDrive 'expired.bin'
+        $deadline = [datetime]::UtcNow.AddSeconds(-5)
+        { Invoke-VegaHttpsDownload -Uri 'https://example.invalid/rustdesk.exe' -OutFile $out -TimeoutSeconds 5 -Deadline $deadline } |
+            Should -Throw '*下载超时*'
+        Test-Path -LiteralPath $out | Should -BeFalse
+    }
+
     It '下载前补齐 TLS 1.2，不拆掉已启用的其他协议' {
         $before = [System.Net.ServicePointManager]::SecurityProtocol
         try {

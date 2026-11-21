@@ -5624,13 +5624,15 @@ function Invoke-VegaHttpsDownload {
 
         [int]$TimeoutSeconds = 120,
 
-        [AllowNull()]
-        [Nullable[datetime]]$Deadline = $null
+        # P1-1：这里是真正的 [datetime]，不是 [Nullable[datetime]]。Windows PowerShell 5.1 会把
+        # 非空的 Nullable 值装箱成 DateTime，$Deadline.Value 直接取不到时间；未传时用
+        # [datetime]::MinValue 当哨兵，下面只做普通时间减法。
+        [datetime]$Deadline = [datetime]::MinValue
     )
 
     Enable-VegaTls12
 
-    if ($null -eq $Deadline) {
+    if ($Deadline -eq [datetime]::MinValue) {
         $Deadline = [datetime]::UtcNow.AddSeconds([Math]::Max(1, $TimeoutSeconds))
     }
 
@@ -5640,7 +5642,7 @@ function Invoke-VegaHttpsDownload {
     for ($hop = 0; $hop -lt 5; $hop++) {
         if ($current.Scheme -ne 'https') { throw "只接受 HTTPS 下载地址（含重定向）：$current" }
 
-        $remainingMs = [int][Math]::Max(0, ($Deadline.Value - [datetime]::UtcNow).TotalMilliseconds)
+        $remainingMs = [int][Math]::Max(0, ($Deadline - [datetime]::UtcNow).TotalMilliseconds)
         if ($remainingMs -lt 1000) { throw ("下载超时（{0} 秒）" -f $TimeoutSeconds) }
 
         $request = [System.Net.HttpWebRequest]::Create($current)
@@ -5674,7 +5676,7 @@ function Invoke-VegaHttpsDownload {
             $file = [System.IO.File]::Open($OutFile, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
             $buffer = New-Object byte[] 81920
             while ($true) {
-                if ([datetime]::UtcNow -ge $Deadline.Value) { throw ("下载超时（{0} 秒）" -f $TimeoutSeconds) }
+                if ([datetime]::UtcNow -ge $Deadline) { throw ("下载超时（{0} 秒）" -f $TimeoutSeconds) }
                 $read = $stream.Read($buffer, 0, $buffer.Length)
                 if ($read -le 0) { break }
                 $file.Write($buffer, 0, $read)
