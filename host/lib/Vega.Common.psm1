@@ -6894,6 +6894,39 @@ function Test-VegaRustDeskClientRunning {
     return ($processes.Count -gt 0)
 }
 
+function Test-VegaServiceAlreadyRunningError {
+    <#
+      t3-fix8 P1-2：启动调用抛出的“服务已经在运行”不是失败。
+      Start-Service / ServiceController.Start() 在服务已被别人启动时抛 Win32 1056
+      （ERROR_SERVICE_ALREADY_RUNNING）；调用方应继续确认它是否达到 Running，
+      而不是把整单安装判失败、跳过中继配置。
+      先看异常链里的 Win32Exception.NativeErrorCode，再看消息文本（本地化/包装层兜底）。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $ErrorRecord
+    )
+
+    $exception = $ErrorRecord.Exception
+    while ($null -ne $exception) {
+        $native = $null
+        if ($exception -is [System.ComponentModel.Win32Exception]) {
+            $native = $exception.NativeErrorCode
+        }
+        elseif ($null -ne $exception.PSObject.Properties['NativeErrorCode']) {
+            $native = $exception.NativeErrorCode
+        }
+        if ($null -ne $native -and [int]$native -eq 1056) { return $true }
+        $exception = $exception.InnerException
+    }
+
+    $text = [string]$ErrorRecord.Exception.Message
+    if ($text -match '(?<!\d)1056(?!\d)') { return $true }
+    if ($text -match '(?i)already running|service is already|已经运行|已在运行|已启动|正在运行') { return $true }
+    return $false
+}
+
 function Start-VegaRustDeskServiceNonBlocking {
     <#
       t3-fix7 P2：启动 RustDesk 服务但不阻塞等待 Running。
@@ -6973,7 +7006,10 @@ function Invoke-VegaRustDeskBootstrap {
         [string]$DownloadDirectory = '',
 
         [AllowEmptyString()]
-        [string]$LogFile = ''
+        [string]$LogFile = '',
+
+        # t3-fix8 P2：测试注入的可控时钟（返回秒数），传给服务启动/等待共用的截止点。
+        [scriptblock]$Clock
     )
 
     $messages = New-Object System.Collections.Generic.List[string]
@@ -7118,7 +7154,10 @@ function Invoke-VegaRustDeskBootstrap {
 
         # P1-5：已装 RustDesk 的机器也要确认服务真的在，否则写进服务级配置也不会生效。
         # t3-fix6 P1-2：区分“服务已注册但停止”和“服务未注册”。
-        #   - 已注册但停止：用 Start-Service 启动，再在有界时间内等 Running（60s）；
+        #   - 已注册但停止：由 Start-VegaRustDeskServiceNonBlocking 发起启动（非阻塞），
+        #     再在有界时间内等 Running（60s）；
+        #   - 已注册且 StartPending（t3-fix8 P1-2）：启动已经在路上，只等不再重复启动，
+        #     否则 5.1 的 ServiceController.Start() 会抛 1056；
         #   - 未注册（RustDesk 官方允许移除服务并保留客户端）：不替用户注册服务；
         #     rustdesk.exe 还在运行（t3-fix7 P1）就一行都不写，直接降级停止（ExitCode=2）；
         #     进程没在跑才写用户级配置并回读，服务级跳过，结果标记降级（ExitCode=2），
@@ -7142,24 +7181,36 @@ function Invoke-VegaRustDeskBootstrap {
                 Write-VegaSetupLog -Path $LogFile -Message ("WARN {0}" -f $message)
             }
             else {
-                # t3-fix7 P2：启动不能阻塞等待 Running（那段时间不在 60 秒轮询里），
-                # 由 Start-VegaRustDeskServiceNonBlocking 立即返回，启动与状态确认
-                # 共用同一个 60 秒截止时间。
-                $serviceDeadline = (Get-Date).AddSeconds(60)
-                if ([string]$service.Status -ne 'Running') {
-                    # 已注册但停止：先启动，再交给有界等待确认 Running。
+                # t3-fix8 P2：截止点在启动之前算一次（单调 Stopwatch），启动与状态确认共用；
+                # 启动耗掉的秒数从同一份 60 秒预算里扣，轮询只按剩余预算休眠。
+                $serviceDeadline = New-VegaServiceDeadline -TimeoutSeconds 60 -Clock $Clock
+                $serviceStatus = [string]$service.Status
+                if ($serviceStatus -eq 'StartPending') {
+                    # t3-fix8 P1-2：StartPending 说明启动请求已经被受理，只等，不再启动。
+                    $message = 'RustDesk 服务处于 StartPending，直接等待其达到 Running（不重复启动）。'
+                    $messages.Add($message)
+                    Write-VegaSetupLog -Path $LogFile -Message $message
+                }
+                elseif ($serviceStatus -ne 'Running') {
+                    # 已注册但停止：发起启动（非阻塞），再交给有界等待确认 Running。
                     try {
                         Start-VegaRustDeskServiceNonBlocking
-                        $message = "RustDesk 服务处于 $($service.Status)，已发起启动（不阻塞等待 Running）。"
+                        $message = "RustDesk 服务处于 $serviceStatus，已发起启动（不阻塞等待 Running）。"
                         $messages.Add($message)
                         Write-VegaSetupLog -Path $LogFile -Message $message
                     }
                     catch {
-                        return (& $fail -Message ("RustDesk 服务已注册但启动失败：{0}" -f $_.Exception.Message) -Installed $false)
+                        # t3-fix8 P1-2：查询后服务已被别人启动时，启动调用抛 Win32 1056；
+                        # 这不是失败，继续按共用截止时间确认 Running。
+                        if (-not (Test-VegaServiceAlreadyRunningError -ErrorRecord $_)) {
+                            return (& $fail -Message ("RustDesk 服务已注册但启动失败：{0}" -f $_.Exception.Message) -Installed $false)
+                        }
+                        $message = 'RustDesk 服务已在运行（启动调用返回 1056），继续确认 Running。'
+                        $messages.Add($message)
+                        Write-VegaSetupLog -Path $LogFile -Message $message
                     }
                 }
-                $remainingSeconds = [int][Math]::Max(1, [Math]::Ceiling(($serviceDeadline - (Get-Date)).TotalSeconds))
-                $await = Wait-VegaRustDeskService -TimeoutSeconds $remainingSeconds
+                $await = Wait-VegaRustDeskService -Deadline $serviceDeadline
                 if (-not $await.Running) {
                     return (& $fail -Message 'RustDesk 服务 60 秒内没有达到 Running，服务级配置暂时不会生效。' -Installed $false)
                 }
@@ -8386,6 +8437,7 @@ Export-ModuleMember -Function @(
     'New-VegaServiceDeadline',
     'Get-VegaServiceDeadlineRemainingSeconds',
     'Start-VegaRustDeskServiceNonBlocking',
+    'Test-VegaServiceAlreadyRunningError',
     'Test-VegaRustDeskClientRunning',
     'Uninstall-VegaRustDeskRecorded',
     'Invoke-VegaRustDeskRollback',
