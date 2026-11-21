@@ -6923,7 +6923,7 @@ function Test-VegaServiceAlreadyRunningError {
 
     $text = [string]$ErrorRecord.Exception.Message
     if ($text -match '(?<!\d)1056(?!\d)') { return $true }
-    if ($text -match '(?i)already running|service is already|已经运行|已在运行|已启动|正在运行') { return $true }
+    if ($text -match '(?i)already running|service is already|已经运行|已在运行|已经启动|已启动|正在运行') { return $true }
     return $false
 }
 
