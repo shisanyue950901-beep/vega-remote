@@ -5289,7 +5289,7 @@ function Write-VegaSetupLog {
     }
 }
 
-function Get-VegaRustDeskDefaults {
+function Get-VegaRustDeskDefaultConfig {
     <#
       读取随安装包发布的 vega-defaults.json（idServer / relayServer / key）。
       fork 者改这个文件即可换成自己的中继；这里只校验，不猜默认值。
@@ -5665,7 +5665,7 @@ function Invoke-VegaRustDeskBootstrap {
     }
 
     try {
-        $defaults = Get-VegaRustDeskDefaults -Path $DefaultsFile
+        $defaults = Get-VegaRustDeskDefaultConfig -Path $DefaultsFile
     }
     catch {
         Write-VegaSetupLog -Path $LogFile -Message "FAIL 读取默认配置：$($_.Exception.Message)"
@@ -6842,7 +6842,7 @@ Export-ModuleMember -Function @(
     'Get-VegaRustDeskDeviceId',
     'Invoke-VegaRustDeskSetup',
     'Write-VegaSetupLog',
-    'Get-VegaRustDeskDefaults',
+    'Get-VegaRustDeskDefaultConfig',
     'Get-VegaRustDeskRelease',
     'Get-VegaRustDeskInstaller',
     'Install-VegaRustDeskSilently',

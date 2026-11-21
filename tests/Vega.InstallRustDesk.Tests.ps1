@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
   T3 安装包脚本的单元测试（Pester 5）：
     默认中继配置解析、官方 Release 下载与 SHA256 校验、静默安装调用、
@@ -30,28 +30,28 @@ BeforeAll {
     }
 }
 
-Describe 'Get-VegaRustDeskDefaults' {
+Describe 'Get-VegaRustDeskDefaultConfig' {
     It '读取 idServer / relayServer / key' {
         $path = Join-Path $TestDrive 'defaults.json'
         $json = @{ rustdesk = @{ idServer = '60.205.95.98'; relayServer = 'relay.example.com'; key = $script:Key } } | ConvertTo-Json
         Set-Content -LiteralPath $path -Value $json -Encoding UTF8
 
-        $defaults = Get-VegaRustDeskDefaults -Path $path
+        $defaults = Get-VegaRustDeskDefaultConfig -Path $path
         $defaults.IdServer | Should -Be '60.205.95.98'
         $defaults.RelayServer | Should -Be 'relay.example.com'
         $defaults.Key | Should -Be $script:Key
     }
 
     It '缺文件、坏 JSON、缺 key 都抛错' {
-        { Get-VegaRustDeskDefaults -Path (Join-Path $TestDrive 'missing.json') } | Should -Throw '*缺少默认配置*'
+        { Get-VegaRustDeskDefaultConfig -Path (Join-Path $TestDrive 'missing.json') } | Should -Throw '*缺少默认配置*'
 
         $bad = Join-Path $TestDrive 'bad.json'
         Set-Content -LiteralPath $bad -Value '{ not json' -Encoding UTF8
-        { Get-VegaRustDeskDefaults -Path $bad } | Should -Throw '*不是合法 JSON*'
+        { Get-VegaRustDeskDefaultConfig -Path $bad } | Should -Throw '*不是合法 JSON*'
 
         $noKey = Join-Path $TestDrive 'nokey.json'
         Set-Content -LiteralPath $noKey -Value '{"rustdesk":{"idServer":"1.2.3.4","relayServer":"1.2.3.4"}}' -Encoding UTF8
-        { Get-VegaRustDeskDefaults -Path $noKey } | Should -Throw '*key*'
+        { Get-VegaRustDeskDefaultConfig -Path $noKey } | Should -Throw '*key*'
     }
 }
 
@@ -246,10 +246,10 @@ Describe 'Invoke-VegaRustDeskBootstrap' {
     }
 
     It '未安装时下载、静默安装、写两处配置并记录到 state.json' {
-        $global:VegaProbeCount = 0
+        & (Get-Module $script:ModuleName) { $script:VegaProbeCount = 0 }
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall {
-            $global:VegaProbeCount += 1
-            if ($global:VegaProbeCount -le 1) { '' } else { 'C:\Program Files\RustDesk\rustdesk.exe' }
+            $script:VegaProbeCount += 1
+            if ($script:VegaProbeCount -le 1) { '' } else { 'C:\Program Files\RustDesk\rustdesk.exe' }
         }
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstaller {
             [pscustomobject]@{ Success = $true; Path = 'C:\temp\rustdesk.exe'; Sha256 = ('a' * 64); Error = '' }
