@@ -8556,3 +8556,13 @@ Export-ModuleMember -Function @(
     'Invoke-VegaClientInstall',
     'Invoke-VegaClientUninstall'
 )
+
+# t3-fix12 P3：两个命令改名（PSSA 单数名词）后保留旧名别名 —— 仓库外仍有脚本按旧名
+# 调用，直接改名会让它们报 CommandNotFound。别名在模块作用域里指向新函数名，
+# 并随模块一起导出，调用语义与新名完全一致（不需要迁移调用方）。
+Set-Alias -Name 'Get-VegaRustDeskRegistryInstallCandidates' -Value 'Get-VegaRustDeskRegistryInstallCandidate'
+Set-Alias -Name 'Get-VegaServiceDeadlineRemainingSeconds' -Value 'Get-VegaServiceDeadlineRemainder'
+Export-ModuleMember -Alias @(
+    'Get-VegaRustDeskRegistryInstallCandidates',
+    'Get-VegaServiceDeadlineRemainingSeconds'
+)
