@@ -7234,6 +7234,22 @@ function Invoke-VegaRustDeskBootstrap {
                 }
                 elseif ($serviceStatus -ne 'Running') {
                     # 已注册但停止：发起启动（非阻塞），再交给有界等待确认 Running。
+                    # t3-fix12 P3：-WhatIf 下启动会被 ShouldProcess 跳过（模块函数内那层），
+                    # 调用方拿不到“已跳过”的信号；这里自己先问一次，跳过时立即返回，
+                    # 与新装分支 WhatIf 的行为一致——不记录“已发起启动”，也不空等 60 秒。
+                    if (-not $PSCmdlet.ShouldProcess('RustDesk', '启动 RustDesk 服务（不阻塞等待 Running）')) {
+                        $messages.Add('已跳过（WhatIf：不启动 RustDesk 服务）')
+                        return [pscustomobject]@{
+                            Success    = $true
+                            ExitCode   = 0
+                            Installed  = $false
+                            Configured = $false
+                            Degraded   = $false
+                            UserConfigWritten = $false
+                            Messages   = $messages.ToArray()
+                            Error      = ''
+                        }
+                    }
                     try {
                         Start-VegaRustDeskServiceNonBlocking
                         $message = "RustDesk 服务处于 $serviceStatus，已发起启动（不阻塞等待 Running）。"
