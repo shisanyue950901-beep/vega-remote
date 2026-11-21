@@ -6752,11 +6752,17 @@ function Invoke-VegaRustDeskBootstrap {
         3. 没装 RustDesk 才在受信随机目录里下载（校验 SHA256，句柄保护到启动，P1-3），
            静默安装后确认新 EXE 与服务就绪（P1-5），并立刻记录安装归属（P1-6）；
         4. 用钩子解析好的交互用户（SID + Roaming AppData）同时写用户级与服务级
-           RustDesk2.toml（P1-5）。成功判定只要求**服务级**写入并回读一致：用户级
-           路径读/写失败或取不到用户上下文时只降级（Degraded=$true、ExitCode=2），
-           不再把整单安装判成失败（t3-fix5 P1-2）；
+           RustDesk2.toml（P1-5）。服务级写入的前提是 RustDesk 服务已注册：
+             已注册但停止 → Start-Service 启动并在 60s 内等 Running；
+             未注册 → 不注册服务，只写用户级配置并回读，服务级跳过（降级，ExitCode=2）。
+           服务已注册时成功判定要求**服务级**写入并回读一致；用户级路径读/写失败或
+           取不到用户上下文时只降级（Degraded=$true、ExitCode=2），
+           不再把整单安装判成失败（t3-fix5 P1-2、t3-fix6 P1-2）；
         5. 把该用户的 SID / AppData / 配置路径与是否已写入记进 state.json，回滚按 SID 走同一路径；
         6. 重启运行中的服务并确认 Running（P1-5）。
+      任何一步失败都返回 Success=$false（ExitCode=1），由调用方提示但不阻断安装。
+      降级（服务级成功、用户级未写；或服务未注册、只写用户级）返回
+      Success=$true、Degraded=$true、ExitCode=2，与入口脚本的进程退出码一致（t3-fix5 P3）。
       任何一步失败都返回 Success=$false（ExitCode=1），由调用方提示但不阻断安装。
       降级（服务级成功、用户级未写）返回 Success=$true、Degraded=$true、ExitCode=2，
       与入口脚本的进程退出码一致（t3-fix5 P3）。
@@ -6928,18 +6934,46 @@ function Invoke-VegaRustDeskBootstrap {
         }
 
         # P1-5：已装 RustDesk 的机器也要确认服务真的在，否则写进服务级配置也不会生效。
-        # 这一步放在写配置之前：服务不在就干脆别写，免得留下一条永远不生效的记录。
+        # t3-fix6 P1-2：区分“服务已注册但停止”和“服务未注册”。
+        #   - 已注册但停止：用 Start-Service 启动，再在有界时间内等 Running（60s）；
+        #   - 未注册（RustDesk 官方允许移除服务并保留客户端）：不替用户注册服务，
+        #     仍写用户级配置并回读，服务级跳过，结果标记降级（ExitCode=2），
+        #     并提示用户在 RustDesk 里启用服务后重跑。
+        $serviceRegistered = $true
         if (-not $installedByVega) {
-            $await = Wait-VegaRustDeskService -TimeoutSeconds 60
-            if (-not $await.Running) {
-                return (& $fail -Message 'RustDesk 服务 60 秒内没有达到 Running，服务级配置暂时不会生效。' -Installed $false)
+            $service = Get-Service -Name 'RustDesk' -ErrorAction SilentlyContinue
+            if ($null -eq $service) {
+                $serviceRegistered = $false
+                $message = 'RustDesk 服务未注册（客户端里停用了服务），跳过服务级配置，只写用户级配置（已降级）。请在 RustDesk 客户端里启用服务后重新运行安装以写入服务级配置。'
+                $messages.Add($message)
+                Write-VegaSetupLog -Path $LogFile -Message ("WARN {0}" -f $message)
             }
-            $messages.Add("RustDesk 服务已就绪（$($await.Status)）")
+            else {
+                if ([string]$service.Status -ne 'Running') {
+                    # 已注册但停止：先启动，再交给有界等待确认 Running。
+                    try {
+                        Start-Service -Name 'RustDesk' -ErrorAction Stop
+                        $message = "RustDesk 服务处于 $($service.Status)，已通过 Start-Service 启动。"
+                        $messages.Add($message)
+                        Write-VegaSetupLog -Path $LogFile -Message $message
+                    }
+                    catch {
+                        return (& $fail -Message ("RustDesk 服务已注册但启动失败：{0}" -f $_.Exception.Message) -Installed $false)
+                    }
+                }
+                $await = Wait-VegaRustDeskService -TimeoutSeconds 60
+                if (-not $await.Running) {
+                    return (& $fail -Message 'RustDesk 服务 60 秒内没有达到 Running，服务级配置暂时不会生效。' -Installed $false)
+                }
+                $messages.Add("RustDesk 服务已就绪（$($await.Status)）")
+            }
         }
 
         # P1-5：用户级 + 服务级一起写。用户级路径来自交互用户，不用提权账户的 %APPDATA%。
         # t3-fix4：用户级写失败（路径不存在/重解析点/权限）不再中止，继续写服务级配置，
-        # 结果标记 Degraded=$true；成功判定只要求服务级配置确实写入并回读一致。
+        # 结果标记 Degraded=$true。
+        # t3-fix6 P1-2：服务已注册时成功判定要求服务级配置确实写入并回读一致；
+        # 服务未注册时只要求用户级写入并回读一致，同时标记降级（ExitCode=2）。
         $userWritten = $false
         $degraded = [string]::IsNullOrWhiteSpace($userTarget)
         try {
@@ -6953,11 +6987,15 @@ function Invoke-VegaRustDeskBootstrap {
                 UserConfigPath        = $userTarget
                 ServiceConfigPath     = $ServiceConfigPath
                 ServiceStatePath      = $ServiceStatePath
-                ForceService          = $true
+                # t3-fix6 P1-2：服务未注册时不再强制写服务级配置（也不替用户注册服务）。
+                ForceService          = $serviceRegistered
                 ContinueOnUserFailure = $true
                 Confirm               = $false
             }
             if ([string]::IsNullOrWhiteSpace($userTarget)) { $configArguments['ServiceOnly'] = $true }
+            if (-not $serviceRegistered -and [string]::IsNullOrWhiteSpace($userTarget)) {
+                return (& $fail -Message 'RustDesk 服务未注册，且没有可用的交互用户上下文，没有可写入的配置目标。请在 RustDesk 客户端里启用服务后重新运行安装。' -Installed $installedByVega)
+            }
             $config = Set-VegaRustDeskConfig @configArguments
             $state = $config.State
             foreach ($warning in @($config.Warnings)) { $messages.Add([string]$warning) }
@@ -6974,20 +7012,30 @@ function Invoke-VegaRustDeskBootstrap {
                     $userApplied = $true
                 }
             }
-            if (-not $serviceApplied) {
-                return (& $fail -Message ("服务级配置没有写入成功：{0}" -f $ServiceConfigPath) -Installed $installedByVega)
-            }
             $userWritten = (-not [string]::IsNullOrWhiteSpace($userTarget)) -and $userApplied
-            $degraded = -not $userWritten
-            if ($degraded) {
-                $message = $(if ([string]::IsNullOrWhiteSpace($userTarget)) {
-                        '未取到可用的交互用户，只写了服务级配置（已降级）。'
-                    }
-                    else {
-                        "用户级配置没有写入成功，已继续写服务级配置（降级）：$userTarget"
-                    })
-                $messages.Add($message)
-                Write-VegaSetupLog -Path $LogFile -Message ("WARN {0}" -f $message)
+            if ($serviceRegistered) {
+                if (-not $serviceApplied) {
+                    return (& $fail -Message ("服务级配置没有写入成功：{0}" -f $ServiceConfigPath) -Installed $installedByVega)
+                }
+                $degraded = -not $userWritten
+                if ($degraded) {
+                    $message = $(if ([string]::IsNullOrWhiteSpace($userTarget)) {
+                            '未取到可用的交互用户，只写了服务级配置（已降级）。'
+                        }
+                        else {
+                            "用户级配置没有写入成功，已继续写服务级配置（降级）：$userTarget"
+                        })
+                    $messages.Add($message)
+                    Write-VegaSetupLog -Path $LogFile -Message ("WARN {0}" -f $message)
+                }
+            }
+            else {
+                # t3-fix6 P1-2：服务未注册时不写服务级，用户级写入并回读成功就算完成，
+                # 但整体按降级处理（ExitCode=2），并提示用户在 RustDesk 里启用服务。
+                if (-not $userWritten) {
+                    return (& $fail -Message ("RustDesk 服务未注册，用户级配置也没有写入成功：{0}" -f $userTarget) -Installed $installedByVega)
+                }
+                $degraded = $true
             }
 
             $null = Save-VegaState -State $state -Path $HostStatePath
