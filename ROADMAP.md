@@ -92,6 +92,12 @@
   Uninstall 的 InstallLocation / DisplayIcon 与服务 ImagePath，命中即只配置不重装；icacls 失败时钩子传
   `-NoFileLog` 且脚本支持；ip-detect 路由回退结果分类（CGNAT/回环/链路本地/组播丢弃，RFC1918 保留带警告）；
   共享写配置函数注释更新为当前流程 ✅
+- t3-fix5（Codex 审计 t3-r4）：注册表 InstallLocation / DisplayIcon / 服务 ImagePath 按字段分别解析，
+  含空格的安装目录（如 `C:\Program Files\RustDesk`、`D:\Remote Tools\RustDesk`）完整保留，不再按空白截断；
+  `Set-VegaRustDeskConfig` 的路径校验/读取/合并/写入/回读全部进入每个目标的 try，用户级读取或写入失败只降级
+  并继续写服务级；`install-rustdesk.ps1` 用 `PSBoundParameters` 区分钩子显式传空上下文与省略参数；
+  `detect_public_ip` 逐来源分类，discard 后继续下一个来源，并丢弃 198.18/15 与本机文档网段
+  192.0.2/24、198.51.100/24、203.0.113/24；降级退出码在模块与入口统一为 2 ✅
 
 ## Backlog（T3 记录）
 - `server/setup-rustdesk-server.sh` 的 `detect_public_ip` 在阿里云回落成 VPC 内网 IP：探测逻辑移到
