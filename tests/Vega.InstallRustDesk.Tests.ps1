@@ -655,16 +655,20 @@ Describe 'install-rustdesk.ps1 入口（真实子进程）' {
 
 Describe 't3-fix6 已有安装的服务状态分支' {
     It '服务已注册但停止：Start-Service 启动并等到 Running 后写两处配置' {
-        $statePath = Join-Path $TestDrive ('h-' + [guid]::NewGuid().ToString('N') + '.json')
-        $serviceStatePath = Join-Path $TestDrive ('s-' + [guid]::NewGuid().ToString('N') + '.json')
-        $defaults = Join-Path $TestDrive 'vega-defaults.json'
+        # $TestDrive 在同一个测试文件里跨 It 共用：每例必须用自己的子目录，
+        # 否则前一例真写过的 RustDesk2.toml 会让本例的 Test-Path/回读断言串味。
+        $root = Join-Path $TestDrive ('svc-' + [guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Path $root -Force
+        $statePath = Join-Path $root ('h-' + [guid]::NewGuid().ToString('N') + '.json')
+        $serviceStatePath = Join-Path $root ('s-' + [guid]::NewGuid().ToString('N') + '.json')
+        $defaults = Join-Path $root 'vega-defaults.json'
         $json = @{ rustdesk = @{ idServer = '60.205.95.98'; relayServer = '60.205.95.98'; key = $script:Key } } | ConvertTo-Json
         Set-Content -LiteralPath $defaults -Value $json -Encoding UTF8
 
         $sid = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
-        $appData = Join-Path $TestDrive 'Users/张三/AppData/Roaming'
+        $appData = Join-Path $root 'Users/张三/AppData/Roaming'
         $null = New-Item -ItemType Directory -Path $appData -Force
-        $serviceConfig = Join-Path $TestDrive 'ProgramData/RustDesk/config/RustDesk2.toml'
+        $serviceConfig = Join-Path $root 'ProgramData/RustDesk/config/RustDesk2.toml'
 
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
         Mock -ModuleName $script:ModuleName Get-Service { [pscustomobject]@{ Name = 'RustDesk'; Status = 'Stopped' } }
@@ -702,17 +706,19 @@ Describe 't3-fix6 已有安装的服务状态分支' {
     }
 
     It '服务未注册：不注册服务，只写用户级配置并回读，降级退出码 2 并提示启用服务' {
-        $statePath = Join-Path $TestDrive ('h-' + [guid]::NewGuid().ToString('N') + '.json')
-        $serviceStatePath = Join-Path $TestDrive ('s-' + [guid]::NewGuid().ToString('N') + '.json')
-        $defaults = Join-Path $TestDrive 'vega-defaults.json'
+        $root = Join-Path $TestDrive ('svc-' + [guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Path $root -Force
+        $statePath = Join-Path $root ('h-' + [guid]::NewGuid().ToString('N') + '.json')
+        $serviceStatePath = Join-Path $root ('s-' + [guid]::NewGuid().ToString('N') + '.json')
+        $defaults = Join-Path $root 'vega-defaults.json'
         $json = @{ rustdesk = @{ idServer = '60.205.95.98'; relayServer = '60.205.95.98'; key = $script:Key } } | ConvertTo-Json
         Set-Content -LiteralPath $defaults -Value $json -Encoding UTF8
 
         $sid = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
-        $appData = Join-Path $TestDrive 'Users/张三/AppData/Roaming'
+        $appData = Join-Path $root 'Users/张三/AppData/Roaming'
         $null = New-Item -ItemType Directory -Path (Join-Path $appData 'RustDesk/config') -Force
         $userConfig = Join-Path $appData 'RustDesk/config/RustDesk2.toml'
-        $serviceConfig = Join-Path $TestDrive 'ProgramData/RustDesk/config/RustDesk2.toml'
+        $serviceConfig = Join-Path $root 'ProgramData/RustDesk/config/RustDesk2.toml'
 
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
         Mock -ModuleName $script:ModuleName Get-Service { $null }
@@ -745,18 +751,20 @@ Describe 't3-fix6 已有安装的服务状态分支' {
     }
 
     It 't3-fix7 服务未注册且 RustDesk 正在运行：一行配置都不写，降级退出码 2 并给出具体原因' {
-        $statePath = Join-Path $TestDrive ('h-' + [guid]::NewGuid().ToString('N') + '.json')
-        $serviceStatePath = Join-Path $TestDrive ('s-' + [guid]::NewGuid().ToString('N') + '.json')
-        $defaults = Join-Path $TestDrive 'vega-defaults.json'
+        $root = Join-Path $TestDrive ('svc-' + [guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Path $root -Force
+        $statePath = Join-Path $root ('h-' + [guid]::NewGuid().ToString('N') + '.json')
+        $serviceStatePath = Join-Path $root ('s-' + [guid]::NewGuid().ToString('N') + '.json')
+        $defaults = Join-Path $root 'vega-defaults.json'
         $json = @{ rustdesk = @{ idServer = '60.205.95.98'; relayServer = '60.205.95.98'; key = $script:Key } } | ConvertTo-Json
         Set-Content -LiteralPath $defaults -Value $json -Encoding UTF8
 
         $sid = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
-        $appData = Join-Path $TestDrive 'Users/张三/AppData/Roaming'
+        $appData = Join-Path $root 'Users/张三/AppData/Roaming'
         $null = New-Item -ItemType Directory -Path (Join-Path $appData 'RustDesk/config') -Force
         $userConfig = Join-Path $appData 'RustDesk/config/RustDesk2.toml'
-        $serviceConfig = Join-Path $TestDrive 'ProgramData/RustDesk/config/RustDesk2.toml'
-        $log = Join-Path $TestDrive 'setup.log'
+        $serviceConfig = Join-Path $root 'ProgramData/RustDesk/config/RustDesk2.toml'
+        $log = Join-Path $root 'setup.log'
 
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
         Mock -ModuleName $script:ModuleName Get-Service { $null }
@@ -793,17 +801,19 @@ Describe 't3-fix6 已有安装的服务状态分支' {
     }
 
     It 't3-fix7 P2 服务持续 StartPending：Start-Service 不等待，共用 60s 上限后判失败' {
-        $statePath = Join-Path $TestDrive ('h-' + [guid]::NewGuid().ToString('N') + '.json')
-        $serviceStatePath = Join-Path $TestDrive ('s-' + [guid]::NewGuid().ToString('N') + '.json')
-        $defaults = Join-Path $TestDrive 'vega-defaults.json'
+        $root = Join-Path $TestDrive ('svc-' + [guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Path $root -Force
+        $statePath = Join-Path $root ('h-' + [guid]::NewGuid().ToString('N') + '.json')
+        $serviceStatePath = Join-Path $root ('s-' + [guid]::NewGuid().ToString('N') + '.json')
+        $defaults = Join-Path $root 'vega-defaults.json'
         $json = @{ rustdesk = @{ idServer = '60.205.95.98'; relayServer = '60.205.95.98'; key = $script:Key } } | ConvertTo-Json
         Set-Content -LiteralPath $defaults -Value $json -Encoding UTF8
 
         $sid = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
-        $appData = Join-Path $TestDrive 'Users/张三/AppData/Roaming'
+        $appData = Join-Path $root 'Users/张三/AppData/Roaming'
         $null = New-Item -ItemType Directory -Path (Join-Path $appData 'RustDesk/config') -Force
         $userConfig = Join-Path $appData 'RustDesk/config/RustDesk2.toml'
-        $serviceConfig = Join-Path $TestDrive 'ProgramData/RustDesk/config/RustDesk2.toml'
+        $serviceConfig = Join-Path $root 'ProgramData/RustDesk/config/RustDesk2.toml'
 
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
         Mock -ModuleName $script:ModuleName Get-Service { [pscustomobject]@{ Name = 'RustDesk'; Status = 'Stopped' } }
