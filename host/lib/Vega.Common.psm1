@@ -5497,73 +5497,106 @@ function Get-VegaRustDeskRegistryInstallCandidates {
       只返回路径候选，是否真实存在由调用方 Test-Path 校验；非 Windows 返回空数组。
       两个视图必须显式打开：32 位钩子进程里 HKLM:\SOFTWARE 会被重定向到 WOW6432Node，
       只看默认视图会漏掉 64 位安装（反之亦然）。
+      -RawEntry（t3-fix6 P2）：测试注入点。传入哈希表数组（InstallLocation / DisplayIcon /
+      ImagePath 的**注册表原始字符串**）时跳过真实注册表，仍走同一套字段解析，
+      这样测试覆盖的是“原始值 → 候选”，而不是“解析后再塞候选”。
     #>
     [CmdletBinding()]
-    param()
-
-    $candidates = New-Object System.Collections.Generic.List[string]
-    if (-not (Test-VegaWindowsPlatform)) { return $candidates.ToArray() }
-
-    $views = @(
-        [Microsoft.Win32.RegistryView]::Registry64,
-        [Microsoft.Win32.RegistryView]::Registry32
+    param(
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [hashtable[]]$RawEntry = @()
     )
 
-    foreach ($view in $views) {
-        $base = $null
-        try {
-            $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, $view)
-            $uninstall = $base.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')
-            if ($null -ne $uninstall) {
-                try {
-                    foreach ($subName in @($uninstall.GetSubKeyNames())) {
-                        $sub = $null
-                        try {
-                            $sub = $uninstall.OpenSubKey($subName)
-                            if ($null -eq $sub) { continue }
-                            if ([string]$sub.GetValue('DisplayName', '') -ne 'RustDesk') { continue }
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $entries = New-Object System.Collections.Generic.List[object]
 
-                            # t3-fix5 P1-1：两个值按字段分别解析。InstallLocation 是
-                            # 可能含空格的目录，DisplayIcon 只剥引号与 ",索引"，都不能按空白切分。
-                            $installLocation = [string]$sub.GetValue('InstallLocation', '')
-                            if (-not [string]::IsNullOrWhiteSpace($installLocation)) {
-                                $candidate = ConvertTo-VegaRustDeskInstallLocationPath -Value $installLocation
-                                if (-not [string]::IsNullOrWhiteSpace($candidate)) { $candidates.Add($candidate) }
+    $rawEntries = @($RawEntry | Where-Object { $null -ne $_ })
+    if ($rawEntries.Count -gt 0) {
+        foreach ($entry in $rawEntries) {
+            $entries.Add([pscustomobject]@{
+                    InstallLocation = [string]$entry['InstallLocation']
+                    DisplayIcon     = [string]$entry['DisplayIcon']
+                    ImagePath       = [string]$entry['ImagePath']
+                })
+        }
+    }
+    elseif (Test-VegaWindowsPlatform) {
+        $views = @(
+            [Microsoft.Win32.RegistryView]::Registry64,
+            [Microsoft.Win32.RegistryView]::Registry32
+        )
+
+        foreach ($view in $views) {
+            $base = $null
+            try {
+                $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, $view)
+                $uninstall = $base.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')
+                if ($null -ne $uninstall) {
+                    try {
+                        foreach ($subName in @($uninstall.GetSubKeyNames())) {
+                            $sub = $null
+                            try {
+                                $sub = $uninstall.OpenSubKey($subName)
+                                if ($null -eq $sub) { continue }
+                                if ([string]$sub.GetValue('DisplayName', '') -ne 'RustDesk') { continue }
+                                $entries.Add([pscustomobject]@{
+                                        InstallLocation = [string]$sub.GetValue('InstallLocation', '')
+                                        DisplayIcon     = [string]$sub.GetValue('DisplayIcon', '')
+                                        ImagePath       = ''
+                                    })
                             }
-                            $displayIcon = [string]$sub.GetValue('DisplayIcon', '')
-                            if (-not [string]::IsNullOrWhiteSpace($displayIcon)) {
-                                $candidate = ConvertTo-VegaRustDeskDisplayIconPath -Value $displayIcon
-                                if (-not [string]::IsNullOrWhiteSpace($candidate)) { $candidates.Add($candidate) }
+                            finally {
+                                if ($null -ne $sub) { $sub.Dispose() }
                             }
-                        }
-                        finally {
-                            if ($null -ne $sub) { $sub.Dispose() }
                         }
                     }
+                    finally {
+                        $uninstall.Dispose()
+                    }
                 }
-                finally {
-                    $uninstall.Dispose()
-                }
-            }
 
-            $service = $base.OpenSubKey('SYSTEM\CurrentControlSet\Services\RustDesk')
-            if ($null -ne $service) {
-                try {
-                    $imagePath = [string]$service.GetValue('ImagePath', '')
-                    $candidate = ConvertTo-VegaRustDeskServiceImagePath -Value $imagePath
-                    if (-not [string]::IsNullOrWhiteSpace($candidate)) { $candidates.Add($candidate) }
-                }
-                finally {
-                    $service.Dispose()
+                $service = $base.OpenSubKey('SYSTEM\CurrentControlSet\Services\RustDesk')
+                if ($null -ne $service) {
+                    try {
+                        $entries.Add([pscustomobject]@{
+                                InstallLocation = ''
+                                DisplayIcon     = ''
+                                ImagePath       = [string]$service.GetValue('ImagePath', '')
+                            })
+                    }
+                    finally {
+                        $service.Dispose()
+                    }
                 }
             }
+            catch {
+                # 注册表不可读（权限/视图不存在）就跳过这个视图，不影响其他探测路径。
+                $null = $_
+            }
+            finally {
+                if ($null -ne $base) { $base.Dispose() }
+            }
         }
-        catch {
-            # 注册表不可读（权限/视图不存在）就跳过这个视图，不影响其他探测路径。
-            $null = $_
+    }
+
+    foreach ($entry in $entries) {
+        # t3-fix5 P1-1：两个值按字段分别解析。InstallLocation 是可能含空格的目录，
+        # DisplayIcon 只剥引号与 ",索引"，都不能按空白切分。
+        $installLocation = [string]$entry.InstallLocation
+        if (-not [string]::IsNullOrWhiteSpace($installLocation)) {
+            $candidate = ConvertTo-VegaRustDeskInstallLocationPath -Value $installLocation
+            if (-not [string]::IsNullOrWhiteSpace($candidate)) { $candidates.Add($candidate) }
         }
-        finally {
-            if ($null -ne $base) { $base.Dispose() }
+        $displayIcon = [string]$entry.DisplayIcon
+        if (-not [string]::IsNullOrWhiteSpace($displayIcon)) {
+            $candidate = ConvertTo-VegaRustDeskDisplayIconPath -Value $displayIcon
+            if (-not [string]::IsNullOrWhiteSpace($candidate)) { $candidates.Add($candidate) }
+        }
+        $imagePath = [string]$entry.ImagePath
+        if (-not [string]::IsNullOrWhiteSpace($imagePath)) {
+            $candidate = ConvertTo-VegaRustDeskServiceImagePath -Value $imagePath
+            if (-not [string]::IsNullOrWhiteSpace($candidate)) { $candidates.Add($candidate) }
         }
     }
 
@@ -5635,6 +5668,9 @@ function ConvertTo-VegaRustDeskDisplayIconPath {
     <#
       Uninstall\...\DisplayIcon：常见 "C:\...\rustdesk.exe,0" 或带引号的 EXE。
       只剥离引号与 ",图标索引"（,0 / ,-1）后缀，路径中的空格完整保留。
+      t3-fix6 P2：图标索引也可能写在引号内（"D:\Remote Tools\RustDesk\rustdesk.exe,0"），
+      所以先去掉外层成对引号，再剥索引，最后才交给路径规整；否则末尾是引号时
+      索引正则匹配不到，整个引号串会被当成目录，拼出 ...\rustdesk.exe,0\rustdesk.exe。
     #>
     [CmdletBinding()]
     param(
@@ -5645,6 +5681,9 @@ function ConvertTo-VegaRustDeskDisplayIconPath {
     if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
 
     $text = $Value.Trim()
+    if ($text.Length -ge 2 -and $text.StartsWith('"') -and $text.EndsWith('"')) {
+        $text = $text.Substring(1, $text.Length - 2).Trim()
+    }
     if ($text -match '^(?<path>.+?),\s*-?\d+$') { $text = [string]$Matches['path'] }
     return (ConvertTo-VegaRustDeskExePath -Text $text)
 }
