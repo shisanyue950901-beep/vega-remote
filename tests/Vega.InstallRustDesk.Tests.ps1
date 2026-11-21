@@ -1518,7 +1518,8 @@ Describe 'P1-2 / P1-4 / P1-5 / P1-8 安装包钩子静态约束' {
         # 结果文件有原因时仍显示该原因（退出码 2 前缀 + 完成页文案）。
         $script:Hooks | Should -Match 'StrCpy \$vegaResultReason "RustDesk 中继配置没有完全生效：\$vegaResultReason"'
         $script:Hooks | Should -Match 'StrCpy \$vegaFinishText "\$\(MUI_TEXT_FINISH_INFO_TEXT\)\$\\r\$\\n\$\\r\$\\n\$vegaResultReason"'
-        # 退出码 2 前脚本必须知道原因文件位置：降级停止在日志里写的是 WARN。
+        # 退出码 2 前脚本必须知道原因文件位置：入口会把原因同时写进 -ResultFile 和 WARN 日志，
+        # 钩子只读前者（t3-fix9 P2 起不再解析日志）。
         $script:ModuleText | Should -Match "'WARN' \} else \{ 'FAIL' \}"
     }
 }

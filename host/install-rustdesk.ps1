@@ -73,7 +73,8 @@
   t3-fix8 P1-1：本次运行专用的结果文件路径（由 NSIS 钩子生成并传入）。
   退出码 2（降级 / 降级停止）或失败时，脚本把一行原因以 UTF-16LE（带 BOM）写进该文件，
   钩子用 FileReadUTF16LE 读取后显示在完成页并删除。日志是 UTF-8 且行首带时间戳，
-  ANSI 的 FileRead 读中文会乱码，所以原因单独走这个文件。留空则不写。
+  ANSI 的 FileRead 读中文会乱码，所以原因单独走这个文件；t3-fix9 起钩子不再解析日志，
+  本文件缺失时完成页改显示固定的重跑指引。留空则不写。
 
 .EXAMPLE
   .\install-rustdesk.ps1 -DefaultsFile .\resources\vega-defaults.json
