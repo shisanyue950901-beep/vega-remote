@@ -4111,6 +4111,21 @@ function Resolve-VegaSetupInteractiveUser {
     $configText = $ConfigPath.Trim()
 
     if (-not [string]::IsNullOrWhiteSpace($configText)) {
+        # 显式 ConfigPath 只决定“写到哪”，身份（SID / Roaming AppData）仍要能解析出来：
+        # SID 是回滚基线的主键，缺了它 Set-VegaStateRustDeskUserConfig 就只能记空值。
+        # 只在缺字段时才回退解析，避免覆盖钩子已经确认过的值。
+        $fallback = $null
+        if ($sidText -notmatch '^S-1-[0-9-]+$' -or [string]::IsNullOrWhiteSpace($appDataText)) {
+            $fallback = Get-VegaInteractiveUserContext -SkipProcessFallback
+        }
+        if ($sidText -notmatch '^S-1-[0-9-]+$' -and $null -ne $fallback) {
+            $fallbackSid = [string]$fallback.Sid
+            if ($fallbackSid -match '^S-1-[0-9-]+$') { $sidText = $fallbackSid }
+        }
+        if ([string]::IsNullOrWhiteSpace($appDataText) -and $null -ne $fallback) {
+            $appDataText = ([string]$fallback.AppDataPath).TrimEnd([char[]]@('\', '/'))
+        }
+
         return [pscustomobject]@{
             Sid            = $(if ($sidText -match '^S-1-[0-9-]+$') { $sidText } else { '' })
             AppDataPath    = $appDataText
