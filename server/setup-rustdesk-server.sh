@@ -21,7 +21,10 @@
 #   - 就绪判定按 up 后采样的容器 ID：ID 必须不变、RestartCount 必须保持 0 持续 5 秒。
 #   - 公钥是 44 字符 base64，私钥是普通文件且 0600。
 set -euo pipefail
-cd "$(dirname "$0")"
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+cd "$SCRIPT_DIR"
+# shellcheck source=lib/ip-detect.sh
+. "$SCRIPT_DIR/lib/ip-detect.sh"
 
 ALLOW_WEBSOCKET=false
 REINSTALL=false
@@ -405,47 +408,8 @@ EOF
 EOF
 }
 
-is_private_ipv4() {
-  local ip="$1"
-  [[ -z "$ip" ]] && return 1
-  [[ "$ip" =~ ^10\. ]] && return 0
-  [[ "$ip" =~ ^192\.168\. ]] && return 0
-  [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]] && return 0
-  # 169.254/16 是链路本地地址，同样不能当公网 IP 给用户填。
-  [[ "$ip" =~ ^169\.254\. ]] && return 0
-  return 1
-}
-
-detect_public_ip() {
-  local ip=""
-  if command -v curl >/dev/null 2>&1; then
-    # 阿里云 ECS 先查元数据里的弹性公网 IP：没有绑定 EIP 的实例直接问 ifconfig.me
-    # 只能拿到 VPC 内网地址，用户会把它填进 RustDesk 后连不上。
-    ip=$(curl -fsS --max-time 2 http://100.100.100.200/latest/meta-data/eipv4 2>/dev/null || true)
-    if is_private_ipv4 "$ip"; then
-      ip=""
-    fi
-  fi
-  if [[ -z "$ip" ]] && command -v curl >/dev/null 2>&1; then
-    ip=$(curl -fsS4 --max-time 5 https://ifconfig.me 2>/dev/null || true)
-    if [[ -z "$ip" ]]; then
-      ip=$(curl -fsS4 --max-time 5 https://api.ipify.org 2>/dev/null || true)
-    fi
-  fi
-  if [[ -z "$ip" ]]; then
-    ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit }}' || true)
-  fi
-  if [[ -z "$ip" ]]; then
-    ip=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
-  fi
-  printf '%s' "$ip"
-}
-
 IP=$(detect_public_ip | tr -d '[:space:]')
-if is_private_ipv4 "$IP"; then
-  echo "警告: 自动探测到的是内网地址 $IP（阿里云实例未绑定 EIP 时常见），不能直接给客户端使用。" >&2
-  echo "      请在云控制台绑定弹性公网 IP，或手动填写服务器公网 IP/域名。" >&2
-fi
+warn_if_private_ipv4 "$IP" || true
 
 CLEANED=true
 

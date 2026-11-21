@@ -94,6 +94,114 @@ for service in hbbs hbbr; do
   fi
 done
 
+
+echo "==> 公网 IP 探测行为（隔离 curl mock）"
+# shellcheck source=../server/lib/ip-detect.sh
+. server/lib/ip-detect.sh
+
+mock_dir=$(mktemp -d)
+trap 'rm -rf "$mock_dir"' EXIT
+cat > "$mock_dir/curl" <<'MOCK'
+#!/usr/bin/env bash
+log="${FAKE_CURL_LOG:-/dev/null}"
+printf '%s\n' "$*" >> "$log"
+url=""
+for arg in "$@"; do
+  case "$arg" in
+    http://*|https://*) url="$arg" ;;
+  esac
+done
+case "$url" in
+  *latest/api/token)
+    [[ "${FAKE_CURL_MODE:-ok}" == "token-fail" ]] && exit 22
+    printf 'FAKE-TOKEN=='
+    ;;
+  *meta-data/eipv4)
+    [[ "${FAKE_CURL_MODE:-ok}" == "token-fail" ]] && exit 22
+    printf '%s' "${FAKE_EIP:-}"
+    ;;
+  *ifconfig\.me*)
+    printf '%s' "${FAKE_HTTP_IP:-}"
+    ;;
+  *api\.ipify\.org*)
+    printf '%s' "${FAKE_IPIFY_IP:-}"
+    ;;
+esac
+exit 0
+MOCK
+chmod +x "$mock_dir/curl"
+old_path="$PATH"
+export PATH="$mock_dir:$PATH"
+
+run_probe() {
+  : > "$mock_dir/log"
+  FAKE_CURL_LOG="$mock_dir/log" detect_public_ip
+}
+
+# 1) IMDSv2：先 PUT 取 token，再带 token GET eipv4；两个请求都绕过代理。
+got=$(FAKE_EIP=203.0.113.9 run_probe)
+log=$(cat "$mock_dir/log")
+if [[ "$got" != "203.0.113.9" ]]; then
+  fail "IMDSv2 成功路径返回值不对：$got"
+fi
+if ! grep -q 'latest/api/token' <<<"$log" || ! grep -q -- '-X PUT' <<<"$log"; then
+  fail "必须先 PUT /latest/api/token（日志：$log）"
+fi
+if ! grep -q 'X-aliyun-ecs-metadata-token-ttl-seconds: 60' <<<"$log"; then
+  fail "取 token 时必须带 TTL 头"
+fi
+if ! grep -q -- '--noproxy \*' <<<"$log"; then
+  fail "元数据请求必须 --noproxy '*'"
+fi
+if ! grep -q 'X-aliyun-ecs-metadata-token: FAKE-TOKEN==' <<<"$log"; then
+  fail "取 eipv4 时必须带 IMDSv2 token"
+fi
+
+# 2) 拿不到 token 时不发无令牌 eipv4 请求，直接回退到公网探测。
+got=$(FAKE_CURL_MODE=token-fail FAKE_HTTP_IP=198.51.100.7 run_probe)
+log=$(cat "$mock_dir/log")
+if [[ "$got" != "198.51.100.7" ]]; then
+  fail "token 失败时应回退到 ifconfig.me，实际：$got"
+fi
+if grep -q 'meta-data/eipv4' <<<"$log"; then
+  fail "没拿到 IMDSv2 token 时不应请求 eipv4"
+fi
+
+# 3) HTML 响应不能被当成地址；成功请求返回合法 IPv4 才采用。
+got=$(FAKE_EIP='<html>error</html>' FAKE_HTTP_IP=198.51.100.7 run_probe)
+if [[ "$got" != "198.51.100.7" ]]; then
+  fail "HTML 响应必须被丢弃，实际：$got"
+fi
+
+# 4) 内网 eipv4 必须丢弃并回退。
+for private in 10.0.0.5 172.16.3.4 192.168.1.9 169.254.1.1; do
+  got=$(FAKE_EIP="$private" FAKE_HTTP_IP=198.51.100.7 run_probe)
+  if [[ "$got" != "198.51.100.7" ]]; then
+    fail "内网地址 $private 必须被丢弃，实际：$got"
+  fi
+done
+
+# 5) ifconfig.me 返回非法值（含部分输出/非 IPv4）时继续用 ipify。
+got=$(FAKE_CURL_MODE=token-fail FAKE_HTTP_IP='198.51.100' FAKE_IPIFY_IP=203.0.113.9 run_probe)
+if [[ "$got" != "203.0.113.9" ]]; then
+  fail "ifconfig.me 非法响应时应回退到 ipify，实际：$got"
+fi
+got=$(FAKE_CURL_MODE=token-fail FAKE_HTTP_IP='999.1.1.1' FAKE_IPIFY_IP=203.0.113.9 run_probe)
+if [[ "$got" != "203.0.113.9" ]]; then
+  fail "越界 IPv4 必须被丢弃，实际：$got"
+fi
+
+# 6) RFC1918 告警行为。
+warn=$(warn_if_private_ipv4 172.20.0.1 2>&1) && warn_code=0 || warn_code=$?
+if [[ "$warn_code" -ne 0 || "$warn" != *"自动探测到的是内网地址 172.20.0.1"* ]]; then
+  fail "RFC1918 地址必须打印内网警告（退出码 $warn_code，输出：$warn）"
+fi
+if warn_if_private_ipv4 203.0.113.9 >/dev/null 2>&1; then
+  fail "公网地址不应打印内网警告"
+fi
+
+export PATH="$old_path"
+
 if (( errors > 0 )); then
   echo "共 $errors 项检查失败" >&2
   exit 1

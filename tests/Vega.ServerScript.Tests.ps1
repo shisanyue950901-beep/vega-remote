@@ -7,8 +7,10 @@
 BeforeAll {
     $root = Join-Path (Join-Path $PSScriptRoot '..') 'server'
     $script:ServerScriptPath = Join-Path $root 'setup-rustdesk-server.sh'
+    $script:IpDetectPath = Join-Path (Join-Path $root 'lib') 'ip-detect.sh'
     $script:ComposePath = Join-Path $root 'docker-compose.yml'
     $script:ServerScript = Get-Content -LiteralPath $script:ServerScriptPath -Encoding UTF8 -Raw
+    $script:IpDetect = Get-Content -LiteralPath $script:IpDetectPath -Encoding UTF8 -Raw
     $script:Compose = Get-Content -LiteralPath $script:ComposePath -Encoding UTF8 -Raw
 }
 
@@ -32,14 +34,25 @@ Describe 'RustDesk 部署脚本：只支持全新部署' {
 }
 
 Describe 'RustDesk 部署脚本：公网 IP 探测' {
-    It '先查阿里云元数据 eipv4，避免回落成 VPC 内网 IP' {
-        $script:ServerScript | Should -Match '100\.100\.100\.200/latest/meta-data/eipv4'
-        $script:ServerScript | Should -Match 'is_private_ipv4'
+    It '脚本 source 探测库，探测逻辑单独可测' {
+        $script:ServerScript | Should -Match 'lib/ip-detect\.sh'
+        $script:ServerScript | Should -Match 'detect_public_ip'
+        $script:ServerScript | Should -Match 'warn_if_private_ipv4'
     }
 
-    It 'RFC1918 结果打印警告' {
-        $script:ServerScript | Should -Match '自动探测到的是内网地址'
-        $script:ServerScript | Should -Match '172\\\.\(1\[6-9\]'
+    It '阿里云元数据走 IMDSv2，只用成功且合法的公网 IPv4' {
+        $script:IpDetect | Should -Match 'latest/api/token'
+        $script:IpDetect | Should -Match 'X-aliyun-ecs-metadata-token-ttl-seconds'
+        $script:IpDetect | Should -Match 'X-aliyun-ecs-metadata-token'
+        $script:IpDetect | Should -Match "100\.100\.100\.200/latest/meta-data/eipv4"
+        $script:IpDetect | Should -Match "--noproxy '\*'"
+        $script:IpDetect | Should -Match 'is_public_ipv4'
+    }
+
+    It 'RFC1918 / 链路本地地址打印警告' {
+        $script:IpDetect | Should -Match '自动探测到的是内网地址'
+        $script:IpDetect | Should -Match '172\\.\\(1\[6-9\]'
+        $script:IpDetect | Should -Match '169\\.254'
     }
 }
 
