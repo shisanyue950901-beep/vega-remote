@@ -15,8 +15,9 @@
 - [ ] `%ProgramData%\Vega\logs\setup.log` 有本次安装记录和 `[nsis] install-rustdesk.ps1 exit code:` 一行。
 - [ ] 已装 RustDesk 的机器上重跑安装包：日志显示「已安装 RustDesk，跳过安装」，配置仍被写入。
 - [ ] 未装 RustDesk 的机器：安装包自动下载固定版本并 SHA256 校验通过后静默安装；RustDesk 服务出现在服务列表。
-- [ ] 校验失败 / 下载失败的机器：Vega 安装照常完成，完成后提示「RustDesk 未装好，请打开 Vega 按提示手动安装」，安装没有整体失败。
-  注意：在架构师填入真实 SHA256 前，所有机器都会走这条失败分支，这是占位常量的预期行为。
+- [ ] 校验失败场景：把下载到的安装包副本改一个字节（或临时把 `Get-VegaRustDeskRelease` 的摘要改错）后重跑，
+      Vega 安装照常完成，完成页提示「RustDesk 未装好，请打开 Vega 按提示手动安装」，安装没有整体失败。
+- [ ] 下载失败场景（断网或代理拦截）：同样只提示，不阻断 Vega 安装；`%ProgramData%\Vega\logs\setup.log` 有失败原因。
 - [ ] 卸载 Vega 后，`RustDesk2.toml` 的三个受管键恢复为安装前的值（或整行删除），用户原有 RustDesk 保留。
 - [ ] 设置页「默认中继」一行显示安装包默认值与 RustDesk 当前配置；手动改过 RustDesk 中继时会显示不一致提示。
 

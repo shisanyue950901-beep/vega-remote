@@ -67,17 +67,21 @@
   退出码写 `%ProgramData%\Vega\logs\setup.log`；脚本失败不阻断安装，只在完成时提示到 Vega 手动安装；
   `NSIS_HOOK_PREUNINSTALL` 调 `-Uninstall` 按 state.json 回滚 ✅
 - `host/install-rustdesk.ps1`：AGPL 约束下不打包 RustDesk 二进制，固定官方 GitHub Release 版本下载并校验 SHA256
-  （当前是占位常量，发布前必须由架构师填），超时 120 秒、下载最多 2 次；已装跳过、`--silent-install`、等服务出现；
-  复用 T2 的 `RustDesk2.toml` ACL/原子写入逻辑，同时写当前用户与 LocalService 两处配置，并在 host-state.json 记录安装归属 ✅
+  （1.5.3 的官方摘要已固定为 `523ba0ef…ed249`），整个下载共用一个 120 秒截止时间、最多 2 次尝试，只接受 HTTPS；
+  已装跳过、`--silent-install`、等服务出现；复用 T2 的 `RustDesk2.toml` ACL/原子写入逻辑，只写 LocalService
+  服务级配置（perMachine 安装包可能由另一管理员账户提权运行），发起安装用户的 SID 与用户级配置路径记进
+  `state.json`，由控制台首次启动时提示；新装时才在 host-state.json 记录安装归属并只卸载本次安装的 RustDesk ✅
 - 架构决策更新：旧「不做应用内提权」改为「安装包启动时 UAC 提权一次」；Vega 控制台运行时仍不提权，
   对 RustDesk 网络配置仍只读，设置页新增只读的「默认中继」比对提示 ✅
-- 测试：`tests/Vega.InstallRustDesk.Tests.ps1` 覆盖哈希不匹配中止、已安装跳过、下载失败非零、双路径写配置、state.json 记录与回滚 ✅
+- 测试：`tests/Vega.InstallRustDesk.Tests.ps1` 覆盖真实 SHA256 校验、哈希不匹配中止、已安装跳过、下载失败非零、
+  TLS 1.2 与仅 HTTPS、只写服务级配置、state.json 记录与回滚，以及在 Windows CI 里跑入口脚本对真实退出码的断言 ✅
 
 ## Backlog（T3 记录）
-- `server/setup-rustdesk-server.sh` 的 `detect_public_ip` 在阿里云回落成 VPC 内网 IP：先查元数据
-  `100.100.100.200/latest/meta-data/eipv4`，对 RFC1918 结果打印警告 ✅ 已修（T3）
-- `Get-VegaRustDeskRelease` 的 SHA256 仍是全 0 占位常量：发布前必须由架构师填真实值，否则安装包会走
-  「RustDesk 未装好」提示分支（这是有意的安全默认值）。
+- `server/setup-rustdesk-server.sh` 的 `detect_public_ip` 在阿里云回落成 VPC 内网 IP：探测逻辑移到
+  `server/lib/ip-detect.sh`，按 IMDSv2（先 `PUT /latest/api/token`）查 `eipv4`，元数据请求 `--noproxy '*'`，
+  只采用成功且通过 IPv4 正则的公网地址，RFC1918 结果打印警告 ✅ 已修（T3）
+- `Get-VegaRustDeskRelease` 的 SHA256 已固定为 RustDesk 1.5.3 官方资产摘要；升级版本时必须同步更新
+  版本号、文件名与摘要，否则安装包会走「RustDesk 未装好」提示分支（这是有意的安全默认值）。
 
 ## M3 进阶（v1.0）
 - 虚拟显示器自动安装（无显示器被控端）
