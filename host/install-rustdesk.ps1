@@ -65,6 +65,8 @@
   t3-fix4：NSIS 钩子一次解析后传来的 ASCII Base64(UTF-8("SID\nAppData"))。
   脚本解码后校验 SID 格式与 AppData 目录存在；校验失败按“取不到交互用户”处理，
   只写服务级配置并返回降级退出码 2。该参数优先于明文参数。
+  t3-fix5：钩子总是显式传这个参数；显式传空串表示“确认没有交互用户”，
+  脚本据此直接只写服务级，不再回退解析（用 PSBoundParameters 区分省略参数）。
 
 .EXAMPLE
   .\install-rustdesk.ps1 -DefaultsFile .\resources\vega-defaults.json
@@ -127,9 +129,18 @@ if (-not (Test-VegaProcessElevated)) {
 
 # t3-fix4：解码 NSIS 传的 Base64 上下文，并校验路径真实存在。
 # 校验失败不硬失败：清空交互用户参数，后面只写服务级配置，最终以退出码 2 标记降级。
+# t3-fix5 P2：钩子每次都显式传 -InteractiveUserContextB64（取不到时是空串）。用
+# PSBoundParameters 区分“钩子明确说没有交互用户”和“手动调用省略参数”：前者直接
+# 只写服务级，不再回退解析，避免把提权账户当成交互用户。
+$contextProvided = $PSBoundParameters.ContainsKey('InteractiveUserContextB64')
 $contextDecodeError = ''
 $forceServiceOnly = $false
-if (-not [string]::IsNullOrWhiteSpace($InteractiveUserContextB64)) {
+if ($contextProvided -and [string]::IsNullOrWhiteSpace($InteractiveUserContextB64)) {
+    $forceServiceOnly = $true
+    Write-VegaLog '钩子显式传入空交互用户上下文，只写服务级配置。'
+    Write-Host '安装包未解析到交互用户，只写服务级中继配置。' -ForegroundColor Yellow
+}
+elseif (-not [string]::IsNullOrWhiteSpace($InteractiveUserContextB64)) {
     $decodedContext = ConvertFrom-VegaInteractiveUserContextPayload -Payload $InteractiveUserContextB64
     if ($decodedContext.Valid) {
         $InteractiveUserSid = [string]$decodedContext.Sid
