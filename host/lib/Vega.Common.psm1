@@ -5583,6 +5583,10 @@ function ConvertTo-VegaRustDeskExeCandidate {
     if ($text -match '^(?<path>.+?),\s*-?\d+$') { $text = [string]$Matches['path'] }
     $text = $text.Trim().Trim('"')
     if ([string]::IsNullOrWhiteSpace($text)) { return '' }
+    # 服务 ImagePath 可能带 %ProgramFiles% 这类环境变量。
+    if ($text -match '%[^%]+%') {
+        $text = [System.Environment]::ExpandEnvironmentVariables($text)
+    }
 
     try {
         if ($text -match '(?i)\.exe$') {
