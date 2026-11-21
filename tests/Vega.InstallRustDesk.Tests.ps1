@@ -746,6 +746,43 @@ Describe 't3-fix6 已有安装的服务状态分支' {
         Should -Invoke -CommandName Wait-VegaRustDeskService -ModuleName $script:ModuleName -Times 1 -Exactly
     }
 
+    It 't3-fix12 P3 -WhatIf 跳过启动：立即返回，不记录已发起启动也不再空等' {
+        $root = Join-Path $TestDrive ('whatif-' + [guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Path $root -Force
+        $statePath = Join-Path $root ('h-' + [guid]::NewGuid().ToString('N') + '.json')
+        $serviceStatePath = Join-Path $root ('s-' + [guid]::NewGuid().ToString('N') + '.json')
+        $defaults = Join-Path $root 'vega-defaults.json'
+        $json = @{ rustdesk = @{ idServer = '60.205.95.98'; relayServer = '60.205.95.98'; key = $script:Key } } | ConvertTo-Json
+        Set-Content -LiteralPath $defaults -Value $json -Encoding UTF8
+
+        $sid = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
+        $appData = Join-Path $root 'Users/张三/AppData/Roaming'
+        $null = New-Item -ItemType Directory -Path $appData -Force
+        $serviceConfig = Join-Path $root 'ProgramData/RustDesk/config/RustDesk2.toml'
+
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
+        Mock -ModuleName $script:ModuleName Get-Service { [pscustomobject]@{ Name = 'RustDesk'; Status = 'Stopped' } }
+        Mock -ModuleName $script:ModuleName Start-VegaRustDeskServiceNonBlocking { }
+        Mock -ModuleName $script:ModuleName Wait-VegaRustDeskService { throw '-WhatIf 下不应进入等待（会空等 60 秒）' }
+        Mock -ModuleName $script:ModuleName Set-VegaRustDeskConfig { throw '-WhatIf 下不应写配置' }
+
+        $result = Invoke-VegaRustDeskBootstrap -DefaultsFile $defaults -HostStatePath $statePath `
+            -ServiceStatePath $serviceStatePath -ServiceConfigPath $serviceConfig `
+            -InteractiveUserSid $sid -InteractiveUserAppData $appData -WhatIf
+
+        # 与新装分支的 WhatIf 行为一致：成功、ExitCode 0、没有配置落地。
+        $result.Success | Should -BeTrue
+        $result.ExitCode | Should -Be 0
+        $result.Configured | Should -BeFalse
+        $result.UserConfigWritten | Should -BeFalse
+        Should -Invoke -CommandName Start-VegaRustDeskServiceNonBlocking -ModuleName $script:ModuleName -Times 0 -Exactly
+        Should -Invoke -CommandName Wait-VegaRustDeskService -ModuleName $script:ModuleName -Times 0 -Exactly
+        $messages = ($result.Messages -join "`n")
+        $messages | Should -Match 'WhatIf'
+        $messages | Should -Not -Match '已发起启动'
+        Test-Path -LiteralPath $serviceConfig | Should -BeFalse
+    }
+
     It '服务未注册：不注册服务，只写用户级配置并回读，降级退出码 2 并提示启用服务' {
         $root = Join-Path $TestDrive ('svc-' + [guid]::NewGuid().ToString('N'))
         $null = New-Item -ItemType Directory -Path $root -Force
