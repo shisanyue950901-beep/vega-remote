@@ -185,6 +185,28 @@ Describe 'Get-VegaRustDeskInstaller' {
     }
 }
 
+Describe 'Invoke-VegaHttpsDownload' {
+    It '只接受 HTTPS，明文重定向在发请求前就被拒绝' {
+        $out = Join-Path $TestDrive 'plain.http'
+        { Invoke-VegaHttpsDownload -Uri 'http://example.invalid/rustdesk.exe' -OutFile $out -TimeoutSeconds 5 } |
+            Should -Throw '*HTTPS*'
+        Test-Path -LiteralPath $out | Should -BeFalse
+    }
+
+    It '下载前补齐 TLS 1.2，不拆掉已启用的其他协议' {
+        $before = [System.Net.ServicePointManager]::SecurityProtocol
+        try {
+            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::SystemDefault
+            Enable-VegaTls12
+            $after = [System.Net.ServicePointManager]::SecurityProtocol
+            (($after -band [System.Net.SecurityProtocolType]::Tls12) -eq [System.Net.SecurityProtocolType]::Tls12) | Should -BeTrue
+        }
+        finally {
+            [System.Net.ServicePointManager]::SecurityProtocol = $before
+        }
+    }
+}
+
 Describe 'Install-VegaRustDeskSilently' {
     It '调用官方 --silent-install 参数' {
         $installer = Join-Path $TestDrive 'rustdesk.exe'
