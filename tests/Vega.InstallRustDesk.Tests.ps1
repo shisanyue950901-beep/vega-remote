@@ -783,19 +783,40 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 Import-Module $ModulePath -Force
-# 在模块作用域替换外部动作：真实进程 + 真实配置写入，只有服务/安装探测是桩。
+# 在模块的 script 作用域里装桩（与仓库其它测试同样的做法）：真实进程 + 真实配置文件，
+# 只有服务/安装探测是桩。直接 function 定义会落在临时子作用域里，模块内部看不到。
 $module = Get-Module 'Vega.Common'
-& $module {
-    param($sid, $appData, $userConfig)
-    function Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
-    function Get-Service { [pscustomobject]@{ Name = 'RustDesk'; Status = 'Running' } }
-    function Wait-VegaRustDeskService { [pscustomobject]@{ Found = $true; Running = $true; Status = 'Running' } }
-    function Restart-VegaRustDeskService { [pscustomobject]@{ Found = $true; WasRunning = $true; Restarted = $true; Status = 'Running'; Message = 'ok' } }
-    function Resolve-VegaSetupInteractiveUser {
-        param([AllowEmptyString()][string]$Sid = '', [AllowEmptyString()][string]$AppDataPath = '', [AllowEmptyString()][string]$ConfigPath = '')
-        [pscustomobject]@{ Sid = $sid; AppDataPath = $appData; UserConfigPath = $userConfig }
+$stubs = @{
+    'Get-VegaRustDeskInstall' = {
+        param()
+        'C:\Program Files\RustDesk\rustdesk.exe'
     }
-} $Sid $AppData $UserConfigPath
+    'Get-Service' = {
+        param([Parameter(Position = 0)][string[]]$Name)
+        $null = $Name
+        [pscustomobject]@{ Name = 'RustDesk'; Status = 'Running' }
+    }
+    'Wait-VegaRustDeskService' = {
+        param([int]$TimeoutSeconds = 60, [int]$IntervalSeconds = 2)
+        $null = $TimeoutSeconds, $IntervalSeconds
+        [pscustomobject]@{ Found = $true; Running = $true; Status = 'Running' }
+    }
+    'Restart-VegaRustDeskService' = {
+        [pscustomobject]@{ Found = $true; WasRunning = $true; Restarted = $true; Status = 'Running'; Message = 'ok' }
+    }
+}
+& $module {
+    param($stubTable, $sid, $appData, $userConfig)
+    $script:VegaHarnessUser = [pscustomobject]@{ Sid = $sid; AppDataPath = $appData; UserConfigPath = $userConfig }
+    foreach ($name in $stubTable.Keys) {
+        New-Item -Path ('function:script:{0}' -f $name) -Value $stubTable[$name] -Force | Out-Null
+    }
+    New-Item -Path 'function:script:Resolve-VegaSetupInteractiveUser' -Force -Value {
+        param([AllowEmptyString()][string]$Sid = '', [AllowEmptyString()][string]$AppDataPath = '', [AllowEmptyString()][string]$ConfigPath = '')
+        $null = $Sid, $AppDataPath, $ConfigPath
+        $script:VegaHarnessUser
+    } | Out-Null
+} $stubs $Sid $AppData $UserConfigPath
 
 $arguments = @{
     DefaultsFile      = $DefaultsFile
