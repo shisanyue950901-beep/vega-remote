@@ -4736,7 +4736,7 @@ function Get-VegaRustDeskConfigSummary {
 
 function Set-VegaRustDeskConfig {
     <#
-      写 RustDesk2.toml：当前用户路径总是写；RustDesk 服务存在时也写服务模式路径。
+      写 RustDesk2.toml：默认写当前用户路径，RustDesk 服务存在时也写服务模式路径。
       -ServiceOnly（安装包使用）：只写 LocalService 服务级配置。安装包由另一个管理员账户
       提权运行时，进程的 %APPDATA% 不是发起安装的用户，写用户级配置会记错 SID 和路径；
       用户级配置改由控制台首次启动时按 state.json 里的 SID 提示写入。
@@ -5458,7 +5458,8 @@ function Get-VegaRustDeskRelease {
     <#
       固定版本 + 官方 Release URL + SHA256。
       RustDesk 是 AGPL：安装包不内嵌二进制，只允许从官方 GitHub Release 下载这一份。
-      SHA256 是占位常量，发布前必须由架构师填真实值；占位值永远校验失败，即“必须填”。
+      SHA256 固定为 1.5.3 官方资产摘要；升级版本时必须同步更新版本号与摘要，
+      全 0 占位值永远校验失败（提醒维护者别忘填）。
     #>
     [CmdletBinding()]
     param()
