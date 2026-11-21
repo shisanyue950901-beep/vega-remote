@@ -1,4 +1,4 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+﻿#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod doctor;
 mod rustdesk;
@@ -35,6 +35,7 @@ fn main() {
             set_close_to_tray,
             rustdesk::get_device_id,
             rustdesk::get_server_config,
+            rustdesk::get_relay_defaults,
             rustdesk::connect_peer,
             rustdesk::get_recent_peers,
             rustdesk::open_rustdesk_window,

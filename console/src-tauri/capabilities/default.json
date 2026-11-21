@@ -1,4 +1,4 @@
-{
+﻿{
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "控制台最小权限：窗口控制 + RustDesk/串流/诊断命令（build.rs AppManifest 声明），不开放文件系统、Shell、网络与托盘插件。",
@@ -12,6 +12,7 @@
     "allow-set-close-to-tray",
     "allow-get-device-id",
     "allow-get-server-config",
+    "allow-get-relay-defaults",
     "allow-connect-peer",
     "allow-get-recent-peers",
     "allow-open-rustdesk-window",

@@ -40,6 +40,15 @@ interface ServerConfigView {
   error: string;
 }
 
+/** 安装包随包的默认中继（`vega-defaults.json`），只读展示。 */
+interface RelayDefaultsView {
+  idServer: string;
+  relayServer: string;
+  keyPresent: boolean;
+  path: string;
+  error: string;
+}
+
 interface OpResult {
   ok: boolean;
   message: string;
@@ -544,6 +553,7 @@ function setupSettingsPage(): void {
   const idServerInput = byId<HTMLInputElement>("set-id-server");
   const relayServerInput = byId<HTMLInputElement>("set-relay-server");
   const fingerprint = byId<HTMLSpanElement>("server-key-fingerprint");
+  const relayDefaultsHint = byId<HTMLSpanElement>("relay-defaults");
   const runDoctorButton = byId<HTMLButtonElement>("run-doctor");
   const exportButton = byId<HTMLButtonElement>("export-log");
   const fixedPasswordButton = byId<HTMLButtonElement>("save-fixed-password");
@@ -557,12 +567,61 @@ function setupSettingsPage(): void {
   });
 
   // 只读页：配置只显示 RustDesk2.toml 里的当前值，写入一律在 RustDesk 里做。
+  // 安装包默认中继只用于比对：不一致时提示，不提供“一键改回”的写入能力。
   let probeGeneration = 0;
+  let relayDefaults: RelayDefaultsView | null = null;
+  let lastConfig: ServerConfigView | null = null;
+
+  const hostOnly = (value: string): string => {
+    let text = value.trim().toLowerCase();
+    text = text.replace(/^\[/, "").replace(/\]$/, "");
+    text = text.replace(/:\d+$/, "");
+    return text;
+  };
+
+  const renderRelayDefaults = (): void => {
+    if (!relayDefaults) {
+      setStatus(relayDefaultsHint, "");
+      return;
+    }
+    if (relayDefaults.error) {
+      setStatus(relayDefaultsHint, `默认中继：${relayDefaults.error}`, "warn");
+      return;
+    }
+    const expected = `${relayDefaults.idServer}（中继 ${relayDefaults.relayServer}）`;
+    if (!lastConfig || lastConfig.error) {
+      setStatus(relayDefaultsHint, `默认中继：${expected}`, "warn");
+      return;
+    }
+    const sameId = hostOnly(lastConfig.server) === hostOnly(relayDefaults.idServer);
+    const sameRelay = hostOnly(lastConfig.relay) === hostOnly(relayDefaults.relayServer);
+    if (sameId && sameRelay) {
+      setStatus(relayDefaultsHint, `与安装包默认中继一致：${expected}`, "ok");
+    } else {
+      setStatus(
+        relayDefaultsHint,
+        `当前 RustDesk 中继与安装包默认（${expected}）不一致；如果你 fork 过 vega-defaults.json 请确认配置文件已同步。`,
+        "warn",
+      );
+    }
+  };
+
+  void invoke<RelayDefaultsView>("get_relay_defaults")
+    .then((view) => {
+      relayDefaults = view ?? null;
+      renderRelayDefaults();
+    })
+    .catch(() => {
+      relayDefaults = null;
+      setStatus(relayDefaultsHint, "默认中继：浏览器预览下不可用", "warn");
+    });
 
   const applyConfig = (config: ServerConfigView | null): void => {
     // 每次重读配置都作废在途探测，并把上一次的结果与按钮状态复位。
     // 旧回调只认自己的代次，不能把按钮永久留在 disabled（审计 r5 P2）。
     probeGeneration += 1;
+    lastConfig = config;
+    renderRelayDefaults();
     testButton.disabled = true;
     setStatus(testResult, "未测试");
     if (!config) {

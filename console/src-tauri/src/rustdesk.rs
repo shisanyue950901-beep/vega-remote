@@ -1,4 +1,4 @@
-//! RustDesk 集成（M2b）。
+﻿//! RustDesk 集成（M2b）。
 //!
 //! 约定（继承 T1/T2 安全约束）：
 //! - 不读取、不保存、不通过命令行传递临时密码。密码只由 RustDesk 自己管理，
@@ -879,6 +879,107 @@ pub fn get_server_config() -> ServerConfigView {
             key_fingerprint: String::new(),
             key_present: false,
             key_error: String::new(),
+            path: display,
+            error,
+        },
+    }
+}
+
+/// 安装包随包的默认中继（`resources/vega-defaults.json`）内容。
+/// 只读展示：设置页用它和 RustDesk 实际配置比对，不提供任何写入能力。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayDefaultsView {
+    pub id_server: String,
+    pub relay_server: String,
+    pub key_present: bool,
+    pub path: String,
+    pub error: String,
+}
+
+/// 从 vega-defaults.json 文本里取展示字段。格式不对只返回错误文案，不 panic。
+pub fn parse_relay_defaults(text: &str) -> Result<(String, String, bool), String> {
+    let data: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("默认配置不是合法 JSON：{e}"))?;
+    let rustdesk = data
+        .get("rustdesk")
+        .ok_or_else(|| "默认配置缺少 rustdesk 段".to_string())?;
+    let id_server = rustdesk
+        .get("idServer")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| "默认配置缺少 rustdesk.idServer".to_string())?
+        .to_string();
+    let relay_server = rustdesk
+        .get("relayServer")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| "默认配置缺少 rustdesk.relayServer".to_string())?
+        .to_string();
+    let key_present = rustdesk
+        .get("key")
+        .and_then(|v| v.as_str())
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    Ok((id_server, relay_server, key_present))
+}
+
+fn relay_defaults_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    // 安装包内：<安装目录>\resources\vega-defaults.json。
+    // 开发/测试环境（tauri dev）资源未必复制到 resource_dir，回落到源码目录。
+    if let Ok(dir) = app.path().resource_dir() {
+        let candidate = dir.join("vega-defaults.json");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("resources")
+        .join("vega-defaults.json");
+    if dev.is_file() {
+        return Some(dev);
+    }
+    None
+}
+
+#[tauri::command]
+pub fn get_relay_defaults(app: tauri::AppHandle) -> RelayDefaultsView {
+    let Some(path) = relay_defaults_path(&app) else {
+        return RelayDefaultsView {
+            id_server: String::new(),
+            relay_server: String::new(),
+            key_present: false,
+            path: String::new(),
+            error: "找不到随包的 vega-defaults.json".into(),
+        };
+    };
+    let display = path.display().to_string();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) => {
+            return RelayDefaultsView {
+                id_server: String::new(),
+                relay_server: String::new(),
+                key_present: false,
+                path: display,
+                error: format!("读取默认配置失败：{e}"),
+            };
+        }
+    };
+    match parse_relay_defaults(&text) {
+        Ok((id_server, relay_server, key_present)) => RelayDefaultsView {
+            id_server,
+            relay_server,
+            key_present,
+            path: display,
+            error: String::new(),
+        },
+        Err(error) => RelayDefaultsView {
+            id_server: String::new(),
+            relay_server: String::new(),
+            key_present: false,
             path: display,
             error,
         },
