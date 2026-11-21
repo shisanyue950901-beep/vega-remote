@@ -830,7 +830,8 @@ Describe 't3-fix4 用户级配置写失败时降级而不是整单失败' {
         Set-Content -LiteralPath $defaults -Value $json -Encoding UTF8
 
         $sid = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
-        $appData = Join-Path $TestDrive ('appdata-' + [guid]::NewGuid().ToString('N'))
+        # 用 Windows 形态的交互用户路径（bootstrap 只接受 Windows 绝对路径），配置写入被 Mock。
+        $appData = 'C:\Users\张三\AppData\Roaming'
         $serviceConfig = Join-Path $TestDrive ('svc-' + [guid]::NewGuid().ToString('N') + '/RustDesk/config/RustDesk2.toml')
 
         Mock -ModuleName $script:ModuleName Get-VegaInteractiveUserContext { throw '显式给了交互用户参数，不应再解析' }
