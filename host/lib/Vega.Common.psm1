@@ -5509,10 +5509,16 @@ function Get-VegaRustDeskRegistryInstallCandidates {
                             if ($null -eq $sub) { continue }
                             if ([string]$sub.GetValue('DisplayName', '') -ne 'RustDesk') { continue }
 
-                            foreach ($valueName in @('InstallLocation', 'DisplayIcon')) {
-                                $raw = [string]$sub.GetValue($valueName, '')
-                                if ([string]::IsNullOrWhiteSpace($raw)) { continue }
-                                $candidate = ConvertTo-VegaRustDeskExeCandidate -Value $raw
+                            # t3-fix5 P1-1：两个值按字段分别解析。InstallLocation 是
+                            # 可能含空格的目录，DisplayIcon 只剥引号与 ",索引"，都不能按空白切分。
+                            $installLocation = [string]$sub.GetValue('InstallLocation', '')
+                            if (-not [string]::IsNullOrWhiteSpace($installLocation)) {
+                                $candidate = ConvertTo-VegaRustDeskInstallLocationPath -Value $installLocation
+                                if (-not [string]::IsNullOrWhiteSpace($candidate)) { $candidates.Add($candidate) }
+                            }
+                            $displayIcon = [string]$sub.GetValue('DisplayIcon', '')
+                            if (-not [string]::IsNullOrWhiteSpace($displayIcon)) {
+                                $candidate = ConvertTo-VegaRustDeskDisplayIconPath -Value $displayIcon
                                 if (-not [string]::IsNullOrWhiteSpace($candidate)) { $candidates.Add($candidate) }
                             }
                         }
@@ -5530,7 +5536,7 @@ function Get-VegaRustDeskRegistryInstallCandidates {
             if ($null -ne $service) {
                 try {
                     $imagePath = [string]$service.GetValue('ImagePath', '')
-                    $candidate = ConvertTo-VegaRustDeskExeCandidate -Value $imagePath
+                    $candidate = ConvertTo-VegaRustDeskServiceImagePath -Value $imagePath
                     if (-not [string]::IsNullOrWhiteSpace($candidate)) { $candidates.Add($candidate) }
                 }
                 finally {
@@ -5555,13 +5561,66 @@ function Get-VegaRustDeskRegistryInstallCandidates {
     return $unique.ToArray()
 }
 
-function ConvertTo-VegaRustDeskExeCandidate {
+function ConvertTo-VegaRustDeskExePath {
     <#
-      把注册表 InstallLocation / DisplayIcon / 服务 ImagePath 规整成 rustdesk.exe 路径：
-        - InstallLocation 是目录 → 拼 rustdesk.exe；
-        - DisplayIcon 常见 "C:\...\rustdesk.exe,0" → 去掉 ",索引"；
-        - ImagePath 常见 '"C:\...\rustdesk.exe" --service' → 只取第一个路径；
-        - 目录或 .exe 之外的返回值一律丢弃（避免把命令当成路径）。
+      单个路径的最终规整（纯函数）：输入已经剥掉引号、图标签与启动参数。
+        - .exe 结尾 → 绝对路径；
+        - 绝对目录 → 拼 rustdesk.exe；
+        - 其他（含相对路径、命令片段）一律返回空串。
+      路径里的空格原样保留：RustDesk 允许装在 "D:\Remote Tools\RustDesk"，
+      按空白切分会把目录截成 "D:\Remote" 从而漏判已有安装（t3-fix5 P1）。
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()]
+        [string]$Text = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
+
+    $value = $Text.Trim().Trim('"').Trim()
+    if ([string]::IsNullOrWhiteSpace($value)) { return '' }
+    # 服务 ImagePath 可能带 %ProgramFiles% 这类环境变量。
+    if ($value -match '%[^%]+%') {
+        $value = [System.Environment]::ExpandEnvironmentVariables($value)
+    }
+
+    try {
+        if ($value -match '(?i)\.exe$') {
+            return [System.IO.Path]::GetFullPath($value)
+        }
+        # 目录形式：只在像绝对路径时拼接（避免把 DisplayName 之类误当目录）。
+        if ($value -match '^[A-Za-z]:\\' -or $value -match '^\\\\') {
+            return [System.IO.Path]::GetFullPath((Join-Path $value 'rustdesk.exe'))
+        }
+    }
+    catch {
+        return ''
+    }
+
+    return ''
+}
+
+function ConvertTo-VegaRustDeskInstallLocationPath {
+    <#
+      Uninstall\...\InstallLocation：官方 EXE 写的是**未加引号**的安装目录，
+      目录名可以含空格（例如 D:\Remote Tools\RustDesk）。这里整体保留，只去掉
+      首尾空白/引号，绝不按空白切分（t3-fix5 P1-1）。
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()]
+        [string]$Value = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+    return (ConvertTo-VegaRustDeskExePath -Text $Value)
+}
+
+function ConvertTo-VegaRustDeskDisplayIconPath {
+    <#
+      Uninstall\...\DisplayIcon：常见 "C:\...\rustdesk.exe,0" 或带引号的 EXE。
+      只剥离引号与 ",图标索引"（,0 / ,-1）后缀，路径中的空格完整保留。
     #>
     [CmdletBinding()]
     param(
@@ -5572,36 +5631,59 @@ function ConvertTo-VegaRustDeskExeCandidate {
     if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
 
     $text = $Value.Trim()
-    # ImagePath 带参数：优先取第一个引号段，否则取到第一个空白为止。
-    if ($text -match '^\s*"(?<path>[^"]+)"') {
+    if ($text -match '^(?<path>.+?),\s*-?\d+$') { $text = [string]$Matches['path'] }
+    return (ConvertTo-VegaRustDeskExePath -Text $text)
+}
+
+function ConvertTo-VegaRustDeskServiceImagePath {
+    <#
+      Services\RustDesk\ImagePath：可能是
+        "C:\Program Files\RustDesk\rustdesk.exe" --service
+      或未加引号的 C:\Program Files\RustDesk\rustdesk.exe --service。
+      引号段优先；否则取到 ".exe"（含）为止，剩余部分视为启动参数。
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()]
+        [string]$Value = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+
+    $text = $Value.Trim()
+    if ($text -match '^"(?<path>[^"]+)"') {
         $text = [string]$Matches['path']
     }
-    elseif ($text -match '[\s]') {
-        $text = ($text -split '\s+')[0]
+    elseif ($text -match '(?i)^(?<path>.+?\.exe)(?=\s|$)') {
+        $text = [string]$Matches['path']
     }
-    # DisplayIcon 的 ",0" / ",-1" 索引后缀。
-    if ($text -match '^(?<path>.+?),\s*-?\d+$') { $text = [string]$Matches['path'] }
-    $text = $text.Trim().Trim('"')
-    if ([string]::IsNullOrWhiteSpace($text)) { return '' }
-    # 服务 ImagePath 可能带 %ProgramFiles% 这类环境变量。
-    if ($text -match '%[^%]+%') {
-        $text = [System.Environment]::ExpandEnvironmentVariables($text)
-    }
-
-    try {
-        if ($text -match '(?i)\.exe$') {
-            return [System.IO.Path]::GetFullPath($text)
-        }
-        # 目录形式：只在像绝对路径时拼接（避免把 DisplayName 之类误当目录）。
-        if ($text -match '^[A-Za-z]:\\' -or $text -match '^\\\\') {
-            return [System.IO.Path]::GetFullPath((Join-Path $text 'rustdesk.exe'))
-        }
-    }
-    catch {
+    elseif ($text -match '(?i)\.exe') {
         return ''
     }
+    return (ConvertTo-VegaRustDeskExePath -Text $text)
+}
 
-    return ''
+function ConvertTo-VegaRustDeskExeCandidate {
+    <#
+      兼容入口：按形态把注册表值分派到对应解析器（见上面三个函数）。
+        - 带引号的路径 + 参数 → ImagePath 解析；
+        - ".exe" 后跟空白 → ImagePath 解析（未加引号的服务路径）；
+        - 其余（目录 / ",图标索引"）→ DisplayIcon 解析。
+      新增代码应直接调用具体字段的解析器（t3-fix5 P1-1）。
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()]
+        [string]$Value = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+
+    $text = $Value.Trim()
+    if ($text -match '^\s*"(?<path>[^"]+)"' -or $text -match '(?i)\.exe(?=\s|$)') {
+        return (ConvertTo-VegaRustDeskServiceImagePath -Value $text)
+    }
+    return (ConvertTo-VegaRustDeskDisplayIconPath -Value $text)
 }
 
 function Get-VegaRustDeskInstall {
