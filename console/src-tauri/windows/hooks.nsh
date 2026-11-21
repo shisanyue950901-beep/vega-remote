@@ -18,8 +18,8 @@ Var vegaFinishText
 Var vegaPowerShell
 Var vegaLogUsable
 Var vegaSetupLogLine
-Var vegaUserSid
-Var vegaUserAppData
+Var vegaUserContextB64
+Var vegaLogArgument
 Var vegaRetryCommand
 
 ; 安装失败时改写完成页文案（$vegaFinishText 在页面显示时按当时的值展开）。
@@ -69,25 +69,36 @@ vega_log_append_${ID}:
 vega_log_append_done_${ID}:
 !macroend
 
-; P1-5：解析当前登录交互用户并作为参数传给脚本。取不到时两个变量都是空串，
-; 脚本退回只写服务级配置。Get-VegaInteractiveUserContextValue 只认可
-; explorer.exe 所有者 / 活动会话用户，不会把提权账户当成交互用户。
+; P1-1（t3-fix4）：交互用户上下文只解析一次，并以 ASCII Base64(UTF-8) 传一串，
+; 不再让 SID 和中文 AppData 走 nsExec 的 ANSI 代码页。脚本解码后校验路径存在。
+; 取不到时字符串为空，脚本退回只写服务级配置并返回退出码 2（降级）。
+; Get-VegaInteractiveUserContextPayload 只认可 explorer.exe 所有者 / 活动会话用户，
+; 不会把提权账户当成交互用户。
 !macro VegaResolveInteractiveUser ID
-  StrCpy $vegaUserSid ""
-  StrCpy $vegaUserAppData ""
-  nsExec::ExecToStack '"$vegaPowerShell" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "$INSTDIR\resources\host\resolve-interactive-user.ps1" -Field Sid'
+  StrCpy $vegaUserContextB64 ""
+  nsExec::ExecToStack '"$vegaPowerShell" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "$INSTDIR\resources\host\resolve-interactive-user.ps1" -Field Context'
   Pop $0
   Pop $1
-  StrCmp $0 "0" 0 vega_user_sid_skip_${ID}
-  StrCpy $vegaUserSid $1
-vega_user_sid_skip_${ID}:
+  StrCmp $0 "0" 0 vega_user_ctx_done_${ID}
+  StrCpy $vegaUserContextB64 $1
+vega_user_ctx_trim_${ID}:
+  ; nsExec 可能带回尾部 CR/LF，Base64 里不会有空白，去掉再传。
+  StrCpy $2 $vegaUserContextB64 1 -1
+  StrCmp $2 "$\r" vega_user_ctx_trim_one_${ID}
+  StrCmp $2 "$\n" vega_user_ctx_trim_one_${ID}
+  Goto vega_user_ctx_done_${ID}
+vega_user_ctx_trim_one_${ID}:
+  StrCpy $vegaUserContextB64 $vegaUserContextB64 -1
+  StrCmp $vegaUserContextB64 "" vega_user_ctx_done_${ID} vega_user_ctx_trim_${ID}
+vega_user_ctx_done_${ID}:
+!macroend
 
-  nsExec::ExecToStack '"$vegaPowerShell" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "$INSTDIR\resources\host\resolve-interactive-user.ps1" -Field AppDataPath'
-  Pop $0
-  Pop $1
-  StrCmp $0 "0" 0 vega_user_appdata_skip_${ID}
-  StrCpy $vegaUserAppData $1
-vega_user_appdata_skip_${ID}:
+; P2（t3-fix4）：ACL 收紧失败时给脚本传 -NoFileLog，两层一起跳过文件日志。
+!macro VegaSelectLogArgument ID
+  StrCpy $vegaLogArgument '-LogFile "$COMMONPROGRAMDATA\Vega\logs\setup.log"'
+  StrCmp $vegaLogUsable "1" vega_log_arg_done_${ID} 0
+  StrCpy $vegaLogArgument '-NoFileLog'
+vega_log_arg_done_${ID}:
 !macroend
 
 ; P1-8：卸载前把回滚脚本复制到 ProgramData 下的固定位置。UNINSTALL 会删掉 $INSTDIR，
@@ -118,24 +129,27 @@ vega_user_appdata_skip_${ID}:
 
   !insertmacro VegaSelectPowerShell install
   !insertmacro VegaPrepareLogDirectory install
+  !insertmacro VegaSelectLogArgument install
   !insertmacro VegaResolveInteractiveUser install
 
   DetailPrint "正在安装并配置 RustDesk（自建中继）…"
   ; -WindowStyle Hidden 兜底：nsExec 本身不弹控制台，但 Windows PowerShell 启动器
   ; 仍可能闪一下窗口。
-  nsExec::ExecToStack '"$vegaPowerShell" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "$INSTDIR\resources\host\install-rustdesk.ps1" -DefaultsFile "$INSTDIR\resources\vega-defaults.json" -LogFile "$COMMONPROGRAMDATA\Vega\logs\setup.log" -InteractiveUserSid "$vegaUserSid" -InteractiveUserAppData "$vegaUserAppData"'
+  nsExec::ExecToStack '"$vegaPowerShell" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "$INSTDIR\resources\host\install-rustdesk.ps1" -DefaultsFile "$INSTDIR\resources\vega-defaults.json" $vegaLogArgument -InteractiveUserContextB64 "$vegaUserContextB64"'
   Pop $0
   Pop $1
   StrCpy $vegaSetupExitCode $0
 
-  StrCpy $vegaSetupLogLine "install-rustdesk.ps1 exit code: $0 (user SID: $vegaUserSid)"
+  StrCpy $vegaSetupLogLine "install-rustdesk.ps1 exit code: $0 (user context: $vegaUserContextB64)"
   !insertmacro VegaAppendSetupLog install
 
-  StrCmp $0 "0" 0 vega_install_failed
-    ; 成功但没取到交互用户：用户级配置没写，完成页必须说清楚。
-    StrCmp $vegaUserSid "" 0 vega_install_finish_done
-      StrCpy $vegaFinishText "$(MUI_TEXT_FINISH_INFO_TEXT)$\r$\n$\r$\n未取到当前登录交互用户，本次只写入了服务级中继配置。请在该用户的 RustDesk 设置 → 网络中填写服务器地址与公钥。"
-      Goto vega_install_finish_done
+  ; 退出码 2 = 服务级已写入、用户级降级；不能当成失败，也不能当成完整成功。
+  StrCmp $0 "0" vega_install_finish_done
+  StrCmp $0 "2" vega_install_degraded 0
+  Goto vega_install_failed
+vega_install_degraded:
+    StrCpy $vegaFinishText "$(MUI_TEXT_FINISH_INFO_TEXT)$\r$\n$\r$\nRustDesk 已写入服务级中继配置，但用户级配置未写入（未取到可用的交互用户或写入失败）。请在该用户的 RustDesk 设置 → 网络中填写服务器地址与公钥。"
+    Goto vega_install_finish_done
 vega_install_failed:
     ; 不 Abort：RustDesk 没装好也要把 Vega 装完，用户可以在控制台里按提示重试。
     ; 交互模式只改完成页文案；/S 与 /P 不弹模态框，只留日志和 DetailPrint。
@@ -150,13 +164,14 @@ vega_install_finish_done:
 
   !insertmacro VegaSelectPowerShell uninstall
   !insertmacro VegaPrepareLogDirectory uninstall
+  !insertmacro VegaSelectLogArgument uninstall
   !insertmacro VegaPreserveRetryScript
   !insertmacro VegaResolveInteractiveUser uninstall
 
   DetailPrint "正在回滚 RustDesk 中继配置…"
   ; -Uninstall 只回滚 state.json / host-state.json 里由 Vega 记录过的改动；
   ; 只卸载本安装包装过、且清单记录了安装路径的 RustDesk（见脚本实现）。
-  nsExec::ExecToStack '"$vegaPowerShell" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "$INSTDIR\resources\host\install-rustdesk.ps1" -Uninstall -DefaultsFile "$INSTDIR\resources\vega-defaults.json" -LogFile "$COMMONPROGRAMDATA\Vega\logs\setup.log" -InteractiveUserAppData "$vegaUserAppData"'
+  nsExec::ExecToStack '"$vegaPowerShell" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "$INSTDIR\resources\host\install-rustdesk.ps1" -Uninstall -DefaultsFile "$INSTDIR\resources\vega-defaults.json" $vegaLogArgument -InteractiveUserContextB64 "$vegaUserContextB64"'
   Pop $0
   Pop $1
 
