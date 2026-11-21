@@ -30,7 +30,7 @@
 
   退出码（安装模式）：
     0 = 用户级 + 服务级都写入成功；
-    2 = 成功但降级（只写了服务级配置，或用户级写入失败）；
+    2 = 成功但降级（只写了服务级配置、用户级写入失败，或 RustDesk 服务未注册时只写用户级配置）；
     1 = 失败。
 
 .PARAMETER DefaultsFile
@@ -194,8 +194,10 @@ try {
     }
 
     if ($result.Degraded) {
-        Write-Host 'RustDesk 已写入服务级自建中继配置；用户级配置未写入（已降级），请在完成页按提示手动处理。' -ForegroundColor Yellow
-        Write-VegaLog '完成（降级：用户级配置未写入）'
+        # t3-fix6 P1-2：降级有两种来源——用户级配置没写成功（只写服务级），
+        # 或者服务未注册（只写用户级）。具体原因已由模块逐条打印，这里不再假设方向。
+        Write-Host 'RustDesk 自建中继配置已写入，但有降级项（原因见上方提示），请按提示处理。' -ForegroundColor Yellow
+        Write-VegaLog '完成（降级：详见上方提示）'
     }
     else {
         Write-Host 'RustDesk 已安装并写入自建中继配置。' -ForegroundColor Green
