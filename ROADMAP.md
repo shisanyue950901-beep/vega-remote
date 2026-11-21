@@ -205,3 +205,5 @@
 - **P2 — A queued focus refresh briefly re-enables the old server.** A Node check reproduced Settings probing the previous address while the follow-up read was pending. Invalidate both views’ probes when refresh starts and apply only the last queued snapshot. 
 - **P3 — The GPU list displays VRAM capacity.** Keep capacity internal to the classifier and display the adapter name, class, and likely encoder. 
 - **P3 — Documentation is stale.** Correct the README’s PATH fallback and TOML write claims. Update the r7 checklist and remove the trailing spaces flagged by `git diff --check`. 
+
+- t3-r9 P2/P3（测试）：标签唯一性按 Tauri Section 合并检查；宏解析兼容 CRLF；Status getter 推进时钟的超时用例。
