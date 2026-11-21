@@ -959,10 +959,6 @@ Describe 't3-fix8 P1-1 结果文件（UTF-16LE + BOM）' {
 }
 
 Describe 't3-fix8 P1-2 服务状态：StartPending 只等、1056 视为正常' {
-    BeforeAll {
-        $script:repoRoot = Join-Path $PSScriptRoot '..'
-    }
-
     It 'Test-VegaServiceAlreadyRunningError 只认 1056 / already running' {
         $win32 = [System.ComponentModel.Win32Exception]::new(1056)
         (Test-VegaServiceAlreadyRunningError -ErrorRecord ([pscustomobject]@{ Exception = $win32 })) | Should -BeTrue
