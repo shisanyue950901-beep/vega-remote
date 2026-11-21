@@ -20,14 +20,16 @@
   Pop $1
 
   FileOpen $2 "$PROGRAMDATA\Vega\logs\setup.log" a
-  IfErrors +3
+  IfErrors vega_setup_log_done
   FileWrite $2 "$\r$\n[nsis] install-rustdesk.ps1 exit code: $0$\r$\n"
   FileClose $2
+vega_setup_log_done:
 
-  StrCmp $0 "0" +3
+  StrCmp $0 "0" vega_setup_installed
     ; 不 Abort：RustDesk 没装好也要把 Vega 装完，用户可以在控制台里按提示重试。
     DetailPrint "RustDesk 未装好（退出码 $0），继续完成 Vega 安装。"
     MessageBox MB_ICONEXCLAMATION|MB_OK "RustDesk 未装好，请打开 Vega 按提示手动安装。"
+vega_setup_installed:
 !macroend
 
 !macro VegaRunUninstallRustDesk
@@ -41,9 +43,10 @@
   Pop $1
 
   FileOpen $2 "$PROGRAMDATA\Vega\logs\setup.log" a
-  IfErrors +3
+  IfErrors vega_unsetup_log_done
   FileWrite $2 "$\r$\n[nsis] install-rustdesk.ps1 -Uninstall exit code: $0$\r$\n"
   FileClose $2
+vega_unsetup_log_done:
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
