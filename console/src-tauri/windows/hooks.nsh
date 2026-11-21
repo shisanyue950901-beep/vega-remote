@@ -9,6 +9,9 @@
 ;   * 脚本失败不阻断安装本身：安装照常完成，只在完成页提示用户到 Vega 里手动安装。
 ;   * 用户级配置写当前登录交互用户（explorer.exe 所有者 / 活动会话用户）的 Roaming
 ;     AppData，不写提权账户的 %APPDATA%；取不到时只写服务级并在完成页提示。
+;   * t3-fix7：退出码 2 的完成页显示脚本给出的具体降级原因（本次运行日志里最后一条
+;     WARN），不写死“服务级已写入”。服务未注册且 RustDesk 正在运行时脚本一行配置都不写，
+;     完成页要求用户完全退出客户端、启用服务后重跑。
 ;
 ; 注意：本文件在 tauri 的 installer.nsi 顶部（MUI 页面插入之前）被 include，
 ; 所以这里的 !define 能影响完成页文案；MUI_FINISHPAGE_TEXT 里放的是运行时变量。
@@ -21,6 +24,8 @@ Var vegaSetupLogLine
 Var vegaUserContextB64
 Var vegaLogArgument
 Var vegaRetryCommand
+Var vegaLogOffset
+Var vegaDegradedReason
 
 ; 安装失败时改写完成页文案（$vegaFinishText 在页面显示时按当时的值展开）。
 ; MUI2 在 include 时已给出默认 MUI_FINISHPAGE_TEXT，这里先 undef 再定义，避免重定义告警。
@@ -67,6 +72,55 @@ vega_log_append_${ID}:
   FileWrite $2 "$\r$\n[nsis] $vegaSetupLogLine$\r$\n"
   FileClose $2
 vega_log_append_done_${ID}:
+!macroend
+
+; t3-fix7 P1：调用安装脚本前记下日志末尾偏移。等脚本返回后再从该偏移读，
+; 只看本次运行写的行，不会把上一次安装的 WARN 当成这次的原因。
+!macro VegaRememberLogOffset ID
+  StrCpy $vegaLogOffset "0"
+  StrCmp $vegaLogUsable "1" 0 vega_log_offset_done_${ID}
+  ClearErrors
+  FileOpen $2 "$COMMONPROGRAMDATA\Vega\logs\setup.log" r
+  IfErrors vega_log_offset_done_${ID} 0
+  FileSeek $2 0 END $vegaLogOffset
+  FileClose $2
+vega_log_offset_done_${ID}:
+!macroend
+
+; t3-fix7 P1：退出码 2 的完成页要显示脚本返回的具体降级原因，而不是笼统的
+; “服务级已写入”。脚本把原因写成一条 WARN 日志（模块 $fail / 配置降级都走 WARN），
+; 这里从 $vegaLogOffset 起逐行扫描，保留最后一条以 "WARN " 开头的行。
+; 只扫本次运行新增的部分；文件读不了就留空，由调用方给兜底文案。
+!macro VegaReadDegradedReason ID
+  StrCpy $vegaDegradedReason ""
+  StrCmp $vegaLogUsable "1" 0 vega_reason_done_${ID}
+  ClearErrors
+  FileOpen $2 "$COMMONPROGRAMDATA\Vega\logs\setup.log" r
+  IfErrors vega_reason_done_${ID} 0
+  FileSeek $2 $vegaLogOffset SET
+  IfErrors vega_reason_close_${ID} 0
+vega_reason_loop_${ID}:
+    ClearErrors
+    FileRead $2 $3
+    IfErrors vega_reason_close_${ID} 0
+    StrCmp $3 "" vega_reason_close_${ID}
+    StrCpy $4 $3 5
+    StrCmp $4 "WARN " 0 vega_reason_loop_${ID}
+      StrCpy $vegaDegradedReason $3
+      Goto vega_reason_loop_${ID}
+vega_reason_close_${ID}:
+  FileClose $2
+  StrCmp $vegaDegradedReason "" vega_reason_done_${ID}
+vega_reason_trim_${ID}:
+  ; FileRead 带回行尾 CR/LF，去掉再拼完成页。
+  StrCpy $4 $vegaDegradedReason 1 -1
+  StrCmp $4 "$\r" vega_reason_trim_one_${ID}
+  StrCmp $4 "$\n" vega_reason_trim_one_${ID}
+  Goto vega_reason_done_${ID}
+vega_reason_trim_one_${ID}:
+  StrCpy $vegaDegradedReason $vegaDegradedReason -1
+  Goto vega_reason_trim_${ID}
+vega_reason_done_${ID}:
 !macroend
 
 ; P1-1（t3-fix4）：交互用户上下文只解析一次，并以 ASCII Base64(UTF-8) 传一串，
@@ -130,6 +184,8 @@ vega_log_arg_done_${ID}:
   !insertmacro VegaSelectPowerShell install
   !insertmacro VegaPrepareLogDirectory install
   !insertmacro VegaSelectLogArgument install
+  ; 先记日志偏移，后面退出码 2 只扫本次运行写的 WARN。
+  !insertmacro VegaRememberLogOffset install
   !insertmacro VegaResolveInteractiveUser install
 
   DetailPrint "正在安装并配置 RustDesk（自建中继）…"
@@ -150,12 +206,24 @@ vega_log_arg_done_${ID}:
 vega_install_log_done:
   !insertmacro VegaAppendSetupLog install
 
-  ; 退出码 2 = 服务级已写入、用户级降级；不能当成失败，也不能当成完整成功。
+  ; 退出码 2 = 降级（成功但只写了一处配置，或服务未注册且 RustDesk 正在运行而未写配置）；
+  ; 不能当成失败，也不能当成完整成功。
   StrCmp $0 "0" vega_install_finish_done
   StrCmp $0 "2" vega_install_degraded 0
   Goto vega_install_failed
 vega_install_degraded:
-    StrCpy $vegaFinishText "$(MUI_TEXT_FINISH_INFO_TEXT)$\r$\n$\r$\nRustDesk 已写入服务级中继配置，但用户级配置未写入（未取到可用的交互用户或写入失败）。请在该用户的 RustDesk 设置 → 网络中填写服务器地址与公钥。"
+    ; t3-fix7 P1：完成页只显示脚本给的具体原因（日志里最后一条 WARN），
+    ; 不再笼统地宣称“服务级已写入”——降级可能是服务未注册、用户级写入失败，
+    ; 也可能是一行配置都没写（RustDesk 还在运行时降级停止）。
+    !insertmacro VegaReadDegradedReason install
+    StrCmp $vegaDegradedReason "" 0 vega_install_degraded_text
+      StrCpy $vegaDegradedReason "RustDesk 中继配置没有完全生效（原因未记录，详见 $COMMONPROGRAMDATA\Vega\logs\setup.log）。"
+      Goto vega_install_degraded_show
+vega_install_degraded_text:
+    StrCpy $vegaDegradedReason "RustDesk 中继配置没有完全生效：$vegaDegradedReason"
+vega_install_degraded_show:
+    StrCpy $vegaFinishText "$(MUI_TEXT_FINISH_INFO_TEXT)$\r$\n$\r$\n$vegaDegradedReason"
+    DetailPrint "RustDesk 中继配置降级（退出码 2）：$vegaDegradedReason"
     Goto vega_install_finish_done
 vega_install_failed:
     ; 不 Abort：RustDesk 没装好也要把 Vega 装完，用户可以在控制台里按提示重试。
