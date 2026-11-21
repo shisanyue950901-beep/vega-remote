@@ -58,6 +58,27 @@
   - 旧清单 `RustDesk.RustDesk` 包按已下线处理：提示手动卸载、销账后继续回滚；host/client 各有 Pester 覆盖
 - 安装包冒烟测试仍延后：CI 继续只跑 `tauri build --no-bundle`，待总控另行安排
 
+## T3 一键安装包（v0.6，Vega-Setup.exe）
+- 打包：`console/src-tauri/tauri.conf.json` 的 `bundle.targets` 改为 `["nsis"]`，`installMode = "perMachine"`（启动时 UAC 提权一次），
+  `languages = ["SimpChinese"]`、`displayLanguageSelector = false`；CI 重命名为 `Vega-Setup.exe` 并上传 artifact `vega-setup-windows` ✅
+- 默认中继：`console/src-tauri/resources/vega-defaults.json`（公开信息，可入库）随安装包作为 resources 打入；
+  host 脚本与 `Vega.Common.psm1` 也随包打成 `resources\host\`。fork 者改这个 JSON 即可换成自己的服务器 ✅
+- NSIS 钩子：`console/src-tauri/windows/hooks.nsh` 的 `NSIS_HOOK_POSTINSTALL` 隐藏窗口跑 `install-rustdesk.ps1`，
+  退出码写 `%ProgramData%\Vega\logs\setup.log`；脚本失败不阻断安装，只在完成时提示到 Vega 手动安装；
+  `NSIS_HOOK_PREUNINSTALL` 调 `-Uninstall` 按 state.json 回滚 ✅
+- `host/install-rustdesk.ps1`：AGPL 约束下不打包 RustDesk 二进制，固定官方 GitHub Release 版本下载并校验 SHA256
+  （当前是占位常量，发布前必须由架构师填），超时 120 秒、下载最多 2 次；已装跳过、`--silent-install`、等服务出现；
+  复用 T2 的 `RustDesk2.toml` ACL/原子写入逻辑，同时写当前用户与 LocalService 两处配置，并在 host-state.json 记录安装归属 ✅
+- 架构决策更新：旧「不做应用内提权」改为「安装包启动时 UAC 提权一次」；Vega 控制台运行时仍不提权，
+  对 RustDesk 网络配置仍只读，设置页新增只读的「默认中继」比对提示 ✅
+- 测试：`tests/Vega.InstallRustDesk.Tests.ps1` 覆盖哈希不匹配中止、已安装跳过、下载失败非零、双路径写配置、state.json 记录与回滚 ✅
+
+## Backlog（T3 记录）
+- `server/setup-rustdesk-server.sh` 的 `detect_public_ip` 在阿里云回落成 VPC 内网 IP：先查元数据
+  `100.100.100.200/latest/meta-data/eipv4`，对 RFC1918 结果打印警告 ✅ 已修（T3）
+- `Get-VegaRustDeskRelease` 的 SHA256 仍是全 0 占位常量：发布前必须由架构师填真实值，否则安装包会走
+  「RustDesk 未装好」提示分支（这是有意的安全默认值）。
+
 ## M3 进阶（v1.0）
 - 虚拟显示器自动安装（无显示器被控端）
 - 多设备管理面板、RustDesk 中继一键迁移国内 VPS
