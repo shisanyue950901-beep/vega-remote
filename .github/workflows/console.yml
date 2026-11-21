@@ -54,3 +54,11 @@ jobs:
       # 上面已生成 ../dist，cargo test 的 build.rs（generate_context!）才有前端资源可用。
       - name: Rust 单元测试
         run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: 上传控制台 exe（供真机试跑）
+        uses: actions/upload-artifact@v4
+        with:
+          name: vega-console-windows
+          path: console/src-tauri/target/release/vega-console.exe
+          if-no-files-found: error
+          retention-days: 14
