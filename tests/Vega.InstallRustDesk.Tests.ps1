@@ -454,6 +454,84 @@ key = "$script:Key"
         Should -Invoke -CommandName Uninstall-VegaRustDeskRecorded -ModuleName $script:ModuleName -Times 0 -Exactly
         @((Read-VegaState -Path $statePath).RustDeskInstalls).Count | Should -Be 1
     }
+
+    It 'P2d：-ServiceStatePath 传到回滚，服务模式清单里的键也真的恢复' {
+        $hostStatePath = Join-Path $TestDrive ('nosuch-' + [guid]::NewGuid().ToString('N') + '.json')
+        $serviceStatePath = Join-Path $TestDrive ('svc-' + [guid]::NewGuid().ToString('N') + '.json')
+        $serviceConfig = Join-Path $TestDrive ('svc-' + [guid]::NewGuid().ToString('N') + '/RustDesk/config/RustDesk2.toml')
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $serviceConfig) -Force
+        Set-Content -LiteralPath $serviceConfig -Encoding UTF8 -NoNewline -Value @"
+[options]
+custom-rendezvous-server = "60.205.95.98"
+relay-server = "relay.example.com:21117"
+key = "$script:Key"
+"@
+
+        $state = Get-VegaEmptyState
+        $state.RustDeskConfigKeys = @(
+            [pscustomobject]@{ Path = $serviceConfig; Key = 'custom-rendezvous-server'; Existed = $true; OriginalValue = 'old.example.com'; Restored = $false }
+            [pscustomobject]@{ Path = $serviceConfig; Key = 'relay-server'; Existed = $false; OriginalValue = ''; Restored = $false }
+            [pscustomobject]@{ Path = $serviceConfig; Key = 'key'; Existed = $false; OriginalValue = ''; Restored = $false }
+        )
+        $null = Save-VegaState -State $state -Path $serviceStatePath
+
+        $result = Invoke-VegaRustDeskRollback -HostStatePath $hostStatePath -ServiceStatePath $serviceStatePath -KeepRustDesk -Confirm:$false
+        $result.Success | Should -BeTrue
+
+        $text = Get-Content -LiteralPath $serviceConfig -Raw -Encoding UTF8
+        $text | Should -Match 'custom-rendezvous-server = "old\.example\.com"'
+        $text | Should -Not -Match 'relay-server'
+        $text | Should -Not -Match ([regex]::Escape($script:Key))
+    }
+}
+
+Describe 'install-rustdesk.ps1 入口（真实子进程）' {
+    It '打包资源路径与 tauri.conf.json / hooks.nsh 一致' {
+        $repo = Join-Path $PSScriptRoot '..'
+        $conf = Get-Content -LiteralPath (Join-Path (Join-Path $repo 'console/src-tauri') 'tauri.conf.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+        $resources = $conf.bundle.resources
+        $resources.'../../host/install-rustdesk.ps1' | Should -Be 'resources/host/install-rustdesk.ps1'
+        $resources.'../../host/lib/Vega.Common.psm1' | Should -Be 'resources/host/lib/Vega.Common.psm1'
+        $resources.'resources/vega-defaults.json' | Should -Be 'resources/vega-defaults.json'
+
+        $hooks = Get-Content -LiteralPath (Join-Path (Join-Path $repo 'console/src-tauri/windows') 'hooks.nsh') -Raw -Encoding UTF8
+        $hooks | Should -Match '\$INSTDIR\\resources\\host\\install-rustdesk\.ps1'
+        $hooks | Should -Match '\$INSTDIR\\resources\\vega-defaults\.json'
+        $hooks | Should -Not -Match '\$INSTDIR\\host\\'
+    }
+
+    It '入口脚本在子进程里以真实退出码报告失败' -Skip:($env:OS -ne 'Windows_NT') {
+        if (-not (Test-VegaProcessElevated)) {
+            Set-ItResult -Skipped -Because '入口脚本要求管理员权限，CI 需要提权运行'
+            return
+        }
+        $package = Join-Path $TestDrive ('pkg-' + [guid]::NewGuid().ToString('N'))
+        $libDir = Join-Path $package 'lib'
+        $null = New-Item -ItemType Directory -Path $libDir -Force
+        Copy-Item -LiteralPath (Join-Path (Join-Path $PSScriptRoot '..') 'host/install-rustdesk.ps1') -Destination $package
+        Copy-Item -LiteralPath (Join-Path (Join-Path (PSScriptRoot) '..') 'host/lib/Vega.Common.psm1') -Destination $libDir
+
+        $defaults = Join-Path $package 'bad-defaults.json'
+        Set-Content -LiteralPath $defaults -Value '{ not json' -Encoding UTF8
+        $log = Join-Path $package 'setup.log'
+        $statePath = Join-Path $package 'host-state.json'
+        $serviceStatePath = Join-Path $package 'state.json'
+
+        $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $arguments = @(
+            '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+            '-File', (Join-Path $package 'install-rustdesk.ps1'),
+            '-DefaultsFile', $defaults, '-LogFile', $log,
+            '-StatePath', $statePath, '-ServiceStatePath', $serviceStatePath
+        )
+        $output = & $ps @arguments 2>&1
+        $code = $LASTEXITCODE
+        Write-Host ($output | Out-String)
+
+        $code | Should -Be 1
+        (Get-Content -LiteralPath $log -Raw -Encoding UTF8) | Should -Match 'FAIL'
+        Test-Path -LiteralPath $serviceStatePath | Should -BeFalse
+    }
 }
 
 Describe 'install-rustdesk.ps1 静态约束' {
