@@ -1133,7 +1133,8 @@ Describe 'P1-2 / P1-4 / P1-5 / P1-8 安装包钩子静态约束' {
 
     It 't3-fix7 P1 完成页按退出码 2 显示本次运行最后一条 WARN，不再写死“服务级已写入”' {
         $script:Hooks | Should -Not -Match '服务级中继配置，但用户级配置未写入'
-        $script:Hooks | Should -Not -Match '服务级已写入'
+        # 文案赋值里不能再宣称“服务级已写入”（注释里说明“不写死”是允许的）。
+        $script:Hooks | Should -Not -Match 'StrCpy \$vegaFinishText[^\r\n]*服务级已写入'
         $script:Hooks | Should -Match 'VegaRememberLogOffset'
         $script:Hooks | Should -Match 'VegaReadDegradedReason'
         # 只从调用前记下的偏移开始扫，避免把上一次运行的 WARN 当成原因。
