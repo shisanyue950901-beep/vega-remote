@@ -447,7 +447,6 @@ Describe 'Invoke-VegaRustDeskBootstrap' {
         $result.Error | Should -Match '服务'
         Test-Path -LiteralPath $script:serviceConfig | Should -BeFalse
     }
-}
 
     It 'P1-5 钩子传来的交互用户 SID + AppData 决定用户级写入路径' {
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
@@ -494,6 +493,7 @@ Describe 'Invoke-VegaRustDeskBootstrap' {
         $serviceState.RustDeskUserConfig.PromptPending | Should -BeTrue
         ($result.Messages -join "`n") | Should -Match '完成页'
     }
+}
 
 Describe 'Invoke-VegaRustDeskRollback' {
     BeforeEach {
