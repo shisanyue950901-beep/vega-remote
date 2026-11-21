@@ -196,12 +196,15 @@ try {
     if ($result.Degraded) {
         Write-Host 'RustDesk 已写入服务级自建中继配置；用户级配置未写入（已降级），请在完成页按提示手动处理。' -ForegroundColor Yellow
         Write-VegaLog '完成（降级：用户级配置未写入）'
-        exit 2
+    }
+    else {
+        Write-Host 'RustDesk 已安装并写入自建中继配置。' -ForegroundColor Green
+        Write-VegaLog '完成'
     }
 
-    Write-Host 'RustDesk 已安装并写入自建中继配置。' -ForegroundColor Green
-    Write-VegaLog '完成'
-    exit 0
+    # t3-fix5 P3：模块已经给出与语义一致的退出码（0 = 完整，2 = 降级），入口直接透传，
+    # 不再由一个分支写 2、另一个分支写 0 各说各话。
+    exit $result.ExitCode
 }
 catch {
     Write-Host $_.Exception.Message -ForegroundColor Red

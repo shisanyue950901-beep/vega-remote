@@ -6741,11 +6741,14 @@ function Invoke-VegaRustDeskBootstrap {
         3. 没装 RustDesk 才在受信随机目录里下载（校验 SHA256，句柄保护到启动，P1-3），
            静默安装后确认新 EXE 与服务就绪（P1-5），并立刻记录安装归属（P1-6）；
         4. 用钩子解析好的交互用户（SID + Roaming AppData）同时写用户级与服务级
-           RustDesk2.toml，两处都回读一致才算成功（P1-5）；取不到用户上下文时退回
-           只写服务级，并在完成页提示；
+           RustDesk2.toml（P1-5）。成功判定只要求**服务级**写入并回读一致：用户级
+           路径读/写失败或取不到用户上下文时只降级（Degraded=$true、ExitCode=2），
+           不再把整单安装判成失败（t3-fix5 P1-2）；
         5. 把该用户的 SID / AppData / 配置路径与是否已写入记进 state.json，回滚按 SID 走同一路径；
         6. 重启运行中的服务并确认 Running（P1-5）。
       任何一步失败都返回 Success=$false（ExitCode=1），由调用方提示但不阻断安装。
+      降级（服务级成功、用户级未写）返回 Success=$true、Degraded=$true、ExitCode=2，
+      与入口脚本的进程退出码一致（t3-fix5 P3）。
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -7015,7 +7018,8 @@ function Invoke-VegaRustDeskBootstrap {
 
         return [pscustomobject]@{
             Success    = $true
-            ExitCode   = 0
+            # t3-fix5 P3：降级也用 2，与入口脚本的进程退出码保持同一语义。
+            ExitCode   = $(if ($degraded) { 2 } else { 0 })
             Installed  = $installedByVega
             Configured = $true
             Degraded   = [bool]$degraded
