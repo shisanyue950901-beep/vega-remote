@@ -5739,8 +5739,11 @@ function Invoke-VegaRustDeskBootstrap {
 
     try {
         $state = Read-VegaState -Path $HostStatePath
+        # 安装阶段两处配置都要覆盖：服务还没注册时也先写 LocalService 路径，
+        # 避免首次以服务模式启动时又用回官方默认服务器。
         $config = Set-VegaRustDeskConfig -Server $defaults.IdServer -Key $defaults.Key -RelayServer $defaults.RelayServer `
-            -State $state -StatePath $HostStatePath -UserConfigPath $UserConfigPath -ServiceConfigPath $ServiceConfigPath -Confirm:$false
+            -State $state -StatePath $HostStatePath -UserConfigPath $UserConfigPath -ServiceConfigPath $ServiceConfigPath `
+            -ForceService -Confirm:$false
         $state = $config.State
         foreach ($warning in @($config.Warnings)) { $messages.Add([string]$warning) }
 
