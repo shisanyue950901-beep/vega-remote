@@ -7051,8 +7051,9 @@ function Invoke-VegaRustDeskBootstrap {
             [string]$Message,
             [bool]$Installed = $false,
             [bool]$Configured = $false,
-            # t3-fix7 P1：降级停止用 ExitCode=2（与成功降级同一语义），日志记 WARN，
-            # 安装包完成页据此显示具体原因而不是笼统的失败文案。
+            # t3-fix7 P1：降级停止用 ExitCode=2（与成功降级同一语义），日志记 WARN。
+            # t3-fix9 P3：完成页的原因来源是入口脚本写进 -ResultFile 的那一行（钩子优先
+            # 读取它，缺失时才显示固定重跑指引）；这里只把原因放进 Error / 日志，不拼文案。
             [int]$ExitCode = 1,
             [bool]$Degraded = $false
         )
