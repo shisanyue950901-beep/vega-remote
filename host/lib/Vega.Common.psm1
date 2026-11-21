@@ -4850,26 +4850,27 @@ function Set-VegaRustDeskConfig {
         if (-not $PSCmdlet.ShouldProcess($target, '写入 RustDesk 中继配置')) { continue }
 
         try {
+            # P1-6：改文件前先把可恢复基线落盘。这样即使写入成功但进程被杀、
+            # 或回读失败抛异常，清单里也有原值，卸载/重跑都能回滚。
+            if ($null -ne $targetState -and $null -ne $changed -and $changed.Count -gt 0) {
+                $targetState = Add-VegaStateRustDeskKey -State $targetState -Path $target -Snapshot $changed
+                if (-not [string]::IsNullOrWhiteSpace($targetStatePath)) {
+                    $null = Save-VegaState -State $targetState -Path $targetStatePath
+                    # 服务模式记录写的是独立管理员清单，不要把调用方的 State 换成它。
+                    if (-not $isServiceTarget -or [string]::Equals($targetStatePath, $StatePath, [StringComparison]::OrdinalIgnoreCase)) {
+                        $State = $targetState
+                    }
+                }
+            }
+
             $null = Write-VegaTextFileAtomic -Path $target -Text $merged
 
-            # 回读确认：三个键都真的落到文件里，才把记录标记为待回滚。
+            # 回读确认：三个键都真的落到文件里；不一致就抛错，基线仍保留在清单里。
             $verifyText = Get-Content -LiteralPath $target -Raw -Encoding UTF8
             $verified = ConvertFrom-VegaRustDeskConfigText -Text $verifyText
             foreach ($managedKey in $managedKeys) {
                 if (-not $verified.Contains($managedKey) -or -not [string]::Equals([string]$verified[$managedKey], [string]$values[$managedKey], [StringComparison]::Ordinal)) {
                     throw "回读 $target 时 $managedKey 与写入值不一致"
-                }
-            }
-
-            # 回读通过后才登记并保存待回滚记录。
-            if ($null -ne $targetState -and $null -ne $changed -and $changed.Count -gt 0) {
-                $targetState = Add-VegaStateRustDeskKey -State $targetState -Path $target -Snapshot $changed
-            }
-            if ($null -ne $targetState -and -not [string]::IsNullOrWhiteSpace($targetStatePath)) {
-                $null = Save-VegaState -State $targetState -Path $targetStatePath
-                # 服务模式记录写的是独立管理员清单，不要把调用方的 State 换成它。
-                if (-not $isServiceTarget -or [string]::Equals($targetStatePath, $StatePath, [StringComparison]::OrdinalIgnoreCase)) {
-                    $State = $targetState
                 }
             }
 
