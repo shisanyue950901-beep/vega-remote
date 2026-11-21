@@ -129,7 +129,20 @@ case "$url" in
 esac
 exit 0
 MOCK
-chmod +x "$mock_dir/curl"
+cat > "$mock_dir/ip" <<'MOCK'
+#!/usr/bin/env bash
+# 模拟 `ip -4 route get 1.1.1.1`：只输出带 src 的一行。
+if [[ -n "${FAKE_ROUTE_IP:-}" ]]; then
+  printf '1.1.1.1 via 10.0.0.1 dev eth0 src %s uid 0\n' "$FAKE_ROUTE_IP"
+fi
+MOCK
+cat > "$mock_dir/hostname" <<'MOCK'
+#!/usr/bin/env bash
+if [[ -n "${FAKE_HOSTNAME_IP:-}" ]]; then
+  printf '%s\n' "$FAKE_HOSTNAME_IP"
+fi
+MOCK
+chmod +x "$mock_dir/curl" "$mock_dir/ip" "$mock_dir/hostname"
 old_path="$PATH"
 export PATH="$mock_dir:$PATH"
 
@@ -216,6 +229,35 @@ fi
 if warn_if_private_ipv4 203.0.113.9 >/dev/null 2>&1; then
   fail "公网地址不应打印内网警告"
 fi
+
+# 8) 路由 / hostname 回退：CGNAT、回环、组播等必须丢弃；RFC1918 保留给调用方告警。
+for bogus in 100.64.1.2 100.127.255.254 127.0.0.1 169.254.10.20 224.0.0.1 0.0.0.0 010.1.2.3; do
+  got=$(FAKE_CURL_MODE=token-fail FAKE_ROUTE_IP="$bogus" FAKE_HOSTNAME_IP="$bogus" run_probe)
+  if [[ -n "$got" ]]; then
+    fail "回退地址 $bogus 必须被丢弃，实际输出：$got"
+  fi
+done
+
+got=$(FAKE_CURL_MODE=token-fail FAKE_ROUTE_IP=172.20.5.6 run_probe)
+if [[ "$got" != "172.20.5.6" ]]; then
+  fail "路由回退的 RFC1918 地址应保留（由调用方告警），实际：$got"
+fi
+got=$(FAKE_CURL_MODE=token-fail FAKE_ROUTE_IP=203.0.113.9 run_probe)
+if [[ "$got" != "203.0.113.9" ]]; then
+  fail "路由回退的公网地址应保留，实际：$got"
+fi
+# hostname 回退同理。
+got=$(FAKE_CURL_MODE=token-fail FAKE_HOSTNAME_IP=198.51.100.7 run_probe)
+if [[ "$got" != "198.51.100.7" ]]; then
+  fail "hostname 回退的公网地址应保留，实际：$got"
+fi
+
+# 分类函数直接断言。
+[[ "$(classify_detected_ipv4 192.168.1.10)" == "private" ]] || fail 'classify: RFC1918 应为 private'
+[[ "$(classify_detected_ipv4 100.64.0.1)" == "discard" ]] || fail 'classify: CGNAT 应为 discard'
+[[ "$(classify_detected_ipv4 127.0.0.1)" == "discard" ]] || fail 'classify: 回环应为 discard'
+[[ "$(classify_detected_ipv4 239.1.2.3)" == "discard" ]] || fail 'classify: 组播应为 discard'
+[[ "$(classify_detected_ipv4 8.8.8.8)" == "public" ]] || fail 'classify: 公网应为 public'
 
 export PATH="$old_path"
 
