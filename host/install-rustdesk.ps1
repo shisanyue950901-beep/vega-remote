@@ -13,12 +13,15 @@
     - 未装时从官方 GitHub Release 下载固定版本（AGPL：不内嵌二进制），
       校验 SHA256 后以 --silent-install 静默安装，等待 RustDesk 服务出现；
     - 复用 Vega.Common 里 T2 的 RustDesk2.toml 写入逻辑（ACL 校验、原子写入），
-      当前用户与 LocalService 两处配置都写；
+      只写 LocalService 服务级配置：安装包可能由另一个管理员账户提权运行，进程里的
+      %APPDATA% 不是发起安装的用户。用户级配置由控制台首次启动时按 state.json 记录的
+      SID 提示写入；
     - 若这次是 Vega 装的，把安装记录写进 host-state.json，卸载时据此回滚。
 
   回滚（-Uninstall）：
     - 只按 state.json / host-state.json 里的记录恢复受管键；
-    - 安装记录标明 InstalledByVega 时连带卸载 RustDesk；-KeepRustDesk 可保留。
+    - 只卸载本次由 Vega 安装、且 state.json 记录了安装路径的 RustDesk；
+      -KeepRustDesk 可保留，卸载失败时保留记录作为重试入口。
 
   脚本失败不会让 Vega 安装失败：NSIS 钩子只提示用户到 Vega 里手动安装。
 

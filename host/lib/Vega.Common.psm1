@@ -868,6 +868,8 @@ function Get-VegaEmptyState {
         ManagedConfigKeys     = @()
         RustDeskConfigKeys    = @()
         RustDeskInstalls      = @()
+        # 安装时记录"发起安装的登录用户"，控制台首次启动据此提示配置用户级中继。
+        RustDeskUserConfig    = $null
     }
 }
 
@@ -924,6 +926,7 @@ function Read-VegaState {
     foreach ($name in @('Packages', 'FirewallRules', 'DisabledFirewallRules', 'Services', 'ManagedConfigKeys', 'RustDeskConfigKeys', 'RustDeskInstalls')) {
         if ($properties -contains $name) { $state.$name = @($data.$name) }
     }
+    if ($properties -contains 'RustDeskUserConfig') { $state.RustDeskUserConfig = $data.RustDeskUserConfig }
 
     return $state
 }
@@ -1676,6 +1679,35 @@ function Remove-VegaStateRustDeskInstall {
     $State.RustDeskInstalls = @(@($State.RustDeskInstalls) | Where-Object {
             $null -ne $_ -and [string]($_.Path) -ne $Path
         })
+    return $State
+}
+
+function Set-VegaStateRustDeskUserConfig {
+    <#
+      P1-8：安装包在 NSIS 里拿不到可靠的“发起安装用户”上下文时，只写服务级配置，
+      把发起用户的 SID 与实际用户级配置路径记进机器级 state.json。
+      控制台首次以该用户启动时据此提示一次，用户确认后再写自己的 RustDesk2.toml。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $State,
+
+        [AllowEmptyString()]
+        [string]$Sid = '',
+
+        [AllowEmptyString()]
+        [string]$Path = '',
+
+        [bool]$PromptPending = $true
+    )
+
+    $State.RustDeskUserConfig = [pscustomobject]@{
+        Sid           = $Sid
+        Path          = $Path
+        PromptPending = $PromptPending
+        RecordedAt    = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    }
     return $State
 }
 
@@ -3819,6 +3851,60 @@ function Get-VegaDoctorAdvice {
 #   - 首次写前把这三个键的原值记进状态清单，卸载按键回滚。
 #   - 不接收、不记录任何密码：固定密码由用户在 RustDesk 界面自己设。
 
+function Get-VegaInteractiveUserContext {
+    <#
+      P1-8：perMachine 安装包可能以“另一个管理员账户”提权运行，此时进程的 %APPDATA%
+      属于提权账户而不是发起安装的用户。这里尽力拿到控制台登录用户的 SID 与用户级
+      配置路径；拿不到就返回空 SID，调用方只记“需要控制台首次启动时提示”。
+      只在 Windows 上取；任何一步失败都返回结构完整的空值，不抛异常。
+    #>
+    [CmdletBinding()]
+    param()
+
+    $name = ''
+    $sid = ''
+    $configPath = ''
+    $systemDrive = $env:SystemDrive
+    if ([string]::IsNullOrWhiteSpace($systemDrive)) { $systemDrive = 'C:' }
+
+    if (Test-VegaWindowsPlatform) {
+        try {
+            $computer = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+            $name = [string]$computer.UserName
+        }
+        catch {
+            $name = ''
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($name)) {
+        # 兜底：当前进程账户。至少不会记录一个空名字。
+        $name = [string]$env:USERNAME
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($name)) {
+        try {
+            $account = New-Object System.Security.Principal.NTAccount($name)
+            $sid = $account.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        }
+        catch {
+            $sid = ''
+        }
+
+        $leaf = $name
+        $separator = $leaf.LastIndexOf('\')
+        if ($separator -ge 0 -and $separator -lt ($leaf.Length - 1)) { $leaf = $leaf.Substring($separator + 1) }
+        if (-not [string]::IsNullOrWhiteSpace($leaf) -and $leaf -notmatch '[\\/]') {
+            $configPath = Join-Path $systemDrive ("Users\{0}\AppData\Roaming\RustDesk\config\RustDesk2.toml" -f $leaf)
+        }
+    }
+
+    return [pscustomobject]@{
+        Name           = $name
+        Sid            = $sid
+        UserConfigPath = $configPath
+    }
+}
+
 function Get-VegaRustDeskConfigPath {
     <#
       当前用户与服务模式（LocalService）的 RustDesk2.toml 路径。
@@ -4635,6 +4721,9 @@ function Get-VegaRustDeskConfigSummary {
 function Set-VegaRustDeskConfig {
     <#
       写 RustDesk2.toml：当前用户路径总是写；RustDesk 服务存在时也写服务模式路径。
+      -ServiceOnly（安装包使用）：只写 LocalService 服务级配置。安装包由另一个管理员账户
+      提权运行时，进程的 %APPDATA% 不是发起安装的用户，写用户级配置会记错 SID 和路径；
+      用户级配置改由控制台首次启动时按 state.json 里的 SID 提示写入。
       当前用户路径的记录写调用方给的清单（host-state / client-state）；
       LocalService 路径的记录只写管理员清单 %ProgramData%\Vega\state.json。
       只为实际变化的键登记基线，写入并回读确认后才保存（标记为待回滚）。
@@ -4666,7 +4755,9 @@ function Set-VegaRustDeskConfig {
         [AllowEmptyString()]
         [string]$RelayServer = '',
 
-        [switch]$ForceService
+        [switch]$ForceService,
+
+        [switch]$ServiceOnly
     )
 
     $endpoint = ConvertFrom-VegaRustDeskServerEndpoint -Server $Server
@@ -4697,8 +4788,8 @@ function Set-VegaRustDeskConfig {
     $servicePresent = ($null -ne $service)
 
     $targets = New-Object System.Collections.Generic.List[string]
-    $targets.Add($UserConfigPath)
-    if ($servicePresent -or $ForceService) {
+    if (-not $ServiceOnly) { $targets.Add($UserConfigPath) }
+    if ($servicePresent -or $ForceService -or $ServiceOnly) {
         if ($ServiceConfigPath -ne $UserConfigPath) { $targets.Add($ServiceConfigPath) }
     }
 
@@ -5033,30 +5124,31 @@ function Restart-VegaRustDeskService {
 
     $service = Get-Service -Name 'RustDesk' -ErrorAction SilentlyContinue
     if ($null -eq $service) {
-        return [pscustomobject]@{ Found = $false; Restarted = $false; Status = ''; Message = '未找到 RustDesk 服务，跳过重启' }
+        return [pscustomobject]@{ Found = $false; WasRunning = $false; Restarted = $false; Status = ''; Message = '未找到 RustDesk 服务，跳过重启' }
     }
 
     if ([string]$service.Status -ne 'Running') {
-        return [pscustomobject]@{ Found = $true; Restarted = $false; Status = [string]$service.Status; Message = "RustDesk 服务未运行（$($service.Status)），跳过重启" }
+        return [pscustomobject]@{ Found = $true; WasRunning = $false; Restarted = $false; Status = [string]$service.Status; Message = "RustDesk 服务未运行（$($service.Status)），跳过重启" }
     }
 
     if (-not $PSCmdlet.ShouldProcess('RustDesk', '重启 RustDesk 服务')) {
-        return [pscustomobject]@{ Found = $true; Restarted = $false; Status = 'Running'; Message = '已跳过（WhatIf）' }
+        return [pscustomobject]@{ Found = $true; WasRunning = $true; Restarted = $false; Status = 'Running'; Message = '已跳过（WhatIf）' }
     }
 
     try {
         Restart-Service -Name 'RustDesk' -Force -ErrorAction Stop
     }
     catch {
-        return [pscustomobject]@{ Found = $true; Restarted = $false; Status = [string]$service.Status; Message = "重启 RustDesk 服务失败：$($_.Exception.Message)" }
+        return [pscustomobject]@{ Found = $true; WasRunning = $true; Restarted = $false; Status = [string]$service.Status; Message = "重启 RustDesk 服务失败：$($_.Exception.Message)" }
     }
 
     $current = Get-Service -Name 'RustDesk' -ErrorAction SilentlyContinue
     $status = ''
     if ($null -ne $current) { $status = [string]$current.Status }
     return [pscustomobject]@{
-        Found     = $true
-        Restarted = ($status -eq 'Running')
+        Found      = $true
+        WasRunning = $true
+        Restarted  = ($status -eq 'Running')
         Status    = $status
         Message   = $(if ($status -eq 'Running') { 'RustDesk 服务已重启' } else { "RustDesk 服务状态是 $status，不是 Running" })
     }
@@ -5367,12 +5459,208 @@ function Get-VegaRustDeskRelease {
     }
 }
 
+function New-VegaSecureDirectory {
+    <#
+      P1-3：在受信父目录下原子创建仅 Administrators/SYSTEM 可写的随机目录。
+      - 目录名是 GUID，冲突时 New-Item 直接失败，不覆盖已有内容；
+      - 拒绝父路径/新目录是重解析点，避免提权写入被重定向到用户可写位置；
+      - 所有者不是 Administrators/SYSTEM 时拒绝使用。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Parent
+    )
+
+    if (-not (Test-Path -LiteralPath $Parent)) {
+        try { $null = New-Item -ItemType Directory -Path $Parent -Force -ErrorAction Stop }
+        catch { throw "无法创建受信父目录：$Parent（$($_.Exception.Message)）" }
+    }
+    if (Test-VegaReparsePoint -Path $Parent) { throw "下载目录父路径是重解析点，拒绝使用：$Parent" }
+
+    $directory = Join-Path $Parent ('dl-' + [System.Guid]::NewGuid().ToString('N'))
+    try {
+        # -Force 会把“已存在”吞掉，这里不能用：GUID 撞名就说明有人在抢先放东西。
+        $null = New-Item -ItemType Directory -Path $directory -ErrorAction Stop
+    }
+    catch {
+        throw "无法创建下载目录：$directory（$($_.Exception.Message)）"
+    }
+
+    if (Test-VegaReparsePoint -Path $directory) { throw "下载目录是重解析点，拒绝使用：$directory" }
+
+    if (-not (Test-VegaWindowsPlatform)) { return $directory }
+
+    try {
+        $administrators = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+        $system = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+
+        $acl = Get-Acl -LiteralPath $directory -ErrorAction Stop
+        $acl.SetAccessRuleProtection($true, $false)
+        foreach ($rule in @($acl.Access)) { $null = $acl.RemoveAccessRule($rule) }
+        foreach ($sid in @($system, $administrators)) {
+            $accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $sid, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')
+            $null = $acl.AddAccessRule($accessRule)
+        }
+        $acl.SetOwner($administrators)
+        Set-Acl -LiteralPath $directory -AclObject $acl -ErrorAction Stop
+    }
+    catch {
+        throw "无法为下载目录设置 Administrators/SYSTEM 专用 ACL：$directory（$($_.Exception.Message)）"
+    }
+
+    $owner = Get-VegaPathOwnerSid -Path $directory
+    if (@('S-1-5-32-544', 'S-1-5-18') -notcontains $owner) {
+        throw "下载目录所有者不是 Administrators/SYSTEM，拒绝使用：$directory"
+    }
+
+    return $directory
+}
+
+function Remove-VegaSecureDirectory {
+    <#
+      P1-3：finally 清理。先释放保护安装包的读句柄，再删目录；删不掉只吞掉错误。
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()]
+        [string]$Path = '',
+
+        [AllowNull()]
+        $Lock = $null
+    )
+
+    if ($null -ne $Lock) {
+        try { $Lock.Dispose() }
+        catch { $null = $_ }
+    }
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    try {
+        if (Test-Path -LiteralPath $Path) {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+        }
+    }
+    catch {
+        $null = $_
+    }
+}
+
+function Enable-VegaTls12 {
+    <#
+      P2b：Windows PowerShell 5.1 默认可能还停在 SSL3/TLS1.0，连不上 GitHub；
+      这里补上 TLS 1.2（不降级、不清空其他已启用协议）。
+    #>
+    [CmdletBinding()]
+    param()
+
+    try {
+        $needed = [System.Net.SecurityProtocolType]::Tls12
+        $current = [System.Net.ServicePointManager]::SecurityProtocol
+        if (($current -band $needed) -ne $needed) {
+            [System.Net.ServicePointManager]::SecurityProtocol = $current -bor $needed
+        }
+    }
+    catch {
+        $null = $_
+    }
+}
+
+function Invoke-VegaHttpsDownload {
+    <#
+      P2b：一次 HTTPS 下载，遵守统一截止时间（含响应体）：
+        - 只接受 https://，重定向也只接受 https://；最多 5 跳；
+        - 每次请求与读流的超时都按剩余时间现算，不会“每个分块重新计时”；
+        - 失败抛异常，由调用方决定重试与报错文案。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Uri,
+
+        [Parameter(Mandatory)]
+        [string]$OutFile,
+
+        [int]$TimeoutSeconds = 120,
+
+        [AllowNull()]
+        [Nullable[datetime]]$Deadline = $null
+    )
+
+    Enable-VegaTls12
+
+    if ($null -eq $Deadline) {
+        $Deadline = [datetime]::UtcNow.AddSeconds([Math]::Max(1, $TimeoutSeconds))
+    }
+
+    try { $current = [uri]$Uri }
+    catch { throw "下载地址无效：$Uri" }
+
+    for ($hop = 0; $hop -lt 5; $hop++) {
+        if ($current.Scheme -ne 'https') { throw "只接受 HTTPS 下载地址（含重定向）：$current" }
+
+        $remainingMs = [int][Math]::Max(0, ($Deadline.Value - [datetime]::UtcNow).TotalMilliseconds)
+        if ($remainingMs -lt 1000) { throw ("下载超时（{0} 秒）" -f $TimeoutSeconds) }
+
+        $request = [System.Net.HttpWebRequest]::Create($current)
+        $request.Method = 'GET'
+        $request.AllowAutoRedirect = $false
+        $request.Timeout = $remainingMs
+        $request.ReadWriteTimeout = $remainingMs
+        $request.UserAgent = 'Vega-Setup'
+
+        $response = $null
+        $stream = $null
+        $file = $null
+        try {
+            try {
+                $response = $request.GetResponse()
+            }
+            catch {
+                throw ("下载失败：{0}" -f $_.Exception.Message)
+            }
+
+            $status = [int]$response.StatusCode
+            if ($status -ge 300 -and $status -lt 400) {
+                $location = [string]$response.Headers['Location']
+                if ([string]::IsNullOrWhiteSpace($location)) { throw "HTTP 重定向没有 Location：$current" }
+                $current = New-Object System.Uri($current, $location)
+                continue
+            }
+            if ($status -ne 200) { throw ("服务器返回 HTTP {0}：{1}" -f $status, $current) }
+
+            $stream = $response.GetResponseStream()
+            $file = [System.IO.File]::Open($OutFile, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            $buffer = New-Object byte[] 81920
+            while ($true) {
+                if ([datetime]::UtcNow -ge $Deadline.Value) { throw ("下载超时（{0} 秒）" -f $TimeoutSeconds) }
+                $read = $stream.Read($buffer, 0, $buffer.Length)
+                if ($read -le 0) { break }
+                $file.Write($buffer, 0, $read)
+            }
+        }
+        finally {
+            if ($null -ne $file) { $file.Dispose() }
+            if ($null -ne $stream) { $stream.Dispose() }
+            if ($null -ne $response) { $response.Dispose() }
+        }
+
+        return
+    }
+
+    throw "重定向次数过多：$Uri"
+}
+
 function Get-VegaRustDeskInstaller {
     <#
       下载固定版本的 Windows x64 安装包并校验 SHA256。
-      - 超时 120 秒，下载失败最多 2 次尝试（不无限重试）。
+      - P1-3：目标目录必须是调用方用 New-VegaSecureDirectory 建的随机目录；
+        下载完成后立即以只读共享打开文件（禁止写/删除），句柄交给调用方，
+        一直保护到进程启动；调用方在 finally 里 Dispose 并删目录。
+      - P2b：整个下载（重定向 + 响应体）共用一个截止时间，最多 2 次尝试；
+        只走 HTTPS，证书校验保持默认开启。
       - 哈希不匹配立即中止，不重试：内容被替换时重试没有意义。
-      返回 { Success, Path, Sha256, Error }。
+      返回 { Success, Path, Sha256, Lock, Error }。
     #>
     [CmdletBinding()]
     param(
@@ -5394,19 +5682,19 @@ function Get-VegaRustDeskInstaller {
             Success = $false
             Path    = ''
             Sha256  = ''
+            Lock    = $null
             Error   = ("RustDesk {0} 安装包的 SHA256 尚未填写（发布前必须由维护者填入真实值）。请到 {1} 手动下载安装。" -f $Release.Version, $Release.Page)
         }
     }
 
-    try {
-        if (-not (Test-Path -LiteralPath $DestinationDirectory)) {
-            $null = New-Item -ItemType Directory -Path $DestinationDirectory -Force
-        }
+    if ([string]::IsNullOrWhiteSpace($DestinationDirectory)) {
+        return [pscustomobject]@{ Success = $false; Path = ''; Sha256 = ''; Lock = $null; Error = '下载目录为空：必须先创建受信随机目录。' }
     }
-    catch {
-        return [pscustomobject]@{ Success = $false; Path = ''; Sha256 = ''; Error = "无法创建下载目录：$($_.Exception.Message)" }
+    if (Test-VegaReparsePoint -Path $DestinationDirectory) {
+        return [pscustomobject]@{ Success = $false; Path = ''; Sha256 = ''; Lock = $null; Error = "下载目录是重解析点，拒绝使用：$DestinationDirectory" }
     }
 
+    $deadline = [datetime]::UtcNow.AddSeconds([Math]::Max(1, $TimeoutSeconds))
     $target = Join-Path $DestinationDirectory ([string]$Release.FileName)
     $lastError = ''
     $attempts = [Math]::Max(1, $MaxAttempts)
@@ -5415,8 +5703,15 @@ function Get-VegaRustDeskInstaller {
         if (Test-Path -LiteralPath $target) {
             Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
         }
+
+        $remaining = [int][Math]::Max(0, ($deadline - [datetime]::UtcNow).TotalSeconds)
+        if ($remaining -lt 1) {
+            $lastError = ("下载超时（{0} 秒）" -f $TimeoutSeconds)
+            break
+        }
+
         try {
-            Invoke-WebRequest -Uri ([string]$Release.Url) -OutFile $target -TimeoutSec $TimeoutSeconds -UseBasicParsing -ErrorAction Stop
+            Invoke-VegaHttpsDownload -Uri ([string]$Release.Url) -OutFile $target -TimeoutSeconds $TimeoutSeconds -Deadline $deadline
         }
         catch {
             $lastError = $_.Exception.Message
@@ -5435,7 +5730,7 @@ function Get-VegaRustDeskInstaller {
         catch {
             $lastError = "计算 SHA256 失败：$($_.Exception.Message)"
             Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
-            return [pscustomobject]@{ Success = $false; Path = ''; Sha256 = ''; Error = $lastError }
+            return [pscustomobject]@{ Success = $false; Path = ''; Sha256 = ''; Lock = $null; Error = $lastError }
         }
 
         if ($actual -ne $expected) {
@@ -5444,17 +5739,33 @@ function Get-VegaRustDeskInstaller {
                 Success = $false
                 Path    = ''
                 Sha256  = $actual
+                Lock    = $null
                 Error   = ("下载的 RustDesk 安装包 SHA256 不匹配（期望 {0}，实际 {1}），已删除并中止。请到 {2} 手动下载安装。" -f $expected, $actual, $Release.Page)
             }
         }
 
-        return [pscustomobject]@{ Success = $true; Path = $target; Sha256 = $actual; Error = '' }
+        # 保护到进程启动：FileShare.Read 只允许别人读，写/删/替换都会失败。
+        $handle = $null
+        try {
+            $handle = [System.IO.File]::Open($target, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        }
+        catch {
+            Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
+            return [pscustomobject]@{ Success = $false; Path = ''; Sha256 = $actual; Lock = $null; Error = "无法锁定已下载的安装包：$($_.Exception.Message)" }
+        }
+
+        return [pscustomobject]@{ Success = $true; Path = $target; Sha256 = $actual; Lock = $handle; Error = '' }
+    }
+
+    if (Test-Path -LiteralPath $target) {
+        Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
     }
 
     return [pscustomobject]@{
         Success = $false
         Path    = ''
         Sha256  = ''
+        Lock    = $null
         Error   = ("下载 RustDesk 安装包失败（已尝试 {0} 次）：{1}。请到 {2} 手动下载安装。" -f $attempts, $lastError, $Release.Page)
     }
 }
@@ -5513,8 +5824,12 @@ function Install-VegaRustDeskSilently {
 
 function Uninstall-VegaRustDeskRecorded {
     <#
-      只卸载 state.json 里标明“由 Vega 安装”的 RustDesk。
-      优先用注册表里的卸载命令（官方安装包自己登记的），找不到就报告需手动卸载。
+      P1-7：只卸载「本次由 Vega 安装、且 state.json 记录了安装路径」的 RustDesk。
+        - 安装记录路径必须在 Program Files / Program Files (x86) 下；
+        - 注册表记录必须 DisplayName 精确等于 RustDesk，且 InstallLocation / DisplayIcon
+          落在记录的安装目录里：不做名称模糊匹配，避免卸错产品；
+        - 直接执行注册表里的卸载程序，不经 cmd /c 二次解释；等待退出并检查退出码；
+        - 卸载后确认记录路径真的不存在才算成功，否则保留记录作为重试入口。
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -5522,7 +5837,22 @@ function Uninstall-VegaRustDeskRecorded {
         $Record
     )
 
-    $displayName = 'RustDesk'
+    $recordedPath = [string]$Record.Path
+    if ([string]::IsNullOrWhiteSpace($recordedPath)) {
+        return [pscustomobject]@{ Success = $false; Message = '安装记录没有路径，保留记录等待人工处理。' }
+    }
+    if (-not (Test-VegaRustDeskProgramFilesPath -Path $recordedPath)) {
+        return [pscustomobject]@{ Success = $false; Message = ("安装记录不在 Program Files 下，拒绝按记录卸载：{0}" -f $recordedPath) }
+    }
+
+    try {
+        $fullRecorded = [System.IO.Path]::GetFullPath($recordedPath)
+        $installDirectory = [System.IO.Path]::GetFullPath((Split-Path -Path $fullRecorded -Parent))
+    }
+    catch {
+        return [pscustomobject]@{ Success = $false; Message = ("安装记录路径无效，拒绝按记录卸载：{0}" -f $recordedPath) }
+    }
+
     $roots = @(
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
         'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
@@ -5533,42 +5863,99 @@ function Uninstall-VegaRustDeskRecorded {
         foreach ($key in @(Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue)) {
             $item = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
             if ($null -eq $item) { continue }
-            if ([string]$item.DisplayName -notmatch $displayName) { continue }
+            # 精确匹配产品名：模糊匹配会把 "RustDesk Server" 之类误当成目标。
+            if ([string]$item.DisplayName -ne 'RustDesk') { continue }
+
+            $belongsToRecord = $false
+            foreach ($candidate in @([string]$item.InstallLocation, [string]$item.DisplayIcon)) {
+                if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+                $candidatePath = $candidate.Trim().Trim('"')
+                # DisplayIcon 常见形式："C:\...\rustdesk.exe,0"
+                if ($candidatePath -match '^(?<path>.+?),\s*-?\d+$') { $candidatePath = $Matches['path'].Trim().Trim('"') }
+                if ([string]::IsNullOrWhiteSpace($candidatePath)) { continue }
+                try { $resolved = [System.IO.Path]::GetFullPath($candidatePath) } catch { continue }
+                $resolvedDirectory = $(if (Test-Path -LiteralPath $resolved -PathType Container) {
+                        $resolved
+                    }
+                    else {
+                        [System.IO.Path]::GetFullPath((Split-Path -Path $resolved -Parent))
+                    })
+                $left = $resolvedDirectory.TrimEnd([char[]]@('\', '/'))
+                $right = $installDirectory.TrimEnd([char[]]@('\', '/'))
+                if ([string]::Equals($left, $right, [StringComparison]::OrdinalIgnoreCase)) { $belongsToRecord = $true }
+            }
+            if (-not $belongsToRecord) { continue }
 
             $command = [string]$item.QuietUninstallString
             if ([string]::IsNullOrWhiteSpace($command)) { $command = [string]$item.UninstallString }
             if ([string]::IsNullOrWhiteSpace($command)) { continue }
-            if (-not $PSCmdlet.ShouldProcess([string]$item.DisplayName, '卸载 RustDesk')) {
+
+            $exe = ''
+            $argsText = ''
+            if ($command -match '^\s*"(?<exe>[^"]+)"\s*(?<args>.*)$') {
+                $exe = [string]$Matches['exe']
+                $argsText = [string]$Matches['args']
+            }
+            elseif ($command -match '^\s*(?<exe>\S+)\s*(?<args>.*)$') {
+                $exe = [string]$Matches['exe']
+                $argsText = [string]$Matches['args']
+            }
+            if ([string]::IsNullOrWhiteSpace($exe)) { continue }
+
+            # 注册表里塞 cmd /c 或 powershell 当作卸载入口：不执行，保留记录。
+            $leaf = ''
+            try { $leaf = [System.IO.Path]::GetFileName($exe) } catch { $leaf = '' }
+            if ($leaf -match '^(?i)(cmd|cmd\.exe|powershell|powershell\.exe|pwsh|pwsh\.exe)$') {
+                return [pscustomobject]@{ Success = $false; Message = ("注册表卸载命令经由 shell 启动，拒绝执行：{0}" -f $command) }
+            }
+
+            if (-not $PSCmdlet.ShouldProcess([string]$item.DisplayName, '卸载本次由 Vega 安装的 RustDesk')) {
                 return [pscustomobject]@{ Success = $true; Message = '已跳过（WhatIf）' }
             }
 
+            $exitCode = -1
             try {
                 $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-                $startInfo.FileName = $env:ComSpec
-                $startInfo.Arguments = '/c ' + $command
+                $startInfo.FileName = $exe
+                $startInfo.Arguments = $argsText.Trim()
                 $startInfo.UseShellExecute = $false
                 $startInfo.CreateNoWindow = $true
                 $process = [System.Diagnostics.Process]::Start($startInfo)
-                $null = $process.WaitForExit(120000)
+                if (-not $process.WaitForExit(120000)) {
+                    try { $process.Kill() } catch { $null = $_ }
+                    return [pscustomobject]@{ Success = $false; Message = 'RustDesk 卸载程序 120 秒未退出，保留安装记录以便重试。' }
+                }
+                $exitCode = [int]$process.ExitCode
             }
             catch {
-                return [pscustomobject]@{ Success = $false; Message = "运行 RustDesk 卸载命令失败：$($_.Exception.Message)" }
+                return [pscustomobject]@{ Success = $false; Message = ("运行 RustDesk 卸载程序失败：{0}" -f $_.Exception.Message) }
             }
-            return [pscustomobject]@{ Success = $true; Message = '已按注册表卸载命令卸载 RustDesk' }
+
+            # 3010 = 需要重启才算完成，按成功处理；其他非 0 一律保留记录。
+            if ($exitCode -ne 0 -and $exitCode -ne 3010) {
+                return [pscustomobject]@{ Success = $false; Message = ("RustDesk 卸载程序退出码 {0}，保留安装记录以便重试。" -f $exitCode) }
+            }
+
+            if (Test-Path -LiteralPath $recordedPath) {
+                return [pscustomobject]@{ Success = $false; Message = ("卸载程序结束，但 {0} 仍存在；保留安装记录以便重试。" -f $recordedPath) }
+            }
+
+            return [pscustomobject]@{ Success = $true; Message = '已卸载本次由 Vega 安装的 RustDesk' }
         }
     }
 
     return [pscustomobject]@{
         Success = $false
-        Message = ("未找到 RustDesk 的卸载命令（记录：{0}），请在「设置 → 应用」中手动卸载。" -f [string]$Record.Path)
+        Message = ("未找到与安装记录匹配的 RustDesk 卸载命令（记录：{0}）；已保留记录，可在「设置 → 应用」手动卸载后重试。" -f $recordedPath)
     }
 }
 
 function Invoke-VegaRustDeskRollback {
     <#
-      安装包卸载时的回滚：只动 Vega 记录过的内容。
-      - 用户与服务两处 RustDesk2.toml 的受管键按基线恢复；
-      - 若清单标明 RustDesk 是 Vega 装的，连带卸载 RustDesk（-KeepRustDesk 可保留）。
+      安装包卸载时的回滚：只动 Vega 记录过的内容，并与安装共用同一把锁（P1-6）。
+      - 用户级与服务级 RustDesk2.toml 的受管键按基线恢复；
+      - 只卸载 state.json 里标明 InstalledByVega、且记录了安装路径的 RustDesk（P1-7）；
+      - 卸载或回滚失败时保留安装记录作为重试入口，不销账。
       返回 { Success, ExitCode, Messages, Failures }。
     #>
     [CmdletBinding(SupportsShouldProcess)]
@@ -5580,62 +5967,89 @@ function Invoke-VegaRustDeskRollback {
 
     $messages = New-Object System.Collections.Generic.List[string]
     $failures = New-Object System.Collections.Generic.List[string]
+    $lock = $null
 
-    if (Test-Path -LiteralPath $HostStatePath -PathType Leaf) {
+    try {
         try {
-            $state = Read-VegaState -Path $HostStatePath
-            $restore = Restore-VegaRustDeskState -State $state -StatePath $HostStatePath -Confirm:$false
-            foreach ($message in @($restore.Messages)) { $messages.Add([string]$message) }
-            foreach ($failure in @($restore.Failures)) { $failures.Add([string]$failure) }
-            $state = $restore.State
-
-            if (-not $KeepRustDesk) {
-                foreach ($record in @(Get-VegaStateRustDeskInstall -State $state)) {
-                    if (-not [bool]$record.InstalledByVega) { continue }
-                    $removed = Uninstall-VegaRustDeskRecorded -Record $record -Confirm:$false
-                    $messages.Add([string]$removed.Message)
-                    if (-not $removed.Success) { $failures.Add([string]$removed.Message) }
-                    else { $state = Remove-VegaStateRustDeskInstall -State $state -Path ([string]$record.Path) -Confirm:$false }
-                }
-                $null = Save-VegaState -State $state -Path $HostStatePath
+            $lock = Enter-VegaSetupLock -Name 'Global\Vega-Host-Setup'
+        }
+        catch {
+            $failures.Add("另一个 Vega 安装/卸载进程正在运行：$($_.Exception.Message)")
+            return [pscustomobject]@{
+                Success  = $false
+                ExitCode = 1
+                Messages = $messages.ToArray()
+                Failures = $failures.ToArray()
             }
         }
-        catch {
-            $failures.Add("回滚用户 RustDesk 配置失败：$($_.Exception.Message)")
-        }
-    }
-    else {
-        $messages.Add("没有用户清单，跳过：$HostStatePath")
-    }
 
-    if (Test-Path -LiteralPath $ServiceStatePath -PathType Leaf) {
-        try {
-            $serviceState = Read-VegaState -Path $ServiceStatePath
-            $serviceRestore = Restore-VegaRustDeskState -State $serviceState -StatePath $ServiceStatePath -ServiceMode -Confirm:$false
-            foreach ($message in @($serviceRestore.Messages)) { $messages.Add([string]$message) }
-            foreach ($failure in @($serviceRestore.Failures)) { $failures.Add([string]$failure) }
+        if (Test-Path -LiteralPath $HostStatePath -PathType Leaf) {
+            try {
+                $state = Read-VegaState -Path $HostStatePath
+                $restore = Restore-VegaRustDeskState -State $state -StatePath $HostStatePath -Confirm:$false
+                foreach ($message in @($restore.Messages)) { $messages.Add([string]$message) }
+                foreach ($failure in @($restore.Failures)) { $failures.Add([string]$failure) }
+                $state = $restore.State
+
+                if (-not $KeepRustDesk) {
+                    foreach ($record in @(Get-VegaStateRustDeskInstall -State $state)) {
+                        if ($null -eq $record) { continue }
+                        if (-not [bool]$record.InstalledByVega) { continue }
+                        $removed = Uninstall-VegaRustDeskRecorded -Record $record -Confirm:$false
+                        $messages.Add([string]$removed.Message)
+                        if (-not $removed.Success) {
+                            # 没确认卸载成功就不销账：保留记录，用户可以重装/再卸载重试。
+                            $failures.Add([string]$removed.Message)
+                            continue
+                        }
+                        $state = Remove-VegaStateRustDeskInstall -State $state -Path ([string]$record.Path) -Confirm:$false
+                    }
+                    $null = Save-VegaState -State $state -Path $HostStatePath
+                }
+            }
+            catch {
+                $failures.Add("回滚用户 RustDesk 配置失败：$($_.Exception.Message)")
+            }
         }
-        catch {
-            $failures.Add("回滚服务模式 RustDesk 配置失败：$($_.Exception.Message)")
+        else {
+            $messages.Add("没有用户清单，跳过：$HostStatePath")
+        }
+
+        if (Test-Path -LiteralPath $ServiceStatePath -PathType Leaf) {
+            try {
+                $serviceState = Read-VegaState -Path $ServiceStatePath
+                $serviceRestore = Restore-VegaRustDeskState -State $serviceState -StatePath $ServiceStatePath -ServiceMode -Confirm:$false
+                foreach ($message in @($serviceRestore.Messages)) { $messages.Add([string]$message) }
+                foreach ($failure in @($serviceRestore.Failures)) { $failures.Add([string]$failure) }
+            }
+            catch {
+                $failures.Add("回滚服务模式 RustDesk 配置失败：$($_.Exception.Message)")
+            }
+        }
+
+        return [pscustomobject]@{
+            Success  = ($failures.Count -eq 0)
+            ExitCode = $(if ($failures.Count -gt 0) { 1 } else { 0 })
+            Messages = $messages.ToArray()
+            Failures = $failures.ToArray()
         }
     }
-
-    return [pscustomobject]@{
-        Success  = ($failures.Count -eq 0)
-        ExitCode = $(if ($failures.Count -gt 0) { 1 } else { 0 })
-        Messages = $messages.ToArray()
-        Failures = $failures.ToArray()
+    finally {
+        Exit-VegaSetupLock -Lock $lock
     }
 }
 
 function Invoke-VegaRustDeskBootstrap {
     <#
       安装包的一键安装/配置流程：
-        1. 读 vega-defaults.json；
-        2. 没装 RustDesk 才下载（校验 SHA256）+ 静默安装 + 等服务出现；
-        3. 写用户与服务两处 RustDesk2.toml（复用 Set-VegaRustDeskConfig 的 ACL/原子写入/回滚记录）；
-        4. 若这次是 Vega 装的，把安装记录写进 host-state.json。
-      任何一步失败都返回 Success=$false，由调用方决定不阻断安装。
+        1. 拿 Global\Vega-Host-Setup 互斥体（与卸载/回滚共用，P1-6）；
+        2. 读 vega-defaults.json；
+        3. 没装 RustDesk 才在受信随机目录里下载（校验 SHA256，句柄保护到启动，P1-3），
+           静默安装后确认新 EXE 与服务就绪（P1-5），并立刻记录安装归属（P1-6）；
+        4. 只写 LocalService 服务级 RustDesk2.toml 并回读确认（P1-8 / P1-5）；
+        5. 把发起安装用户的 SID 记进 state.json，用户级配置留给控制台首次启动提示；
+        6. 重启运行中的服务并确认 Running（P1-5）。
+      任何一步失败都返回 Success=$false（ExitCode=1），由调用方提示但不阻断安装。
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -5660,129 +6074,174 @@ function Invoke-VegaRustDeskBootstrap {
     )
 
     $messages = New-Object System.Collections.Generic.List[string]
+    $lock = $null
+    $secureDirectory = ''
+    $downloadLock = $null
 
     if ([string]::IsNullOrWhiteSpace($DownloadDirectory)) {
-        $DownloadDirectory = Join-Path (Join-Path $env:TEMP 'Vega') 'setup'
+        $programData = $env:ProgramData
+        if ([string]::IsNullOrWhiteSpace($programData)) { $programData = [System.IO.Path]::GetTempPath() }
+        $DownloadDirectory = Join-Path $programData 'Vega\setup'
     }
 
-    try {
-        $defaults = Get-VegaRustDeskDefaultConfig -Path $DefaultsFile
-    }
-    catch {
-        Write-VegaSetupLog -Path $LogFile -Message "FAIL 读取默认配置：$($_.Exception.Message)"
+    $fail = {
+        param(
+            [string]$Message,
+            [bool]$Installed = $false,
+            [bool]$Configured = $false
+        )
+        Write-VegaSetupLog -Path $LogFile -Message ("FAIL {0}" -f $Message)
         return [pscustomobject]@{
             Success    = $false
             ExitCode   = 1
-            Installed  = $false
-            Configured = $false
+            Installed  = $Installed
+            Configured = $Configured
             Messages   = $messages.ToArray()
-            Error      = $_.Exception.Message
+            Error      = $Message
         }
     }
 
-    $installedByVega = $false
-    $releaseVersion = ''
-
-    $existing = Get-VegaRustDeskInstall
-    if ([string]::IsNullOrWhiteSpace($existing)) {
-        $release = Get-VegaRustDeskRelease
-        $releaseVersion = [string]$release.Version
-        Write-VegaSetupLog -Path $LogFile -Message "下载 RustDesk $releaseVersion：$($release.Url)"
-
-        $download = Get-VegaRustDeskInstaller -DestinationDirectory $DownloadDirectory -Release $release
-        if (-not $download.Success) {
-            Write-VegaSetupLog -Path $LogFile -Message "FAIL 下载：$($download.Error)"
-            return [pscustomobject]@{
-                Success    = $false
-                ExitCode   = 1
-                Installed  = $false
-                Configured = $false
-                Messages   = $messages.ToArray()
-                Error      = $download.Error
-            }
+    try {
+        try {
+            $lock = Enter-VegaSetupLock -Name 'Global\Vega-Host-Setup'
+        }
+        catch {
+            return (& $fail -Message ("另一个 Vega 安装/卸载进程正在运行：{0}" -f $_.Exception.Message))
         }
 
-        Write-VegaSetupLog -Path $LogFile -Message "校验通过：$($download.Sha256)"
-        if (-not $PSCmdlet.ShouldProcess('RustDesk', '静默安装 RustDesk')) {
-            return [pscustomobject]@{
-                Success    = $true
-                ExitCode   = 0
-                Installed  = $false
-                Configured = $false
-                Messages   = @('已跳过（WhatIf）')
-                Error      = ''
-            }
+        try {
+            $defaults = Get-VegaRustDeskDefaultConfig -Path $DefaultsFile
+        }
+        catch {
+            return (& $fail -Message $_.Exception.Message)
         }
 
-        $install = Install-VegaRustDeskSilently -InstallerPath $download.Path
-        if (-not $install.Success) {
-            Write-VegaSetupLog -Path $LogFile -Message "FAIL 安装：$($install.Error)"
-            return [pscustomobject]@{
-                Success    = $false
-                ExitCode   = 1
-                Installed  = $false
-                Configured = $false
-                Messages   = $messages.ToArray()
-                Error      = $install.Error
-            }
-        }
-        $installedByVega = $true
-        $messages.Add("已静默安装 RustDesk $releaseVersion")
+        $installedByVega = $false
+        $releaseVersion = ''
+        $existing = Get-VegaRustDeskInstall
 
-        $wait = Wait-VegaRustDeskService
-        if ($wait.Found) {
+        if ([string]::IsNullOrWhiteSpace($existing)) {
+            $release = Get-VegaRustDeskRelease
+            $releaseVersion = [string]$release.Version
+            Write-VegaSetupLog -Path $LogFile -Message ("下载 RustDesk {0}：{1}" -f $releaseVersion, $release.Url)
+
+            try {
+                $secureDirectory = New-VegaSecureDirectory -Parent $DownloadDirectory
+            }
+            catch {
+                return (& $fail -Message $_.Exception.Message)
+            }
+
+            $download = Get-VegaRustDeskInstaller -DestinationDirectory $secureDirectory -Release $release
+            if (-not $download.Success) {
+                return (& $fail -Message ([string]$download.Error))
+            }
+            $downloadLock = $download.Lock
+            Write-VegaSetupLog -Path $LogFile -Message ("校验通过：{0}" -f $download.Sha256)
+
+            if (-not $PSCmdlet.ShouldProcess('RustDesk', '静默安装 RustDesk')) {
+                return [pscustomobject]@{
+                    Success    = $true
+                    ExitCode   = 0
+                    Installed  = $false
+                    Configured = $false
+                    Messages   = @('已跳过（WhatIf）')
+                    Error      = ''
+                }
+            }
+
+            $install = Install-VegaRustDeskSilently -InstallerPath $download.Path
+            if (-not $install.Success) {
+                return (& $fail -Message ([string]$install.Error))
+            }
+
+            $installedByVega = $true
+            $messages.Add("已静默安装 RustDesk $releaseVersion")
+
+            # P1-5：RustDesk 的静默安装入口内部报错后仍可能以 0 退出，必须自己确认结果。
+            $newExe = Get-VegaRustDeskInstall
+            if ([string]::IsNullOrWhiteSpace($newExe)) {
+                return (& $fail -Message 'RustDesk 静默安装返回 0，但 Program Files 下没有 rustdesk.exe。' -Installed $true)
+            }
+
+            # P1-6：确认是新装的就立刻记录归属，再动配置；后续失败也能回滚。
+            $state = Read-VegaState -Path $HostStatePath
+            $state = Add-VegaStateRustDeskInstall -State $state -Path $newExe -Version $releaseVersion -InstalledByVega $true
+            $null = Save-VegaState -State $state -Path $HostStatePath
+
+            $wait = Wait-VegaRustDeskService
+            if (-not $wait.Found) {
+                return (& $fail -Message 'RustDesk 服务在 120 秒内没有出现。' -Installed $true)
+            }
             $messages.Add("RustDesk 服务已出现（$($wait.Status)）")
         }
         else {
-            $messages.Add('RustDesk 服务尚未出现；配置已写入，首次启动 RustDesk 后生效。')
+            $messages.Add("已安装 RustDesk，跳过安装：$existing")
         }
-    }
-    else {
-        $messages.Add("已安装 RustDesk，跳过安装：$existing")
-    }
 
-    try {
-        $state = Read-VegaState -Path $HostStatePath
-        # 安装阶段两处配置都要覆盖：服务还没注册时也先写 LocalService 路径，
-        # 避免首次以服务模式启动时又用回官方默认服务器。
-        $config = Set-VegaRustDeskConfig -Server $defaults.IdServer -Key $defaults.Key -RelayServer $defaults.RelayServer `
-            -State $state -StatePath $HostStatePath -UserConfigPath $UserConfigPath -ServiceConfigPath $ServiceConfigPath `
-            -ForceService -Confirm:$false
-        $state = $config.State
-        foreach ($warning in @($config.Warnings)) { $messages.Add([string]$warning) }
+        # P1-8：只写服务级配置。perMachine 安装包可能以另一个管理员账户提权运行，
+        # 写 %APPDATA% 会落到提权账户上；用户级配置留给控制台首次启动时提示。
+        try {
+            $state = Read-VegaState -Path $HostStatePath
+            $config = Set-VegaRustDeskConfig -Server $defaults.IdServer -Key $defaults.Key -RelayServer $defaults.RelayServer `
+                -State $state -StatePath $HostStatePath -UserConfigPath $UserConfigPath -ServiceConfigPath $ServiceConfigPath `
+                -ServiceStatePath $ServiceStatePath -ForceService -ServiceOnly -Confirm:$false
+            $state = $config.State
+            foreach ($warning in @($config.Warnings)) { $messages.Add([string]$warning) }
 
-        if ($installedByVega) {
-            $exePath = Get-VegaRustDeskInstall
-            if (-not [string]::IsNullOrWhiteSpace($exePath)) {
-                $state = Add-VegaStateRustDeskInstall -State $state -Path $exePath -Version $releaseVersion -InstalledByVega $true
+            $serviceApplied = $false
+            foreach ($applied in @($config.Applied)) {
+                if ($null -eq $applied) { continue }
+                if ([string]::Equals([string]$applied.Path, [string]$ServiceConfigPath, [StringComparison]::OrdinalIgnoreCase)) {
+                    $serviceApplied = $true
+                }
             }
+            if (-not $serviceApplied) {
+                return (& $fail -Message ("服务级配置没有写入成功：{0}" -f $ServiceConfigPath) -Installed $installedByVega)
+            }
+
+            $null = Save-VegaState -State $state -Path $HostStatePath
         }
-        $null = Save-VegaState -State $state -Path $HostStatePath
+        catch {
+            return (& $fail -Message ("写入 RustDesk 服务级中继配置失败：{0}" -f $_.Exception.Message) -Installed $installedByVega)
+        }
+
+        # P1-8：记录发起安装的登录用户 SID 与用户级配置路径。
+        try {
+            $userContext = Get-VegaInteractiveUserContext
+            $serviceState = Read-VegaState -Path $ServiceStatePath
+            $serviceState = Set-VegaStateRustDeskUserConfig -State $serviceState -Sid ([string]$userContext.Sid) `
+                -Path ([string]$userContext.UserConfigPath) -PromptPending $true
+            $null = Save-VegaState -State $serviceState -Path $ServiceStatePath
+            $sidText = '(未取到)'
+            if (-not [string]::IsNullOrWhiteSpace([string]$userContext.Sid)) { $sidText = [string]$userContext.Sid }
+            $messages.Add("用户级配置待控制台首次启动时提示：SID $sidText")
+        }
+        catch {
+            $messages.Add("记录发起安装用户失败（不影响服务级配置）：$($_.Exception.Message)")
+        }
 
         $restart = Restart-VegaRustDeskService -Confirm:$false
         $messages.Add([string]$restart.Message)
+        if ($restart.Found -and $restart.WasRunning -and -not $restart.Restarted) {
+            return (& $fail -Message ("RustDesk 服务重启失败：{0}" -f $restart.Message) -Installed $installedByVega -Configured $true)
+        }
 
         Write-VegaSetupLog -Path $LogFile -Message ("OK 中继 {0}，relay {1}，已配置 {2} 个路径" -f $defaults.IdServer, $defaults.RelayServer, @($config.Applied).Count)
-    }
-    catch {
-        Write-VegaSetupLog -Path $LogFile -Message "FAIL 写配置：$($_.Exception.Message)"
+
         return [pscustomobject]@{
-            Success    = $false
-            ExitCode   = 1
+            Success    = $true
+            ExitCode   = 0
             Installed  = $installedByVega
-            Configured = $false
+            Configured = $true
             Messages   = $messages.ToArray()
-            Error      = "写入 RustDesk 中继配置失败：$($_.Exception.Message)"
+            Error      = ''
         }
     }
-
-    return [pscustomobject]@{
-        Success    = $true
-        ExitCode   = 0
-        Installed  = $installedByVega
-        Configured = $true
-        Messages   = $messages.ToArray()
-        Error      = ''
+    finally {
+        # P1-3：无论成功失败都在 finally 释放句柄并删下载目录。
+        Remove-VegaSecureDirectory -Path $secureDirectory -Lock $downloadLock
+        Exit-VegaSetupLock -Lock $lock
     }
 }
 
@@ -6846,6 +7305,12 @@ Export-ModuleMember -Function @(
     'Get-VegaRustDeskDefaultConfig',
     'Get-VegaRustDeskRelease',
     'Get-VegaRustDeskInstaller',
+    'Invoke-VegaHttpsDownload',
+    'Enable-VegaTls12',
+    'New-VegaSecureDirectory',
+    'Remove-VegaSecureDirectory',
+    'Get-VegaInteractiveUserContext',
+    'Set-VegaStateRustDeskUserConfig',
     'Install-VegaRustDeskSilently',
     'Wait-VegaRustDeskService',
     'Uninstall-VegaRustDeskRecorded',

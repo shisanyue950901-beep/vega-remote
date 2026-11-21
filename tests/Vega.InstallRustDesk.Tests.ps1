@@ -76,11 +76,12 @@ Describe 'Get-VegaRustDeskInstaller' {
             Page     = 'https://rustdesk.com/download'
         }
         $script:downloadDir = Join-Path $TestDrive ('download-' + [guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Path $script:downloadDir -Force
     }
 
     It 'SHA256 不匹配立即中止并删除文件' {
-        Mock -ModuleName $script:ModuleName Invoke-WebRequest {
-            param($Uri, $OutFile, $TimeoutSec, $UseBasicParsing)
+        Mock -ModuleName $script:ModuleName Invoke-VegaHttpsDownload {
+            param($Uri, $OutFile, $TimeoutSeconds, $Deadline)
             Set-Content -LiteralPath $OutFile -Value 'not-the-real-installer' -Encoding UTF8
         }
         Mock -ModuleName $script:ModuleName Get-FileHash {
@@ -92,11 +93,11 @@ Describe 'Get-VegaRustDeskInstaller' {
         $result.Error | Should -Match 'SHA256 不匹配'
         $result.Error | Should -Match 'rustdesk\.com/download'
         Test-Path -LiteralPath (Join-Path $script:downloadDir $script:release.FileName) | Should -BeFalse
-        Should -Invoke -CommandName Get-FileHash -ModuleName $script:ModuleName -Times 1 -Exactly
+        Should -Invoke -CommandName Invoke-VegaHttpsDownload -ModuleName $script:ModuleName -Times 1 -Exactly
     }
 
     It 'SHA256 仍是占位值时不发起下载' {
-        Mock -ModuleName $script:ModuleName Invoke-WebRequest { throw '不应被调用' }
+        Mock -ModuleName $script:ModuleName Invoke-VegaHttpsDownload { throw '不应被调用' }
         $placeholder = [pscustomobject]@{
             Version  = $script:release.Version
             FileName = $script:release.FileName
@@ -108,25 +109,22 @@ Describe 'Get-VegaRustDeskInstaller' {
         $result = Get-VegaRustDeskInstaller -DestinationDirectory $script:downloadDir -Release $placeholder
         $result.Success | Should -BeFalse
         $result.Error | Should -Match 'SHA256 尚未填写'
-        Should -Invoke -CommandName Invoke-WebRequest -ModuleName $script:ModuleName -Times 0 -Exactly
+        Should -Invoke -CommandName Invoke-VegaHttpsDownload -ModuleName $script:ModuleName -Times 0 -Exactly
     }
 
     It '下载失败最多尝试 2 次并返回非零原因' {
-        Mock -ModuleName $script:ModuleName Invoke-WebRequest {
-            param($Uri, $OutFile, $TimeoutSec, $UseBasicParsing)
-            throw '网络不可用'
-        }
+        Mock -ModuleName $script:ModuleName Invoke-VegaHttpsDownload { throw '网络不可用' }
 
         $result = Get-VegaRustDeskInstaller -DestinationDirectory $script:downloadDir -Release $script:release
         $result.Success | Should -BeFalse
         $result.Error | Should -Match '已尝试 2 次'
         $result.Error | Should -Match 'rustdesk\.com/download'
-        Should -Invoke -CommandName Invoke-WebRequest -ModuleName $script:ModuleName -Times 2 -Exactly
+        Should -Invoke -CommandName Invoke-VegaHttpsDownload -ModuleName $script:ModuleName -Times 2 -Exactly
     }
 
-    It '校验通过返回安装包路径' {
-        Mock -ModuleName $script:ModuleName Invoke-WebRequest {
-            param($Uri, $OutFile, $TimeoutSec, $UseBasicParsing)
+    It '校验通过返回安装包路径，并保持独占读句柄到启动' {
+        Mock -ModuleName $script:ModuleName Invoke-VegaHttpsDownload {
+            param($Uri, $OutFile, $TimeoutSeconds, $Deadline)
             Set-Content -LiteralPath $OutFile -Value 'installer' -Encoding UTF8
         }
         Mock -ModuleName $script:ModuleName Get-FileHash {
@@ -137,6 +135,53 @@ Describe 'Get-VegaRustDeskInstaller' {
         $result.Success | Should -BeTrue
         $result.Path | Should -Be (Join-Path $script:downloadDir $script:release.FileName)
         Test-Path -LiteralPath $result.Path | Should -BeTrue
+        $null -eq $result.Lock | Should -BeFalse
+
+        # 句柄期间别人不能再拿写权限打开同一个文件：TOCTOU 的替换窗口被关掉。
+        { [System.IO.File]::Open($result.Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None) } | Should -Throw
+
+        $result.Lock.Dispose()
+        Remove-Item -LiteralPath $result.Path -Force -ErrorAction SilentlyContinue
+    }
+
+    It '用真实 SHA256 校验临时文件：匹配通过，不匹配中止' {
+        # P2e：不 mock Get-FileHash，用真实临时文件算出摘要，验证校验链路本身。
+        $payload = Join-Path $TestDrive ('payload-' + [guid]::NewGuid().ToString('N') + '.bin')
+        Set-Content -LiteralPath $payload -Value 'real-installer-bytes' -Encoding UTF8
+        $realHash = (Get-FileHash -LiteralPath $payload -Algorithm SHA256).Hash.ToLowerInvariant()
+        # mock 体在模块作用域执行，用全局变量把真实临时文件路径带进去。
+        $global:VegaTestPayload = $payload
+
+        Mock -ModuleName $script:ModuleName Invoke-VegaHttpsDownload {
+            param($Uri, $OutFile, $TimeoutSeconds, $Deadline)
+            Copy-Item -LiteralPath $global:VegaTestPayload -Destination $OutFile -Force
+        }
+
+        $good = [pscustomobject]@{
+            Version  = $script:release.Version
+            FileName = 'good-' + $script:release.FileName
+            Url      = $script:release.Url
+            Sha256   = $realHash
+            Page     = $script:release.Page
+        }
+        $ok = Get-VegaRustDeskInstaller -DestinationDirectory $script:downloadDir -Release $good
+        $ok.Success | Should -BeTrue
+        $ok.Sha256 | Should -Be $realHash
+        $ok.Lock.Dispose()
+        Remove-Item -LiteralPath $ok.Path -Force -ErrorAction SilentlyContinue
+
+        $bad = [pscustomobject]@{
+            Version  = $script:release.Version
+            FileName = 'bad-' + $script:release.FileName
+            Url      = $script:release.Url
+            Sha256   = ('c' * 64)
+            Page     = $script:release.Page
+        }
+        $mismatch = Get-VegaRustDeskInstaller -DestinationDirectory $script:downloadDir -Release $bad
+        $mismatch.Success | Should -BeFalse
+        $mismatch.Error | Should -Match 'SHA256 不匹配'
+        Test-Path -LiteralPath (Join-Path $script:downloadDir $bad.FileName) | Should -BeFalse
+        Remove-Variable -Name VegaTestPayload -Scope Global -ErrorAction SilentlyContinue
     }
 }
 
@@ -180,16 +225,31 @@ Describe 'Invoke-VegaRustDeskBootstrap' {
         $json = @{ rustdesk = @{ idServer = '60.205.95.98'; relayServer = '60.205.95.98'; key = $script:Key } } | ConvertTo-Json
         Set-Content -LiteralPath $script:defaults -Value $json -Encoding UTF8
         $script:downloadDir = Join-Path $TestDrive 'downloads'
+        $script:testSid = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
 
         Mock -ModuleName $script:ModuleName Restart-VegaRustDeskService {
-            [pscustomobject]@{ Found = $true; Restarted = $false; Status = 'Running'; Message = 'RustDesk 服务已重启' }
+            [pscustomobject]@{ Found = $true; WasRunning = $true; Restarted = $true; Status = 'Running'; Message = 'RustDesk 服务已重启' }
         }
         Mock -ModuleName $script:ModuleName Wait-VegaRustDeskService {
             [pscustomobject]@{ Found = $true; Status = 'Running' }
         }
+        # P1-3：下载目录的 ACL/所有权检查只在 Windows 真机上有效，这里换成 TestDrive 临时目录。
+        Mock -ModuleName $script:ModuleName New-VegaSecureDirectory {
+            $dir = Join-Path $TestDrive ('secure-' + [guid]::NewGuid().ToString('N'))
+            $null = New-Item -ItemType Directory -Path $dir -Force
+            $dir
+        }
+        Mock -ModuleName $script:ModuleName Remove-VegaSecureDirectory { }
+        Mock -ModuleName $script:ModuleName Get-VegaInteractiveUserContext {
+            [pscustomobject]@{
+                Name           = 'TEST\alice'
+                Sid            = $script:testSid
+                UserConfigPath = 'C:\Users\alice\AppData\Roaming\RustDesk\config\RustDesk2.toml'
+            }
+        }
     }
 
-    It '已安装时跳过下载与安装，只写配置' {
+    It '已安装时跳过下载与安装，只写服务级配置并记录 SID' {
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstaller { throw '已安装时不应下载' }
         Mock -ModuleName $script:ModuleName Install-VegaRustDeskSilently { throw '已安装时不应安装' }
@@ -205,15 +265,21 @@ Describe 'Invoke-VegaRustDeskBootstrap' {
         Should -Invoke -CommandName Get-VegaRustDeskInstaller -ModuleName $script:ModuleName -Times 0 -Exactly
         Should -Invoke -CommandName Install-VegaRustDeskSilently -ModuleName $script:ModuleName -Times 0 -Exactly
 
-        (Get-Content -LiteralPath $script:userConfig -Raw -Encoding UTF8) | Should -Match 'custom-rendezvous-server = "60\.205\.95\.98"'
+        # P1-8：安装阶段不写用户级配置，避免把配置写到提权账户的 %APPDATA%。
+        Test-Path -LiteralPath $script:userConfig | Should -BeFalse
         (Get-Content -LiteralPath $script:serviceConfig -Raw -Encoding UTF8) | Should -Match 'relay-server = "60\.205\.95\.98:21117"'
         @((Read-VegaState -Path $script:statePath).RustDeskInstalls).Count | Should -Be 0
+
+        $serviceState = Read-VegaState -Path $script:serviceStatePath
+        $serviceState.RustDeskUserConfig.Sid | Should -Be $script:testSid
+        $serviceState.RustDeskUserConfig.PromptPending | Should -BeTrue
+        @($serviceState.RustDeskConfigKeys).Count | Should -Be 3
     }
 
     It '下载失败返回非零，不写配置' {
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { '' }
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstaller {
-            [pscustomobject]@{ Success = $false; Path = ''; Sha256 = ''; Error = '下载失败，请到 https://rustdesk.com/download' }
+            [pscustomobject]@{ Success = $false; Path = ''; Sha256 = ''; Lock = $null; Error = '下载失败，请到 https://rustdesk.com/download' }
         }
         Mock -ModuleName $script:ModuleName Get-Service { $null }
 
@@ -225,13 +291,15 @@ Describe 'Invoke-VegaRustDeskBootstrap' {
         $result.ExitCode | Should -Be 1
         $result.Error | Should -Match 'rustdesk\.com/download'
         Test-Path -LiteralPath $script:userConfig | Should -BeFalse
+        Test-Path -LiteralPath $script:serviceConfig | Should -BeFalse
         Test-Path -LiteralPath $script:statePath | Should -BeFalse
+        Should -Invoke -CommandName Remove-VegaSecureDirectory -ModuleName $script:ModuleName -Times 1 -Exactly
     }
 
     It '哈希不匹配中止安装，不启动安装程序' {
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { '' }
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstaller {
-            [pscustomobject]@{ Success = $false; Path = ''; Sha256 = ('b' * 64); Error = '下载的 RustDesk 安装包 SHA256 不匹配，已删除并中止。' }
+            [pscustomobject]@{ Success = $false; Path = ''; Sha256 = ('b' * 64); Lock = $null; Error = '下载的 RustDesk 安装包 SHA256 不匹配，已删除并中止。' }
         }
         Mock -ModuleName $script:ModuleName Install-VegaRustDeskSilently { throw '哈希不匹配时不应安装' }
         Mock -ModuleName $script:ModuleName Get-Service { $null }
@@ -245,14 +313,14 @@ Describe 'Invoke-VegaRustDeskBootstrap' {
         Should -Invoke -CommandName Install-VegaRustDeskSilently -ModuleName $script:ModuleName -Times 0 -Exactly
     }
 
-    It '未安装时下载、静默安装、写两处配置并记录到 state.json' {
+    It '未安装时下载、静默安装、只写服务级配置并记录到 state.json' {
         & (Get-Module $script:ModuleName) { $script:VegaProbeCount = 0 }
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall {
             $script:VegaProbeCount += 1
             if ($script:VegaProbeCount -le 1) { '' } else { 'C:\Program Files\RustDesk\rustdesk.exe' }
         }
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstaller {
-            [pscustomobject]@{ Success = $true; Path = 'C:\temp\rustdesk.exe'; Sha256 = ('a' * 64); Error = '' }
+            [pscustomobject]@{ Success = $true; Path = 'C:\temp\rustdesk.exe'; Sha256 = ('a' * 64); Lock = $null; Error = '' }
         }
         Mock -ModuleName $script:ModuleName Install-VegaRustDeskSilently {
             [pscustomobject]@{ Success = $true; ExitCode = 0; Error = '' }
@@ -267,14 +335,44 @@ Describe 'Invoke-VegaRustDeskBootstrap' {
         $result.Installed | Should -BeTrue
         Should -Invoke -CommandName Install-VegaRustDeskSilently -ModuleName $script:ModuleName -Times 1 -Exactly
 
-        (Get-Content -LiteralPath $script:userConfig -Raw -Encoding UTF8) | Should -Match 'custom-rendezvous-server = "60\.205\.95\.98"'
+        # P1-8：只写服务级配置。
+        Test-Path -LiteralPath $script:userConfig | Should -BeFalse
         (Get-Content -LiteralPath $script:serviceConfig -Raw -Encoding UTF8) | Should -Match 'custom-rendezvous-server = "60\.205\.95\.98"'
 
         $saved = Read-VegaState -Path $script:statePath
         @($saved.RustDeskInstalls).Count | Should -Be 1
         $saved.RustDeskInstalls[0].InstalledByVega | Should -BeTrue
         $saved.RustDeskInstalls[0].Path | Should -Be 'C:\Program Files\RustDesk\rustdesk.exe'
-        @($saved.RustDeskConfigKeys).Count | Should -BeGreaterThan 0
+
+        # P2d：服务清单参数必须转发生效，记录落在传入的 state.json，而不是真实 %ProgramData%。
+        $serviceState = Read-VegaState -Path $script:serviceStatePath
+        @($serviceState.RustDeskConfigKeys).Count | Should -Be 3
+        @($serviceState.RustDeskConfigKeys | ForEach-Object { [string]$_.Path } | Select-Object -Unique) | Should -Contain $script:serviceConfig
+    }
+
+    It 'P1-5 服务没出现时返回非零，不把失败当成功' {
+        & (Get-Module $script:ModuleName) { $script:VegaProbeCount = 0 }
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall {
+            $script:VegaProbeCount += 1
+            if ($script:VegaProbeCount -le 1) { '' } else { 'C:\Program Files\RustDesk\rustdesk.exe' }
+        }
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstaller {
+            [pscustomobject]@{ Success = $true; Path = 'C:\temp\rustdesk.exe'; Sha256 = ('a' * 64); Lock = $null; Error = '' }
+        }
+        Mock -ModuleName $script:ModuleName Install-VegaRustDeskSilently {
+            [pscustomobject]@{ Success = $true; ExitCode = 0; Error = '' }
+        }
+        Mock -ModuleName $script:ModuleName Wait-VegaRustDeskService { [pscustomobject]@{ Found = $false; Status = '' } }
+        Mock -ModuleName $script:ModuleName Get-Service { $null }
+
+        $result = Invoke-VegaRustDeskBootstrap -DefaultsFile $script:defaults -HostStatePath $script:statePath `
+            -ServiceStatePath $script:serviceStatePath -UserConfigPath $script:userConfig `
+            -ServiceConfigPath $script:serviceConfig -DownloadDirectory $script:downloadDir -Confirm:$false
+
+        $result.Success | Should -BeFalse
+        $result.ExitCode | Should -Be 1
+        $result.Error | Should -Match '服务'
+        Test-Path -LiteralPath $script:serviceConfig | Should -BeFalse
     }
 }
 
