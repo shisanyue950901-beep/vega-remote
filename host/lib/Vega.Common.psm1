@@ -4178,7 +4178,7 @@ function ConvertFrom-VegaInteractiveUserContextPayload {
         $invalid.Error = "交互用户 SID 无效：$sid"
         return $invalid
     }
-    if ([string]::IsNullOrWhiteSpace($appDataPath) -or $appDataPath -notmatch '^[A-Za-z]:\\') {
+    if ([string]::IsNullOrWhiteSpace($appDataPath) -or $appDataPath -notmatch '^(?:[A-Za-z]:\\|/)') {
         $invalid.Error = "交互用户 AppData 路径无效：$appDataPath"
         return $invalid
     }
