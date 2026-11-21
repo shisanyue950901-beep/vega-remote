@@ -6505,22 +6505,79 @@ function Get-VegaRustDeskInstaller {
     }
 }
 
-function Wait-VegaRustDeskService {
+function New-VegaServiceDeadline {
     <#
-      P1-6：安装完成后在有界时间内等服务真正达到 Running，而不是“看到服务对象就算成功”。
-      服务可能稍晚注册，也可能注册后仍是 StartPending / Stopped：只有 Running 才返回
-      Running=$true；超时返回最后的 Found / Status 交给调用方判失败。
+      t3-fix8 P2：单调截止点。调用方在发起启动**之前**算一次，启动与状态轮询共用：
+      启动耗掉的秒数从同一份预算里扣，轮询只按剩余预算休眠。
+      用 Stopwatch 而不是 Get-Date：系统时间被调整时截止时间不会跟着漂。
+      -Clock 是给测试注入的可控时钟（返回从创建时刻起经过的秒数）；不传就用 Stopwatch。
     #>
     [CmdletBinding()]
     param(
         [int]$TimeoutSeconds = 60,
 
-        [int]$IntervalSeconds = 2
+        [scriptblock]$Clock
     )
 
-    $deadline = (Get-Date).AddSeconds([Math]::Max(1, $TimeoutSeconds))
+    return [pscustomobject]@{
+        BudgetSeconds = [Math]::Max(0.0, [double]$TimeoutSeconds)
+        Stopwatch     = [System.Diagnostics.Stopwatch]::StartNew()
+        Clock         = $Clock
+    }
+}
+
+function Get-VegaServiceDeadlineRemainingSeconds {
+    <#
+      t3-fix8 P2：截止点剩余秒数（可能为负，表示预算已耗尽）。
+      只读同一份预算，不会因为调用时机不同重建一个新的截止时间。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $Deadline
+    )
+
+    $elapsed = 0.0
+    if ($null -ne $Deadline.Clock) {
+        $elapsed = [double](& $Deadline.Clock)
+    }
+    elseif ($null -ne $Deadline.Stopwatch) {
+        $elapsed = [double]$Deadline.Stopwatch.Elapsed.TotalSeconds
+    }
+    return ([double]$Deadline.BudgetSeconds - $elapsed)
+}
+
+function Wait-VegaRustDeskService {
+    <#
+      P1-6：安装完成后在有界时间内等服务真正达到 Running，而不是“看到服务对象就算成功”。
+      服务可能稍晚注册，也可能注册后仍是 StartPending / Stopped：只有 Running 才返回
+      Running=$true；超时返回最后的 Found / Status 交给调用方判失败。
+      t3-fix8 P2：不再自己重建截止时间。传 -Deadline（New-VegaServiceDeadline 造的单调
+      截止点）时与调用方的启动共用同一份预算；每次休眠不超过剩余预算，预算耗尽后不再
+      接受 Running（先判预算，再查状态）。-TimeoutSeconds 只在没传 -Deadline 时用来造截止点。
+      -Clock 是给测试注入的可控时钟。
+    #>
+    [CmdletBinding()]
+    param(
+        $Deadline,
+
+        [int]$TimeoutSeconds = 60,
+
+        [double]$IntervalSeconds = 2,
+
+        [scriptblock]$Clock
+    )
+
+    if ($null -eq $Deadline) {
+        $Deadline = New-VegaServiceDeadline -TimeoutSeconds $TimeoutSeconds -Clock $Clock
+    }
+    $interval = [Math]::Max(0.001, [double]$IntervalSeconds)
+
     $last = $null
     while ($true) {
+        $remaining = Get-VegaServiceDeadlineRemainingSeconds -Deadline $Deadline
+        if ($remaining -le 0) { break }
+
         $last = Get-Service -Name 'RustDesk' -ErrorAction SilentlyContinue
         if ($null -ne $last) {
             $status = [string]$last.Status
@@ -6528,8 +6585,12 @@ function Wait-VegaRustDeskService {
                 return [pscustomobject]@{ Found = $true; Running = $true; Status = $status }
             }
         }
-        if ((Get-Date) -ge $deadline) { break }
-        Start-Sleep -Seconds ([Math]::Max(1, $IntervalSeconds))
+
+        # 查询本身也花时间：休眠前重新算，避免睡过截止点。
+        $remaining = Get-VegaServiceDeadlineRemainingSeconds -Deadline $Deadline
+        if ($remaining -le 0) { break }
+        $sleepSeconds = [Math]::Min($interval, $remaining)
+        Start-Sleep -Milliseconds ([int][Math]::Max(1, [Math]::Ceiling($sleepSeconds * 1000)))
     }
 
     $found = ($null -ne $last)
@@ -8322,6 +8383,8 @@ Export-ModuleMember -Function @(
     'Set-VegaStateRustDeskUserConfig',
     'Install-VegaRustDeskSilently',
     'Wait-VegaRustDeskService',
+    'New-VegaServiceDeadline',
+    'Get-VegaServiceDeadlineRemainingSeconds',
     'Start-VegaRustDeskServiceNonBlocking',
     'Test-VegaRustDeskClientRunning',
     'Uninstall-VegaRustDeskRecorded',
