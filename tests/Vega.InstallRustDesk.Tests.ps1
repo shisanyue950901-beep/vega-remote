@@ -279,6 +279,11 @@ Describe 'Invoke-VegaRustDeskBootstrap' {
 }
 
 Describe 'Invoke-VegaRustDeskRollback' {
+    BeforeEach {
+        # 生产环境记录路径就是真实 %APPDATA% 路径，这里用 $TestDrive，跳过路径白名单校验。
+        Mock -ModuleName $script:ModuleName Test-VegaRustDeskManagedConfigPath { $true }
+    }
+
     It '按记录恢复配置，InstalledByVega 时卸载 RustDesk' {
         $statePath = Join-Path $TestDrive ('rollback-' + [guid]::NewGuid().ToString('N') + '.json')
         $serviceStatePath = Join-Path $TestDrive ('rollback-service-' + [guid]::NewGuid().ToString('N') + '.json')
