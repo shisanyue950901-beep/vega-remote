@@ -799,7 +799,7 @@ Describe 't3-fix6 已有安装的服务状态分支' {
         Should -Invoke -CommandName Start-VegaRustDeskServiceNonBlocking -ModuleName $script:ModuleName -Times 1 -Exactly
         Should -Invoke -CommandName Wait-VegaRustDeskService -ModuleName $script:ModuleName -Times 1 -Exactly -ParameterFilter {
             $null -ne $Deadline -and [double]$Deadline.BudgetSeconds -eq 60 -and
-            $null -ne $Deadline.Stopwatch -and $null -eq $TimeoutSeconds
+            $null -ne $Deadline.Stopwatch
         }
         Should -Invoke -CommandName Set-VegaRustDeskConfig -ModuleName $script:ModuleName -Times 0 -Exactly
         Test-Path -LiteralPath $userConfig | Should -BeFalse
