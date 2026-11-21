@@ -56,16 +56,25 @@ Describe 'RustDesk 部署脚本：公网 IP 探测' {
         $script:IpDetect | Should -Match '169\\.254'
     }
 
-    It 't3-fix4 路由/hostname 回退结果分类后再输出' {
+    It 't3-fix5 逐来源分类，discard 后继续探测下一个来源' {
         $script:IpDetect | Should -Match 'is_rfc1918_ipv4'
         $script:IpDetect | Should -Match 'classify_detected_ipv4'
         $script:IpDetect | Should -Match 'sanitize_detected_ipv4'
-        # 最终输出前必须过滤，而不是只靠元数据/HTTP 分支。
-        $script:IpDetect | Should -Match ([regex]::Escape('ip=$(sanitize_detected_ipv4 "$ip")'))
+        # 每个来源单独过滤：discard 后继续探测下一个来源，而不是只在最后过滤一次。
+        $script:IpDetect | Should -Match ([regex]::Escape('candidate=$(sanitize_detected_ipv4 "$candidate")'))
+        $script:IpDetect | Should -Not -Match ([regex]::Escape('ip=$(sanitize_detected_ipv4 "$ip")'))
+        # 基准测试网段（198.18/15）与 RFC 5737 文档网段一律 discard。
+        $script:IpDetect | Should -Match ([regex]::Escape('is_documentation_ipv4'))
+        $script:IpDetect | Should -Match ([regex]::Escape('^198\.(18|19)\.'))
+        $script:IpDetect | Should -Match ([regex]::Escape('^192\.0\.2\.'))
+        $script:IpDetect | Should -Match ([regex]::Escape('^198\.51\.100\.'))
+        $script:IpDetect | Should -Match ([regex]::Escape('^203\.0\.113\.'))
         $script:ServerScript | Should -Match 'detect_public_ip'
         $script:ServerScript | Should -Match 'warn_if_private_ipv4'
         $script:StaticTest | Should -Match 'FAKE_ROUTE_IP'
         $script:StaticTest | Should -Match 'classify_detected_ipv4 100\.64\.0\.1'
+        # 行为断言：路由拿到 CGNAT 后必须回退到 hostname，而不是直接空结果。
+        $script:StaticTest | Should -Match 'FAKE_ROUTE_IP=100\.64\.1\.2 FAKE_HOSTNAME_IP=192\.168\.1\.8'
     }
 
     It '拒绝回环 / 本网络 / CGNAT / 组播 / 前导零写法' {
