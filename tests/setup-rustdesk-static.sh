@@ -274,6 +274,21 @@ if [[ "$got" != "192.168.1.8" ]]; then
   fail "路由文档段丢弃后必须回退到 hostname，实际：$got"
 fi
 
+# 11) hostname -I 一次输出多个地址时逐个分类（t3-fix6 P2）：
+#     首个 CGNAT/文档段被丢弃后必须继续用后面的可用地址，而不是直接空结果。
+got=$(FAKE_CURL_MODE=token-fail FAKE_ROUTE_IP= FAKE_HOSTNAME_IP='100.64.1.2 203.0.113.9 192.168.1.8' run_probe)
+if [[ "$got" != "192.168.1.8" ]]; then
+  fail "hostname 多地址必须逐个分类，实际：$got"
+fi
+got=$(FAKE_CURL_MODE=token-fail FAKE_ROUTE_IP= FAKE_HOSTNAME_IP='100.64.1.2 8.8.4.4 192.168.1.8' run_probe)
+if [[ "$got" != "8.8.4.4" ]]; then
+  fail "hostname 多地址应返回第一个可用地址，实际：$got"
+fi
+got=$(FAKE_CURL_MODE=token-fail FAKE_ROUTE_IP= FAKE_HOSTNAME_IP='100.64.1.2 203.0.113.9' run_probe)
+if [[ -n "$got" ]]; then
+  fail "hostname 全部不可用时必须为空，实际：$got"
+fi
+
 # 分类函数直接断言。
 [[ "$(classify_detected_ipv4 192.168.1.10)" == "private" ]] || fail 'classify: RFC1918 应为 private'
 [[ "$(classify_detected_ipv4 100.64.0.1)" == "discard" ]] || fail 'classify: CGNAT 应为 discard'

@@ -632,6 +632,255 @@ Describe 'install-rustdesk.ps1 入口（真实子进程）' {
     }
 }
 
+Describe 't3-fix6 已有安装的服务状态分支' {
+    It '服务已注册但停止：Start-Service 启动并等到 Running 后写两处配置' {
+        $statePath = Join-Path $TestDrive ('h-' + [guid]::NewGuid().ToString('N') + '.json')
+        $serviceStatePath = Join-Path $TestDrive ('s-' + [guid]::NewGuid().ToString('N') + '.json')
+        $defaults = Join-Path $TestDrive 'vega-defaults.json'
+        $json = @{ rustdesk = @{ idServer = '60.205.95.98'; relayServer = '60.205.95.98'; key = $script:Key } } | ConvertTo-Json
+        Set-Content -LiteralPath $defaults -Value $json -Encoding UTF8
+
+        $sid = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
+        $appData = Join-Path $TestDrive 'Users/张三/AppData/Roaming'
+        $null = New-Item -ItemType Directory -Path $appData -Force
+        $serviceConfig = Join-Path $TestDrive 'ProgramData/RustDesk/config/RustDesk2.toml'
+
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
+        Mock -ModuleName $script:ModuleName Get-Service { [pscustomobject]@{ Name = 'RustDesk'; Status = 'Stopped' } }
+        Mock -ModuleName $script:ModuleName Start-Service { }
+        Mock -ModuleName $script:ModuleName Wait-VegaRustDeskService { [pscustomobject]@{ Found = $true; Running = $true; Status = 'Running' } }
+        Mock -ModuleName $script:ModuleName Restart-VegaRustDeskService { [pscustomobject]@{ Found = $true; WasRunning = $true; Restarted = $true; Status = 'Running'; Message = 'ok' } }
+        Mock -ModuleName $script:ModuleName Set-VegaRustDeskConfig {
+            param($Server, $Key, $RelayServer, $State, $StatePath, $UserConfigPath, $ServiceConfigPath, $ServiceStatePath, $ForceService, $ServiceOnly, $ContinueOnUserFailure, $Confirm)
+            [pscustomobject]@{
+                Applied = @(
+                    [pscustomobject]@{ Path = $UserConfigPath; Changed = $true }
+                    [pscustomobject]@{ Path = $ServiceConfigPath; Changed = $true }
+                )
+                Warnings       = @()
+                ServicePresent = $true
+                Values         = @{}
+                State          = $State
+            }
+        }
+
+        $result = Invoke-VegaRustDeskBootstrap -DefaultsFile $defaults -HostStatePath $statePath `
+            -ServiceStatePath $serviceStatePath -ServiceConfigPath $serviceConfig `
+            -InteractiveUserSid $sid -InteractiveUserAppData $appData -Confirm:$false
+
+        $result.Success | Should -BeTrue
+        $result.Degraded | Should -BeFalse
+        $result.ExitCode | Should -Be 0
+        # t3-fix6 P1-2：已注册但停止时必须主动启动，而不是等 60 秒后直接失败。
+        Should -Invoke -CommandName Start-Service -ModuleName $script:ModuleName -Times 1 -Exactly
+        Should -Invoke -CommandName Wait-VegaRustDeskService -ModuleName $script:ModuleName -Times 1 -Exactly
+    }
+
+    It '服务未注册：不注册服务，只写用户级配置并回读，降级退出码 2 并提示启用服务' {
+        $statePath = Join-Path $TestDrive ('h-' + [guid]::NewGuid().ToString('N') + '.json')
+        $serviceStatePath = Join-Path $TestDrive ('s-' + [guid]::NewGuid().ToString('N') + '.json')
+        $defaults = Join-Path $TestDrive 'vega-defaults.json'
+        $json = @{ rustdesk = @{ idServer = '60.205.95.98'; relayServer = '60.205.95.98'; key = $script:Key } } | ConvertTo-Json
+        Set-Content -LiteralPath $defaults -Value $json -Encoding UTF8
+
+        $sid = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
+        $appData = Join-Path $TestDrive 'Users/张三/AppData/Roaming'
+        $null = New-Item -ItemType Directory -Path (Join-Path $appData 'RustDesk/config') -Force
+        $userConfig = Join-Path $appData 'RustDesk/config/RustDesk2.toml'
+        $serviceConfig = Join-Path $TestDrive 'ProgramData/RustDesk/config/RustDesk2.toml'
+
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
+        Mock -ModuleName $script:ModuleName Get-Service { $null }
+        Mock -ModuleName $script:ModuleName Start-Service { throw '服务未注册时不应启动服务' }
+        Mock -ModuleName $script:ModuleName Wait-VegaRustDeskService { throw '服务未注册时不应等待服务' }
+        Mock -ModuleName $script:ModuleName Restart-VegaRustDeskService { [pscustomobject]@{ Found = $false; WasRunning = $false; Restarted = $false; Status = ''; Message = '未找到 RustDesk 服务，跳过重启。' } }
+
+        # Set-VegaRustDeskConfig 走真实代码：用户级配置必须真的写入并回读一致。
+        $result = Invoke-VegaRustDeskBootstrap -DefaultsFile $defaults -HostStatePath $statePath `
+            -ServiceStatePath $serviceStatePath -ServiceConfigPath $serviceConfig `
+            -InteractiveUserSid $sid -InteractiveUserAppData $appData -Confirm:$false
+
+        $result.Success | Should -BeTrue
+        $result.Degraded | Should -BeTrue
+        $result.ExitCode | Should -Be 2
+        $result.UserConfigWritten | Should -BeTrue
+        ($result.Messages -join "`n") | Should -Match '启用服务'
+
+        # 用户级落盘并回读；服务级跳过（不替用户注册/写服务）。
+        (Microsoft.PowerShell.Management\Get-Content -LiteralPath $userConfig -Raw -Encoding UTF8) |
+            Should -Match 'custom-rendezvous-server = "60\.205\.95\.98"'
+        Test-Path -LiteralPath $serviceConfig | Should -BeFalse
+        Should -Invoke -CommandName Start-Service -ModuleName $script:ModuleName -Times 0 -Exactly
+
+        $serviceState = Read-VegaState -Path $serviceStatePath
+        $serviceState.RustDeskUserConfig.Written | Should -BeTrue
+        $serviceState.RustDeskUserConfig.PromptPending | Should -BeFalse
+    }
+}
+
+Describe 't3-fix6 用户配置读取失败时不写基线' {
+    It '真实文件锁导致读取失败：服务级仍落盘、降级退出码 2、用户基线不新增' -Skip:($env:OS -ne 'Windows_NT') {
+        $statePath = Join-Path $TestDrive ('h-' + [guid]::NewGuid().ToString('N') + '.json')
+        $serviceStatePath = Join-Path $TestDrive ('s-' + [guid]::NewGuid().ToString('N') + '.json')
+        $defaults = Join-Path $TestDrive 'vega-defaults.json'
+        $json = @{ rustdesk = @{ idServer = '60.205.95.98'; relayServer = '60.205.95.98'; key = $script:Key } } | ConvertTo-Json
+        Set-Content -LiteralPath $defaults -Value $json -Encoding UTF8
+
+        $sid = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
+        $appData = Join-Path $TestDrive 'Users/张三/AppData/Roaming'
+        $userConfig = Join-Path $appData 'RustDesk/config/RustDesk2.toml'
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $userConfig) -Force
+        Set-Content -LiteralPath $userConfig -Value 'relay-server = "old.example.com:21117"' -Encoding UTF8
+        $serviceConfig = Join-Path $TestDrive 'ProgramData/RustDesk/config/RustDesk2.toml'
+
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
+        Mock -ModuleName $script:ModuleName Get-Service { [pscustomobject]@{ Name = 'RustDesk'; Status = 'Running' } }
+        Mock -ModuleName $script:ModuleName Wait-VegaRustDeskService { [pscustomobject]@{ Found = $true; Running = $true; Status = 'Running' } }
+        Mock -ModuleName $script:ModuleName Restart-VegaRustDeskService { [pscustomobject]@{ Found = $true; WasRunning = $true; Restarted = $true; Status = 'Running'; Message = 'ok' } }
+
+        # 真实共享冲突：独占打开用户文件，Get-Content 会抛非终止错误（这正是 P1-1 的场景，
+        # 用 throw 模拟不出来）。没有 -ErrorAction Stop 时读失败会被当成空配置。
+        $lock = [System.IO.File]::Open($userConfig, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        try {
+            $result = Invoke-VegaRustDeskBootstrap -DefaultsFile $defaults -HostStatePath $statePath `
+                -ServiceStatePath $serviceStatePath -ServiceConfigPath $serviceConfig `
+                -InteractiveUserSid $sid -InteractiveUserAppData $appData -Confirm:$false
+        }
+        finally {
+            $lock.Dispose()
+        }
+
+        $result.Success | Should -BeTrue
+        $result.Degraded | Should -BeTrue
+        $result.ExitCode | Should -Be 2
+
+        # 用户文件原值保留，且 host-state.json 里没有它的回滚基线（读失败不写基线）。
+        (Microsoft.PowerShell.Management\Get-Content -LiteralPath $userConfig -Raw -Encoding UTF8) |
+            Should -Match 'old\.example\.com:21117'
+        $saved = Read-VegaState -Path $statePath
+        $userRecords = @($saved.RustDeskConfigKeys | Where-Object { $null -ne $_ -and [string]::Equals([string]$_.Path, $userConfig, [StringComparison]::OrdinalIgnoreCase) })
+        $userRecords.Count | Should -Be 0
+
+        # 服务级配置照常写入并回读。
+        (Microsoft.PowerShell.Management\Get-Content -LiteralPath $serviceConfig -Raw -Encoding UTF8) |
+            Should -Match 'custom-rendezvous-server = "60\.205\.95\.98"'
+    }
+}
+
+Describe 't3-fix6 入口语义子进程（显式空 / 省略交互用户上下文）' {
+    BeforeAll {
+        $script:EntryHarness = @'
+param(
+    [string]$ModulePath,
+    [string]$DefaultsFile,
+    [string]$HostStatePath,
+    [string]$ServiceStatePath,
+    [string]$ServiceConfigPath,
+    [string]$UserConfigPath,
+    [string]$Sid,
+    [string]$AppData,
+    [switch]$ServiceOnly
+)
+$ErrorActionPreference = 'Stop'
+Import-Module $ModulePath -Force
+# 在模块作用域替换外部动作：真实进程 + 真实配置写入，只有服务/安装探测是桩。
+$module = Get-Module 'Vega.Common'
+& $module {
+    param($sid, $appData, $userConfig)
+    function Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
+    function Get-Service { [pscustomobject]@{ Name = 'RustDesk'; Status = 'Running' } }
+    function Wait-VegaRustDeskService { [pscustomobject]@{ Found = $true; Running = $true; Status = 'Running' } }
+    function Restart-VegaRustDeskService { [pscustomobject]@{ Found = $true; WasRunning = $true; Restarted = $true; Status = 'Running'; Message = 'ok' } }
+    function Resolve-VegaSetupInteractiveUser {
+        param([AllowEmptyString()][string]$Sid = '', [AllowEmptyString()][string]$AppDataPath = '', [AllowEmptyString()][string]$ConfigPath = '')
+        [pscustomobject]@{ Sid = $sid; AppDataPath = $appData; UserConfigPath = $userConfig }
+    }
+} $Sid $AppData $UserConfigPath
+
+$arguments = @{
+    DefaultsFile      = $DefaultsFile
+    HostStatePath     = $HostStatePath
+    ServiceStatePath  = $ServiceStatePath
+    ServiceConfigPath = $ServiceConfigPath
+    Confirm           = $false
+}
+if ($ServiceOnly) { $arguments['ServiceOnly'] = $true }
+elseif (-not [string]::IsNullOrWhiteSpace($UserConfigPath)) { $arguments['UserConfigPath'] = $UserConfigPath }
+
+$result = Invoke-VegaRustDeskBootstrap @arguments
+exit [int]$result.ExitCode
+'@
+        $script:HarnessPath = Join-Path $TestDrive 'entry-harness.ps1'
+        Set-Content -LiteralPath $script:HarnessPath -Value $script:EntryHarness -Encoding UTF8
+        $script:HarnessModule = Join-Path (Join-Path $PSScriptRoot '..') 'host/lib/Vega.Common.psm1'
+        $script:HarnessPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    }
+
+    It '显式传空上下文（入口置 -ServiceOnly）：子进程退出码 2 且只落服务级配置' -Skip:($env:OS -ne 'Windows_NT') {
+        $statePath = Join-Path $TestDrive ('h-' + [guid]::NewGuid().ToString('N') + '.json')
+        $serviceStatePath = Join-Path $TestDrive ('s-' + [guid]::NewGuid().ToString('N') + '.json')
+        $defaults = Join-Path $TestDrive 'vega-defaults.json'
+        $json = @{ rustdesk = @{ idServer = '60.205.95.98'; relayServer = '60.205.95.98'; key = $script:Key } } | ConvertTo-Json
+        Set-Content -LiteralPath $defaults -Value $json -Encoding UTF8
+        $serviceConfig = Join-Path $TestDrive 'ProgramData/RustDesk/config/RustDesk2.toml'
+
+        $arguments = @(
+            '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+            '-File', $script:HarnessPath,
+            '-ModulePath', $script:HarnessModule,
+            '-DefaultsFile', $defaults,
+            '-HostStatePath', $statePath,
+            '-ServiceStatePath', $serviceStatePath,
+            '-ServiceConfigPath', $serviceConfig,
+            '-Sid', 'S-1-5-21-1111111111-2222222222-3333333333-1001',
+            '-AppData', (Join-Path $TestDrive 'Users/张三/AppData/Roaming'),
+            '-UserConfigPath', '',
+            '-ServiceOnly'
+        )
+        $output = & $script:HarnessPowerShell @arguments 2>&1
+        $code = $LASTEXITCODE
+        Write-Host ($output | Out-String)
+
+        $code | Should -Be 2
+        (Microsoft.PowerShell.Management\Get-Content -LiteralPath $serviceConfig -Raw -Encoding UTF8) |
+            Should -Match 'custom-rendezvous-server = "60\.205\.95\.98"'
+    }
+
+    It '省略上下文参数：子进程退出码 0 且用户级与服务级都落盘' -Skip:($env:OS -ne 'Windows_NT') {
+        $statePath = Join-Path $TestDrive ('h-' + [guid]::NewGuid().ToString('N') + '.json')
+        $serviceStatePath = Join-Path $TestDrive ('s-' + [guid]::NewGuid().ToString('N') + '.json')
+        $defaults = Join-Path $TestDrive 'vega-defaults.json'
+        $json = @{ rustdesk = @{ idServer = '60.205.95.98'; relayServer = '60.205.95.98'; key = $script:Key } } | ConvertTo-Json
+        Set-Content -LiteralPath $defaults -Value $json -Encoding UTF8
+        $appData = Join-Path $TestDrive 'Users/张三/AppData/Roaming'
+        $userConfig = Join-Path $appData 'RustDesk/config/RustDesk2.toml'
+        $null = New-Item -ItemType Directory -Path (Split-Path -Parent $userConfig) -Force
+        $serviceConfig = Join-Path $TestDrive 'ProgramData/RustDesk/config/RustDesk2.toml'
+
+        $arguments = @(
+            '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+            '-File', $script:HarnessPath,
+            '-ModulePath', $script:HarnessModule,
+            '-DefaultsFile', $defaults,
+            '-HostStatePath', $statePath,
+            '-ServiceStatePath', $serviceStatePath,
+            '-ServiceConfigPath', $serviceConfig,
+            '-Sid', 'S-1-5-21-1111111111-2222222222-3333333333-1001',
+            '-AppData', $appData,
+            '-UserConfigPath', $userConfig
+        )
+        $output = & $script:HarnessPowerShell @arguments 2>&1
+        $code = $LASTEXITCODE
+        Write-Host ($output | Out-String)
+
+        $code | Should -Be 0
+        (Microsoft.PowerShell.Management\Get-Content -LiteralPath $userConfig -Raw -Encoding UTF8) |
+            Should -Match 'custom-rendezvous-server = "60\.205\.95\.98"'
+        (Microsoft.PowerShell.Management\Get-Content -LiteralPath $serviceConfig -Raw -Encoding UTF8) |
+            Should -Match 'custom-rendezvous-server = "60\.205\.95\.98"'
+    }
+}
+
 Describe 'install-rustdesk.ps1 静态约束' {
     BeforeAll {
         $script:ScriptPath = Join-Path (Join-Path $PSScriptRoot '..') 'host/install-rustdesk.ps1'

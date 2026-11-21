@@ -179,11 +179,15 @@ detect_public_ip() {
     return 0
   fi
 
-  candidate=$(hostname -I 2>/dev/null | awk '{print $1}') || candidate=""
-  if candidate=$(sanitize_detected_ipv4 "$candidate"); then
-    printf '%s' "$candidate"
-    return 0
-  fi
+  # t3-fix6 P2：hostname -I 一次可能输出多个地址（容器/多网卡常见 100.64.x 在前，
+  # 内网或公网地址在后）。只取第一个会漏掉可用地址，这里逐个分类，
+  # 第一个通过 sanitize 的地址胜出，其余继续按顺序尝试。
+  while IFS= read -r candidate; do
+    if candidate=$(sanitize_detected_ipv4 "$candidate"); then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done < <(hostname -I 2>/dev/null | tr -s '[:space:]' '\n')
 
   printf '%s' ""
 }
