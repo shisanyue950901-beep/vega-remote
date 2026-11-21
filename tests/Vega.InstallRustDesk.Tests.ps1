@@ -646,6 +646,16 @@ Describe 'install-rustdesk.ps1 静态约束' {
         $script:ScriptText | Should -Match '\[switch\]\$Uninstall'
         $script:ScriptText | Should -Match 'exit 1'
     }
+
+    It 't3-fix4 支持 -NoFileLog 与 Base64 上下文，降级返回退出码 2' {
+        $script:ScriptText | Should -Match '\[switch\]\$NoFileLog'
+        $script:ScriptText | Should -Match 'if \(\$NoFileLog\)'
+        $script:ScriptText | Should -Match '\[string\]\$InteractiveUserContextB64'
+        $script:ScriptText | Should -Match 'ConvertFrom-VegaInteractiveUserContextPayload'
+        $script:ScriptText | Should -Match 'exit 2'
+        # -NoFileLog 时不能再补默认日志路径。
+        $script:ScriptText | Should -Match 'if \(\$NoFileLog\)[\s\S]*?\$LogFile = \x27\x27'
+    }
 }
 
 Describe 'P1-5 回滚按 SID 记录的用户配置路径校验' {
@@ -711,15 +721,25 @@ Describe 'P1-2 / P1-4 / P1-5 / P1-8 安装包钩子静态约束' {
         $script:Hooks | Should -Match 'StrCmp \$vegaLogUsable "1"'
     }
 
-    It 'P1-5 钩子把交互用户 SID 与 Roaming AppData 传给脚本' {
-        $script:Hooks | Should -Match '-InteractiveUserSid "\$vegaUserSid"'
-        $script:Hooks | Should -Match '-InteractiveUserAppData "\$vegaUserAppData"'
-        # 用 -File 调独立解析脚本（避免 NSIS 单引号嵌套），字段分开取。
-        $script:Hooks | Should -Match 'resolve-interactive-user\.ps1" -Field Sid'
-        $script:Hooks | Should -Match 'resolve-interactive-user\.ps1" -Field AppDataPath'
-        $script:ResolverText | Should -Match 'Get-VegaInteractiveUserContextValue -Field \$Field'
+    It 'P1-5/t3-fix4 钩子一次解析并以 ASCII Base64 传交互用户上下文' {
+        $script:Hooks | Should -Match '-InteractiveUserContextB64 "\$vegaUserContextB64"'
+        $script:Hooks | Should -Not -Match '-InteractiveUserSid "\$vegaUserSid"'
+        $script:Hooks | Should -Not -Match '-InteractiveUserAppData "\$vegaUserAppData"'
+        # 用 -File 调独立解析脚本（避免 NSIS 单引号嵌套），只取一次 Context。
+        $script:Hooks | Should -Match 'resolve-interactive-user\.ps1" -Field Context'
+        $script:Hooks | Should -Match 'StrCpy \$vegaUserContextB64 \$1'
+        $script:ResolverText | Should -Match 'Get-VegaInteractiveUserContextPayload'
+        $script:ModuleText | Should -Match 'ConvertTo-VegaAsciiBase64'
         # 解析只认交互用户，不能把提权账户当用户。
         $script:ModuleText | Should -Match 'SkipProcessFallback'
+    }
+
+    It 'P2/t3-fix4 icacls 失败时钩子传 -NoFileLog' {
+        $script:Hooks | Should -Match 'VegaSelectLogArgument'
+        $script:Hooks | Should -Match "\$vegaLogArgument = '-NoFileLog'|StrCpy \$vegaLogArgument '-NoFileLog'"
+        $script:Hooks | Should -Match '\$vegaLogArgument -InteractiveUserContextB64'
+        # 安装与卸载两处都必须用条件参数，而不是写死 -LogFile。
+        ([regex]::Matches($script:Hooks, '\$vegaLogArgument -')).Count | Should -BeGreaterThan 1
     }
 
     It 'P1-8 回滚失败保留重试脚本，成功后才删除' {
@@ -732,5 +752,116 @@ Describe 'P1-2 / P1-4 / P1-5 / P1-8 安装包钩子静态约束' {
         $uninstall | Should -BeGreaterThan $preserve
         $remove | Should -BeGreaterThan $uninstall
         $script:Hooks | Should -Match 'vega_unsetup_failed:[\s\S]*可重试'
+    }
+}
+
+
+Describe 't3-fix4 ASCII Base64 交互用户上下文' {
+    BeforeEach {
+        $script:CtxSid = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
+        # 中文用户名/目录：nsExec 用 ANSI 解码会变成 '?'，Base64 必须原样往返。
+        $script:CtxAppData = Join-Path $TestDrive ('用户 张三/AppData/Roaming')
+        $null = New-Item -ItemType Directory -Path $script:CtxAppData -Force
+    }
+
+    It '中文路径编码后是纯 ASCII，解码校验通过' {
+        $payload = ConvertTo-VegaAsciiBase64 -Text ("{0}`n{1}" -f $script:CtxSid, $script:CtxAppData)
+        $payload | Should -Match '^[A-Za-z0-9+/]+={0,2}$'
+        $payload | Should -Not -Match '[^\x20-\x7E]'
+
+        $decoded = ConvertFrom-VegaInteractiveUserContextPayload -Payload ($payload + "`r`n")
+        $decoded.Valid | Should -BeTrue
+        $decoded.Sid | Should -Be $script:CtxSid
+        $decoded.AppDataPath | Should -Be $script:CtxAppData.TrimEnd([char[]]@('\', '/'))
+        $decoded.UserConfigPath | Should -Match 'RustDesk'
+    }
+
+    It 'AppData 目录不存在时判为无效（脚本据此降级）' {
+        $missing = Join-Path $TestDrive ('不存在 ' + [guid]::NewGuid().ToString('N'))
+        $payload = ConvertTo-VegaAsciiBase64 -Text ("{0}`n{1}" -f $script:CtxSid, $missing)
+        $decoded = ConvertFrom-VegaInteractiveUserContextPayload -Payload $payload
+        $decoded.Valid | Should -BeFalse
+        $decoded.Error | Should -Match '不存在'
+    }
+
+    It '非法 Base64 / 非法 SID 一律拒绝' {
+        (ConvertFrom-VegaInteractiveUserContextPayload -Payload '!!!not-base64!!!').Valid | Should -BeFalse
+        $badSid = ConvertTo-VegaAsciiBase64 -Text ("not-a-sid`n{0}" -f $script:CtxAppData)
+        (ConvertFrom-VegaInteractiveUserContextPayload -Payload $badSid).Valid | Should -BeFalse
+        # 裸明文（含中文）不是合法 Base64，也不能被误当上下文。
+        (ConvertFrom-VegaInteractiveUserContextPayload -Payload ('S-1-5-21`n' + $script:CtxAppData)).Valid | Should -BeFalse
+    }
+}
+
+Describe 't3-fix4 已有 RustDesk 装在自定义目录时不重装' {
+    It 'Registry64/32 候选命中 ASCII 自定义目录即视为已安装' {
+        $dir = Join-Path $TestDrive 'CustomApps/RustDesk'
+        $null = New-Item -ItemType Directory -Path $dir -Force
+        $exe = Join-Path $dir 'rustdesk.exe'
+        Set-Content -LiteralPath $exe -Value 'stub' -Encoding UTF8
+
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskRegistryInstallCandidates { @($exe) }
+        (Get-VegaRustDeskInstall) | Should -Be $exe
+    }
+
+    It '中文自定义目录同样命中，不再走静默安装' {
+        $dir = Join-Path $TestDrive '自定义 软件/远程控制 RustDesk'
+        $null = New-Item -ItemType Directory -Path $dir -Force
+        $exe = Join-Path $dir 'rustdesk.exe'
+        Set-Content -LiteralPath $exe -Value 'stub' -Encoding UTF8
+
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskRegistryInstallCandidates { @($exe) }
+        (Get-VegaRustDeskInstall) | Should -Be $exe
+    }
+
+    It '注册表 InstallLocation / DisplayIcon / 服务 ImagePath 规整成 rustdesk.exe' -Skip:($env:OS -ne 'Windows_NT') {
+        (ConvertTo-VegaRustDeskExeCandidate -Value 'C:\Tools\RustDesk') | Should -Be 'C:\Tools\RustDesk\rustdesk.exe'
+        (ConvertTo-VegaRustDeskExeCandidate -Value 'C:\Tools\RustDesk\rustdesk.exe,0') | Should -Be 'C:\Tools\RustDesk\rustdesk.exe'
+        (ConvertTo-VegaRustDeskExeCandidate -Value '"C:\Tools\RustDesk\rustdesk.exe" --service') | Should -Be 'C:\Tools\RustDesk\rustdesk.exe'
+    }
+}
+
+Describe 't3-fix4 用户级配置写失败时降级而不是整单失败' {
+    It '服务级写成功后返回 Success + Degraded，并保留 PromptPending' {
+        $statePath = Join-Path $TestDrive ('host-' + [guid]::NewGuid().ToString('N') + '.json')
+        $serviceStatePath = Join-Path $TestDrive ('svc-' + [guid]::NewGuid().ToString('N') + '.json')
+        $defaults = Join-Path $TestDrive 'vega-defaults.json'
+        $json = @{ rustdesk = @{ idServer = '60.205.95.98'; relayServer = '60.205.95.98'; key = $script:Key } } | ConvertTo-Json
+        Set-Content -LiteralPath $defaults -Value $json -Encoding UTF8
+
+        $sid = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
+        $appData = Join-Path $TestDrive ('appdata-' + [guid]::NewGuid().ToString('N'))
+        $serviceConfig = Join-Path $TestDrive ('svc-' + [guid]::NewGuid().ToString('N') + '/RustDesk/config/RustDesk2.toml')
+
+        Mock -ModuleName $script:ModuleName Get-VegaInteractiveUserContext { throw '显式给了交互用户参数，不应再解析' }
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
+        Mock -ModuleName $script:ModuleName Get-Service { [pscustomobject]@{ Name = 'RustDesk'; Status = 'Running' } }
+        Mock -ModuleName $script:ModuleName Wait-VegaRustDeskService { [pscustomobject]@{ Found = $true; Running = $true; Status = 'Running' } }
+        Mock -ModuleName $script:ModuleName Restart-VegaRustDeskService { [pscustomobject]@{ Found = $true; WasRunning = $true; Restarted = $true; Status = 'Running'; Message = 'ok' } }
+        Mock -ModuleName $script:ModuleName Set-VegaRustDeskConfig {
+            param($Server, $Key, $RelayServer, $State, $StatePath, $UserConfigPath, $ServiceConfigPath, $ServiceStatePath, $ForceService, $ContinueOnUserFailure, $Confirm)
+            $ContinueOnUserFailure | Should -BeTrue
+            [pscustomobject]@{
+                Applied        = @([pscustomobject]@{ Path = $ServiceConfigPath; Changed = $true })
+                Warnings       = @("用户级配置路径写入失败：$UserConfigPath")
+                ServicePresent = $true
+                Values         = @{}
+                State          = $State
+            }
+        }
+
+        $result = Invoke-VegaRustDeskBootstrap -DefaultsFile $defaults -HostStatePath $statePath `
+            -ServiceStatePath $serviceStatePath -ServiceConfigPath $serviceConfig `
+            -InteractiveUserSid $sid -InteractiveUserAppData $appData -Confirm:$false
+
+        $result.Success | Should -BeTrue
+        $result.Configured | Should -BeTrue
+        $result.Degraded | Should -BeTrue
+        $result.UserConfigWritten | Should -BeFalse
+        ($result.Messages -join "`n") | Should -Match '降级'
+
+        $serviceState = Read-VegaState -Path $serviceStatePath
+        $serviceState.RustDeskUserConfig.Written | Should -BeFalse
+        $serviceState.RustDeskUserConfig.PromptPending | Should -BeTrue
     }
 }
