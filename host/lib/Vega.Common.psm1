@@ -6834,7 +6834,8 @@ function Invoke-VegaRustDeskBootstrap {
            静默安装后确认新 EXE 与服务就绪（P1-5），并立刻记录安装归属（P1-6）；
         4. 用钩子解析好的交互用户（SID + Roaming AppData）同时写用户级与服务级
            RustDesk2.toml（P1-5）。服务级写入的前提是 RustDesk 服务已注册：
-             已注册但停止 → Start-Service 启动并在 60s 内等 Running；
+             已注册但停止 → 非阻塞启动（-NoWait / ServiceController.Start）并与状态
+                           确认共用同一个 60s 截止时间；
               未注册 → 不注册服务；若 rustdesk.exe 正在运行（t3-fix7 P1）则不写任何
                        配置，直接以 ExitCode=2 停止并说明原因；进程没在跑时只写用户级
                        配置并回读，服务级跳过（降级，ExitCode=2）。
@@ -7054,7 +7055,7 @@ function Invoke-VegaRustDeskBootstrap {
                     # 已注册但停止：先启动，再交给有界等待确认 Running。
                     try {
                         Start-VegaRustDeskServiceNonBlocking
-                        $message = "RustDesk 服务处于 $($service.Status)，已通过 Start-Service 启动。"
+                        $message = "RustDesk 服务处于 $($service.Status)，已发起启动（不阻塞等待 Running）。"
                         $messages.Add($message)
                         Write-VegaSetupLog -Path $LogFile -Message $message
                     }
