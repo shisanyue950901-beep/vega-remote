@@ -96,7 +96,7 @@ done
 
 
 echo "==> 公网 IP 探测行为（隔离 curl mock）"
-# shellcheck source=../server/lib/ip-detect.sh
+# shellcheck source=server/lib/ip-detect.sh
 . server/lib/ip-detect.sh
 
 mock_dir=$(mktemp -d)

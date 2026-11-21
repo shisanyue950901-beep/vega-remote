@@ -23,7 +23,7 @@
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$SCRIPT_DIR"
-# shellcheck source=lib/ip-detect.sh
+# shellcheck source=server/lib/ip-detect.sh
 . "$SCRIPT_DIR/lib/ip-detect.sh"
 
 ALLOW_WEBSOCKET=false
