@@ -607,7 +607,7 @@ Describe 'install-rustdesk.ps1 入口（真实子进程）' {
         $libDir = Join-Path $package 'lib'
         $null = New-Item -ItemType Directory -Path $libDir -Force
         Copy-Item -LiteralPath (Join-Path (Join-Path $PSScriptRoot '..') 'host/install-rustdesk.ps1') -Destination $package
-        Copy-Item -LiteralPath (Join-Path (Join-Path (PSScriptRoot) '..') 'host/lib/Vega.Common.psm1') -Destination $libDir
+        Copy-Item -LiteralPath (Join-Path (Join-Path $PSScriptRoot '..') 'host/lib/Vega.Common.psm1') -Destination $libDir
 
         $defaults = Join-Path $package 'bad-defaults.json'
         Set-Content -LiteralPath $defaults -Value '{ not json' -Encoding UTF8
