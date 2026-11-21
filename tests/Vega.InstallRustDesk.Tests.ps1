@@ -25,16 +25,6 @@ BeforeAll {
             param([Parameter(Position = 0)][string[]]$Name)
             $null = $Name
         }
-        # Linux 上的 pwsh 没有 Windows 服务 cmdlet；先放桩，Mock 才有目标可替换。
-        'Start-Service' = {
-            [CmdletBinding()]
-            param(
-                [Parameter(Position = 0)][string[]]$Name,
-                [switch]$NoWait
-            )
-            $null = $Name
-            $null = $NoWait
-        }
     }
     foreach ($stubName in $stubs.Keys) {
         if (Get-Command -Name $stubName -ErrorAction SilentlyContinue) { continue }
@@ -43,6 +33,24 @@ BeforeAll {
             param($name, $body)
             New-Item -Path ("function:script:{0}" -f $name) -Value $body -Force | Out-Null
         } $stubName $stubBody
+    }
+
+    # t3-fix12 P2-1：Start-Service 的桩无条件定义，不再看 Get-Command 的结果。
+    # Windows PowerShell 7 自带原生命令却没有 -NoWait；沿用原生元数据时 Pester 生成的
+    # Mock 只有原生命令的参数集，-NoWait 用例会在参数绑定阶段就失败（只有缺原生命令的
+    # 本机能通过）。模块作用域里的函数优先于原生 cmdlet，这里始终覆盖成带 -NoWait 的
+    # script 级桩，用例就不再依赖宿主 Start-Service 的元数据。
+    & $module {
+        param($body)
+        New-Item -Path 'function:script:Start-Service' -Value $body -Force | Out-Null
+    } {
+        [CmdletBinding()]
+        param(
+            [Parameter(Position = 0)][string[]]$Name,
+            [switch]$NoWait
+        )
+        $null = $Name
+        $null = $NoWait
     }
 }
 
@@ -944,8 +952,9 @@ Describe 't3-fix7 服务等待的有界语义' {
         $global:VegaClockElapsed | Should -BeLessOrEqual 1.0
     }
 
-    It 'P2 有 -NoWait 时用它启动，不阻塞等 Running' -Skip:($PSVersionTable.PSVersion.Major -lt 6) {
-        # Windows PowerShell 5.1 的 Start-Service 根本没有 -NoWait，只能走回退分支。
+    It 'P2 有 -NoWait 时用它启动，不阻塞等 Running' {
+        # t3-fix12 P2-1：模块作用域里的 Start-Service 桩（BeforeAll 无条件定义）始终带
+        # -NoWait，所以这条用例不再受宿主原生命令参数集影响，Windows PS7 与 5.1 行为一致。
         Mock -ModuleName $script:ModuleName Get-Command { [pscustomobject]@{ Parameters = @{ NoWait = $true } } }
         Mock -ModuleName $script:ModuleName Start-Service { }
 
