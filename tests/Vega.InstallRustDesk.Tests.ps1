@@ -1763,7 +1763,7 @@ Describe 't3-fix5 命中已有安装后不下载、不静默安装' {
         Mock -ModuleName $script:ModuleName Restart-VegaRustDeskService { [pscustomobject]@{ Found = $true; WasRunning = $true; Restarted = $true; Status = 'Running'; Message = 'ok' } }
         Mock -ModuleName $script:ModuleName Set-VegaRustDeskConfig {
             param($Server, $Key, $RelayServer, $State, $StatePath, $UserConfigPath, $ServiceConfigPath, $ServiceStatePath, $ForceService, $ContinueOnUserFailure, $Confirm)
-            $null = $Server, $Key, $RelayServer, $StatePath, $ServiceStatePath, $ForceService, $ContinueOnUserFailure, $Confirm
+            $null = $Server, $Key, $RelayServer, $StatePath, $ServiceStatePath, $UserConfigPath, $ForceService, $ContinueOnUserFailure, $Confirm
             [pscustomobject]@{
                 Applied        = @([pscustomobject]@{ Path = $ServiceConfigPath; Changed = $true })
                 Warnings       = @()
@@ -1871,7 +1871,7 @@ Describe 't3-fix5 显式空上下文走 -ServiceOnly 时不再解析交互用户
         Mock -ModuleName $script:ModuleName Restart-VegaRustDeskService { [pscustomobject]@{ Found = $true; WasRunning = $true; Restarted = $true; Status = 'Running'; Message = 'ok' } }
         Mock -ModuleName $script:ModuleName Set-VegaRustDeskConfig {
             param($Server, $Key, $RelayServer, $State, $StatePath, $UserConfigPath, $ServiceConfigPath, $ServiceStatePath, $ForceService, $ServiceOnly, $ContinueOnUserFailure, $Confirm)
-            $null = $Server, $Key, $RelayServer, $StatePath, $ServiceStatePath, $ForceService, $ServiceOnly, $ContinueOnUserFailure, $Confirm
+            $null = $Server, $Key, $RelayServer, $StatePath, $ServiceStatePath, $UserConfigPath, $ForceService, $ServiceOnly, $ContinueOnUserFailure, $Confirm
             if ($ServiceOnly) { $script:CapturedServiceOnly = $true }
             [pscustomobject]@{
                 Applied        = @([pscustomobject]@{ Path = $ServiceConfigPath; Changed = $true })
@@ -1965,7 +1965,7 @@ Describe 't3-fix5 原始带空格的注册表值能被探测命中' {
         Mock -ModuleName $script:ModuleName Restart-VegaRustDeskService { [pscustomobject]@{ Found = $true; WasRunning = $true; Restarted = $true; Status = 'Running'; Message = 'ok' } }
         Mock -ModuleName $script:ModuleName Set-VegaRustDeskConfig {
             param($Server, $Key, $RelayServer, $State, $StatePath, $UserConfigPath, $ServiceConfigPath, $ServiceStatePath, $ForceService, $ServiceOnly, $ContinueOnUserFailure, $Confirm)
-            $null = $Server, $Key, $RelayServer, $StatePath, $ServiceStatePath, $ForceService, $ServiceOnly, $ContinueOnUserFailure, $Confirm
+            $null = $Server, $Key, $RelayServer, $StatePath, $ServiceStatePath, $UserConfigPath, $ForceService, $ServiceOnly, $ContinueOnUserFailure, $Confirm
             [pscustomobject]@{
                 Applied        = @([pscustomobject]@{ Path = $ServiceConfigPath; Changed = $true })
                 Warnings       = @()
