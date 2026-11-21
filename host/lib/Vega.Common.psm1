@@ -1674,7 +1674,7 @@ function Remove-VegaStateRustDeskInstall {
     if (-not $PSCmdlet.ShouldProcess($Path, '删除 RustDesk 安装记录')) { return $State }
 
     $State.RustDeskInstalls = @(@($State.RustDeskInstalls) | Where-Object {
-            $null -ne $_ -and [string]$_.Path -ne $Path
+            $null -ne $_ -and [string]($_.Path) -ne $Path
         })
     return $State
 }
