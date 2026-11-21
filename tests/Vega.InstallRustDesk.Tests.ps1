@@ -270,7 +270,7 @@ Describe 'Wait-VegaRustDeskService' {
         $result = Wait-VegaRustDeskService -TimeoutSeconds 10 -IntervalSeconds 1
         $result.Running | Should -BeTrue
         $result.Status | Should -Be 'Running'
-        $script:VegaWaitCalls | Should -BeGreaterOrEqual 2
+        (& (Get-Module $script:ModuleName) { $script:VegaWaitCalls }) | Should -BeGreaterOrEqual 2
     }
 }
 
@@ -450,7 +450,7 @@ Describe 'Invoke-VegaRustDeskBootstrap' {
         Mock -ModuleName $script:ModuleName Get-VegaInteractiveUserContext { throw '钩子已给参数时不应再解析上下文' }
 
         $appData = Join-Path $TestDrive ('appdata-' + [guid]::NewGuid().ToString('N'))
-        $hookUserConfig = Join-Path $appData 'RustDesk/config/RustDesk2.toml'
+        $hookUserConfig = Join-Path $appData 'RustDesk\config\RustDesk2.toml'
 
         $result = Invoke-VegaRustDeskBootstrap -DefaultsFile $script:defaults -HostStatePath $script:statePath `
             -ServiceStatePath $script:serviceStatePath -ServiceConfigPath $script:serviceConfig `
@@ -665,6 +665,7 @@ Describe 'P1-5 回滚按 SID 记录的用户配置路径校验' {
 
         Mock -ModuleName $script:ModuleName Test-VegaRustDeskManagedConfigPath { $true }
         Mock -ModuleName $script:ModuleName Restore-VegaRustDeskState {
+            param($State)
             [pscustomobject]@{ State = $State; Failures = @(); Messages = @('ok') }
         }
 
