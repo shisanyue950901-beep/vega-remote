@@ -5258,7 +5258,7 @@ function Invoke-VegaRustDeskSetup {
 }
 
 # ---------------------------------------------------------------------------
-# T3：安装包内的 RustDesk 一键安装（VEga-Setup.exe -> install-rustdesk.ps1）
+# T3：安装包内的 RustDesk 一键安装（Vega-Setup.exe -> install-rustdesk.ps1）
 # ---------------------------------------------------------------------------
 
 function Write-VegaSetupLog {

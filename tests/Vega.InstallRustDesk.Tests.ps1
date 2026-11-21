@@ -92,7 +92,7 @@ Describe 'Get-VegaRustDeskInstaller' {
         $result.Error | Should -Match 'SHA256 不匹配'
         $result.Error | Should -Match 'rustdesk\.com/download'
         Test-Path -LiteralPath (Join-Path $script:downloadDir $script:release.FileName) | Should -BeFalse
-        Should -Invoke -ModuleName $script:ModuleName Get-FileHash -Times 1 -Exactly
+        Should -Invoke -CommandName Get-FileHash -ModuleName $script:ModuleName -Times 1 -Exactly
     }
 
     It 'SHA256 仍是占位值时不发起下载' {
@@ -108,7 +108,7 @@ Describe 'Get-VegaRustDeskInstaller' {
         $result = Get-VegaRustDeskInstaller -DestinationDirectory $script:downloadDir -Release $placeholder
         $result.Success | Should -BeFalse
         $result.Error | Should -Match 'SHA256 尚未填写'
-        Should -Invoke -ModuleName $script:ModuleName Invoke-WebRequest -Times 0 -Exactly
+        Should -Invoke -CommandName Invoke-WebRequest -ModuleName $script:ModuleName -Times 0 -Exactly
     }
 
     It '下载失败最多尝试 2 次并返回非零原因' {
@@ -121,7 +121,7 @@ Describe 'Get-VegaRustDeskInstaller' {
         $result.Success | Should -BeFalse
         $result.Error | Should -Match '已尝试 2 次'
         $result.Error | Should -Match 'rustdesk\.com/download'
-        Should -Invoke -ModuleName $script:ModuleName Invoke-WebRequest -Times 2 -Exactly
+        Should -Invoke -CommandName Invoke-WebRequest -ModuleName $script:ModuleName -Times 2 -Exactly
     }
 
     It '校验通过返回安装包路径' {
@@ -151,7 +151,7 @@ Describe 'Install-VegaRustDeskSilently' {
 
         $result = Install-VegaRustDeskSilently -InstallerPath $installer
         $result.Success | Should -BeTrue
-        Should -Invoke -ModuleName $script:ModuleName Invoke-VegaCommand -Times 1 -Exactly -ParameterFilter {
+        Should -Invoke -CommandName Invoke-VegaCommand -ModuleName $script:ModuleName -Times 1 -Exactly -ParameterFilter {
             $ArgumentList -contains '--silent-install'
         }
     }
@@ -202,8 +202,8 @@ Describe 'Invoke-VegaRustDeskBootstrap' {
         $result.Success | Should -BeTrue
         $result.Installed | Should -BeFalse
         $result.Configured | Should -BeTrue
-        Should -Invoke -ModuleName $script:ModuleName Get-VegaRustDeskInstaller -Times 0 -Exactly
-        Should -Invoke -ModuleName $script:ModuleName Install-VegaRustDeskSilently -Times 0 -Exactly
+        Should -Invoke -CommandName Get-VegaRustDeskInstaller -ModuleName $script:ModuleName -Times 0 -Exactly
+        Should -Invoke -CommandName Install-VegaRustDeskSilently -ModuleName $script:ModuleName -Times 0 -Exactly
 
         (Get-Content -LiteralPath $script:userConfig -Raw -Encoding UTF8) | Should -Match 'custom-rendezvous-server = "60\.205\.95\.98"'
         (Get-Content -LiteralPath $script:serviceConfig -Raw -Encoding UTF8) | Should -Match 'relay-server = "60\.205\.95\.98:21117"'
@@ -242,7 +242,7 @@ Describe 'Invoke-VegaRustDeskBootstrap' {
 
         $result.Success | Should -BeFalse
         $result.Error | Should -Match 'SHA256 不匹配'
-        Should -Invoke -ModuleName $script:ModuleName Install-VegaRustDeskSilently -Times 0 -Exactly
+        Should -Invoke -CommandName Install-VegaRustDeskSilently -ModuleName $script:ModuleName -Times 0 -Exactly
     }
 
     It '未安装时下载、静默安装、写两处配置并记录到 state.json' {
@@ -265,7 +265,7 @@ Describe 'Invoke-VegaRustDeskBootstrap' {
 
         $result.Success | Should -BeTrue
         $result.Installed | Should -BeTrue
-        Should -Invoke -ModuleName $script:ModuleName Install-VegaRustDeskSilently -Times 1 -Exactly
+        Should -Invoke -CommandName Install-VegaRustDeskSilently -ModuleName $script:ModuleName -Times 1 -Exactly
 
         (Get-Content -LiteralPath $script:userConfig -Raw -Encoding UTF8) | Should -Match 'custom-rendezvous-server = "60\.205\.95\.98"'
         (Get-Content -LiteralPath $script:serviceConfig -Raw -Encoding UTF8) | Should -Match 'custom-rendezvous-server = "60\.205\.95\.98"'
@@ -311,7 +311,7 @@ key = "$script:Key"
 
         $result = Invoke-VegaRustDeskRollback -HostStatePath $statePath -ServiceStatePath $serviceStatePath -Confirm:$false
         $result.Success | Should -BeTrue
-        Should -Invoke -ModuleName $script:ModuleName Uninstall-VegaRustDeskRecorded -Times 1 -Exactly
+        Should -Invoke -CommandName Uninstall-VegaRustDeskRecorded -ModuleName $script:ModuleName -Times 1 -Exactly
 
         $text = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8
         $text | Should -Match 'custom-rendezvous-server = "old\.example\.com"'
@@ -331,7 +331,7 @@ key = "$script:Key"
 
         $result = Invoke-VegaRustDeskRollback -HostStatePath $statePath -ServiceStatePath $serviceStatePath -KeepRustDesk -Confirm:$false
         $result.Success | Should -BeTrue
-        Should -Invoke -ModuleName $script:ModuleName Uninstall-VegaRustDeskRecorded -Times 0 -Exactly
+        Should -Invoke -CommandName Uninstall-VegaRustDeskRecorded -ModuleName $script:ModuleName -Times 0 -Exactly
         @((Read-VegaState -Path $statePath).RustDeskInstalls).Count | Should -Be 1
     }
 }
