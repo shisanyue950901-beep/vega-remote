@@ -6,6 +6,12 @@
   所有下载/安装/服务/配置写入的外部动作都 Mock，文件只落在 $TestDrive。
 #>
 
+# Mock 体在模块作用域执行，计数器/注入数据用 $global: 才能在测试作用域回读；
+# 改成 $script: 会落到模块作用域，断言读不到。这里只豁免这一条规则。
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', '',
+    Justification = 'Pester Mock 在模块作用域执行，用 $global: 在测试与 Mock 之间共享注入数据和调用计数。')]
+param()
+
 BeforeAll {
     $modulePath = Join-Path (Join-Path $PSScriptRoot '..') 'host/lib/Vega.Common.psm1'
     Import-Module $modulePath -Force
@@ -18,6 +24,16 @@ BeforeAll {
             [CmdletBinding()]
             param([Parameter(Position = 0)][string[]]$Name)
             $null = $Name
+        }
+        # Linux 上的 pwsh 没有 Windows 服务 cmdlet；先放桩，Mock 才有目标可替换。
+        'Start-Service' = {
+            [CmdletBinding()]
+            param(
+                [Parameter(Position = 0)][string[]]$Name,
+                [switch]$NoWait
+            )
+            $null = $Name
+            $null = $NoWait
         }
     }
     foreach ($stubName in $stubs.Keys) {
@@ -82,6 +98,7 @@ Describe 'Get-VegaRustDeskInstaller' {
     It 'SHA256 不匹配立即中止并删除文件' {
         Mock -ModuleName $script:ModuleName Invoke-VegaHttpsDownload {
             param($Uri, $OutFile, $TimeoutSeconds, $Deadline)
+            $null = $Uri, $OutFile, $TimeoutSeconds, $Deadline
             Set-Content -LiteralPath $OutFile -Value 'not-the-real-installer' -Encoding UTF8
         }
         Mock -ModuleName $script:ModuleName Get-FileHash {
@@ -125,6 +142,7 @@ Describe 'Get-VegaRustDeskInstaller' {
     It '校验通过返回安装包路径，并保持独占读句柄到启动' {
         Mock -ModuleName $script:ModuleName Invoke-VegaHttpsDownload {
             param($Uri, $OutFile, $TimeoutSeconds, $Deadline)
+            $null = $Uri, $OutFile, $TimeoutSeconds, $Deadline
             Set-Content -LiteralPath $OutFile -Value 'installer' -Encoding UTF8
         }
         Mock -ModuleName $script:ModuleName Get-FileHash {
@@ -154,6 +172,7 @@ Describe 'Get-VegaRustDeskInstaller' {
 
         Mock -ModuleName $script:ModuleName Invoke-VegaHttpsDownload {
             param($Uri, $OutFile, $TimeoutSeconds, $Deadline)
+            $null = $Uri, $OutFile, $TimeoutSeconds, $Deadline
             Copy-Item -LiteralPath $global:VegaTestPayload -Destination $OutFile -Force
         }
 
@@ -225,6 +244,7 @@ Describe 'Install-VegaRustDeskSilently' {
         Set-Content -LiteralPath $installer -Value 'x' -Encoding UTF8
         Mock -ModuleName $script:ModuleName Invoke-VegaCommand {
             param($FilePath, $ArgumentList, $TimeoutSeconds)
+            $null = $FilePath, $ArgumentList, $TimeoutSeconds
             [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Output = @() }
         }
 
@@ -240,6 +260,7 @@ Describe 'Install-VegaRustDeskSilently' {
         Set-Content -LiteralPath $installer -Value 'x' -Encoding UTF8
         Mock -ModuleName $script:ModuleName Invoke-VegaCommand {
             param($FilePath, $ArgumentList, $TimeoutSeconds)
+            $null = $FilePath, $ArgumentList, $TimeoutSeconds
             [pscustomobject]@{ ExitCode = 5; TimedOut = $false; Output = @() }
         }
 
@@ -454,12 +475,12 @@ Describe 'Invoke-VegaRustDeskBootstrap' {
         Mock -ModuleName $script:ModuleName Get-VegaInteractiveUserContext { throw '钩子已给参数时不应再解析上下文' }
 
         $appData = Join-Path $TestDrive ('appdata-' + [guid]::NewGuid().ToString('N'))
-        $hookUserConfig = Join-Path $appData 'RustDesk\config\RustDesk2.toml'
+        $hookUserConfig = Join-Path $appData 'RustDesk/config/RustDesk2.toml'
 
         $result = Invoke-VegaRustDeskBootstrap -DefaultsFile $script:defaults -HostStatePath $script:statePath `
             -ServiceStatePath $script:serviceStatePath -ServiceConfigPath $script:serviceConfig `
             -DownloadDirectory $script:downloadDir -InteractiveUserSid $script:testSid `
-            -InteractiveUserAppData $appData -Confirm:$false
+            -InteractiveUserAppData $appData -UserConfigPath $hookUserConfig -Confirm:$false
 
         $result.Success | Should -BeTrue
         Test-Path -LiteralPath $hookUserConfig | Should -BeTrue
@@ -654,6 +675,7 @@ Describe 't3-fix6 已有安装的服务状态分支' {
         Mock -ModuleName $script:ModuleName Restart-VegaRustDeskService { [pscustomobject]@{ Found = $true; WasRunning = $true; Restarted = $true; Status = 'Running'; Message = 'ok' } }
         Mock -ModuleName $script:ModuleName Set-VegaRustDeskConfig {
             param($Server, $Key, $RelayServer, $State, $StatePath, $UserConfigPath, $ServiceConfigPath, $ServiceStatePath, $ForceService, $ServiceOnly, $ContinueOnUserFailure, $Confirm)
+            $null = $Server, $Key, $RelayServer, $StatePath, $ServiceStatePath, $ForceService, $ServiceOnly, $ContinueOnUserFailure, $Confirm
             [pscustomobject]@{
                 Applied = @(
                     [pscustomobject]@{ Path = $UserConfigPath; Changed = $true }
@@ -668,7 +690,8 @@ Describe 't3-fix6 已有安装的服务状态分支' {
 
         $result = Invoke-VegaRustDeskBootstrap -DefaultsFile $defaults -HostStatePath $statePath `
             -ServiceStatePath $serviceStatePath -ServiceConfigPath $serviceConfig `
-            -InteractiveUserSid $sid -InteractiveUserAppData $appData -Confirm:$false
+            -InteractiveUserSid $sid -InteractiveUserAppData $appData `
+            -UserConfigPath (Join-Path $appData 'RustDesk/config/RustDesk2.toml') -Confirm:$false
 
         $result.Success | Should -BeTrue
         $result.Degraded | Should -BeFalse
@@ -702,7 +725,7 @@ Describe 't3-fix6 已有安装的服务状态分支' {
         # Set-VegaRustDeskConfig 走真实代码：用户级配置必须真的写入并回读一致。
         $result = Invoke-VegaRustDeskBootstrap -DefaultsFile $defaults -HostStatePath $statePath `
             -ServiceStatePath $serviceStatePath -ServiceConfigPath $serviceConfig `
-            -InteractiveUserSid $sid -InteractiveUserAppData $appData -Confirm:$false
+            -InteractiveUserSid $sid -InteractiveUserAppData $appData -UserConfigPath $userConfig -Confirm:$false
 
         $result.Success | Should -BeTrue
         $result.Degraded | Should -BeTrue
@@ -740,6 +763,7 @@ Describe 't3-fix6 已有安装的服务状态分支' {
         # 客户端还开着：内存里的旧配置会在启用服务时覆盖刚写入的新值，所以不能写。
         Mock -ModuleName $script:ModuleName Test-VegaRustDeskClientRunning { $true }
         Mock -ModuleName $script:ModuleName Set-VegaRustDeskConfig { throw 'RustDesk 正在运行时不应写配置' }
+        Mock -ModuleName $script:ModuleName Set-VegaStateRustDeskUserConfig { throw '降级停止时不应记录用户级基线' }
         Mock -ModuleName $script:ModuleName Start-VegaRustDeskServiceNonBlocking { throw '服务未注册时不应启动服务' }
         Mock -ModuleName $script:ModuleName Wait-VegaRustDeskService { throw '服务未注册时不应等待服务' }
         Mock -ModuleName $script:ModuleName Restart-VegaRustDeskService { throw '未写配置时不应重启服务' }
@@ -1051,6 +1075,7 @@ Describe 't3-fix8 P1-2 服务状态：StartPending 只等、1056 视为正常' {
         Mock -ModuleName $script:ModuleName Restart-VegaRustDeskService { [pscustomobject]@{ Found = $true; WasRunning = $true; Restarted = $true; Status = 'Running'; Message = 'ok' } }
         Mock -ModuleName $script:ModuleName Set-VegaRustDeskConfig {
             param($Server, $Key, $RelayServer, $State, $StatePath, $UserConfigPath, $ServiceConfigPath, $ServiceStatePath, $ForceService, $ServiceOnly, $ContinueOnUserFailure, $Confirm)
+            $null = $Server, $Key, $RelayServer, $StatePath, $ServiceStatePath, $ForceService, $ServiceOnly, $ContinueOnUserFailure, $Confirm
             [pscustomobject]@{
                 Applied = @(
                     [pscustomobject]@{ Path = $UserConfigPath; Changed = $true }
@@ -1065,7 +1090,8 @@ Describe 't3-fix8 P1-2 服务状态：StartPending 只等、1056 视为正常' {
 
         $result = Invoke-VegaRustDeskBootstrap -DefaultsFile $defaults -HostStatePath $statePath `
             -ServiceStatePath $serviceStatePath -ServiceConfigPath $serviceConfig `
-            -InteractiveUserSid $sid -InteractiveUserAppData $appData -Confirm:$false
+            -InteractiveUserSid $sid -InteractiveUserAppData $appData `
+            -UserConfigPath (Join-Path $appData 'RustDesk/config/RustDesk2.toml') -Confirm:$false
 
         $result.Success | Should -BeTrue
         $result.ExitCode | Should -Be 0
@@ -1097,6 +1123,7 @@ Describe 't3-fix8 P1-2 服务状态：StartPending 只等、1056 视为正常' {
         Mock -ModuleName $script:ModuleName Restart-VegaRustDeskService { [pscustomobject]@{ Found = $true; WasRunning = $true; Restarted = $true; Status = 'Running'; Message = 'ok' } }
         Mock -ModuleName $script:ModuleName Set-VegaRustDeskConfig {
             param($Server, $Key, $RelayServer, $State, $StatePath, $UserConfigPath, $ServiceConfigPath, $ServiceStatePath, $ForceService, $ServiceOnly, $ContinueOnUserFailure, $Confirm)
+            $null = $Server, $Key, $RelayServer, $StatePath, $ServiceStatePath, $ForceService, $ServiceOnly, $ContinueOnUserFailure, $Confirm
             [pscustomobject]@{
                 Applied = @(
                     [pscustomobject]@{ Path = $UserConfigPath; Changed = $true }
@@ -1111,7 +1138,8 @@ Describe 't3-fix8 P1-2 服务状态：StartPending 只等、1056 视为正常' {
 
         $result = Invoke-VegaRustDeskBootstrap -DefaultsFile $defaults -HostStatePath $statePath `
             -ServiceStatePath $serviceStatePath -ServiceConfigPath $serviceConfig `
-            -InteractiveUserSid $sid -InteractiveUserAppData $appData -Confirm:$false
+            -InteractiveUserSid $sid -InteractiveUserAppData $appData `
+            -UserConfigPath (Join-Path $appData 'RustDesk/config/RustDesk2.toml') -Confirm:$false
 
         $result.Success | Should -BeTrue
         $result.ExitCode | Should -Be 0
@@ -1592,7 +1620,7 @@ Describe 't3-fix4 已有 RustDesk 装在自定义目录时不重装' {
         Set-Content -LiteralPath $exe -Value 'stub' -Encoding UTF8
 
         $script:CustomExe = $exe
-        Mock -ModuleName $script:ModuleName Get-VegaRustDeskRegistryInstallCandidates { @($script:CustomExe) }
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskRegistryInstallCandidate { @($script:CustomExe) }
         (Get-VegaRustDeskInstall) | Should -Be $exe
     }
 
@@ -1603,7 +1631,7 @@ Describe 't3-fix4 已有 RustDesk 装在自定义目录时不重装' {
         Set-Content -LiteralPath $exe -Value 'stub' -Encoding UTF8
 
         $script:ChineseExe = $exe
-        Mock -ModuleName $script:ModuleName Get-VegaRustDeskRegistryInstallCandidates { @($script:ChineseExe) }
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskRegistryInstallCandidate { @($script:ChineseExe) }
         (Get-VegaRustDeskInstall) | Should -Be $exe
     }
 
@@ -1634,6 +1662,7 @@ Describe 't3-fix4 用户级配置写失败时降级而不是整单失败' {
         Mock -ModuleName $script:ModuleName Restart-VegaRustDeskService { [pscustomobject]@{ Found = $true; WasRunning = $true; Restarted = $true; Status = 'Running'; Message = 'ok' } }
         Mock -ModuleName $script:ModuleName Set-VegaRustDeskConfig {
             param($Server, $Key, $RelayServer, $State, $StatePath, $UserConfigPath, $ServiceConfigPath, $ServiceStatePath, $ForceService, $ContinueOnUserFailure, $Confirm)
+            $null = $Server, $Key, $RelayServer, $StatePath, $ServiceStatePath, $ForceService, $ContinueOnUserFailure, $Confirm
             $ContinueOnUserFailure | Should -BeTrue
             [pscustomobject]@{
                 Applied        = @([pscustomobject]@{ Path = $ServiceConfigPath; Changed = $true })
@@ -1724,6 +1753,7 @@ Describe 't3-fix5 命中已有安装后不下载、不静默安装' {
         Mock -ModuleName $script:ModuleName Restart-VegaRustDeskService { [pscustomobject]@{ Found = $true; WasRunning = $true; Restarted = $true; Status = 'Running'; Message = 'ok' } }
         Mock -ModuleName $script:ModuleName Set-VegaRustDeskConfig {
             param($Server, $Key, $RelayServer, $State, $StatePath, $UserConfigPath, $ServiceConfigPath, $ServiceStatePath, $ForceService, $ContinueOnUserFailure, $Confirm)
+            $null = $Server, $Key, $RelayServer, $StatePath, $ServiceStatePath, $ForceService, $ContinueOnUserFailure, $Confirm
             [pscustomobject]@{
                 Applied        = @([pscustomobject]@{ Path = $ServiceConfigPath; Changed = $true })
                 Warnings       = @()
@@ -1776,6 +1806,7 @@ Describe 't3-fix5 用户级配置读取失败时降级到服务级并返回退�
         # 只让用户级文件的读取失败（拒绝访问/共享冲突）；服务级写入与回读走真实代码。
         Mock -ModuleName $script:ModuleName Get-Content {
             param($LiteralPath, $Path, $Raw, $Encoding)
+            $null = $Path
             # 用户级配置在 ...\AppData\Roaming\RustDesk\...，服务级在 ProgramData 下：
             # 只让用户级那一份读取失败，服务级的写入与回读仍然走真实文件。
             if ([string]$LiteralPath -like '*AppData*Roaming*RustDesk2.toml') { throw '拒绝访问：模拟共享冲突' }
@@ -1830,6 +1861,7 @@ Describe 't3-fix5 显式空上下文走 -ServiceOnly 时不再解析交互用户
         Mock -ModuleName $script:ModuleName Restart-VegaRustDeskService { [pscustomobject]@{ Found = $true; WasRunning = $true; Restarted = $true; Status = 'Running'; Message = 'ok' } }
         Mock -ModuleName $script:ModuleName Set-VegaRustDeskConfig {
             param($Server, $Key, $RelayServer, $State, $StatePath, $UserConfigPath, $ServiceConfigPath, $ServiceStatePath, $ForceService, $ServiceOnly, $ContinueOnUserFailure, $Confirm)
+            $null = $Server, $Key, $RelayServer, $StatePath, $ServiceStatePath, $ForceService, $ServiceOnly, $ContinueOnUserFailure, $Confirm
             if ($ServiceOnly) { $script:CapturedServiceOnly = $true }
             [pscustomobject]@{
                 Applied        = @([pscustomobject]@{ Path = $ServiceConfigPath; Changed = $true })
@@ -1887,10 +1919,10 @@ Describe 't3-fix5 原始带空格的注册表值能被探测命中' {
             InstallLocation = $dir
             DisplayIcon     = ('"{0},0"' -f $exe)
         }
-        $script:RawCandidates = @(Get-VegaRustDeskRegistryInstallCandidates -RawEntry @($rawEntry))
+        $script:RawCandidates = @(Get-VegaRustDeskRegistryInstallCandidate -RawEntry @($rawEntry))
         $script:RawCandidates | Should -Contain $exe
 
-        Mock -ModuleName $script:ModuleName Get-VegaRustDeskRegistryInstallCandidates { @($script:RawCandidates) }
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskRegistryInstallCandidate { @($script:RawCandidates) }
         (Get-VegaRustDeskInstall) | Should -Be $exe
     }
 
@@ -1901,12 +1933,12 @@ Describe 't3-fix5 原始带空格的注册表值能被探测命中' {
         Set-Content -LiteralPath $exe -Value 'stub' -Encoding UTF8
 
         # t3-fix6 P2：同样注入原始注册表值（引号外索引），候选由真实解析器生成。
-        $script:RawCandidates = @(Get-VegaRustDeskRegistryInstallCandidates -RawEntry @(@{
+        $script:RawCandidates = @(Get-VegaRustDeskRegistryInstallCandidate -RawEntry @(@{
                     InstallLocation = $dir
                     DisplayIcon     = ('"{0}",0' -f $exe)
                 }))
         $script:RawCandidates | Should -Contain $exe
-        Mock -ModuleName $script:ModuleName Get-VegaRustDeskRegistryInstallCandidates { @($script:RawCandidates) }
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskRegistryInstallCandidate { @($script:RawCandidates) }
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskRelease { throw '命中后不应查询 Release' }
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstaller { throw '命中后不应下载' }
         Mock -ModuleName $script:ModuleName Install-VegaRustDeskSilently { throw '命中后不应静默安装' }
@@ -1923,6 +1955,7 @@ Describe 't3-fix5 原始带空格的注册表值能被探测命中' {
         Mock -ModuleName $script:ModuleName Restart-VegaRustDeskService { [pscustomobject]@{ Found = $true; WasRunning = $true; Restarted = $true; Status = 'Running'; Message = 'ok' } }
         Mock -ModuleName $script:ModuleName Set-VegaRustDeskConfig {
             param($Server, $Key, $RelayServer, $State, $StatePath, $UserConfigPath, $ServiceConfigPath, $ServiceStatePath, $ForceService, $ServiceOnly, $ContinueOnUserFailure, $Confirm)
+            $null = $Server, $Key, $RelayServer, $StatePath, $ServiceStatePath, $ForceService, $ServiceOnly, $ContinueOnUserFailure, $Confirm
             [pscustomobject]@{
                 Applied        = @([pscustomobject]@{ Path = $ServiceConfigPath; Changed = $true })
                 Warnings       = @()

@@ -226,7 +226,7 @@ try {
             # t3-fix7 P1：服务未注册且 RustDesk 正在运行是“降级停止”，不是失败：
             # 一行配置都没写，退出码 2 让完成页显示脚本给出的具体原因。
             Write-Host '处理后重新运行 Vega 安装即可写入中继配置。' -ForegroundColor Yellow
-            exit 2
+            exit $result.ExitCode
         }
         Write-Host '也可以打开 https://rustdesk.com/download 手动下载安装，装完回到 Vega 设置页查看配置。'
         Write-VegaLog "FAIL $($result.Error)"
