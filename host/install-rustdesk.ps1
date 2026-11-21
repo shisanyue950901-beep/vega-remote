@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
   Vega 安装包内的 RustDesk 一键安装 / 配置 / 回滚脚本。
