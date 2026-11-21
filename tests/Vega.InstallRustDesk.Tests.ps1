@@ -795,10 +795,11 @@ Describe 't3-fix6 已有安装的服务状态分支' {
         $result.ExitCode | Should -Be 1
         $result.Error | Should -Match '60 秒内没有达到 Running'
 
-        # 启动本身不再阻塞，且等待用的是共用截止时间算出的剩余时间（1..60 秒）。
+        # 启动本身不再阻塞，等待用调用方算出的同一个单调截止点（t3-fix8 P2：不再传剩余秒数）。
         Should -Invoke -CommandName Start-VegaRustDeskServiceNonBlocking -ModuleName $script:ModuleName -Times 1 -Exactly
         Should -Invoke -CommandName Wait-VegaRustDeskService -ModuleName $script:ModuleName -Times 1 -Exactly -ParameterFilter {
-            $TimeoutSeconds -ge 1 -and $TimeoutSeconds -le 60
+            $null -ne $Deadline -and [double]$Deadline.BudgetSeconds -eq 60 -and
+            $null -ne $Deadline.Stopwatch -and $null -eq $TimeoutSeconds
         }
         Should -Invoke -CommandName Set-VegaRustDeskConfig -ModuleName $script:ModuleName -Times 0 -Exactly
         Test-Path -LiteralPath $userConfig | Should -BeFalse
@@ -808,15 +809,52 @@ Describe 't3-fix6 已有安装的服务状态分支' {
 Describe 't3-fix7 服务等待的有界语义' {
     It 'P2 服务一直 StartPending：等到截止时间后返回 Running=$false 且保留状态' {
         Mock -ModuleName $script:ModuleName Get-Service { [pscustomobject]@{ Name = 'RustDesk'; Status = 'StartPending' } }
-        # 不真的睡：用 mock 掉 Start-Sleep 让循环按真实时钟跑到 2 秒截止。
-        Mock -ModuleName $script:ModuleName Start-Sleep { }
+        # t3-fix8 P2：用注入时钟推进时间，不真的睡，也不靠机器速度。
+        $global:VegaClockElapsed = 0.0
+        Mock -ModuleName $script:ModuleName Start-Sleep { $global:VegaClockElapsed += ($Milliseconds / 1000.0) }
 
-        $wait = Wait-VegaRustDeskService -TimeoutSeconds 2 -IntervalSeconds 1
+        $deadline = New-VegaServiceDeadline -TimeoutSeconds 2 -Clock { $global:VegaClockElapsed }
+        $wait = Wait-VegaRustDeskService -Deadline $deadline -IntervalSeconds 1
 
         $wait.Found | Should -BeTrue
         $wait.Running | Should -BeFalse
         $wait.Status | Should -Be 'StartPending'
-        Should -Invoke -CommandName Start-Sleep -ModuleName $script:ModuleName -Times 1
+        $global:VegaClockElapsed | Should -BeGreaterOrEqual 2
+        Should -Invoke -CommandName Start-Sleep -ModuleName $script:ModuleName -Times 2 -Exactly
+    }
+
+    It 't3-fix8 P2 启动耗时会扣减同一份预算：耗尽后连 Running 都不再接受' {
+        Mock -ModuleName $script:ModuleName Get-Service { [pscustomobject]@{ Name = 'RustDesk'; Status = 'Running' } }
+        Mock -ModuleName $script:ModuleName Start-Sleep { throw '预算已耗尽时不应休眠' }
+
+        $global:VegaClockElapsed = 0.0
+        $deadline = New-VegaServiceDeadline -TimeoutSeconds 60 -Clock { $global:VegaClockElapsed }
+        # 模拟启动调用花掉 61 秒：同一份预算已被扣完。
+        $global:VegaClockElapsed = 61.0
+
+        $wait = Wait-VegaRustDeskService -Deadline $deadline
+
+        $wait.Running | Should -BeFalse
+        $wait.Found | Should -BeFalse
+        # 先判预算再查状态：超时后即使服务是 Running 也不接受。
+        Should -Invoke -CommandName Get-Service -ModuleName $script:ModuleName -Times 0 -Exactly
+        Should -Invoke -CommandName Start-Sleep -ModuleName $script:ModuleName -Times 0 -Exactly
+    }
+
+    It 't3-fix8 P2 轮询休眠不超过剩余预算（间隔大于预算时按剩余预算睡）' {
+        Mock -ModuleName $script:ModuleName Get-Service { [pscustomobject]@{ Name = 'RustDesk'; Status = 'StartPending' } }
+        $global:VegaClockElapsed = 0.0
+        Mock -ModuleName $script:ModuleName Start-Sleep { $global:VegaClockElapsed += ($Milliseconds / 1000.0) }
+
+        $deadline = New-VegaServiceDeadline -TimeoutSeconds 1 -Clock { $global:VegaClockElapsed }
+        # 间隔 5 秒 > 预算 1 秒：只允许睡剩余预算（1000ms），不许睡满 5 秒。
+        $wait = Wait-VegaRustDeskService -Deadline $deadline -IntervalSeconds 5
+
+        $wait.Running | Should -BeFalse
+        Should -Invoke -CommandName Start-Sleep -ModuleName $script:ModuleName -Times 1 -Exactly -ParameterFilter {
+            $Milliseconds -le 1000
+        }
+        $global:VegaClockElapsed | Should -BeLessOrEqual 1.0
     }
 
     It 'P2 有 -NoWait 时用它启动，不阻塞等 Running' -Skip:($PSVersionTable.PSVersion.Major -lt 6) {
@@ -848,6 +886,241 @@ Describe 't3-fix7 服务等待的有界语义' {
             $global:VegaFakeServiceStarted = $null
         }
         Should -Invoke -CommandName Start-Service -ModuleName $script:ModuleName -Times 0 -Exactly
+    }
+}
+
+Describe 't3-fix8 P1-1 结果文件（UTF-16LE + BOM）' {
+    BeforeAll {
+        $repoRoot = Join-Path $PSScriptRoot '..'
+        $script:EntryText = Get-Content -LiteralPath (Join-Path $repoRoot 'host/install-rustdesk.ps1') -Raw -Encoding UTF8
+        $script:HooksText = Get-Content -LiteralPath (Join-Path $repoRoot 'console/src-tauri/windows/hooks.nsh') -Raw -Encoding UTF8
+    }
+
+    It '写一行 UTF-16LE 带 BOM：中文原因原样可读，多行折成一行' {
+        $path = Join-Path $TestDrive ('result-' + [guid]::NewGuid().ToString('N') + '.txt')
+        $message = "检测到 RustDesk 正在运行且服务未启用`r`n请完全退出 RustDesk（托盘右键退出），在 RustDesk 里启用服务后重新运行 Vega 安装"
+
+        Write-VegaSetupResultFile -Path $path -Message $message
+
+        $bytes = [System.IO.File]::ReadAllBytes($path)
+        # BOM：FF FE = 小端 UTF-16。
+        $bytes[0] | Should -Be 0xFF
+        $bytes[1] | Should -Be 0xFE
+        $text = (Get-Content -LiteralPath $path -Raw -Encoding Unicode).Trim()
+        $text | Should -Be '检测到 RustDesk 正在运行且服务未启用 请完全退出 RustDesk（托盘右键退出），在 RustDesk 里启用服务后重新运行 Vega 安装'
+        ([regex]::Matches($text, "`r|`n")).Count | Should -Be 0
+    }
+
+    It '空路径或空原因时不创建文件（完成页走兜底文案）' {
+        $path = Join-Path $TestDrive ('empty-' + [guid]::NewGuid().ToString('N') + '.txt')
+        Write-VegaSetupResultFile -Path '' -Message '原因'
+        Write-VegaSetupResultFile -Path $path -Message " `r`n "
+        Test-Path -LiteralPath $path | Should -BeFalse
+    }
+
+    It '入口脚本声明 -ResultFile，并在降级停止、失败与降级成功时都写原因' {
+        $script:EntryText | Should -Match '\[string\]\$ResultFile'
+        $script:EntryText | Should -Match 'Write-VegaSetupResultFile -Path \$ResultFile'
+        # 失败（含退出码 2 降级停止）/ 降级成功 / 回滚失败 / 未捕获异常都要写原因。
+        ([regex]::Matches($script:EntryText, 'Write-VegaResult ')).Count | Should -BeGreaterOrEqual 4
+        $script:EntryText | Should -Match 'Write-VegaResult \$result\.Error'
+        $script:EntryText | Should -Match 'Write-VegaResult \$degradedReason'
+    }
+
+    It '钩子每次运行生成唯一结果文件、传 -ResultFile、用 FileReadUTF16LE 读完删除' {
+        $script:HooksText | Should -Match 'VegaPrepareResultFile'
+        $script:HooksText | Should -Match 'GetTempFileName \$vegaResultFile'
+        $script:HooksText | Should -Match '-ResultFile "\$vegaResultFile"'
+        # 结果文件必须用 UTF-16LE 读取；日志 WARN 扫描（ANSI FileRead）只作为兜底。
+        $script:HooksText | Should -Match 'FileReadUTF16LE \$2 \$3'
+        $script:HooksText | Should -Match 'VegaReadResultFile'
+        $readMacro = $script:HooksText.IndexOf('!macro VegaReadResultFile')
+        $utf16 = $script:HooksText.IndexOf('FileReadUTF16LE $2 $3', $readMacro)
+        $utf16 | Should -BeGreaterThan $readMacro
+        $script:HooksText | Should -Match 'VegaDeleteResultFile'
+        # 读取后删除：Delete 出现在读取宏里、读完的下一个标签之前。
+        $read = $script:HooksText.IndexOf('!macro VegaReadResultFile')
+        $delete = $script:HooksText.IndexOf('Delete "$vegaResultFile"', $read)
+        $read | Should -BeGreaterThan -1
+        $delete | Should -BeGreaterThan $read
+        # 退出码 2 与失败分支都用结果文件；日志 WARN 只作为兜底。
+        $degraded = $script:HooksText.IndexOf('vega_install_degraded:')
+        $failed = $script:HooksText.IndexOf('vega_install_failed:')
+        $script:HooksText.IndexOf('!insertmacro VegaReadResultFile install', $degraded) | Should -BeGreaterThan $degraded
+        $script:HooksText.IndexOf('!insertmacro VegaReadResultFile install', $failed) | Should -BeGreaterThan $failed
+        $script:HooksText.IndexOf('!insertmacro VegaReadDegradedReason install', $degraded) |
+            Should -BeGreaterThan $degraded
+        # 准备/传参顺序：先建结果文件，再调用脚本。
+        $prepare = $script:HooksText.IndexOf('!insertmacro VegaPrepareResultFile install')
+        $run = $script:HooksText.IndexOf('-ResultFile "$vegaResultFile"')
+        $prepare | Should -BeGreaterThan -1
+        $run | Should -BeGreaterThan $prepare
+    }
+}
+
+Describe 't3-fix8 P1-2 服务状态：StartPending 只等、1056 视为正常' {
+    BeforeAll {
+        $script:repoRoot = Join-Path $PSScriptRoot '..'
+    }
+
+    It 'Test-VegaServiceAlreadyRunningError 只认 1056 / already running' {
+        $win32 = [System.ComponentModel.Win32Exception]::new(1056)
+        (Test-VegaServiceAlreadyRunningError -ErrorRecord ([pscustomobject]@{ Exception = $win32 })) | Should -BeTrue
+        # 包装层（PowerShell 把异常塞进 InnerException）也要认出来。
+        $wrapped = [System.Management.Automation.RuntimeException]::new('启动失败', $win32)
+        (Test-VegaServiceAlreadyRunningError -ErrorRecord ([pscustomobject]@{ Exception = $wrapped })) | Should -BeTrue
+        # 中文/英文消息兜底（拿不到 NativeErrorCode 时）。
+        (Test-VegaServiceAlreadyRunningError -ErrorRecord ([pscustomobject]@{ Exception = (New-Object System.Exception('The service is already running.') ) })) | Should -BeTrue
+        (Test-VegaServiceAlreadyRunningError -ErrorRecord ([pscustomobject]@{ Exception = (New-Object System.Exception('服务已经启动。') ) })) | Should -BeTrue
+        (Test-VegaServiceAlreadyRunningError -ErrorRecord ([pscustomobject]@{ Exception = (New-Object System.Exception('拒绝访问') ) })) | Should -BeFalse
+    }
+
+    It '服务处于 StartPending：只等待 Running，不再发起启动' {
+        $statePath = Join-Path $TestDrive ('h-' + [guid]::NewGuid().ToString('N') + '.json')
+        $serviceStatePath = Join-Path $TestDrive ('s-' + [guid]::NewGuid().ToString('N') + '.json')
+        $defaults = Join-Path $TestDrive 'vega-defaults.json'
+        $json = @{ rustdesk = @{ idServer = '60.205.95.98'; relayServer = '60.205.95.98'; key = $script:Key } } | ConvertTo-Json
+        Set-Content -LiteralPath $defaults -Value $json -Encoding UTF8
+
+        $sid = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
+        $appData = Join-Path $TestDrive 'Users/张三/AppData/Roaming'
+        $null = New-Item -ItemType Directory -Path $appData -Force
+        $serviceConfig = Join-Path $TestDrive 'ProgramData/RustDesk/config/RustDesk2.toml'
+
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
+        Mock -ModuleName $script:ModuleName Get-Service { [pscustomobject]@{ Name = 'RustDesk'; Status = 'StartPending' } }
+        Mock -ModuleName $script:ModuleName Start-VegaRustDeskServiceNonBlocking { throw 'StartPending 时不应重复启动服务' }
+        Mock -ModuleName $script:ModuleName Wait-VegaRustDeskService { [pscustomobject]@{ Found = $true; Running = $true; Status = 'Running' } }
+        Mock -ModuleName $script:ModuleName Restart-VegaRustDeskService { [pscustomobject]@{ Found = $true; WasRunning = $true; Restarted = $true; Status = 'Running'; Message = 'ok' } }
+        Mock -ModuleName $script:ModuleName Set-VegaRustDeskConfig {
+            param($Server, $Key, $RelayServer, $State, $StatePath, $UserConfigPath, $ServiceConfigPath, $ServiceStatePath, $ForceService, $ServiceOnly, $ContinueOnUserFailure, $Confirm)
+            [pscustomobject]@{
+                Applied = @(
+                    [pscustomobject]@{ Path = $UserConfigPath; Changed = $true }
+                    [pscustomobject]@{ Path = $ServiceConfigPath; Changed = $true }
+                )
+                Warnings = @()
+                ServicePresent = $true
+                Values = @{}
+                State = $State
+            }
+        }
+
+        $result = Invoke-VegaRustDeskBootstrap -DefaultsFile $defaults -HostStatePath $statePath `
+            -ServiceStatePath $serviceStatePath -ServiceConfigPath $serviceConfig `
+            -InteractiveUserSid $sid -InteractiveUserAppData $appData -Confirm:$false
+
+        $result.Success | Should -BeTrue
+        $result.ExitCode | Should -Be 0
+        Should -Invoke -CommandName Start-VegaRustDeskServiceNonBlocking -ModuleName $script:ModuleName -Times 0 -Exactly
+        Should -Invoke -CommandName Wait-VegaRustDeskService -ModuleName $script:ModuleName -Times 1 -Exactly -ParameterFilter {
+            $null -ne $Deadline
+        }
+        ($result.Messages -join "`n") | Should -Match 'StartPending'
+    }
+
+    It '启动调用遇 Win32 1056：视为已在运行，继续确认 Running 并写配置' {
+        $statePath = Join-Path $TestDrive ('h-' + [guid]::NewGuid().ToString('N') + '.json')
+        $serviceStatePath = Join-Path $TestDrive ('s-' + [guid]::NewGuid().ToString('N') + '.json')
+        $defaults = Join-Path $TestDrive 'vega-defaults.json'
+        $json = @{ rustdesk = @{ idServer = '60.205.95.98'; relayServer = '60.205.95.98'; key = $script:Key } } | ConvertTo-Json
+        Set-Content -LiteralPath $defaults -Value $json -Encoding UTF8
+
+        $sid = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
+        $appData = Join-Path $TestDrive 'Users/张三/AppData/Roaming'
+        $null = New-Item -ItemType Directory -Path $appData -Force
+        $serviceConfig = Join-Path $TestDrive 'ProgramData/RustDesk/config/RustDesk2.toml'
+
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
+        Mock -ModuleName $script:ModuleName Get-Service { [pscustomobject]@{ Name = 'RustDesk'; Status = 'Stopped' } }
+        Mock -ModuleName $script:ModuleName Start-VegaRustDeskServiceNonBlocking {
+            throw [System.ComponentModel.Win32Exception]::new(1056)
+        }
+        Mock -ModuleName $script:ModuleName Wait-VegaRustDeskService { [pscustomobject]@{ Found = $true; Running = $true; Status = 'Running' } }
+        Mock -ModuleName $script:ModuleName Restart-VegaRustDeskService { [pscustomobject]@{ Found = $true; WasRunning = $true; Restarted = $true; Status = 'Running'; Message = 'ok' } }
+        Mock -ModuleName $script:ModuleName Set-VegaRustDeskConfig {
+            param($Server, $Key, $RelayServer, $State, $StatePath, $UserConfigPath, $ServiceConfigPath, $ServiceStatePath, $ForceService, $ServiceOnly, $ContinueOnUserFailure, $Confirm)
+            [pscustomobject]@{
+                Applied = @(
+                    [pscustomobject]@{ Path = $UserConfigPath; Changed = $true }
+                    [pscustomobject]@{ Path = $ServiceConfigPath; Changed = $true }
+                )
+                Warnings = @()
+                ServicePresent = $true
+                Values = @{}
+                State = $State
+            }
+        }
+
+        $result = Invoke-VegaRustDeskBootstrap -DefaultsFile $defaults -HostStatePath $statePath `
+            -ServiceStatePath $serviceStatePath -ServiceConfigPath $serviceConfig `
+            -InteractiveUserSid $sid -InteractiveUserAppData $appData -Confirm:$false
+
+        $result.Success | Should -BeTrue
+        $result.ExitCode | Should -Be 0
+        ($result.Messages -join "`n") | Should -Match '1056'
+        Should -Invoke -CommandName Wait-VegaRustDeskService -ModuleName $script:ModuleName -Times 1 -Exactly
+        (Microsoft.PowerShell.Management\Get-Content -LiteralPath $serviceConfig -Raw -Encoding UTF8) |
+            Should -Match 'custom-rendezvous-server = "60\.205\.95\.98"'
+    }
+
+    It '启动失败但错误码不是 1056：仍按失败返回退出码 1' {
+        $statePath = Join-Path $TestDrive ('h-' + [guid]::NewGuid().ToString('N') + '.json')
+        $serviceStatePath = Join-Path $TestDrive ('s-' + [guid]::NewGuid().ToString('N') + '.json')
+        $defaults = Join-Path $TestDrive 'vega-defaults.json'
+        $json = @{ rustdesk = @{ idServer = '60.205.95.98'; relayServer = '60.205.95.98'; key = $script:Key } } | ConvertTo-Json
+        Set-Content -LiteralPath $defaults -Value $json -Encoding UTF8
+
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
+        Mock -ModuleName $script:ModuleName Get-Service { [pscustomobject]@{ Name = 'RustDesk'; Status = 'Stopped' } }
+        Mock -ModuleName $script:ModuleName Start-VegaRustDeskServiceNonBlocking {
+            throw [System.ComponentModel.Win32Exception]::new(5)
+        }
+        Mock -ModuleName $script:ModuleName Wait-VegaRustDeskService { throw '启动失败时不应继续等待' }
+
+        $result = Invoke-VegaRustDeskBootstrap -DefaultsFile $defaults -HostStatePath $statePath `
+            -ServiceStatePath $serviceStatePath -ServiceConfigPath (Join-Path $TestDrive 'P/config/RustDesk2.toml') `
+            -InteractiveUserSid 'S-1-5-21-1111111111-2222222222-3333333333-1001' `
+            -InteractiveUserAppData (Join-Path $TestDrive 'Users/张三/AppData/Roaming') -Confirm:$false
+
+        $result.Success | Should -BeFalse
+        $result.ExitCode | Should -Be 1
+        $result.Error | Should -Match '启动失败'
+        Should -Invoke -CommandName Wait-VegaRustDeskService -ModuleName $script:ModuleName -Times 0 -Exactly
+    }
+
+    It 't3-fix8 P2 启动耗时从共用预算扣减：超时后不再接受 Running（可注入时钟）' {
+        $statePath = Join-Path $TestDrive ('h-' + [guid]::NewGuid().ToString('N') + '.json')
+        $serviceStatePath = Join-Path $TestDrive ('s-' + [guid]::NewGuid().ToString('N') + '.json')
+        $defaults = Join-Path $TestDrive 'vega-defaults.json'
+        $json = @{ rustdesk = @{ idServer = '60.205.95.98'; relayServer = '60.205.95.98'; key = $script:Key } } | ConvertTo-Json
+        Set-Content -LiteralPath $defaults -Value $json -Encoding UTF8
+
+        $global:VegaClockElapsed = 0.0
+        $global:VegaServiceQueries = 0
+
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
+        Mock -ModuleName $script:ModuleName Get-Service {
+            $global:VegaServiceQueries += 1
+            if ($global:VegaServiceQueries -le 1) { [pscustomobject]@{ Name = 'RustDesk'; Status = 'Stopped' } }
+            else { [pscustomobject]@{ Name = 'RustDesk'; Status = 'Running' } }
+        }
+        # 启动本身耗掉 61 秒：共用预算已经耗尽。
+        Mock -ModuleName $script:ModuleName Start-VegaRustDeskServiceNonBlocking { $global:VegaClockElapsed = 61.0 }
+        Mock -ModuleName $script:ModuleName Start-Sleep { throw '预算耗尽后不应休眠' }
+
+        $result = Invoke-VegaRustDeskBootstrap -DefaultsFile $defaults -HostStatePath $statePath `
+            -ServiceStatePath $serviceStatePath -ServiceConfigPath (Join-Path $TestDrive 'P/config/RustDesk2.toml') `
+            -InteractiveUserSid 'S-1-5-21-1111111111-2222222222-3333333333-1001' `
+            -InteractiveUserAppData (Join-Path $TestDrive 'Users/张三/AppData/Roaming') `
+            -Clock { $global:VegaClockElapsed } -Confirm:$false
+
+        $result.Success | Should -BeFalse
+        $result.ExitCode | Should -Be 1
+        $result.Error | Should -Match '60 秒内没有达到 Running'
+        # 只查了启动前那一次状态；等待阶段预算已耗尽，不再查询（迟到的 Running 不被接受）。
+        $global:VegaServiceQueries | Should -Be 1
+        Should -Invoke -CommandName Start-Sleep -ModuleName $script:ModuleName -Times 0 -Exactly
     }
 }
 
