@@ -4663,11 +4663,22 @@ function Set-VegaRustDeskConfig {
         [AllowEmptyString()]
         [string]$ServiceStatePath = '',
 
+        [AllowEmptyString()]
+        [string]$RelayServer = '',
+
         [switch]$ForceService
     )
 
     $endpoint = ConvertFrom-VegaRustDeskServerEndpoint -Server $Server
     if ($null -eq $endpoint) { throw 'RustDesk 服务器地址格式无效（应为 主机名/IPv4/IPv6，可带 :端口）。' }
+
+    # 默认由 ID 服务器推导中继（:21117）；安装包的默认配置允许单独指定中继服务器。
+    $relayValue = $endpoint.RelayServer
+    if (-not [string]::IsNullOrWhiteSpace($RelayServer)) {
+        $relayEndpoint = ConvertFrom-VegaRustDeskServerEndpoint -Server $RelayServer
+        if ($null -eq $relayEndpoint) { throw 'RustDesk 中继服务器地址格式无效（应为 主机名/IPv4/IPv6，可带 :端口）。' }
+        $relayValue = $relayEndpoint.RelayServer
+    }
 
     if ([string]::IsNullOrWhiteSpace($UserConfigPath)) { $UserConfigPath = Get-VegaRustDeskConfigPath }
     if ([string]::IsNullOrWhiteSpace($ServiceConfigPath)) { $ServiceConfigPath = Get-VegaRustDeskConfigPath -ServiceMode }
@@ -4675,7 +4686,7 @@ function Set-VegaRustDeskConfig {
 
     $values = [ordered]@{
         'custom-rendezvous-server' = $endpoint.Server
-        'relay-server'             = $endpoint.RelayServer
+        'relay-server'             = $relayValue
         'key'                      = $Key.Trim()
     }
     $managedKeys = @(Get-VegaRustDeskManagedKeyName)
@@ -5728,8 +5739,8 @@ function Invoke-VegaRustDeskBootstrap {
 
     try {
         $state = Read-VegaState -Path $HostStatePath
-        $config = Set-VegaRustDeskConfig -Server $defaults.IdServer -Key $defaults.Key -State $state -StatePath $HostStatePath `
-            -UserConfigPath $UserConfigPath -ServiceConfigPath $ServiceConfigPath -Confirm:$false
+        $config = Set-VegaRustDeskConfig -Server $defaults.IdServer -Key $defaults.Key -RelayServer $defaults.RelayServer `
+            -State $state -StatePath $HostStatePath -UserConfigPath $UserConfigPath -ServiceConfigPath $ServiceConfigPath -Confirm:$false
         $state = $config.State
         foreach ($warning in @($config.Warnings)) { $messages.Add([string]$warning) }
 
