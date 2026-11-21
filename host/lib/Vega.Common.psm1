@@ -6799,6 +6799,32 @@ function Test-VegaRustDeskClientRunning {
     return ($processes.Count -gt 0)
 }
 
+function Start-VegaRustDeskServiceNonBlocking {
+    <#
+      t3-fix7 P2：启动 RustDesk 服务但不阻塞等待 Running。
+      安装包用 Windows PowerShell 5.1，它的 Start-Service 没有 -NoWait，会一直等到
+      Running 才返回，那段等待不受调用方的 60 秒上限约束（服务卡在 StartPending 时
+      总耗时可远超上限）。因此：有 -NoWait（PowerShell 6+）就用它；没有就退回
+      ServiceController.Start()，同样立即返回，由调用方在同一个截止时间里轮询状态。
+    #>
+    [CmdletBinding()]
+    param()
+
+    $supportsNoWait = $false
+    $command = Get-Command -Name 'Start-Service' -ErrorAction SilentlyContinue
+    if ($null -ne $command -and $null -ne $command.Parameters -and $command.Parameters.ContainsKey('NoWait')) {
+        $supportsNoWait = $true
+    }
+
+    if ($supportsNoWait) {
+        Start-Service -Name 'RustDesk' -NoWait -ErrorAction Stop
+        return
+    }
+
+    $service = Get-Service -Name 'RustDesk' -ErrorAction Stop
+    $service.Start()
+}
+
 function Invoke-VegaRustDeskBootstrap {
     <#
       安装包的一键安装/配置流程：
@@ -7020,14 +7046,14 @@ function Invoke-VegaRustDeskBootstrap {
                 Write-VegaSetupLog -Path $LogFile -Message ("WARN {0}" -f $message)
             }
             else {
-                # t3-fix7 P2：Start-Service 默认会阻塞到 Running 才返回，那段等待不在
-                # 后面的 60 秒轮询里，服务卡在 StartPending 时总耗时可以远超上限。
-                # 改成 -NoWait 立即返回，启动与状态确认共用同一个 60 秒截止时间。
+                # t3-fix7 P2：启动不能阻塞等待 Running（那段时间不在 60 秒轮询里），
+                # 由 Start-VegaRustDeskServiceNonBlocking 立即返回，启动与状态确认
+                # 共用同一个 60 秒截止时间。
                 $serviceDeadline = (Get-Date).AddSeconds(60)
                 if ([string]$service.Status -ne 'Running') {
                     # 已注册但停止：先启动，再交给有界等待确认 Running。
                     try {
-                        Start-Service -Name 'RustDesk' -NoWait -ErrorAction Stop
+                        Start-VegaRustDeskServiceNonBlocking
                         $message = "RustDesk 服务处于 $($service.Status)，已通过 Start-Service 启动。"
                         $messages.Add($message)
                         Write-VegaSetupLog -Path $LogFile -Message $message
@@ -8260,6 +8286,8 @@ Export-ModuleMember -Function @(
     'Set-VegaStateRustDeskUserConfig',
     'Install-VegaRustDeskSilently',
     'Wait-VegaRustDeskService',
+    'Start-VegaRustDeskServiceNonBlocking',
+    'Test-VegaRustDeskClientRunning',
     'Uninstall-VegaRustDeskRecorded',
     'Invoke-VegaRustDeskRollback',
     'Invoke-VegaRustDeskBootstrap',

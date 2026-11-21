@@ -647,7 +647,9 @@ Describe 't3-fix6 已有安装的服务状态分支' {
 
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
         Mock -ModuleName $script:ModuleName Get-Service { [pscustomobject]@{ Name = 'RustDesk'; Status = 'Stopped' } }
-        Mock -ModuleName $script:ModuleName Start-Service { }
+        # t3-fix7 P2：启动走不阻塞的封装（内部再有 -NoWait / ServiceController 回退）。
+        Mock -ModuleName $script:ModuleName Start-VegaRustDeskServiceNonBlocking { }
+        Mock -ModuleName $script:ModuleName Start-Service { throw '启动必须走非阻塞封装，不能直接调 Start-Service' }
         Mock -ModuleName $script:ModuleName Wait-VegaRustDeskService { [pscustomobject]@{ Found = $true; Running = $true; Status = 'Running' } }
         Mock -ModuleName $script:ModuleName Restart-VegaRustDeskService { [pscustomobject]@{ Found = $true; WasRunning = $true; Restarted = $true; Status = 'Running'; Message = 'ok' } }
         Mock -ModuleName $script:ModuleName Set-VegaRustDeskConfig {
@@ -672,7 +674,7 @@ Describe 't3-fix6 已有安装的服务状态分支' {
         $result.Degraded | Should -BeFalse
         $result.ExitCode | Should -Be 0
         # t3-fix6 P1-2：已注册但停止时必须主动启动，而不是等 60 秒后直接失败。
-        Should -Invoke -CommandName Start-Service -ModuleName $script:ModuleName -Times 1 -Exactly
+        Should -Invoke -CommandName Start-VegaRustDeskServiceNonBlocking -ModuleName $script:ModuleName -Times 1 -Exactly
         Should -Invoke -CommandName Wait-VegaRustDeskService -ModuleName $script:ModuleName -Times 1 -Exactly
     }
 
@@ -693,7 +695,7 @@ Describe 't3-fix6 已有安装的服务状态分支' {
         Mock -ModuleName $script:ModuleName Get-Service { $null }
         # t3-fix7 P1：服务未注册但客户端已退出，才允许只写用户级配置。
         Mock -ModuleName $script:ModuleName Test-VegaRustDeskClientRunning { $false }
-        Mock -ModuleName $script:ModuleName Start-Service { throw '服务未注册时不应启动服务' }
+        Mock -ModuleName $script:ModuleName Start-VegaRustDeskServiceNonBlocking { throw '服务未注册时不应启动服务' }
         Mock -ModuleName $script:ModuleName Wait-VegaRustDeskService { throw '服务未注册时不应等待服务' }
         Mock -ModuleName $script:ModuleName Restart-VegaRustDeskService { [pscustomobject]@{ Found = $false; WasRunning = $false; Restarted = $false; Status = ''; Message = '未找到 RustDesk 服务，跳过重启。' } }
 
@@ -712,7 +714,7 @@ Describe 't3-fix6 已有安装的服务状态分支' {
         (Microsoft.PowerShell.Management\Get-Content -LiteralPath $userConfig -Raw -Encoding UTF8) |
             Should -Match 'custom-rendezvous-server = "60\.205\.95\.98"'
         Test-Path -LiteralPath $serviceConfig | Should -BeFalse
-        Should -Invoke -CommandName Start-Service -ModuleName $script:ModuleName -Times 0 -Exactly
+        Should -Invoke -CommandName Start-VegaRustDeskServiceNonBlocking -ModuleName $script:ModuleName -Times 0 -Exactly
 
         $serviceState = Read-VegaState -Path $serviceStatePath
         $serviceState.RustDeskUserConfig.Written | Should -BeTrue
@@ -738,7 +740,7 @@ Describe 't3-fix6 已有安装的服务状态分支' {
         # 客户端还开着：内存里的旧配置会在启用服务时覆盖刚写入的新值，所以不能写。
         Mock -ModuleName $script:ModuleName Test-VegaRustDeskClientRunning { $true }
         Mock -ModuleName $script:ModuleName Set-VegaRustDeskConfig { throw 'RustDesk 正在运行时不应写配置' }
-        Mock -ModuleName $script:ModuleName Start-Service { throw '服务未注册时不应启动服务' }
+        Mock -ModuleName $script:ModuleName Start-VegaRustDeskServiceNonBlocking { throw '服务未注册时不应启动服务' }
         Mock -ModuleName $script:ModuleName Wait-VegaRustDeskService { throw '服务未注册时不应等待服务' }
         Mock -ModuleName $script:ModuleName Restart-VegaRustDeskService { throw '未写配置时不应重启服务' }
 
@@ -781,7 +783,7 @@ Describe 't3-fix6 已有安装的服务状态分支' {
 
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
         Mock -ModuleName $script:ModuleName Get-Service { [pscustomobject]@{ Name = 'RustDesk'; Status = 'Stopped' } }
-        Mock -ModuleName $script:ModuleName Start-Service { }
+        Mock -ModuleName $script:ModuleName Start-VegaRustDeskServiceNonBlocking { }
         Mock -ModuleName $script:ModuleName Wait-VegaRustDeskService { [pscustomobject]@{ Found = $true; Running = $false; Status = 'StartPending' } }
         Mock -ModuleName $script:ModuleName Set-VegaRustDeskConfig { throw '服务没就绪时不应写配置' }
 
@@ -794,7 +796,7 @@ Describe 't3-fix6 已有安装的服务状态分支' {
         $result.Error | Should -Match '60 秒内没有达到 Running'
 
         # 启动本身不再阻塞，且等待用的是共用截止时间算出的剩余时间（1..60 秒）。
-        Should -Invoke -CommandName Start-Service -ModuleName $script:ModuleName -Times 1 -Exactly -ParameterFilter { $NoWait }
+        Should -Invoke -CommandName Start-VegaRustDeskServiceNonBlocking -ModuleName $script:ModuleName -Times 1 -Exactly
         Should -Invoke -CommandName Wait-VegaRustDeskService -ModuleName $script:ModuleName -Times 1 -Exactly -ParameterFilter {
             $TimeoutSeconds -ge 1 -and $TimeoutSeconds -le 60
         }
@@ -815,6 +817,37 @@ Describe 't3-fix7 服务等待的有界语义' {
         $wait.Running | Should -BeFalse
         $wait.Status | Should -Be 'StartPending'
         Should -Invoke -CommandName Start-Sleep -ModuleName $script:ModuleName -Times 1
+    }
+
+    It 'P2 有 -NoWait 时用它启动，不阻塞等 Running' -Skip:($PSVersionTable.PSVersion.Major -lt 6) {
+        # Windows PowerShell 5.1 的 Start-Service 根本没有 -NoWait，只能走回退分支。
+        Mock -ModuleName $script:ModuleName Get-Command { [pscustomobject]@{ Parameters = @{ NoWait = $true } } }
+        Mock -ModuleName $script:ModuleName Start-Service { }
+
+        Start-VegaRustDeskServiceNonBlocking
+
+        Should -Invoke -CommandName Start-Service -ModuleName $script:ModuleName -Times 1 -Exactly -ParameterFilter { $NoWait }
+    }
+
+    It 'P2 Windows PowerShell 5.1 没有 -NoWait：退回 ServiceController.Start()，同样立即返回' {
+        # 安装包用 powershell.exe 5.1，它的 Start-Service 没有 -NoWait。
+        Mock -ModuleName $script:ModuleName Get-Command { [pscustomobject]@{ Parameters = @{} } }
+        Mock -ModuleName $script:ModuleName Start-Service { throw '5.1 下没有 -NoWait 参数，不应走到这里' }
+        $global:VegaFakeServiceStarted = $false
+        Mock -ModuleName $script:ModuleName Get-Service {
+            $service = [pscustomobject]@{ Name = 'RustDesk'; Status = 'Stopped' }
+            $service | Add-Member -MemberType ScriptMethod -Name Start -Value { $global:VegaFakeServiceStarted = $true }
+            $service
+        }
+
+        try {
+            Start-VegaRustDeskServiceNonBlocking
+            $global:VegaFakeServiceStarted | Should -BeTrue
+        }
+        finally {
+            $global:VegaFakeServiceStarted = $null
+        }
+        Should -Invoke -CommandName Start-Service -ModuleName $script:ModuleName -Times 0 -Exactly
     }
 }
 
