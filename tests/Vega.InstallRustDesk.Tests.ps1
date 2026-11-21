@@ -691,6 +691,8 @@ Describe 't3-fix6 已有安装的服务状态分支' {
 
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
         Mock -ModuleName $script:ModuleName Get-Service { $null }
+        # t3-fix7 P1：服务未注册但客户端已退出，才允许只写用户级配置。
+        Mock -ModuleName $script:ModuleName Test-VegaRustDeskClientRunning { $false }
         Mock -ModuleName $script:ModuleName Start-Service { throw '服务未注册时不应启动服务' }
         Mock -ModuleName $script:ModuleName Wait-VegaRustDeskService { throw '服务未注册时不应等待服务' }
         Mock -ModuleName $script:ModuleName Restart-VegaRustDeskService { [pscustomobject]@{ Found = $false; WasRunning = $false; Restarted = $false; Status = ''; Message = '未找到 RustDesk 服务，跳过重启。' } }
@@ -715,6 +717,104 @@ Describe 't3-fix6 已有安装的服务状态分支' {
         $serviceState = Read-VegaState -Path $serviceStatePath
         $serviceState.RustDeskUserConfig.Written | Should -BeTrue
         $serviceState.RustDeskUserConfig.PromptPending | Should -BeFalse
+    }
+
+    It 't3-fix7 服务未注册且 RustDesk 正在运行：一行配置都不写，降级退出码 2 并给出具体原因' {
+        $statePath = Join-Path $TestDrive ('h-' + [guid]::NewGuid().ToString('N') + '.json')
+        $serviceStatePath = Join-Path $TestDrive ('s-' + [guid]::NewGuid().ToString('N') + '.json')
+        $defaults = Join-Path $TestDrive 'vega-defaults.json'
+        $json = @{ rustdesk = @{ idServer = '60.205.95.98'; relayServer = '60.205.95.98'; key = $script:Key } } | ConvertTo-Json
+        Set-Content -LiteralPath $defaults -Value $json -Encoding UTF8
+
+        $sid = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
+        $appData = Join-Path $TestDrive 'Users/张三/AppData/Roaming'
+        $null = New-Item -ItemType Directory -Path (Join-Path $appData 'RustDesk/config') -Force
+        $userConfig = Join-Path $appData 'RustDesk/config/RustDesk2.toml'
+        $serviceConfig = Join-Path $TestDrive 'ProgramData/RustDesk/config/RustDesk2.toml'
+        $log = Join-Path $TestDrive 'setup.log'
+
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
+        Mock -ModuleName $script:ModuleName Get-Service { $null }
+        # 客户端还开着：内存里的旧配置会在启用服务时覆盖刚写入的新值，所以不能写。
+        Mock -ModuleName $script:ModuleName Test-VegaRustDeskClientRunning { $true }
+        Mock -ModuleName $script:ModuleName Set-VegaRustDeskConfig { throw 'RustDesk 正在运行时不应写配置' }
+        Mock -ModuleName $script:ModuleName Start-Service { throw '服务未注册时不应启动服务' }
+        Mock -ModuleName $script:ModuleName Wait-VegaRustDeskService { throw '服务未注册时不应等待服务' }
+        Mock -ModuleName $script:ModuleName Restart-VegaRustDeskService { throw '未写配置时不应重启服务' }
+
+        $result = Invoke-VegaRustDeskBootstrap -DefaultsFile $defaults -HostStatePath $statePath `
+            -ServiceStatePath $serviceStatePath -ServiceConfigPath $serviceConfig `
+            -InteractiveUserSid $sid -InteractiveUserAppData $appData -LogFile $log -Confirm:$false
+
+        $result.Success | Should -BeFalse
+        $result.Degraded | Should -BeTrue
+        $result.ExitCode | Should -Be 2
+        $result.Error | Should -Match '检测到 RustDesk 正在运行且服务未启用'
+        $result.Error | Should -Match '完全退出 RustDesk'
+        $result.Error | Should -Match '启用服务'
+        $result.UserConfigWritten | Should -BeFalse
+
+        # 用户级与服务级文件都没有被创建，配置写入函数一次都没被调用。
+        Test-Path -LiteralPath $userConfig | Should -BeFalse
+        Test-Path -LiteralPath $serviceConfig | Should -BeFalse
+        Should -Invoke -CommandName Set-VegaRustDeskConfig -ModuleName $script:ModuleName -Times 0 -Exactly
+        Should -Invoke -CommandName Set-VegaStateRustDeskUserConfig -ModuleName $script:ModuleName -Times 0 -Exactly
+
+        # 降级停止在日志里记 WARN（完成页读最后一条 WARN 显示具体原因），不记 FAIL。
+        $logText = Get-Content -LiteralPath $log -Raw -Encoding UTF8
+        $logText | Should -Match 'WARN 检测到 RustDesk 正在运行且服务未启用'
+        $logText | Should -Not -Match 'FAIL 检测到 RustDesk 正在运行'
+    }
+
+    It 't3-fix7 P2 服务持续 StartPending：Start-Service 不等待，共用 60s 上限后判失败' {
+        $statePath = Join-Path $TestDrive ('h-' + [guid]::NewGuid().ToString('N') + '.json')
+        $serviceStatePath = Join-Path $TestDrive ('s-' + [guid]::NewGuid().ToString('N') + '.json')
+        $defaults = Join-Path $TestDrive 'vega-defaults.json'
+        $json = @{ rustdesk = @{ idServer = '60.205.95.98'; relayServer = '60.205.95.98'; key = $script:Key } } | ConvertTo-Json
+        Set-Content -LiteralPath $defaults -Value $json -Encoding UTF8
+
+        $sid = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
+        $appData = Join-Path $TestDrive 'Users/张三/AppData/Roaming'
+        $null = New-Item -ItemType Directory -Path (Join-Path $appData 'RustDesk/config') -Force
+        $userConfig = Join-Path $appData 'RustDesk/config/RustDesk2.toml'
+        $serviceConfig = Join-Path $TestDrive 'ProgramData/RustDesk/config/RustDesk2.toml'
+
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall { 'C:\Program Files\RustDesk\rustdesk.exe' }
+        Mock -ModuleName $script:ModuleName Get-Service { [pscustomobject]@{ Name = 'RustDesk'; Status = 'Stopped' } }
+        Mock -ModuleName $script:ModuleName Start-Service { }
+        Mock -ModuleName $script:ModuleName Wait-VegaRustDeskService { [pscustomobject]@{ Found = $true; Running = $false; Status = 'StartPending' } }
+        Mock -ModuleName $script:ModuleName Set-VegaRustDeskConfig { throw '服务没就绪时不应写配置' }
+
+        $result = Invoke-VegaRustDeskBootstrap -DefaultsFile $defaults -HostStatePath $statePath `
+            -ServiceStatePath $serviceStatePath -ServiceConfigPath $serviceConfig `
+            -InteractiveUserSid $sid -InteractiveUserAppData $appData -Confirm:$false
+
+        $result.Success | Should -BeFalse
+        $result.ExitCode | Should -Be 1
+        $result.Error | Should -Match '60 秒内没有达到 Running'
+
+        # 启动本身不再阻塞，且等待用的是共用截止时间算出的剩余时间（1..60 秒）。
+        Should -Invoke -CommandName Start-Service -ModuleName $script:ModuleName -Times 1 -Exactly -ParameterFilter { $NoWait }
+        Should -Invoke -CommandName Wait-VegaRustDeskService -ModuleName $script:ModuleName -Times 1 -Exactly -ParameterFilter {
+            $TimeoutSeconds -ge 1 -and $TimeoutSeconds -le 60
+        }
+        Should -Invoke -CommandName Set-VegaRustDeskConfig -ModuleName $script:ModuleName -Times 0 -Exactly
+        Test-Path -LiteralPath $userConfig | Should -BeFalse
+    }
+}
+
+Describe 't3-fix7 服务等待的有界语义' {
+    It 'P2 服务一直 StartPending：等到截止时间后返回 Running=$false 且保留状态' {
+        Mock -ModuleName $script:ModuleName Get-Service { [pscustomobject]@{ Name = 'RustDesk'; Status = 'StartPending' } }
+        # 不真的睡：用 mock 掉 Start-Sleep 让循环按真实时钟跑到 2 秒截止。
+        Mock -ModuleName $script:ModuleName Start-Sleep { }
+
+        $wait = Wait-VegaRustDeskService -TimeoutSeconds 2 -IntervalSeconds 1
+
+        $wait.Found | Should -BeTrue
+        $wait.Running | Should -BeFalse
+        $wait.Status | Should -Be 'StartPending'
+        Should -Invoke -CommandName Start-Sleep -ModuleName $script:ModuleName -Times 1
     }
 }
 
@@ -1029,6 +1129,24 @@ Describe 'P1-2 / P1-4 / P1-5 / P1-8 安装包钩子静态约束' {
         $uninstall | Should -BeGreaterThan $preserve
         $remove | Should -BeGreaterThan $uninstall
         $script:Hooks | Should -Match 'vega_unsetup_failed:[\s\S]*可重试'
+    }
+
+    It 't3-fix7 P1 完成页按退出码 2 显示本次运行最后一条 WARN，不再写死“服务级已写入”' {
+        $script:Hooks | Should -Not -Match '服务级中继配置，但用户级配置未写入'
+        $script:Hooks | Should -Not -Match '服务级已写入'
+        $script:Hooks | Should -Match 'VegaRememberLogOffset'
+        $script:Hooks | Should -Match 'VegaReadDegradedReason'
+        # 只从调用前记下的偏移开始扫，避免把上一次运行的 WARN 当成原因。
+        $offset = $script:Hooks.IndexOf('!insertmacro VegaRememberLogOffset install')
+        $install = $script:Hooks.IndexOf('-File "$INSTDIR\resources\host\install-rustdesk.ps1" -DefaultsFile')
+        $degraded = $script:Hooks.IndexOf('!insertmacro VegaReadDegradedReason install')
+        $offset | Should -BeGreaterThan -1
+        $install | Should -BeGreaterThan $offset
+        $degraded | Should -BeGreaterThan $install
+        $script:Hooks | Should -Match 'StrCmp \$4 "WARN " 0 vega_reason_loop'
+        $script:Hooks | Should -Match 'StrCpy \$vegaFinishText "\$\(MUI_TEXT_FINISH_INFO_TEXT\)\$\\r\$\\n\$\\r\$\\n\$vegaDegradedReason"'
+        # 退出码 2 前脚本必须知道原因文件位置：降级停止在日志里写的是 WARN。
+        $script:ModuleText | Should -Match "'WARN' \} else \{ 'FAIL' \}"
     }
 }
 
