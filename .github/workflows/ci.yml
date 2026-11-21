@@ -92,8 +92,8 @@ jobs:
 
       - name: shellcheck
         run: |
-          shellcheck server/setup-rustdesk-server.sh
-          shellcheck tests/setup-rustdesk-static.sh
+          shellcheck -x server/setup-rustdesk-server.sh
+          shellcheck -x tests/setup-rustdesk-static.sh
 
       - name: 部署脚本静态检查（不实跑 docker）
         run: bash tests/setup-rustdesk-static.sh
