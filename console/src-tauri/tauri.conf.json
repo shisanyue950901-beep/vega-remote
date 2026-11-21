@@ -35,9 +35,9 @@
     "shortDescription": "Vega 远程协助控制台",
     "longDescription": "零登录、零广告的远程协助与串流控制台。",
     "resources": {
-      "resources/vega-defaults.json": "vega-defaults.json",
-      "../../host/install-rustdesk.ps1": "host/install-rustdesk.ps1",
-      "../../host/lib/Vega.Common.psm1": "host/lib/Vega.Common.psm1"
+      "resources/vega-defaults.json": "resources/vega-defaults.json",
+      "../../host/install-rustdesk.ps1": "resources/host/install-rustdesk.ps1",
+      "../../host/lib/Vega.Common.psm1": "resources/host/lib/Vega.Common.psm1"
     },
     "windows": {
       "nsis": {

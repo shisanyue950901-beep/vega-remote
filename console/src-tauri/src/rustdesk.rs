@@ -930,9 +930,15 @@ fn relay_defaults_path(app: &tauri::AppHandle) -> Option<PathBuf> {
     // 安装包内：<安装目录>\resources\vega-defaults.json。
     // 开发/测试环境（tauri dev）资源未必复制到 resource_dir，回落到源码目录。
     if let Ok(dir) = app.path().resource_dir() {
-        let candidate = dir.join("vega-defaults.json");
+        // tauri.conf.json 把资源显式映射到 resources\ 下，与 NSIS 钩子用的是同一路径。
+        let candidate = dir.join("resources").join("vega-defaults.json");
         if candidate.is_file() {
             return Some(candidate);
+        }
+        // 兼容早期安装包：当时资源被放在安装目录根下。
+        let legacy = dir.join("vega-defaults.json");
+        if legacy.is_file() {
+            return Some(legacy);
         }
     }
     let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
