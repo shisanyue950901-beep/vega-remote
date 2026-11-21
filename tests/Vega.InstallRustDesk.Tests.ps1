@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
   T3 安装包脚本的单元测试（Pester 5）：
     默认中继配置解析、官方 Release 下载与 SHA256 校验、静默安装调用、

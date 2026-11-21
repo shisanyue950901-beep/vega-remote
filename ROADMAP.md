@@ -98,6 +98,12 @@
   并继续写服务级；`install-rustdesk.ps1` 用 `PSBoundParameters` 区分钩子显式传空上下文与省略参数；
   `detect_public_ip` 逐来源分类，discard 后继续下一个来源，并丢弃 198.18/15 与本机文档网段
   192.0.2/24、198.51.100/24、203.0.113/24；降级退出码在模块与入口统一为 2 ✅
+- t3-fix6（Codex 审计 t3-r5）：RustDesk 配置的读取/回读/回滚全部显式 `-ErrorAction Stop`，读失败（拒绝访问/
+  共享冲突）直接终止该目标，不再把读不到的文件当空配置，也不写用户回滚基线；已有安装区分服务状态：
+  已注册但停止用 `Start-Service` 启动并在 60s 内等 Running，未注册则不注册服务、只写用户级配置并回读，
+  服务级跳过、结果降级（退出码 2）并提示在 RustDesk 里启用服务；`DisplayIcon` 兼容引号内外的 `,N` 图标索引，
+  注册表探测支持注入原始字段值供测试；`hostname -I` 逐个地址分类；测试恢复 UTF-8 BOM，含空格路径改用
+  `$TestDrive`，修正 `$PSScriptRoot` 引用并补入口子进程与真实文件锁测试 ✅
 
 ## Backlog（T3 记录）
 - `server/setup-rustdesk-server.sh` 的 `detect_public_ip` 在阿里云回落成 VPC 内网 IP：探测逻辑移到
