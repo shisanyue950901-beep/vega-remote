@@ -1,3 +1,6 @@
 server/data/
 *.bak
 .DS_Store
+
+# 审计日志软链接（指向仓库外 work/logs，不入库）
+.logs-link
