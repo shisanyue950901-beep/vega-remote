@@ -51,7 +51,7 @@ Describe 'RustDesk 部署脚本：公网 IP 探测' {
 
     It 'RFC1918 / 链路本地地址打印警告' {
         $script:IpDetect | Should -Match '自动探测到的是内网地址'
-        $script:IpDetect | Should -Match '172\\.\\(1\[6-9\]'
+        $script:IpDetect | Should -Match ([regex]::Escape('172\.(1[6-9]'))
         $script:IpDetect | Should -Match '169\\.254'
     }
 }
