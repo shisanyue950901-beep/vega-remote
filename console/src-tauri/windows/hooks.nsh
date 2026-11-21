@@ -9,9 +9,12 @@
 ;   * 脚本失败不阻断安装本身：安装照常完成，只在完成页提示用户到 Vega 里手动安装。
 ;   * 用户级配置写当前登录交互用户（explorer.exe 所有者 / 活动会话用户）的 Roaming
 ;     AppData，不写提权账户的 %APPDATA%；取不到时只写服务级并在完成页提示。
-;   * t3-fix7：退出码 2 的完成页显示脚本给出的具体降级原因（本次运行日志里最后一条
-;     WARN），不写死“服务级已写入”。服务未注册且 RustDesk 正在运行时脚本一行配置都不写，
-;     完成页要求用户完全退出客户端、启用服务后重跑。
+;   * t3-fix7：退出码 2 的完成页显示脚本给出的具体降级原因，不写死“服务级已写入”。
+;     服务未注册且 RustDesk 正在运行时脚本一行配置都不写，完成页要求用户完全退出客户端、
+;     启用服务后重跑。
+;   * t3-fix8 P1-1：原因不再靠 ANSI 的 FileRead 扫 UTF-8 日志（中文会乱码）。每次运行
+;     生成唯一的 UTF-16LE 结果文件，脚本写入一行降级/失败原因，这里用 FileReadUTF16LE
+;     读取并显示，读完删除；日志 WARN 扫描只作为结果文件缺失时的兜底。
 ;
 ; 注意：本文件在 tauri 的 installer.nsi 顶部（MUI 页面插入之前）被 include，
 ; 所以这里的 !define 能影响完成页文案；MUI_FINISHPAGE_TEXT 里放的是运行时变量。
@@ -26,6 +29,8 @@ Var vegaLogArgument
 Var vegaRetryCommand
 Var vegaLogOffset
 Var vegaDegradedReason
+Var vegaResultFile
+Var vegaResultReason
 
 ; 安装失败时改写完成页文案（$vegaFinishText 在页面显示时按当时的值展开）。
 ; MUI2 在 include 时已给出默认 MUI_FINISHPAGE_TEXT，这里先 undef 再定义，避免重定义告警。
@@ -177,6 +182,61 @@ vega_log_arg_done_${ID}:
   RMDir "$COMMONPROGRAMDATA\Vega\retry"
 !macroend
 
+; t3-fix8 P1-1：本次运行专用的结果文件路径。GetTempFileName 每次给出唯一名，
+; 先删掉占位文件，让脚本以 UTF-16LE + BOM 重新创建（避免读到空文件或上一次残留）。
+; 日志目录 ACL 已收紧就放日志目录，没收紧就放 $TEMP。
+!macro VegaPrepareResultFile ID
+  StrCpy $vegaResultFile ""
+  StrCpy $vegaResultReason ""
+  StrCmp $vegaLogUsable "1" 0 vega_result_temp_${ID}
+    GetTempFileName $vegaResultFile "$COMMONPROGRAMDATA\Vega\logs"
+    Goto vega_result_ready_${ID}
+vega_result_temp_${ID}:
+    GetTempFileName $vegaResultFile "$TEMP"
+vega_result_ready_${ID}:
+  StrCmp $vegaResultFile "" vega_result_prepare_done_${ID}
+  Delete "$vegaResultFile"
+vega_result_prepare_done_${ID}:
+!macroend
+
+; t3-fix8 P1-1：读脚本写的一行原因。FileReadUTF16LE 跳过 BOM，不会把中文读成乱码。
+; 读完（读成功或读失败）都删除：结果文件只服务本次运行。
+!macro VegaReadResultFile ID
+  StrCpy $vegaResultReason ""
+  StrCmp $vegaResultFile "" vega_result_read_done_${ID}
+  IfFileExists "$vegaResultFile" 0 vega_result_read_done_${ID}
+  ClearErrors
+  FileOpen $2 "$vegaResultFile" r
+  IfErrors vega_result_read_done_${ID} 0
+  FileReadUTF16LE $2 $3
+  IfErrors vega_result_read_close_${ID} 0
+  StrCpy $vegaResultReason $3
+vega_result_read_close_${ID}:
+  FileClose $2
+vega_result_read_done_${ID}:
+  StrCmp $vegaResultFile "" vega_result_read_finish_${ID}
+  Delete "$vegaResultFile"
+vega_result_read_finish_${ID}:
+  ; FileRead 带回行尾 CR/LF：只留一行给完成页。
+  StrCmp $vegaResultReason "" vega_result_trim_done_${ID}
+vega_result_trim_${ID}:
+  StrCpy $4 $vegaResultReason 1 -1
+  StrCmp $4 "$\r" vega_result_trim_one_${ID}
+  StrCmp $4 "$\n" vega_result_trim_one_${ID}
+  Goto vega_result_trim_done_${ID}
+vega_result_trim_one_${ID}:
+  StrCpy $vegaResultReason $vegaResultReason -1
+  Goto vega_result_trim_${ID}
+vega_result_trim_done_${ID}:
+!macroend
+
+; 退出码 0 时脚本不写原因；仍删掉占位文件，避免在日志目录留下垃圾。
+!macro VegaDeleteResultFile ID
+  StrCmp $vegaResultFile "" vega_result_delete_done_${ID}
+  Delete "$vegaResultFile"
+vega_result_delete_done_${ID}:
+!macroend
+
 !macro VegaRunInstallRustDesk
   ; 先用各语言默认文案打底；失败时才换成具体提示。
   StrCpy $vegaFinishText "$(MUI_TEXT_FINISH_INFO_TEXT)"
@@ -184,8 +244,10 @@ vega_log_arg_done_${ID}:
   !insertmacro VegaSelectPowerShell install
   !insertmacro VegaPrepareLogDirectory install
   !insertmacro VegaSelectLogArgument install
-  ; 先记日志偏移，后面退出码 2 只扫本次运行写的 WARN。
+  ; 先记日志偏移（结果文件缺失时的兜底扫描只扫本次运行写的 WARN）。
   !insertmacro VegaRememberLogOffset install
+  ; t3-fix8 P1-1：每次运行生成唯一结果文件路径，传给脚本写降级/失败原因。
+  !insertmacro VegaPrepareResultFile install
   !insertmacro VegaResolveInteractiveUser install
 
   DetailPrint "正在安装并配置 RustDesk（自建中继）…"
@@ -194,7 +256,7 @@ vega_log_arg_done_${ID}:
   ; t3-fix5 P2：-InteractiveUserContextB64 总是显式传（取不到时是空串）。脚本用
   ; PSBoundParameters 区分“钩子确认没有交互用户”（直接只写服务级，退出码 2）与
   ; “手动调用省略参数”（才回退解析），所以这里不要去条件拼接这个参数。
-  nsExec::ExecToStack '"$vegaPowerShell" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "$INSTDIR\resources\host\install-rustdesk.ps1" -DefaultsFile "$INSTDIR\resources\vega-defaults.json" $vegaLogArgument -InteractiveUserContextB64 "$vegaUserContextB64"'
+  nsExec::ExecToStack '"$vegaPowerShell" -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "$INSTDIR\resources\host\install-rustdesk.ps1" -DefaultsFile "$INSTDIR\resources\vega-defaults.json" $vegaLogArgument -InteractiveUserContextB64 "$vegaUserContextB64" -ResultFile "$vegaResultFile"'
   Pop $0
   Pop $1
   StrCpy $vegaSetupExitCode $0
@@ -212,25 +274,33 @@ vega_install_log_done:
   StrCmp $0 "2" vega_install_degraded 0
   Goto vega_install_failed
 vega_install_degraded:
-    ; t3-fix7 P1：完成页只显示脚本给的具体原因（日志里最后一条 WARN），
-    ; 不再笼统地宣称“服务级已写入”——降级可能是服务未注册、用户级写入失败，
-    ; 也可能是一行配置都没写（RustDesk 还在运行时降级停止）。
-    !insertmacro VegaReadDegradedReason install
-    StrCmp $vegaDegradedReason "" 0 vega_install_degraded_text
-      StrCpy $vegaDegradedReason "RustDesk 中继配置没有完全生效（原因未记录，详见 $COMMONPROGRAMDATA\Vega\logs\setup.log）。"
+    ; t3-fix8 P1-1：先读本次运行的结果文件（UTF-16LE，中文不会乱码）；
+    ; 文件缺失（旧脚本 / 写失败）才退回扫描日志最后一条 WARN。
+    !insertmacro VegaReadResultFile install
+    StrCmp $vegaResultReason "" 0 vega_install_degraded_text
+      !insertmacro VegaReadDegradedReason install
+      StrCpy $vegaResultReason "$vegaDegradedReason"
+    StrCmp $vegaResultReason "" 0 vega_install_degraded_text
+      StrCpy $vegaResultReason "RustDesk 中继配置没有完全生效（原因未记录，详见 $COMMONPROGRAMDATA\Vega\logs\setup.log）。"
       Goto vega_install_degraded_show
 vega_install_degraded_text:
-    StrCpy $vegaDegradedReason "RustDesk 中继配置没有完全生效：$vegaDegradedReason"
+    StrCpy $vegaResultReason "RustDesk 中继配置没有完全生效：$vegaResultReason"
 vega_install_degraded_show:
-    StrCpy $vegaFinishText "$(MUI_TEXT_FINISH_INFO_TEXT)$\r$\n$\r$\n$vegaDegradedReason"
-    DetailPrint "RustDesk 中继配置降级（退出码 2）：$vegaDegradedReason"
+    StrCpy $vegaFinishText "$(MUI_TEXT_FINISH_INFO_TEXT)$\r$\n$\r$\n$vegaResultReason"
+    DetailPrint "RustDesk 中继配置降级（退出码 2）：$vegaResultReason"
     Goto vega_install_finish_done
 vega_install_failed:
     ; 不 Abort：RustDesk 没装好也要把 Vega 装完，用户可以在控制台里按提示重试。
     ; 交互模式只改完成页文案；/S 与 /P 不弹模态框，只留日志和 DetailPrint。
+    ; t3-fix8 P1-1：失败也读结果文件，把脚本给的具体原因带到完成页，读完删除。
+    !insertmacro VegaReadResultFile install
     DetailPrint "RustDesk 未装好（退出码 $0），继续完成 Vega 安装。"
     StrCpy $vegaFinishText "Vega 已安装，但 RustDesk 未装好（退出码 $0）。请打开 Vega，按设置页提示手动安装，或到 https://rustdesk.com/download 下载安装。"
+    StrCmp $vegaResultReason "" vega_install_finish_done
+      StrCpy $vegaFinishText "$vegaFinishText$\r$\n$\r$\n$vegaResultReason"
 vega_install_finish_done:
+    ; 成功时脚本不写原因；统一清理占位/残留结果文件。
+    !insertmacro VegaDeleteResultFile install
 !macroend
 
 !macro VegaRunUninstallRustDesk
