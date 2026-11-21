@@ -68,13 +68,22 @@
   `NSIS_HOOK_PREUNINSTALL` 调 `-Uninstall` 按 state.json 回滚 ✅
 - `host/install-rustdesk.ps1`：AGPL 约束下不打包 RustDesk 二进制，固定官方 GitHub Release 版本下载并校验 SHA256
   （1.5.3 的官方摘要已固定为 `523ba0ef…ed249`），整个下载共用一个 120 秒截止时间、最多 2 次尝试，只接受 HTTPS；
-  已装跳过、`--silent-install`、等服务出现；复用 T2 的 `RustDesk2.toml` ACL/原子写入逻辑，只写 LocalService
-  服务级配置（perMachine 安装包可能由另一管理员账户提权运行），发起安装用户的 SID 与用户级配置路径记进
-  `state.json`，由控制台首次启动时提示；新装时才在 host-state.json 记录安装归属并只卸载本次安装的 RustDesk ✅
+  已装跳过、`--silent-install`、有界 60 秒等服务达到 Running；复用 T2 的 `RustDesk2.toml` ACL/原子写入逻辑，
+  由 NSIS 钩子解析当前登录交互用户（explorer.exe 所有者 / 活动会话用户）的 SID 与 Roaming AppData，
+  同时写用户级与服务级配置，两处回读一致才算成功；取不到交互用户时只写服务级并在完成页提示。
+  该用户的 SID / AppData / 路径与是否已写入记进 `state.json`，回滚按记录路径校验；
+  新装时才在 host-state.json 记录安装归属并只卸载本次安装的 RustDesk ✅
 - 架构决策更新：旧「不做应用内提权」改为「安装包启动时 UAC 提权一次」；Vega 控制台运行时仍不提权，
   对 RustDesk 网络配置仍只读，设置页新增只读的「默认中继」比对提示 ✅
 - 测试：`tests/Vega.InstallRustDesk.Tests.ps1` 覆盖真实 SHA256 校验、哈希不匹配中止、已安装跳过、下载失败非零、
-  TLS 1.2 与仅 HTTPS、只写服务级配置、state.json 记录与回滚，以及在 Windows CI 里跑入口脚本对真实退出码的断言 ✅
+  TLS 1.2 与仅 HTTPS、非 Nullable 的下载截止时间、用户级+服务级双写与取不到交互用户时的降级、
+  有界 60 秒服务就绪、state.json 记录与按记录路径回滚，以及安装包钩子的静态约束
+  （Sysnative PowerShell、icacls 绝对路径、回滚重试脚本保留）✅
+- t3-fix3（Codex 审计 t3-r2，架构师裁剪范围）：下载截止时间改 `[datetime]`；WOW64 下钩子用
+  `Sysnative\WindowsPowerShell` 并双看 ProgramW6432/ProgramFiles 与注册表 64/32 视图；icacls 绝对路径并检查
+  退出码；交互用户 SID/Roaming AppData 传入脚本并双写用户级/服务级；有界 60 秒等 Running；
+  卸载 30 秒确认 EXE 与服务消失；回滚失败保留重试脚本；`.logs-link` 移出版本控制；
+  公网探测拒绝 127/8、0/8、100.64/10、224/4 及以上与前导零 ✅
 
 ## Backlog（T3 记录）
 - `server/setup-rustdesk-server.sh` 的 `detect_public_ip` 在阿里云回落成 VPC 内网 IP：探测逻辑移到
@@ -82,6 +91,23 @@
   只采用成功且通过 IPv4 正则的公网地址，RFC1918 结果打印警告 ✅ 已修（T3）
 - `Get-VegaRustDeskRelease` 的 SHA256 已固定为 RustDesk 1.5.3 官方资产摘要；升级版本时必须同步更新
   版本号、文件名与摘要，否则安装包会走「RustDesk 未装好」提示分支（这是有意的安全默认值）。
+
+## Backlog「T3 加固」（t3-fix3 架构师裁剪后未做，按原审计编号保留）
+- P1-3 下载目录信任：只检查直接父目录的所有者/重解析属性，没有校验整条目录链 DACL 与祖先路径；
+  随机子目录创建后才收紧 ACL，SHA256 校验完成后才拿禁止写入/删除的句柄。应验证整条链、创建目录时
+  即指定安全描述符，并在同一个受保护句柄上算 SHA256、持有到进程启动。
+- P1-7 安装归属与清单并发：首次读写归属清单仍发生在 RustDesk 已安装之后；清单不可读或保存失败时
+  重跑会走「已安装」分支而补不回归属。安装前应持久化可恢复的待办记录，安装后按已验证的产品身份提交，
+  所有机器级清单写入方共用同一把锁（T3 与提权 client 入口当前用不同互斥体）。
+- P2 下载总时限与 TLS：`ReadWriteTimeout` 只在发请求前设一次，最后一次阻塞读可能越过 120 秒截止时间；
+  钩子本身没有独立总时限。应改用单调时钟 + 可取消的请求与响应体读取。TLS 测试还需覆盖保留
+  `SystemDefault` 的情况（当前按位加入 TLS 1.2 会把系统协商收窄为仅 TLS 1.2）。
+- P2 服务回滚后重载：保留已有 RustDesk 时，回滚只改文件，未让运行中的服务加载恢复值；应重载或受控重启
+  原服务并确认恢复生效后才销账。
+- P2 设置页地址与公钥比较：同一 IPv6 地址的裸地址与方括号形式会生成不同字符串，公钥摘要只取前八个字符；
+  应统一解析 IP+端口，并用完整公钥摘要参与比较，同时对无效公钥显示配置错误。
+- P2 CI 安装包实测：仍未在 Windows CI 对产出的 `Vega-Setup.exe` 验证钩子位数、静默退出码、两处配置写入
+  与卸载回滚；`server/lib/ip-detect.sh` 也尚未纳入 shellcheck 步骤。
 
 ## M3 进阶（v1.0）
 - 虚拟显示器自动安装（无显示器被控端）
