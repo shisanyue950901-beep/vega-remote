@@ -191,7 +191,24 @@ if [[ "$got" != "203.0.113.9" ]]; then
   fail "越界 IPv4 必须被丢弃，实际：$got"
 fi
 
-# 6) RFC1918 告警行为。
+# 6) 回环 / 本网络 / CGNAT / 组播 / 前导零写法一律不算公网地址。
+for bogus in 127.0.0.1 127.10.20.30 0.0.0.0 0.1.2.3 100.64.0.1 100.127.255.254 \
+  224.0.0.1 239.255.255.255 240.0.0.1 255.255.255.255 010.1.2.3 192.168.001.1 01.2.3.4; do
+  got=$(FAKE_EIP="$bogus" FAKE_HTTP_IP=198.51.100.7 run_probe)
+  if [[ "$got" != "198.51.100.7" ]]; then
+    fail "不可公网路由的地址 $bogus 必须被丢弃，实际：$got"
+  fi
+done
+
+# 100.63/100.128 与 223.x 仍是公网单播，不能被上面的网段规则误杀。
+for good in 100.63.0.1 100.128.0.1 223.255.255.254; do
+  got=$(FAKE_EIP="$good" run_probe)
+  if [[ "$got" != "$good" ]]; then
+    fail "公网地址 $good 不应被丢弃，实际：$got"
+  fi
+done
+
+# 7) RFC1918 告警行为。
 warn=$(warn_if_private_ipv4 172.20.0.1 2>&1) && warn_code=0 || warn_code=$?
 if [[ "$warn_code" -ne 0 || "$warn" != *"自动探测到的是内网地址 172.20.0.1"* ]]; then
   fail "RFC1918 地址必须打印内网警告（退出码 $warn_code，输出：$warn）"

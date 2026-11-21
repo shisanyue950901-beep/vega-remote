@@ -20,7 +20,9 @@ is_valid_ipv4() {
   local parts=($ip)
   [[ "${#parts[@]}" -ne 4 ]] && return 1
   for octet in "${parts[@]}"; do
-    [[ "$octet" =~ ^[0-9]{1,3}$ ]] || return 1
+    # 前导零写法（010.1.2.3）在 inet_aton 里是八进制，容易和十进制解析出不同地址：
+    # 一律判为非法，避免歧义输入。
+    [[ "$octet" =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
     ((10#$octet <= 255)) || return 1
   done
   return 0
@@ -41,6 +43,18 @@ is_public_ipv4() {
   local ip="$1"
   is_valid_ipv4 "$ip" || return 1
   is_private_ipv4 "$ip" && return 1
+
+  local first second
+  IFS='.' read -r first second _ _ <<<"$ip"
+  # 0/8（本网络，0.0.0.0 之类）、127/8（回环）都不能给客户端填。
+  ((10#$first == 0)) && return 1
+  ((10#$first == 127)) && return 1
+  # 100.64/10 是运营商级 NAT / 共享地址空间，公网客户端连不到。
+  if ((10#$first == 100)) && ((10#$second >= 64 && 10#$second <= 127)); then
+    return 1
+  fi
+  # 224/4 组播、240/4 保留（含 255.255.255.255 广播）都不是可路由的单播地址。
+  ((10#$first >= 224)) && return 1
   return 0
 }
 

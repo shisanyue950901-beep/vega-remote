@@ -12,6 +12,7 @@ BeforeAll {
     $script:ServerScript = Get-Content -LiteralPath $script:ServerScriptPath -Encoding UTF8 -Raw
     $script:IpDetect = Get-Content -LiteralPath $script:IpDetectPath -Encoding UTF8 -Raw
     $script:Compose = Get-Content -LiteralPath $script:ComposePath -Encoding UTF8 -Raw
+    $script:StaticTest = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'setup-rustdesk-static.sh') -Encoding UTF8 -Raw
 }
 
 Describe 'RustDesk 部署脚本：只支持全新部署' {
@@ -53,6 +54,18 @@ Describe 'RustDesk 部署脚本：公网 IP 探测' {
         $script:IpDetect | Should -Match '自动探测到的是内网地址'
         $script:IpDetect | Should -Match ([regex]::Escape('172\.(1[6-9]'))
         $script:IpDetect | Should -Match '169\\.254'
+    }
+
+    It '拒绝回环 / 本网络 / CGNAT / 组播 / 前导零写法' {
+        # 静态断言：这些网段必须在 is_public_ipv4 里被排除，前导零在 is_valid_ipv4 里被拒。
+        $script:IpDetect | Should -Match '10#\$first == 127'
+        $script:IpDetect | Should -Match '10#\$first == 0'
+        $script:IpDetect | Should -Match '100\.64/10|10#\$second >= 64'
+        $script:IpDetect | Should -Match '10#\$first >= 224'
+        $script:IpDetect | Should -Match '\^\(0\|\[1-9\]\[0-9\]\{0,2\}\)\$'
+        # 行为断言在 bash 静态检查里跑（tests/setup-rustdesk-static.sh 的探测段）。
+        $script:StaticTest | Should -Match '127\.0\.0\.1'
+        $script:StaticTest | Should -Match '010\.1\.2\.3'
     }
 }
 
