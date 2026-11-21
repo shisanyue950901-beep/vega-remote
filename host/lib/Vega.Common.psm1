@@ -6680,6 +6680,9 @@ function Invoke-VegaRustDeskBootstrap {
         [AllowEmptyString()]
         [string]$InteractiveUserAppData = '',
 
+        # 编码上下文解码失败时由入口脚本置位：不再尝试重新解析交互用户，直接只写服务级。
+        [switch]$ServiceOnly,
+
         [AllowEmptyString()]
         [string]$ServiceConfigPath = '',
 
@@ -6706,10 +6709,14 @@ function Invoke-VegaRustDeskBootstrap {
     if ([string]::IsNullOrWhiteSpace($ServiceConfigPath)) { $ServiceConfigPath = Get-VegaRustDeskConfigPath -ServiceMode }
 
     # 用户级目标只认钩子解析出的交互用户（或显式传入），绝不用提权账户的 %APPDATA%。
-    $userContext = Resolve-VegaSetupInteractiveUser -Sid $InteractiveUserSid `
-        -AppDataPath $InteractiveUserAppData -ConfigPath $UserConfigPath
+    # -ServiceOnly（解码失败时）：连重新解析都不做，避免把无效上下文换成另一个账户。
+    $userContext = $null
     $userTarget = ''
-    if ($null -ne $userContext) { $userTarget = [string]$userContext.UserConfigPath }
+    if (-not $ServiceOnly) {
+        $userContext = Resolve-VegaSetupInteractiveUser -Sid $InteractiveUserSid `
+            -AppDataPath $InteractiveUserAppData -ConfigPath $UserConfigPath
+        if ($null -ne $userContext) { $userTarget = [string]$userContext.UserConfigPath }
+    }
 
     $fail = {
         param(

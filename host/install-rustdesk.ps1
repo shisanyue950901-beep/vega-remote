@@ -128,6 +128,7 @@ if (-not (Test-VegaProcessElevated)) {
 # t3-fix4：解码 NSIS 传的 Base64 上下文，并校验路径真实存在。
 # 校验失败不硬失败：清空交互用户参数，后面只写服务级配置，最终以退出码 2 标记降级。
 $contextDecodeError = ''
+$forceServiceOnly = $false
 if (-not [string]::IsNullOrWhiteSpace($InteractiveUserContextB64)) {
     $decodedContext = ConvertFrom-VegaInteractiveUserContextPayload -Payload $InteractiveUserContextB64
     if ($decodedContext.Valid) {
@@ -139,6 +140,7 @@ if (-not [string]::IsNullOrWhiteSpace($InteractiveUserContextB64)) {
         $contextDecodeError = [string]$decodedContext.Error
         $InteractiveUserSid = ''
         $InteractiveUserAppData = ''
+        $forceServiceOnly = $true
         Write-VegaLog ("WARN 交互用户上下文无效（{0}），只写服务级配置。" -f $contextDecodeError)
         Write-Host ("未取到可用的交互用户（{0}），只写服务级中继配置。" -f $contextDecodeError) -ForegroundColor Yellow
     }
@@ -165,7 +167,8 @@ try {
 
     $result = Invoke-VegaRustDeskBootstrap -DefaultsFile $DefaultsFile -HostStatePath $StatePath `
         -ServiceStatePath $ServiceStatePath -InteractiveUserSid $InteractiveUserSid `
-        -InteractiveUserAppData $InteractiveUserAppData -LogFile $LogFile -Confirm:$false
+        -InteractiveUserAppData $InteractiveUserAppData -ServiceOnly:$forceServiceOnly `
+        -LogFile $LogFile -Confirm:$false
 
     foreach ($message in @($result.Messages)) {
         Write-Host $message
