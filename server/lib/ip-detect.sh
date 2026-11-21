@@ -8,6 +8,8 @@
 #     拿不到令牌就不发无令牌请求（该实例要求令牌，无令牌请求只会失败/误导）。
 #   - 元数据请求必须 --noproxy '*'：经过用户配置的代理会把 100.100.100.200 解析到别处。
 #   - 只接受请求成功且通过 IPv4 正则的完整响应；失败时的部分输出/HTML 一律丢弃。
+#   - 路由/hostname 回退可能拿到 100.64/10、回环、组播等不可路由地址：最终输出前统一
+#     分类。RFC1918 保留并由调用方打印警告；CGNAT/回环/链路本地/组播/保留段直接丢弃。
 #   - 本文件只定义函数，不执行任何动作。
 
 is_valid_ipv4() {
@@ -28,12 +30,19 @@ is_valid_ipv4() {
   return 0
 }
 
-is_private_ipv4() {
+is_rfc1918_ipv4() {
   local ip="$1"
   is_valid_ipv4 "$ip" || return 1
   [[ "$ip" =~ ^10\. ]] && return 0
   [[ "$ip" =~ ^192\.168\. ]] && return 0
   [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]] && return 0
+  return 1
+}
+
+is_private_ipv4() {
+  local ip="$1"
+  is_valid_ipv4 "$ip" || return 1
+  is_rfc1918_ipv4 "$ip" && return 0
   # 169.254/16 是链路本地地址，同样不能当公网 IP 给用户填。
   [[ "$ip" =~ ^169\.254\. ]] && return 0
   return 1
@@ -56,6 +65,45 @@ is_public_ipv4() {
   # 224/4 组播、240/4 保留（含 255.255.255.255 广播）都不是可路由的单播地址。
   ((10#$first >= 224)) && return 1
   return 0
+}
+
+# 把候选地址分类：
+#   public  = 可路由公网单播；
+#   private = RFC1918（调用方打印警告后仍可展示）；
+#   discard = CGNAT / 回环 / 0/8 / 链路本地 / 组播 / 保留段 / 非法写法，必须丢弃。
+classify_detected_ipv4() {
+  local ip="$1"
+  if ! is_valid_ipv4 "$ip"; then
+    printf 'discard'
+    return 0
+  fi
+  if is_public_ipv4 "$ip"; then
+    printf 'public'
+    return 0
+  fi
+  if is_rfc1918_ipv4 "$ip"; then
+    printf 'private'
+    return 0
+  fi
+  printf 'discard'
+}
+
+# 最终输出前的唯一过滤器：只放行 public / RFC1918，其余返回 1（调用方置空）。
+sanitize_detected_ipv4() {
+  local ip="$1"
+  case "$(classify_detected_ipv4 "$ip")" in
+    public)
+      printf '%s' "$ip"
+      return 0
+      ;;
+    private)
+      printf '%s' "$ip"
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 # 阿里云元数据：IMDSv2。成功且是公网 IPv4 时打印地址并返回 0。
@@ -106,8 +154,11 @@ detect_public_ip() {
     ip=$(hostname -I 2>/dev/null | awk '{print $1}') || ip=""
   fi
 
-  # 走本地路由/hostname 拿到的是内网地址也原样返回，让调用方打印警告。
-  is_valid_ipv4 "$ip" || ip=""
+  # 本地回退可能是内网地址（保留给调用方打印警告），但 CGNAT/回环/链路本地/组播
+  # 这类不可路由地址必须在这里丢弃，不能打印成服务器地址。
+  if [[ -n "$ip" ]]; then
+    ip=$(sanitize_detected_ipv4 "$ip") || ip=""
+  fi
   printf '%s' "$ip"
 }
 

@@ -408,6 +408,8 @@ EOF
 EOF
 }
 
+# detect_public_ip 已丢弃 CGNAT/回环/链路本地/组播等不可路由地址；
+# 只有 RFC1918 会保留，这里统一打印警告。
 IP=$(detect_public_ip | tr -d '[:space:]')
 warn_if_private_ipv4 "$IP" || true
 
