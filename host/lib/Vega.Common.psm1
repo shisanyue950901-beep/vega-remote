@@ -1686,9 +1686,10 @@ function Remove-VegaStateRustDeskInstall {
 
 function Set-VegaStateRustDeskUserConfig {
     <#
-      P1-8：安装包在 NSIS 里拿不到可靠的“发起安装用户”上下文时，只写服务级配置，
-      把发起用户的 SID 与实际用户级配置路径记进机器级 state.json。
-      控制台首次以该用户启动时据此提示一次，用户确认后再写自己的 RustDesk2.toml。
+      P1-5：把发起安装/交互用户的 SID、Roaming AppData 与用户级配置路径记进机器级
+      state.json。Written=$true 表示用户级 RustDesk2.toml 已按该 SID 写入并回读通过；
+      取不到用户上下文时 Written=$false、PromptPending=$true，由完成页提示用户手动处理。
+      回滚时按记录的 Path 作为预期路径校验用户级基线。
     #>
     [CmdletBinding()]
     param(
@@ -1701,12 +1702,19 @@ function Set-VegaStateRustDeskUserConfig {
         [AllowEmptyString()]
         [string]$Path = '',
 
-        [bool]$PromptPending = $true
+        [AllowEmptyString()]
+        [string]$AppDataPath = '',
+
+        [bool]$PromptPending = $true,
+
+        [bool]$Written = $false
     )
 
     $State.RustDeskUserConfig = [pscustomobject]@{
         Sid           = $Sid
         Path          = $Path
+        AppDataPath   = $AppDataPath
+        Written       = $Written
         PromptPending = $PromptPending
         RecordedAt    = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
     }
@@ -3855,31 +3863,46 @@ function Get-VegaDoctorAdvice {
 
 function Get-VegaInteractiveUserContext {
     <#
-      P1-8：perMachine 安装包可能以“另一个管理员账户”提权运行，此时进程的 %APPDATA%
-      属于提权账户而不是发起安装的用户。这里尽力拿到控制台登录用户的 SID 与用户级
-      配置路径；拿不到就返回空 SID，调用方只记“需要控制台首次启动时提示”。
+      P1-5：perMachine 安装包可能以“另一个管理员账户”提权运行，此时进程的 %APPDATA%
+      属于提权账户而不是当前登录的交互用户。这里按顺序解析交互用户：
+        1. explorer.exe 的所有者（GetOwner，最贴近“正在用桌面的人”）；
+        2. query user / query session 里状态为 Active 的会话用户；
+        3. Win32_ComputerSystem.UserName；
+        4. 当前进程账户（兜底，手动运行脚本时）。
+      SID 用 NTAccount 翻译；Roaming AppData 路径优先取
+      HKU\<SID>\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders 的 AppData，
+      其次 ProfileList 的 ProfileImagePath\AppData\Roaming，最后 Win32_UserProfile.LocalPath。
       只在 Windows 上取；任何一步失败都返回结构完整的空值，不抛异常。
+      -SkipProcessFallback：不做“当前进程账户”兜底。安装包钩子必须用它，否则提权账户
+      会被误当成交互用户，用户级配置就写到了管理员自己的 %APPDATA%。
     #>
     [CmdletBinding()]
-    param()
+    param(
+        [switch]$SkipProcessFallback
+    )
 
     $name = ''
     $sid = ''
+    $appDataPath = ''
     $configPath = ''
     $systemDrive = $env:SystemDrive
     if ([string]::IsNullOrWhiteSpace($systemDrive)) { $systemDrive = 'C:' }
 
     if (Test-VegaWindowsPlatform) {
-        try {
-            $computer = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
-            $name = [string]$computer.UserName
-        }
-        catch {
-            $name = ''
+        $name = [string](Get-VegaExplorerOwnerName)
+        if ([string]::IsNullOrWhiteSpace($name)) { $name = [string](Get-VegaActiveSessionUserName) }
+        if ([string]::IsNullOrWhiteSpace($name)) {
+            try {
+                $computer = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+                $name = [string]$computer.UserName
+            }
+            catch {
+                $name = ''
+            }
         }
     }
-    if ([string]::IsNullOrWhiteSpace($name)) {
-        # 兜底：当前进程账户。至少不会记录一个空名字。
+    if ([string]::IsNullOrWhiteSpace($name) -and -not $SkipProcessFallback) {
+        # 兜底：当前进程账户（手动运行脚本时）。
         $name = [string]$env:USERNAME
     }
 
@@ -3892,26 +3915,21 @@ function Get-VegaInteractiveUserContext {
             $sid = ''
         }
 
-        # 实际用户目录从 Win32_UserProfile 取：域账户 / 重名时 C:\Users\<用户名> 的
-        # 目录名可能带后缀，按用户名硬拼会记录错路径。
-        if (-not [string]::IsNullOrWhiteSpace($sid) -and (Test-VegaWindowsPlatform)) {
-            try {
-                $userProfile = Get-CimInstance -ClassName Win32_UserProfile -Filter ("SID='{0}'" -f $sid) -ErrorAction Stop
-                if ($null -ne $userProfile -and -not [string]::IsNullOrWhiteSpace([string]$userProfile.LocalPath)) {
-                    $configPath = Join-Path ([string]$userProfile.LocalPath) 'AppData\Roaming\RustDesk\config\RustDesk2.toml'
-                }
-            }
-            catch {
-                $configPath = ''
-            }
+        if (-not [string]::IsNullOrWhiteSpace($sid)) {
+            $appDataPath = [string](Get-VegaUserRoamingAppData -Sid $sid)
         }
 
-        if ([string]::IsNullOrWhiteSpace($configPath)) {
+        if (-not [string]::IsNullOrWhiteSpace($appDataPath)) {
+            $configPath = Join-Path $appDataPath 'RustDesk\config\RustDesk2.toml'
+        }
+        else {
+            # 连 Roaming 都取不到：按用户名拼一个候选路径，交给调用方的重解析点/白名单校验。
             $leaf = $name
             $separator = $leaf.LastIndexOf('\')
             if ($separator -ge 0 -and $separator -lt ($leaf.Length - 1)) { $leaf = $leaf.Substring($separator + 1) }
             if (-not [string]::IsNullOrWhiteSpace($leaf) -and $leaf -notmatch '[\\/]') {
-                $configPath = Join-Path $systemDrive ("Users\{0}\AppData\Roaming\RustDesk\config\RustDesk2.toml" -f $leaf)
+                $appDataPath = Join-Path $systemDrive ("Users\{0}\AppData\Roaming" -f $leaf)
+                $configPath = Join-Path $appDataPath 'RustDesk\config\RustDesk2.toml'
             }
         }
     }
@@ -3919,8 +3937,197 @@ function Get-VegaInteractiveUserContext {
     return [pscustomobject]@{
         Name           = $name
         Sid            = $sid
+        AppDataPath    = $appDataPath
         UserConfigPath = $configPath
     }
+}
+
+function Get-VegaExplorerOwnerName {
+    <#
+      explorer.exe 的所有者，形如 DOMAIN\user（无域时 user）。取不到返回空串。
+    #>
+    [CmdletBinding()]
+    param()
+
+    if (-not (Test-VegaWindowsPlatform)) { return '' }
+
+    try {
+        $process = Get-CimInstance -ClassName Win32_Process -Filter "Name='explorer.exe'" -ErrorAction Stop |
+            Select-Object -First 1
+        if ($null -eq $process) { return '' }
+        $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwner -ErrorAction Stop
+        if ($null -eq $owner -or [int]$owner.ReturnValue -ne 0) { return '' }
+        $user = [string]$owner.User
+        if ([string]::IsNullOrWhiteSpace($user)) { return '' }
+        $domain = [string]$owner.Domain
+        if ([string]::IsNullOrWhiteSpace($domain)) { return $user }
+        return ('{0}\{1}' -f $domain, $user)
+    }
+    catch {
+        return ''
+    }
+}
+
+function Get-VegaActiveSessionUserName {
+    <#
+      query user 里 Active 会话的用户名（行首可能带 '>'）。中文系统表头不同，
+      所以只按状态列关键字 Active 与首个字段解析，不依赖列名。
+    #>
+    [CmdletBinding()]
+    param()
+
+    if (-not (Test-VegaWindowsPlatform)) { return '' }
+
+    try {
+        $lines = @(& query user 2>$null)
+    }
+    catch {
+        return ''
+    }
+
+    foreach ($line in $lines) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        if ($line -notmatch '(?i)\bActive\b') { continue }
+        $fields = @(($line.Trim().TrimStart('>')) -split '\s+' | Where-Object { $_ -ne '' })
+        if ($fields.Count -eq 0) { continue }
+        $candidate = [string]$fields[0]
+        if ($candidate -notmatch '[\\/]' -and $candidate -ne 'USERNAME') { return $candidate }
+    }
+    return ''
+}
+
+function Get-VegaUserRoamingAppData {
+    <#
+      给定 SID，返回该用户的 Roaming AppData 目录：
+        1. HKU\<SID>\...\Explorer\Shell Folders 的 AppData；
+        2. HKLM ProfileList\<SID>\ProfileImagePath + AppData\Roaming；
+        3. Win32_UserProfile.LocalPath + AppData\Roaming。
+      只返回绝对路径且不含引号/换行；取不到返回空串。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Sid
+    )
+
+    if (-not (Test-VegaWindowsPlatform)) { return '' }
+    if ($Sid -notmatch '^S-1-[0-9-]+$') { return '' }
+
+    $candidates = New-Object System.Collections.Generic.List[string]
+
+    try {
+        $shellFolders = 'Registry::HKEY_USERS\{0}\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders' -f $Sid
+        if (Test-Path -LiteralPath $shellFolders) {
+            $item = Get-ItemProperty -LiteralPath $shellFolders -ErrorAction Stop
+            if ($null -ne $item.PSObject.Properties['AppData']) {
+                $candidates.Add([string]$item.AppData)
+            }
+        }
+    }
+    catch {
+        $null = $_
+    }
+
+    try {
+        $profileList = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\{0}' -f $Sid
+        if (Test-Path -LiteralPath $profileList) {
+            $item = Get-ItemProperty -LiteralPath $profileList -ErrorAction Stop
+            if ($null -ne $item.PSObject.Properties['ProfileImagePath']) {
+                $profilePath = [string]$item.ProfileImagePath
+                if (-not [string]::IsNullOrWhiteSpace($profilePath)) {
+                    $candidates.Add((Join-Path $profilePath 'AppData\Roaming'))
+                }
+            }
+        }
+    }
+    catch {
+        $null = $_
+    }
+
+    try {
+        $userProfile = Get-CimInstance -ClassName Win32_UserProfile -Filter ("SID='{0}'" -f $Sid) -ErrorAction Stop |
+            Select-Object -First 1
+        if ($null -ne $userProfile -and -not [string]::IsNullOrWhiteSpace([string]$userProfile.LocalPath)) {
+            $candidates.Add((Join-Path ([string]$userProfile.LocalPath) 'AppData\Roaming'))
+        }
+    }
+    catch {
+        $null = $_
+    }
+
+    foreach ($candidate in $candidates) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+        if ($candidate -match '[\r\n"]') { continue }
+        if ($candidate -notmatch '^[A-Za-z]:\\') { continue }
+        if ($candidate -notmatch '(?i)\\AppData\\Roaming\\?$') { continue }
+        return $candidate.TrimEnd([char[]]@('\', '/'))
+    }
+
+    return ''
+}
+
+function Get-VegaInteractiveUserContextValue {
+    <#
+      P1-5：给 NSIS 钩子用的一行取值接口。钩子用 nsExec 调
+      `Get-VegaInteractiveUserContextValue -Field Sid|AppDataPath`，把结果作为参数传给
+      install-rustdesk.ps1，避免脚本在提权上下文里用错账户。取不到返回空串。
+    #>
+    [CmdletBinding()]
+    param(
+        [ValidateSet('Sid', 'AppDataPath', 'UserConfigPath')]
+        [string]$Field = 'Sid'
+    )
+
+    $context = Get-VegaInteractiveUserContext -SkipProcessFallback
+    if ($null -eq $context) { return '' }
+
+    switch ($Field) {
+        'Sid' { return [string]$context.Sid }
+        'AppDataPath' { return [string]$context.AppDataPath }
+        default { return [string]$context.UserConfigPath }
+    }
+}
+
+function Resolve-VegaSetupInteractiveUser {
+    <#
+      P1-5：钩子已经把交互用户解析好时直接用（SID + Roaming AppData），
+      否则回落 Get-VegaInteractiveUserContext。显式传入 -ConfigPath 时以它为准。
+      任何参数都只当作候选，真正写入前仍要过 Test-VegaRustDeskManagedConfigPath。
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()]
+        [string]$Sid = '',
+
+        [AllowEmptyString()]
+        [string]$AppDataPath = '',
+
+        [AllowEmptyString()]
+        [string]$ConfigPath = ''
+    )
+
+    $sidText = $Sid.Trim()
+    $appDataText = $AppDataPath.Trim()
+    $configText = $ConfigPath.Trim()
+
+    if (-not [string]::IsNullOrWhiteSpace($configText)) {
+        return [pscustomobject]@{
+            Sid            = $(if ($sidText -match '^S-1-[0-9-]+$') { $sidText } else { '' })
+            AppDataPath    = $appDataText
+            UserConfigPath = $configText
+        }
+    }
+
+    if ($sidText -match '^S-1-[0-9-]+$' -and $appDataText -match '^[A-Za-z]:\\') {
+        $appDataText = $appDataText.TrimEnd([char[]]@('\', '/'))
+        return [pscustomobject]@{
+            Sid            = $sidText
+            AppDataPath    = $appDataText
+            UserConfigPath = (Join-Path $appDataText 'RustDesk\config\RustDesk2.toml')
+        }
+    }
+
+    return (Get-VegaInteractiveUserContext -SkipProcessFallback)
 }
 
 function Get-VegaRustDeskConfigPath {
@@ -5099,13 +5306,50 @@ function Test-VegaRustDeskSignatureValid {
     }
 }
 
+function Get-VegaProgramFilesRegistryRoot {
+    <#
+      P1-2：从注册表的 64 位视图和 WOW6432Node 视图读取 ProgramFilesDir /
+      ProgramFilesDir (x86)。32 位进程读 HKLM:\SOFTWARE 会被重定向，两个路径都读
+      才能同时覆盖 64 位与 32 位安装目录；读不到或非 Windows 返回空数组。
+    #>
+    [CmdletBinding()]
+    param()
+
+    $keys = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion'
+    )
+    $values = @('ProgramFilesDir', 'ProgramFilesDir (x86)')
+    $roots = New-Object System.Collections.Generic.List[string]
+
+    foreach ($key in $keys) {
+        if (-not (Test-Path -LiteralPath $key)) { continue }
+        try {
+            $item = Get-ItemProperty -LiteralPath $key -ErrorAction Stop
+        }
+        catch {
+            continue
+        }
+        foreach ($value in $values) {
+            if ($null -eq $item.PSObject.Properties[$value]) { continue }
+            $root = [string]$item.$value
+            if ([string]::IsNullOrWhiteSpace($root)) { continue }
+            $roots.Add($root)
+        }
+    }
+
+    return $roots.ToArray()
+}
+
 function Get-VegaRustDeskInstall {
     <#
       找 rustdesk.exe；找不到返回 $null。
       -RequireSigned：只返回 Program Files / Program Files (x86) 下且 Authenticode 状态为
       Valid 的副本，并完全不考虑 %LOCALAPPDATA%——提权运行时不能启动低权限目录里的可执行文件。
-      -SearchRoot：可注入的安装根目录列表（测试用）；不传时取两个 Program Files
-      环境变量中非空的值。Windows 上其中一项为空、或非 Windows 上两者都为空时安全跳过。
+      -SearchRoot：可注入的安装根目录列表（测试用）；不传时同时看 ProgramW6432 /
+      ProgramFiles / ProgramFiles(x86)，以及注册表 64 位与 WOW6432Node 两个视图里的
+      ProgramFilesDir（P1-2：32 位钩子进程里 env:ProgramFiles 指向 x86，只看它会漏掉
+      x64 RustDesk）。路径去重后逐个探测，Windows 上取不到就安全跳过。
     #>
     [CmdletBinding()]
     param(
@@ -5124,9 +5368,14 @@ function Get-VegaRustDeskInstall {
         $explicitRoots = $true
     }
     if (-not $explicitRoots) {
-        foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+        $envRoots = @($env:ProgramW6432, $env:ProgramFiles, ${env:ProgramFiles(x86)})
+        $registryRoots = @(Get-VegaProgramFilesRegistryRoot)
+        $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($root in @($envRoots + $registryRoots)) {
             if ([string]::IsNullOrWhiteSpace($root)) { continue }
-            $roots.Add([string]$root)
+            $trimmed = ([string]$root).TrimEnd([char[]]@('\', '/'))
+            if (-not $seen.Add($trimmed)) { continue }
+            $roots.Add($trimmed)
         }
     }
 
@@ -5987,8 +6236,23 @@ function Uninstall-VegaRustDeskRecorded {
                 return [pscustomobject]@{ Success = $false; Message = ("RustDesk 卸载程序退出码 {0}，保留安装记录以便重试。" -f $exitCode) }
             }
 
-            if (Test-Path -LiteralPath $recordedPath) {
-                return [pscustomobject]@{ Success = $false; Message = ("卸载程序结束，但 {0} 仍存在；保留安装记录以便重试。" -f $recordedPath) }
+            # P1-8：RustDesk 1.5.3 的 --uninstall 会先结束自身进程，再异步删注册表和服务；
+            # 退出码 0 不等于清理完成。有界（30 秒）确认 EXE 与服务都实际消失再销账。
+            $disappearDeadline = (Get-Date).AddSeconds(30)
+            while ($true) {
+                $exeLeft = Test-Path -LiteralPath $recordedPath
+                $serviceLeft = $null -ne (Get-Service -Name 'RustDesk' -ErrorAction SilentlyContinue)
+                if (-not $exeLeft -and -not $serviceLeft) { break }
+                if ((Get-Date) -ge $disappearDeadline) {
+                    $left = @()
+                    if ($exeLeft) { $left += ("文件 {0}" -f $recordedPath) }
+                    if ($serviceLeft) { $left += 'RustDesk 服务' }
+                    return [pscustomobject]@{
+                        Success = $false
+                        Message = ("卸载程序结束后 30 秒内仍有残留（{0}）；保留安装记录以便重试。" -f ($left -join '、'))
+                    }
+                }
+                Start-Sleep -Seconds 1
             }
 
             return [pscustomobject]@{ Success = $true; Message = '已卸载本次由 Vega 安装的 RustDesk' }
@@ -6013,6 +6277,8 @@ function Invoke-VegaRustDeskRollback {
     param(
         [string]$HostStatePath = (Get-VegaHostStatePath),
         [string]$ServiceStatePath = (Get-VegaRustDeskServiceStatePath),
+        [AllowEmptyString()]
+        [string]$InteractiveUserAppData = '',
         [switch]$KeepRustDesk
     )
 
@@ -6034,10 +6300,29 @@ function Invoke-VegaRustDeskRollback {
             }
         }
 
+        # P1-5：用户级基线按“安装时记录的 SID/路径”校验。优先用钩子传进来的交互用户
+        # Roaming AppData，其次用 state.json 里记录的路径；都没有才回落到当前用户。
+        $expectedUserConfigPath = ''
+        if (-not [string]::IsNullOrWhiteSpace($InteractiveUserAppData)) {
+            $appDataText = $InteractiveUserAppData.Trim().TrimEnd([char[]]@('\', '/'))
+            $expectedUserConfigPath = Join-Path $appDataText 'RustDesk\config\RustDesk2.toml'
+        }
+        elseif ((-not [string]::IsNullOrWhiteSpace($ServiceStatePath)) -and (Test-Path -LiteralPath $ServiceStatePath -PathType Leaf)) {
+            try {
+                $serviceStateForUser = Read-VegaState -Path $ServiceStatePath
+                if ($null -ne $serviceStateForUser.RustDeskUserConfig) {
+                    $expectedUserConfigPath = [string]$serviceStateForUser.RustDeskUserConfig.Path
+                }
+            }
+            catch {
+                $expectedUserConfigPath = ''
+            }
+        }
+
         if (Test-Path -LiteralPath $HostStatePath -PathType Leaf) {
             try {
                 $state = Read-VegaState -Path $HostStatePath
-                $restore = Restore-VegaRustDeskState -State $state -StatePath $HostStatePath -Confirm:$false
+                $restore = Restore-VegaRustDeskState -State $state -StatePath $HostStatePath -ExpectedPath $expectedUserConfigPath -Confirm:$false
                 foreach ($message in @($restore.Messages)) { $messages.Add([string]$message) }
                 foreach ($failure in @($restore.Failures)) { $failures.Add([string]$failure) }
                 $state = $restore.State
@@ -6097,8 +6382,10 @@ function Invoke-VegaRustDeskBootstrap {
         2. 读 vega-defaults.json；
         3. 没装 RustDesk 才在受信随机目录里下载（校验 SHA256，句柄保护到启动，P1-3），
            静默安装后确认新 EXE 与服务就绪（P1-5），并立刻记录安装归属（P1-6）；
-        4. 只写 LocalService 服务级 RustDesk2.toml 并回读确认（P1-8 / P1-5）；
-        5. 把发起安装用户的 SID 记进 state.json，用户级配置留给控制台首次启动提示；
+        4. 用钩子解析好的交互用户（SID + Roaming AppData）同时写用户级与服务级
+           RustDesk2.toml，两处都回读一致才算成功（P1-5）；取不到用户上下文时退回
+           只写服务级，并在完成页提示；
+        5. 把该用户的 SID / AppData / 配置路径与是否已写入记进 state.json，回滚按 SID 走同一路径；
         6. 重启运行中的服务并确认 Running（P1-5）。
       任何一步失败都返回 Success=$false（ExitCode=1），由调用方提示但不阻断安装。
     #>
@@ -6113,6 +6400,12 @@ function Invoke-VegaRustDeskBootstrap {
 
         [AllowEmptyString()]
         [string]$UserConfigPath = '',
+
+        [AllowEmptyString()]
+        [string]$InteractiveUserSid = '',
+
+        [AllowEmptyString()]
+        [string]$InteractiveUserAppData = '',
 
         [AllowEmptyString()]
         [string]$ServiceConfigPath = '',
@@ -6138,7 +6431,12 @@ function Invoke-VegaRustDeskBootstrap {
     # P1-5：入口脚本不传配置路径。先在调用方解析默认路径，后面的
     # “服务级配置确实写入”判断才能比对到真实路径，而不是空字符串。
     if ([string]::IsNullOrWhiteSpace($ServiceConfigPath)) { $ServiceConfigPath = Get-VegaRustDeskConfigPath -ServiceMode }
-    if ([string]::IsNullOrWhiteSpace($UserConfigPath)) { $UserConfigPath = Get-VegaRustDeskConfigPath }
+
+    # 用户级目标只认钩子解析出的交互用户（或显式传入），绝不用提权账户的 %APPDATA%。
+    $userContext = Resolve-VegaSetupInteractiveUser -Sid $InteractiveUserSid `
+        -AppDataPath $InteractiveUserAppData -ConfigPath $UserConfigPath
+    $userTarget = ''
+    if ($null -ne $userContext) { $userTarget = [string]$userContext.UserConfigPath }
 
     $fail = {
         param(
@@ -6256,46 +6554,75 @@ function Invoke-VegaRustDeskBootstrap {
             $messages.Add("RustDesk 服务已就绪（$($await.Status)）")
         }
 
-        # P1-8：只写服务级配置。perMachine 安装包可能以另一个管理员账户提权运行，
-        # 写 %APPDATA% 会落到提权账户上；用户级配置留给控制台首次启动时提示。
+        # P1-5：用户级 + 服务级一起写。用户级路径来自交互用户，不用提权账户的 %APPDATA%。
+        $userWritten = $false
         try {
             $state = Read-VegaState -Path $HostStatePath
-            $config = Set-VegaRustDeskConfig -Server $defaults.IdServer -Key $defaults.Key -RelayServer $defaults.RelayServer `
-                -State $state -StatePath $HostStatePath -UserConfigPath $UserConfigPath -ServiceConfigPath $ServiceConfigPath `
-                -ServiceStatePath $ServiceStatePath -ForceService -ServiceOnly -Confirm:$false
+            $configArguments = @{
+                Server           = $defaults.IdServer
+                Key              = $defaults.Key
+                RelayServer      = $defaults.RelayServer
+                State            = $state
+                StatePath        = $HostStatePath
+                UserConfigPath   = $userTarget
+                ServiceConfigPath = $ServiceConfigPath
+                ServiceStatePath = $ServiceStatePath
+                ForceService     = $true
+                Confirm          = $false
+            }
+            if ([string]::IsNullOrWhiteSpace($userTarget)) { $configArguments['ServiceOnly'] = $true }
+            $config = Set-VegaRustDeskConfig @configArguments
             $state = $config.State
             foreach ($warning in @($config.Warnings)) { $messages.Add([string]$warning) }
 
             $serviceApplied = $false
+            $userApplied = [string]::IsNullOrWhiteSpace($userTarget)
             foreach ($applied in @($config.Applied)) {
                 if ($null -eq $applied) { continue }
                 if ([string]::Equals([string]$applied.Path, [string]$ServiceConfigPath, [StringComparison]::OrdinalIgnoreCase)) {
                     $serviceApplied = $true
                 }
+                if (-not [string]::IsNullOrWhiteSpace($userTarget) -and
+                    [string]::Equals([string]$applied.Path, [string]$userTarget, [StringComparison]::OrdinalIgnoreCase)) {
+                    $userApplied = $true
+                }
             }
             if (-not $serviceApplied) {
                 return (& $fail -Message ("服务级配置没有写入成功：{0}" -f $ServiceConfigPath) -Installed $installedByVega)
             }
+            # 两处回读一致才算成功：用户级写失败不能悄悄降级成“只写了服务级”。
+            if (-not $userApplied) {
+                return (& $fail -Message ("用户级配置没有写入成功：{0}" -f $userTarget) -Installed $installedByVega -Configured $serviceApplied)
+            }
+            $userWritten = -not [string]::IsNullOrWhiteSpace($userTarget)
 
             $null = Save-VegaState -State $state -Path $HostStatePath
         }
         catch {
-            return (& $fail -Message ("写入 RustDesk 服务级中继配置失败：{0}" -f $_.Exception.Message) -Installed $installedByVega)
+            return (& $fail -Message ("写入 RustDesk 中继配置失败：{0}" -f $_.Exception.Message) -Installed $installedByVega)
         }
 
-        # P1-8：记录发起安装的登录用户 SID 与用户级配置路径。
+        # P1-5：按 SID 记录用户级配置与回滚基线；取不到时明确留待完成页提示。
         try {
-            $userContext = Get-VegaInteractiveUserContext
             $serviceState = Read-VegaState -Path $ServiceStatePath
-            $serviceState = Set-VegaStateRustDeskUserConfig -State $serviceState -Sid ([string]$userContext.Sid) `
-                -Path ([string]$userContext.UserConfigPath) -PromptPending $true
+            $userSid = ''
+            $userAppData = ''
+            if ($null -ne $userContext) {
+                $userSid = [string]$userContext.Sid
+                $userAppData = [string]$userContext.AppDataPath
+            }
+            $serviceState = Set-VegaStateRustDeskUserConfig -State $serviceState -Sid $userSid `
+                -Path $userTarget -AppDataPath $userAppData -Written $userWritten -PromptPending (-not $userWritten)
             $null = Save-VegaState -State $serviceState -Path $ServiceStatePath
-            $sidText = '(未取到)'
-            if (-not [string]::IsNullOrWhiteSpace([string]$userContext.Sid)) { $sidText = [string]$userContext.Sid }
-            $messages.Add("用户级配置待控制台首次启动时提示：SID $sidText")
+            if ($userWritten) {
+                $messages.Add("已写入用户级配置：$userTarget（SID $userSid）")
+            }
+            else {
+                $messages.Add('未取到当前登录交互用户，只写了服务级配置；完成页会提示手动处理用户级配置。')
+            }
         }
         catch {
-            $messages.Add("记录发起安装用户失败（不影响服务级配置）：$($_.Exception.Message)")
+            $messages.Add("记录发起安装用户失败（不影响已写入的配置）：$($_.Exception.Message)")
         }
 
         $restart = Restart-VegaRustDeskService -Confirm:$false
@@ -7393,6 +7720,12 @@ Export-ModuleMember -Function @(
     'New-VegaSecureDirectory',
     'Remove-VegaSecureDirectory',
     'Get-VegaInteractiveUserContext',
+    'Get-VegaInteractiveUserContextValue',
+    'Get-VegaExplorerOwnerName',
+    'Get-VegaActiveSessionUserName',
+    'Get-VegaUserRoamingAppData',
+    'Resolve-VegaSetupInteractiveUser',
+    'Get-VegaProgramFilesRegistryRoot',
     'Set-VegaStateRustDeskUserConfig',
     'Install-VegaRustDeskSilently',
     'Wait-VegaRustDeskService',
