@@ -1451,7 +1451,8 @@ Describe 'P1-2 / P1-4 / P1-5 / P1-8 安装包钩子静态约束' {
         $install | Should -BeGreaterThan $offset
         $degraded | Should -BeGreaterThan $install
         $script:Hooks | Should -Match 'StrCmp \$4 "WARN " 0 vega_reason_loop'
-        $script:Hooks | Should -Match 'StrCpy \$vegaFinishText "\$\(MUI_TEXT_FINISH_INFO_TEXT\)\$\\r\$\\n\$\\r\$\\n\$vegaDegradedReason"'
+        # t3-fix8 P1-1：完成页文案改为显示结果文件里的原因（$vegaResultReason）。
+        $script:Hooks | Should -Match 'StrCpy \$vegaFinishText "\$\(MUI_TEXT_FINISH_INFO_TEXT\)\$\\r\$\\n\$\\r\$\\n\$vegaResultReason"'
         # 退出码 2 前脚本必须知道原因文件位置：降级停止在日志里写的是 WARN。
         $script:ModuleText | Should -Match "'WARN' \} else \{ 'FAIL' \}"
     }
