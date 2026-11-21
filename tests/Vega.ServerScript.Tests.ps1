@@ -56,6 +56,18 @@ Describe 'RustDesk 部署脚本：公网 IP 探测' {
         $script:IpDetect | Should -Match '169\\.254'
     }
 
+    It 't3-fix4 路由/hostname 回退结果分类后再输出' {
+        $script:IpDetect | Should -Match 'is_rfc1918_ipv4'
+        $script:IpDetect | Should -Match 'classify_detected_ipv4'
+        $script:IpDetect | Should -Match 'sanitize_detected_ipv4'
+        # 最终输出前必须过滤，而不是只靠元数据/HTTP 分支。
+        $script:IpDetect | Should -Match 'ip=\$\(sanitize_detected_ipv4 "\$ip"\\)'
+        $script:ServerScript | Should -Match 'detect_public_ip'
+        $script:ServerScript | Should -Match 'warn_if_private_ipv4'
+        $script:StaticTest | Should -Match 'FAKE_ROUTE_IP'
+        $script:StaticTest | Should -Match 'classify_detected_ipv4 100\.64\.0\.1'
+    }
+
     It '拒绝回环 / 本网络 / CGNAT / 组播 / 前导零写法' {
         # 静态断言：这些网段必须在 is_public_ipv4 里被排除，前导零在 is_valid_ipv4 里被拒。
         $script:IpDetect | Should -Match '10#\$first == 127'
