@@ -900,28 +900,29 @@ Describe 't3-fix4 用户级配置写失败时降级而不是整单失败' {
     }
 }
 
-Describe 't3-fix5 注册表原始值按字段解析（含空格安装目录）' {
-    It 'InstallLocation 完整保留空格目录，DisplayIcon 只剥图标索引，ImagePath 单独剥启动参数' -Skip:($env:OS -ne 'Windows_NT') {
+Describe 't3-fix6 注册表原始值按字段解析（含空格安装目录）' {
+    It 'InstallLocation 完整保留空格目录，DisplayIcon 兼容引号内外的图标索引，ImagePath 单独剥启动参数' -Skip:($env:OS -ne 'Windows_NT') {
+        # t3-fix6 P2：含空格的安装目录路径一律从 $TestDrive 生成，不再依赖本机有 D: 盘。
         # RustDesk 官方 EXE 写的是未加引号的 InstallLocation / DisplayIcon，路径里可以有空格；
-        # 旧实现按第一个空白截断，'D:\Remote Tools\RustDesk' 会变成 'D:\Remote'。
-        (ConvertTo-VegaRustDeskInstallLocationPath -Value 'D:\Remote Tools\RustDesk') |
-            Should -Be 'D:\Remote Tools\RustDesk\rustdesk.exe'
+        # 旧实现按第一个空白截断，'.../Remote Tools/RustDesk' 会变成 '.../Remote'。
+        $spaceDir = Join-Path $TestDrive 'Remote Tools/RustDesk'
+        $spaceExe = Join-Path $spaceDir 'rustdesk.exe'
+
+        (ConvertTo-VegaRustDeskInstallLocationPath -Value $spaceDir) | Should -Be $spaceExe
+        (ConvertTo-VegaRustDeskInstallLocationPath -Value $spaceExe) | Should -Be $spaceExe
         (ConvertTo-VegaRustDeskInstallLocationPath -Value 'C:\Program Files\RustDesk') |
             Should -Be 'C:\Program Files\RustDesk\rustdesk.exe'
-        (ConvertTo-VegaRustDeskInstallLocationPath -Value 'D:\Remote Tools\RustDesk\rustdesk.exe') |
-            Should -Be 'D:\Remote Tools\RustDesk\rustdesk.exe'
 
-        (ConvertTo-VegaRustDeskDisplayIconPath -Value 'D:\Remote Tools\RustDesk\rustdesk.exe,0') |
-            Should -Be 'D:\Remote Tools\RustDesk\rustdesk.exe'
-        (ConvertTo-VegaRustDeskDisplayIconPath -Value '"D:\Remote Tools\RustDesk\rustdesk.exe",0') |
-            Should -Be 'D:\Remote Tools\RustDesk\rustdesk.exe'
-        (ConvertTo-VegaRustDeskDisplayIconPath -Value 'D:\Remote Tools\RustDesk\rustdesk.exe,-1') |
-            Should -Be 'D:\Remote Tools\RustDesk\rustdesk.exe'
+        # DisplayIcon 的四种形态：未加引号、"路径",0、"路径,0"、",-1"。
+        # 引号内的索引（"path,0"）曾经漏掉，整串被当成目录并追加 rustdesk.exe。
+        (ConvertTo-VegaRustDeskDisplayIconPath -Value ('{0},0' -f $spaceExe)) | Should -Be $spaceExe
+        (ConvertTo-VegaRustDeskDisplayIconPath -Value ('"{0}",0' -f $spaceExe)) | Should -Be $spaceExe
+        (ConvertTo-VegaRustDeskDisplayIconPath -Value ('"{0},0"' -f $spaceExe)) | Should -Be $spaceExe
+        (ConvertTo-VegaRustDeskDisplayIconPath -Value ('"{0},-1"' -f $spaceExe)) | Should -Be $spaceExe
+        (ConvertTo-VegaRustDeskDisplayIconPath -Value ('{0},-1' -f $spaceExe)) | Should -Be $spaceExe
 
-        (ConvertTo-VegaRustDeskServiceImagePath -Value '"D:\Remote Tools\RustDesk\rustdesk.exe" --service') |
-            Should -Be 'D:\Remote Tools\RustDesk\rustdesk.exe'
-        (ConvertTo-VegaRustDeskServiceImagePath -Value 'D:\Remote Tools\RustDesk\rustdesk.exe --service') |
-            Should -Be 'D:\Remote Tools\RustDesk\rustdesk.exe'
+        (ConvertTo-VegaRustDeskServiceImagePath -Value ('"{0}" --service' -f $spaceExe)) | Should -Be $spaceExe
+        (ConvertTo-VegaRustDeskServiceImagePath -Value ('{0} --service' -f $spaceExe)) | Should -Be $spaceExe
         (ConvertTo-VegaRustDeskServiceImagePath -Value '"C:\Program Files\RustDesk\rustdesk.exe" --service') |
             Should -Be 'C:\Program Files\RustDesk\rustdesk.exe'
     }
