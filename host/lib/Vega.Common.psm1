@@ -6085,6 +6085,11 @@ function Invoke-VegaRustDeskBootstrap {
         $DownloadDirectory = Join-Path $programData 'Vega\setup'
     }
 
+    # P1-5：入口脚本不传配置路径。先在调用方解析默认路径，后面的
+    # “服务级配置确实写入”判断才能比对到真实路径，而不是空字符串。
+    if ([string]::IsNullOrWhiteSpace($ServiceConfigPath)) { $ServiceConfigPath = Get-VegaRustDeskConfigPath -ServiceMode }
+    if ([string]::IsNullOrWhiteSpace($UserConfigPath)) { $UserConfigPath = Get-VegaRustDeskConfigPath }
+
     $fail = {
         param(
             [string]$Message,
@@ -6220,6 +6225,15 @@ function Invoke-VegaRustDeskBootstrap {
         }
         catch {
             $messages.Add("记录发起安装用户失败（不影响服务级配置）：$($_.Exception.Message)")
+        }
+
+        # P1-5：已装 RustDesk 的机器也要确认服务真的在，否则写进服务级配置也不会生效。
+        if (-not $installedByVega) {
+            $await = Wait-VegaRustDeskService
+            if (-not $await.Found) {
+                return (& $fail -Message 'RustDesk 服务不存在，服务级配置暂时不会生效。' -Installed $false -Configured $true)
+            }
+            $messages.Add("RustDesk 服务已就绪（$($await.Status)）")
         }
 
         $restart = Restart-VegaRustDeskService -Confirm:$false
