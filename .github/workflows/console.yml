@@ -36,6 +36,32 @@ jobs:
         with:
           node-version: "24"
 
+      # Tauri 直接把 capability JSON 交给 serde_json::from_str：带 UTF-8 BOM 会解析失败，
+      # 构建在“上传安装包”之前就中止。这里先拦一道，错误信息比 Tauri 的报错更直接。
+      - name: 校验 Tauri 配置与 capability 是合法无 BOM JSON
+        shell: bash
+        run: |
+          node -e '
+          const fs = require("fs");
+          let failed = false;
+          for (const file of process.argv.slice(1)) {
+            const buf = fs.readFileSync(file);
+            if (buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) {
+              console.error("BOM found: " + file);
+              failed = true;
+              continue;
+            }
+            try {
+              JSON.parse(buf.toString("utf8"));
+              console.log("ok: " + file);
+            } catch (err) {
+              console.error("invalid JSON: " + file + " (" + err.message + ")");
+              failed = true;
+            }
+          }
+          if (failed) process.exit(1);
+          ' src-tauri/tauri.conf.json src-tauri/capabilities/default.json
+
       # 仓库暂未提交 package-lock.json / Cargo.lock：离线环境无法生成，先保留 npm install。
       # TODO(m2b): 在联网机器上生成并提交 package-lock.json 与 src-tauri/Cargo.lock，
       # 然后把这里换成 `npm ci`，构建步骤换成 Cargo `--locked`（或 tauri build -- --locked）。
