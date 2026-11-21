@@ -2071,7 +2071,7 @@ Describe 't3-fix5 原始带空格的注册表值能被探测命中' {
 Describe 't3-fix9 P1 NSIS 宏展开后标签唯一' {
     BeforeAll {
         $script:RepoRoot = Join-Path $PSScriptRoot '..'
-        $script:HooksText = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'console/src-tauri/windows/hooks.nsh') -Raw -Encoding UTF8
+        $script:HooksText = (Get-Content -LiteralPath (Join-Path $script:RepoRoot 'console/src-tauri/windows/hooks.nsh') -Raw -Encoding UTF8) -replace "`r`n", "`n"
 
         function Get-VegaNsisMacroTable {
             param([string]$Text)
