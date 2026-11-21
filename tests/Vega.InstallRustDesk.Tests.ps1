@@ -943,7 +943,13 @@ Describe 't3-fix5 命中已有安装后不下载、不静默安装' {
         $json = @{ rustdesk = @{ idServer = '60.205.95.98'; relayServer = '60.205.95.98'; key = $script:Key } } | ConvertTo-Json
         Set-Content -LiteralPath $defaults -Value $json -Encoding UTF8
 
-        $existing = 'D:\Remote Tools\RustDesk\rustdesk.exe'
+        # t3-fix6 P2：含空格的自定义目录用 $TestDrive 生成，不依赖本机有 D: 盘。
+        $existingDir = Join-Path $TestDrive 'Remote Tools/RustDesk'
+        $null = New-Item -ItemType Directory -Path $existingDir -Force
+        $existing = Join-Path $existingDir 'rustdesk.exe'
+        Set-Content -LiteralPath $existing -Value 'stub' -Encoding UTF8
+        $appData = Join-Path $TestDrive 'Users/张三/AppData/Roaming'
+        $null = New-Item -ItemType Directory -Path $appData -Force
         $serviceConfig = Join-Path $TestDrive 'ProgramData/RustDesk/config/RustDesk2.toml'
         $sid = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
 
@@ -967,7 +973,7 @@ Describe 't3-fix5 命中已有安装后不下载、不静默安装' {
 
         $result = Invoke-VegaRustDeskBootstrap -DefaultsFile $defaults -HostStatePath $statePath `
             -ServiceStatePath $serviceStatePath -ServiceConfigPath $serviceConfig `
-            -InteractiveUserSid $sid -InteractiveUserAppData 'D:\Users\张三\AppData\Roaming' -Confirm:$false
+            -InteractiveUserSid $sid -InteractiveUserAppData $appData -Confirm:$false
 
         $result.Success | Should -BeTrue
         $result.Installed | Should -BeFalse
