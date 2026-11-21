@@ -3890,11 +3890,27 @@ function Get-VegaInteractiveUserContext {
             $sid = ''
         }
 
-        $leaf = $name
-        $separator = $leaf.LastIndexOf('\')
-        if ($separator -ge 0 -and $separator -lt ($leaf.Length - 1)) { $leaf = $leaf.Substring($separator + 1) }
-        if (-not [string]::IsNullOrWhiteSpace($leaf) -and $leaf -notmatch '[\\/]') {
-            $configPath = Join-Path $systemDrive ("Users\{0}\AppData\Roaming\RustDesk\config\RustDesk2.toml" -f $leaf)
+        # 实际用户目录从 Win32_UserProfile 取：域账户 / 重名时 C:\Users\<用户名> 的
+        # 目录名可能带后缀，按用户名硬拼会记录错路径。
+        if (-not [string]::IsNullOrWhiteSpace($sid) -and (Test-VegaWindowsPlatform)) {
+            try {
+                $profile = Get-CimInstance -ClassName Win32_UserProfile -Filter ("SID='{0}'" -f $sid) -ErrorAction Stop
+                if ($null -ne $profile -and -not [string]::IsNullOrWhiteSpace([string]$profile.LocalPath)) {
+                    $configPath = Join-Path ([string]$profile.LocalPath) 'AppData\Roaming\RustDesk\config\RustDesk2.toml'
+                }
+            }
+            catch {
+                $configPath = ''
+            }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($configPath)) {
+            $leaf = $name
+            $separator = $leaf.LastIndexOf('\')
+            if ($separator -ge 0 -and $separator -lt ($leaf.Length - 1)) { $leaf = $leaf.Substring($separator + 1) }
+            if (-not [string]::IsNullOrWhiteSpace($leaf) -and $leaf -notmatch '[\\/]') {
+                $configPath = Join-Path $systemDrive ("Users\{0}\AppData\Roaming\RustDesk\config\RustDesk2.toml" -f $leaf)
+            }
         }
     }
 
