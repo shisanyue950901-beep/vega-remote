@@ -6802,9 +6802,6 @@ function Invoke-VegaRustDeskBootstrap {
       任何一步失败都返回 Success=$false（ExitCode=1），由调用方提示但不阻断安装。
       降级（服务级成功、用户级未写；或服务未注册、只写用户级）返回
       Success=$true、Degraded=$true、ExitCode=2，与入口脚本的进程退出码一致（t3-fix5 P3）。
-      任何一步失败都返回 Success=$false（ExitCode=1），由调用方提示但不阻断安装。
-      降级（服务级成功、用户级未写）返回 Success=$true、Degraded=$true、ExitCode=2，
-      与入口脚本的进程退出码一致（t3-fix5 P3）。
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
