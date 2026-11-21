@@ -6234,6 +6234,16 @@ function Invoke-VegaRustDeskBootstrap {
             $messages.Add("已安装 RustDesk，跳过安装：$existing")
         }
 
+        # P1-5：已装 RustDesk 的机器也要确认服务真的在，否则写进服务级配置也不会生效。
+        # 这一步放在写配置之前：服务不在就干脆别写，免得留下一条永远不生效的记录。
+        if (-not $installedByVega) {
+            $await = Wait-VegaRustDeskService
+            if (-not $await.Found) {
+                return (& $fail -Message 'RustDesk 服务不存在，服务级配置暂时不会生效。' -Installed $false)
+            }
+            $messages.Add("RustDesk 服务已就绪（$($await.Status)）")
+        }
+
         # P1-8：只写服务级配置。perMachine 安装包可能以另一个管理员账户提权运行，
         # 写 %APPDATA% 会落到提权账户上；用户级配置留给控制台首次启动时提示。
         try {
@@ -6274,15 +6284,6 @@ function Invoke-VegaRustDeskBootstrap {
         }
         catch {
             $messages.Add("记录发起安装用户失败（不影响服务级配置）：$($_.Exception.Message)")
-        }
-
-        # P1-5：已装 RustDesk 的机器也要确认服务真的在，否则写进服务级配置也不会生效。
-        if (-not $installedByVega) {
-            $await = Wait-VegaRustDeskService
-            if (-not $await.Found) {
-                return (& $fail -Message 'RustDesk 服务不存在，服务级配置暂时不会生效。' -Installed $false -Configured $true)
-            }
-            $messages.Add("RustDesk 服务已就绪（$($await.Status)）")
         }
 
         $restart = Restart-VegaRustDeskService -Confirm:$false
