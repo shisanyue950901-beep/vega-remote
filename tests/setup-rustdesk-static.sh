@@ -152,9 +152,9 @@ run_probe() {
 }
 
 # 1) IMDSv2：先 PUT 取 token，再带 token GET eipv4；两个请求都绕过代理。
-got=$(FAKE_EIP=203.0.113.9 run_probe)
+got=$(FAKE_EIP=93.184.216.34 run_probe)
 log=$(cat "$mock_dir/log")
-if [[ "$got" != "203.0.113.9" ]]; then
+if [[ "$got" != "93.184.216.34" ]]; then
   fail "IMDSv2 成功路径返回值不对：$got"
 fi
 if ! grep -q 'latest/api/token' <<<"$log" || ! grep -q -- '-X PUT' <<<"$log"; then
@@ -171,9 +171,9 @@ if ! grep -q 'X-aliyun-ecs-metadata-token: FAKE-TOKEN==' <<<"$log"; then
 fi
 
 # 2) 拿不到 token 时不发无令牌 eipv4 请求，直接回退到公网探测。
-got=$(FAKE_CURL_MODE=token-fail FAKE_HTTP_IP=198.51.100.7 run_probe)
+got=$(FAKE_CURL_MODE=token-fail FAKE_HTTP_IP=8.8.4.4 run_probe)
 log=$(cat "$mock_dir/log")
-if [[ "$got" != "198.51.100.7" ]]; then
+if [[ "$got" != "8.8.4.4" ]]; then
   fail "token 失败时应回退到 ifconfig.me，实际：$got"
 fi
 if grep -q 'meta-data/eipv4' <<<"$log"; then
@@ -181,34 +181,34 @@ if grep -q 'meta-data/eipv4' <<<"$log"; then
 fi
 
 # 3) HTML 响应不能被当成地址；成功请求返回合法 IPv4 才采用。
-got=$(FAKE_EIP='<html>error</html>' FAKE_HTTP_IP=198.51.100.7 run_probe)
-if [[ "$got" != "198.51.100.7" ]]; then
+got=$(FAKE_EIP='<html>error</html>' FAKE_HTTP_IP=8.8.4.4 run_probe)
+if [[ "$got" != "8.8.4.4" ]]; then
   fail "HTML 响应必须被丢弃，实际：$got"
 fi
 
 # 4) 内网 eipv4 必须丢弃并回退。
 for private in 10.0.0.5 172.16.3.4 192.168.1.9 169.254.1.1; do
-  got=$(FAKE_EIP="$private" FAKE_HTTP_IP=198.51.100.7 run_probe)
-  if [[ "$got" != "198.51.100.7" ]]; then
+  got=$(FAKE_EIP="$private" FAKE_HTTP_IP=8.8.4.4 run_probe)
+  if [[ "$got" != "8.8.4.4" ]]; then
     fail "内网地址 $private 必须被丢弃，实际：$got"
   fi
 done
 
 # 5) ifconfig.me 返回非法值（含部分输出/非 IPv4）时继续用 ipify。
-got=$(FAKE_CURL_MODE=token-fail FAKE_HTTP_IP='198.51.100' FAKE_IPIFY_IP=203.0.113.9 run_probe)
-if [[ "$got" != "203.0.113.9" ]]; then
+got=$(FAKE_CURL_MODE=token-fail FAKE_HTTP_IP='198.51.100' FAKE_IPIFY_IP=93.184.216.34 run_probe)
+if [[ "$got" != "93.184.216.34" ]]; then
   fail "ifconfig.me 非法响应时应回退到 ipify，实际：$got"
 fi
-got=$(FAKE_CURL_MODE=token-fail FAKE_HTTP_IP='999.1.1.1' FAKE_IPIFY_IP=203.0.113.9 run_probe)
-if [[ "$got" != "203.0.113.9" ]]; then
+got=$(FAKE_CURL_MODE=token-fail FAKE_HTTP_IP='999.1.1.1' FAKE_IPIFY_IP=93.184.216.34 run_probe)
+if [[ "$got" != "93.184.216.34" ]]; then
   fail "越界 IPv4 必须被丢弃，实际：$got"
 fi
 
 # 6) 回环 / 本网络 / CGNAT / 组播 / 前导零写法一律不算公网地址。
 for bogus in 127.0.0.1 127.10.20.30 0.0.0.0 0.1.2.3 100.64.0.1 100.127.255.254 \
   224.0.0.1 239.255.255.255 240.0.0.1 255.255.255.255 010.1.2.3 192.168.001.1 01.2.3.4; do
-  got=$(FAKE_EIP="$bogus" FAKE_HTTP_IP=198.51.100.7 run_probe)
-  if [[ "$got" != "198.51.100.7" ]]; then
+  got=$(FAKE_EIP="$bogus" FAKE_HTTP_IP=8.8.4.4 run_probe)
+  if [[ "$got" != "8.8.4.4" ]]; then
     fail "不可公网路由的地址 $bogus 必须被丢弃，实际：$got"
   fi
 done
@@ -226,7 +226,7 @@ warn=$(warn_if_private_ipv4 172.20.0.1 2>&1) && warn_code=0 || warn_code=$?
 if [[ "$warn_code" -ne 0 || "$warn" != *"自动探测到的是内网地址 172.20.0.1"* ]]; then
   fail "RFC1918 地址必须打印内网警告（退出码 $warn_code，输出：$warn）"
 fi
-if warn_if_private_ipv4 203.0.113.9 >/dev/null 2>&1; then
+if warn_if_private_ipv4 93.184.216.34 >/dev/null 2>&1; then
   fail "公网地址不应打印内网警告"
 fi
 
@@ -242,14 +242,36 @@ got=$(FAKE_CURL_MODE=token-fail FAKE_ROUTE_IP=172.20.5.6 run_probe)
 if [[ "$got" != "172.20.5.6" ]]; then
   fail "路由回退的 RFC1918 地址应保留（由调用方告警），实际：$got"
 fi
-got=$(FAKE_CURL_MODE=token-fail FAKE_ROUTE_IP=203.0.113.9 run_probe)
-if [[ "$got" != "203.0.113.9" ]]; then
+got=$(FAKE_CURL_MODE=token-fail FAKE_ROUTE_IP=93.184.216.34 run_probe)
+if [[ "$got" != "93.184.216.34" ]]; then
   fail "路由回退的公网地址应保留，实际：$got"
 fi
 # hostname 回退同理。
-got=$(FAKE_CURL_MODE=token-fail FAKE_HOSTNAME_IP=198.51.100.7 run_probe)
-if [[ "$got" != "198.51.100.7" ]]; then
+got=$(FAKE_CURL_MODE=token-fail FAKE_HOSTNAME_IP=8.8.4.4 run_probe)
+if [[ "$got" != "8.8.4.4" ]]; then
   fail "hostname 回退的公网地址应保留，实际：$got"
+fi
+
+# 9) 198.18/15 基准测试网段与 RFC 5737 文档网段都必须是 discard，丢弃后继续下一个来源。
+for doc in 198.18.0.1 198.19.255.254 192.0.2.10 198.51.100.7 203.0.113.9; do
+  got=$(FAKE_EIP="$doc" FAKE_HTTP_IP=8.8.4.4 run_probe)
+  if [[ "$got" != "8.8.4.4" ]]; then
+    fail "文档/基准段 $doc 必须被丢弃并回退，实际：$got"
+  fi
+  got=$(FAKE_CURL_MODE=token-fail FAKE_ROUTE_IP="$doc" FAKE_HOSTNAME_IP=1.1.1.1 run_probe)
+  if [[ "$got" != "1.1.1.1" ]]; then
+    fail "路由返回 $doc 后必须继续用 hostname 回退，实际：$got"
+  fi
+done
+
+# 10) 逐来源分类：路由回退拿到 CGNAT/文档段时不能直接空结果，要接着试 hostname。
+got=$(FAKE_CURL_MODE=token-fail FAKE_ROUTE_IP=100.64.1.2 FAKE_HOSTNAME_IP=192.168.1.8 run_probe)
+if [[ "$got" != "192.168.1.8" ]]; then
+  fail "路由 CGNAT 丢弃后必须回退到 hostname，实际：$got"
+fi
+got=$(FAKE_CURL_MODE=token-fail FAKE_ROUTE_IP=203.0.113.9 FAKE_HOSTNAME_IP=192.168.1.8 run_probe)
+if [[ "$got" != "192.168.1.8" ]]; then
+  fail "路由文档段丢弃后必须回退到 hostname，实际：$got"
 fi
 
 # 分类函数直接断言。
@@ -257,7 +279,13 @@ fi
 [[ "$(classify_detected_ipv4 100.64.0.1)" == "discard" ]] || fail 'classify: CGNAT 应为 discard'
 [[ "$(classify_detected_ipv4 127.0.0.1)" == "discard" ]] || fail 'classify: 回环应为 discard'
 [[ "$(classify_detected_ipv4 239.1.2.3)" == "discard" ]] || fail 'classify: 组播应为 discard'
+[[ "$(classify_detected_ipv4 198.18.0.1)" == "discard" ]] || fail 'classify: 198.18/15 应为 discard'
+[[ "$(classify_detected_ipv4 198.19.255.254)" == "discard" ]] || fail 'classify: 198.19 应为 discard'
+[[ "$(classify_detected_ipv4 192.0.2.1)" == "discard" ]] || fail 'classify: 192.0.2/24 应为 discard'
+[[ "$(classify_detected_ipv4 198.51.100.1)" == "discard" ]] || fail 'classify: 198.51.100/24 应为 discard'
+[[ "$(classify_detected_ipv4 203.0.113.1)" == "discard" ]] || fail 'classify: 203.0.113/24 应为 discard'
 [[ "$(classify_detected_ipv4 8.8.8.8)" == "public" ]] || fail 'classify: 公网应为 public'
+[[ "$(classify_detected_ipv4 93.184.216.34)" == "public" ]] || fail 'classify: 真实公网应为 public'
 
 export PATH="$old_path"
 
