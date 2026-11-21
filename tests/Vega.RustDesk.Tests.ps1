@@ -191,6 +191,18 @@ Describe 'Set-VegaRustDeskConfig / Restore-VegaRustDeskConfig' {
         @($saved.RustDeskConfigKeys | ForEach-Object { [bool]$_.Existed }) | Should -Not -Contain $true
     }
 
+    It '显式给出的中继端口保留，不被默认 21117 覆盖' {
+        $path = Join-Path $TestDrive ('relayport-' + [guid]::NewGuid().ToString('N') + '/RustDesk/config/RustDesk2.toml')
+        $statePath = Join-Path $TestDrive ('relayport-' + [guid]::NewGuid().ToString('N') + '.json')
+        $state = Get-VegaEmptyState
+
+        $null = Set-VegaRustDeskConfig -Server 'relay.example.com' -RelayServer 'relay.example.com:23456' `
+            -Key ('C' * 43 + '=') -State $state -StatePath $statePath -UserConfigPath $path -Confirm:$false
+
+        $text = Get-Content -LiteralPath $path -Encoding UTF8 -Raw
+        $text | Should -Match '(?m)^relay-server = "relay\.example\.com:23456"\r?$'
+    }
+
     It '重跑不覆盖首次基线，卸载只恢复 Vega 改过的键' {
         $path = Join-Path $TestDrive 'restore/RustDesk/config/RustDesk2.toml'
         $statePath = Join-Path $TestDrive 'restore-state.json'

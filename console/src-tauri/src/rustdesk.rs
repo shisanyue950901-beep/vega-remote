@@ -893,12 +893,15 @@ pub struct RelayDefaultsView {
     pub id_server: String,
     pub relay_server: String,
     pub key_present: bool,
+    /// 公钥摘要（前 8 位）。设置页用它和 RustDesk 实际配置比对，不回显完整公钥。
+    pub key_fingerprint: String,
     pub path: String,
     pub error: String,
 }
 
 /// 从 vega-defaults.json 文本里取展示字段。格式不对只返回错误文案，不 panic。
-pub fn parse_relay_defaults(text: &str) -> Result<(String, String, bool), String> {
+/// 返回 (idServer, relayServer, key)；公钥摘要由调用方计算，避免把原文带进视图。
+pub fn parse_relay_defaults(text: &str) -> Result<(String, String, String), String> {
     let data: serde_json::Value =
         serde_json::from_str(text).map_err(|e| format!("默认配置不是合法 JSON：{e}"))?;
     let rustdesk = data
@@ -918,12 +921,13 @@ pub fn parse_relay_defaults(text: &str) -> Result<(String, String, bool), String
         .filter(|v| !v.is_empty())
         .ok_or_else(|| "默认配置缺少 rustdesk.relayServer".to_string())?
         .to_string();
-    let key_present = rustdesk
+    let key = rustdesk
         .get("key")
         .and_then(|v| v.as_str())
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false);
-    Ok((id_server, relay_server, key_present))
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    Ok((id_server, relay_server, key))
 }
 
 fn relay_defaults_path(app: &tauri::AppHandle) -> Option<PathBuf> {
@@ -957,6 +961,7 @@ pub fn get_relay_defaults(app: tauri::AppHandle) -> RelayDefaultsView {
             id_server: String::new(),
             relay_server: String::new(),
             key_present: false,
+            key_fingerprint: String::new(),
             path: String::new(),
             error: "找不到随包的 vega-defaults.json".into(),
         };
@@ -969,16 +974,18 @@ pub fn get_relay_defaults(app: tauri::AppHandle) -> RelayDefaultsView {
                 id_server: String::new(),
                 relay_server: String::new(),
                 key_present: false,
+                key_fingerprint: String::new(),
                 path: display,
                 error: format!("读取默认配置失败：{e}"),
             };
         }
     };
     match parse_relay_defaults(&text) {
-        Ok((id_server, relay_server, key_present)) => RelayDefaultsView {
+        Ok((id_server, relay_server, key)) => RelayDefaultsView {
             id_server,
             relay_server,
-            key_present,
+            key_present: !key.is_empty(),
+            key_fingerprint: key_fingerprint(&key),
             path: display,
             error: String::new(),
         },
@@ -986,6 +993,7 @@ pub fn get_relay_defaults(app: tauri::AppHandle) -> RelayDefaultsView {
             id_server: String::new(),
             relay_server: String::new(),
             key_present: false,
+            key_fingerprint: String::new(),
             path: display,
             error,
         },

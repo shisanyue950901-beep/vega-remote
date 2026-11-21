@@ -4677,7 +4677,9 @@ function Set-VegaRustDeskConfig {
     if (-not [string]::IsNullOrWhiteSpace($RelayServer)) {
         $relayEndpoint = ConvertFrom-VegaRustDeskServerEndpoint -Server $RelayServer
         if ($null -eq $relayEndpoint) { throw 'RustDesk 中继服务器地址格式无效（应为 主机名/IPv4/IPv6，可带 :端口）。' }
-        $relayValue = $relayEndpoint.RelayServer
+        # 显式给出中继端口时必须保留，不能一律换成 21117：
+        # 自建中继常把 hbbr 放在非默认端口上，覆盖端口后 RustDesk 就连不上。
+        $relayValue = $(if ($relayEndpoint.Port -gt 0) { $relayEndpoint.Server } else { $relayEndpoint.RelayServer })
     }
 
     if ([string]::IsNullOrWhiteSpace($UserConfigPath)) { $UserConfigPath = Get-VegaRustDeskConfigPath }

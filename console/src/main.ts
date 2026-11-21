@@ -45,6 +45,8 @@ interface RelayDefaultsView {
   idServer: string;
   relayServer: string;
   keyPresent: boolean;
+  /** 公钥摘要（前 8 位），用于和 RustDesk 实际配置比对，不回显完整公钥。 */
+  keyFingerprint: string;
   path: string;
   error: string;
 }
@@ -572,11 +574,25 @@ function setupSettingsPage(): void {
   let relayDefaults: RelayDefaultsView | null = null;
   let lastConfig: ServerConfigView | null = null;
 
-  const hostOnly = (value: string): string => {
-    let text = value.trim().toLowerCase();
-    text = text.replace(/^\[/, "").replace(/\]$/, "");
-    text = text.replace(/:\d+$/, "");
-    return text;
+  // RustDesk 的 ID 与中继各有默认端口；比较前按角色补默认端口，
+  // 保留显式端口，并且不把裸 IPv6 末尾的数字当端口截掉。
+  const RUSTDESK_ID_PORT = 21116;
+  const RUSTDESK_RELAY_PORT = 21117;
+
+  const normalizeEndpoint = (value: string, defaultPort: number): string => {
+    const text = value.trim().toLowerCase();
+    if (!text) return "";
+    const bracketed = /^\[([0-9a-f:.]+)\](?::(\d+))?$/.exec(text);
+    if (bracketed) {
+      const port = bracketed[2] ? Number(bracketed[2]) : defaultPort;
+      return `[${bracketed[1]}]:${port}`;
+    }
+    // 只有一个冒号且后面是数字才算 host:port；裸 IPv6 有多个冒号，保持原样。
+    const withPort = /^([^:]+):(\d+)$/.exec(text);
+    if (withPort) {
+      return `${withPort[1]}:${Number(withPort[2])}`;
+    }
+    return `${text}:${defaultPort}`;
   };
 
   const renderRelayDefaults = (): void => {
@@ -593,9 +609,17 @@ function setupSettingsPage(): void {
       setStatus(relayDefaultsHint, `默认中继：${expected}`, "warn");
       return;
     }
-    const sameId = hostOnly(lastConfig.server) === hostOnly(relayDefaults.idServer);
-    const sameRelay = hostOnly(lastConfig.relay) === hostOnly(relayDefaults.relayServer);
-    if (sameId && sameRelay) {
+    const sameId =
+      normalizeEndpoint(lastConfig.server, RUSTDESK_ID_PORT) ===
+      normalizeEndpoint(relayDefaults.idServer, RUSTDESK_ID_PORT);
+    const sameRelay =
+      normalizeEndpoint(lastConfig.relay, RUSTDESK_RELAY_PORT) ===
+      normalizeEndpoint(relayDefaults.relayServer, RUSTDESK_RELAY_PORT);
+    // 公钥也要比：只比地址会让「同地址不同密钥」被误判为一致。
+    const sameKey = relayDefaults.keyPresent
+      ? lastConfig.keyPresent && lastConfig.keyFingerprint === relayDefaults.keyFingerprint
+      : true;
+    if (sameId && sameRelay && sameKey) {
       setStatus(relayDefaultsHint, `与安装包默认中继一致：${expected}`, "ok");
     } else {
       setStatus(
