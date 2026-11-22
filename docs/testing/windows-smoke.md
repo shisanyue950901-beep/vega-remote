@@ -9,9 +9,9 @@
 
 ## 0.5 安装包（Vega-Setup.exe）
 - [ ] Actions → Console → Artifacts 下载 `vega-setup-windows`，解压得 `Vega-Setup.exe`。
-- [ ] 双击后只弹一次 UAC；安装界面是简体中文且没有语言选择框。
-- [ ] 装完 `C:\Program Files\Vega 控制台\resources\vega-defaults.json` 存在，且与仓库里的默认中继一致。
-- [ ] `C:\Program Files\Vega 控制台\resources\host\install-rustdesk.ps1` 与 `...\host\lib\Vega.Common.psm1` 都存在。
+- [ ] 双击后只弹一次 UAC；安装界面是简体中文且没有语言选择框，**也没有「选择安装目录」页**（定制模板已删除该页，路径固定、不可改）。
+- [ ] 装完 `C:\Program Files\Vega\resources\vega-defaults.json` 存在，且与仓库里的默认中继一致。
+- [ ] `C:\Program Files\Vega\resources\host\install-rustdesk.ps1` 与 `...\host\lib\Vega.Common.psm1` 都存在。
 - [ ] `%ProgramData%\Vega\logs\setup.log` 有本次安装记录和 `[nsis] install-rustdesk.ps1 exit code:` 一行。
 - [ ] 已装 RustDesk 的机器上重跑安装包：日志显示「已安装 RustDesk，跳过安装」，配置仍被写入。
 - [ ] 未装 RustDesk 的机器：安装包自动下载固定版本并 SHA256 校验通过后静默安装；RustDesk 服务出现在服务列表。
@@ -20,7 +20,8 @@
 - [ ] 下载失败场景（断网或代理拦截）：同样只提示，不阻断 Vega 安装；`%ProgramData%\Vega\logs\setup.log` 有失败原因。
 - [ ] 卸载 Vega 后，`RustDesk2.toml` 的三个受管键恢复为安装前的值（或整行删除），用户原有 RustDesk 保留。
 - [ ] 设置页「默认中继」一行显示安装包默认值与 RustDesk 当前配置；手动改过 RustDesk 中继时会显示不一致提示。
-- [ ] 旧版装在 D 盘 → 安装新版后 D 盘旧目录被移除、配置保留（`%ProgramData%\Vega`、RustDesk 配置与用户 AppData 都还在）。
+- [ ] 旧版装在 D 盘 → 安装新版后 D 盘旧目录里的 Vega 文件（`vega-console.exe`、`uninstall.exe`、`resources\`）被清除，旧目录本身非递归删除；安装过程**没有运行旧卸载器**，RustDesk 与配置不受影响（`%ProgramData%\Vega`、RustDesk 配置与用户 AppData 都还在）。旧目录里若有非 Vega 文件，目录保留且完成页有提示。
+- [ ] 在线更新（安装器 `/UPDATE` 模式）后，Vega 程序文件被替换，但 RustDesk 没有被重新下载/安装，中继配置不被改写（`%ProgramData%\Vega\logs\setup.log` 本次运行没有 RustDesk 安装记录）。
 
 ## 1. 脚本安装
 - [ ] A：管理员 PowerShell，`Set-ExecutionPolicy -Scope Process Bypass -Force`，`.\host\install-host.ps1`，无报错结束。
