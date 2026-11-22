@@ -77,10 +77,12 @@ curl -fsSI http://60.205.95.98/vega/updates/<版本>/Vega-Setup-<版本>.exe
 
    脚本用 `tauri signer sign` 生成 `Vega-Setup-<版本>.exe.sig`，写出 `latest.json`（指向 GitHub
    固定 tag `vega-updates` 的版本化资产）与 `latest-mirror.json`（指向本镜像的版本目录），打印
-   SHA256，然后把安装包与 `.sig` 传到 `/opt/vega-relay/updates/<版本>/`（已存在则拒绝，永不覆盖），
-   清单最后写临时名再原子 `mv` 成 `latest.json`，客户端不会读到半个文件；同名资产发到
-   GitHub Release `vega-updates` 时用 `--clobber` 覆盖清单。只想发一边时用
-   `VEGA_SKIP_GITHUB=1` / `VEGA_SKIP_MIRROR=1`；同时发不同版本请逐个跑，旧版本目录不动。
+   SHA256。两个通道都先把版本化安装包与 `.sig` 传完（镜像先写 `<file>.part` 再远端 `mv`），
+   最后才切清单：GitHub 上传 `latest.json.new`、删除旧资产、再改名为 `latest.json`；镜像临时名
+   原子 `mv` 成 `latest.json`，客户端不会读到半个文件。版本化文件已存在时，远程 SHA256 与本地
+   相同才允许重跑，不同则中止，绝不用 `--clobber` 覆盖；Release 以 `--latest=false` 创建，
+   不会顶掉一键安装用的源码 Release。只想发一边时用 `VEGA_SKIP_GITHUB=1` / `VEGA_SKIP_MIRROR=1`；
+   同时发不同版本请逐个跑，旧版本目录不动。
 3. 用上面的 `curl` 复查 `latest.json` 的 `version` 与 `url`。
 
 注意：漏签或改用手工 `scp` 时，务必连 `.sig` 一起传；`latest.json` 里的 `signature`

@@ -20,8 +20,9 @@
 - [ ] 下载失败场景（断网或代理拦截）：同样只提示，不阻断 Vega 安装；`%ProgramData%\Vega\logs\setup.log` 有失败原因。
 - [ ] 卸载 Vega 后，`RustDesk2.toml` 的三个受管键恢复为安装前的值（或整行删除），用户原有 RustDesk 保留。
 - [ ] 设置页「默认中继」一行显示安装包默认值与 RustDesk 当前配置；手动改过 RustDesk 中继时会显示不一致提示。
-- [ ] 旧版装在 D 盘 → 安装新版后 D 盘旧目录里的 Vega 文件（`vega-console.exe`、`uninstall.exe`、`resources\`）被清除，旧目录本身非递归删除；安装过程**没有运行旧卸载器**，RustDesk 与配置不受影响（`%ProgramData%\Vega`、RustDesk 配置与用户 AppData 都还在）。旧目录里若有非 Vega 文件，目录保留且完成页有提示。
-- [ ] 在线更新（安装器 `/UPDATE` 模式）后，Vega 程序文件被替换，但 RustDesk 没有被重新下载/安装，中继配置不被改写（`%ProgramData%\Vega\logs\setup.log` 本次运行没有 RustDesk 安装记录）。
+- [ ] 旧版装在 D 盘 → 安装新版后 D 盘旧目录里的 Vega 文件（`vega-console.exe`、`uninstall.exe`、`resources\`）被清除，旧目录本身非递归删除；安装过程**没有运行旧卸载器**，RustDesk 与配置不受影响（`%ProgramData%\Vega`、RustDesk 配置与用户 AppData 都还在）。旧目录里若有非 Vega 文件，目录保留且完成页有提示。旧目录或 `old\resources` 是 junction/symlink 时，整个清理跳过，不删链接目标。
+- [ ] 在线更新（安装器 `/UPDATE` 模式）后，Vega 程序文件被替换，但 RustDesk 没有被重新下载/安装，中继配置不被改写（`%ProgramData%\Vega\logs\setup.log` 本次运行没有 RustDesk 安装记录）。若旧版曾装在 D 盘，这次 `/UPDATE` 也会清掉 D 盘旧目录；若删除 `C:\Program Files\RustDesk\rustdesk.exe` 后再 `/UPDATE`，安装器会补装并配置 RustDesk。
+- [ ] 覆盖重装同版本：安装器不再出现「重新安装 / 已安装」页，不运行旧卸载器，也不重跑 RustDesk 脚本；删除 RustDesk 后重装同一版本则应补装。
 
 ## 1. 脚本安装
 - [ ] A：管理员 PowerShell，`Set-ExecutionPolicy -Scope Process Bypass -Force`，`.\host\install-host.ps1`，无报错结束。
