@@ -516,25 +516,88 @@ fn same_path(a: &Path, b: &Path) -> bool {
     under_root(&a, &b) && under_root(&b, &a)
 }
 
+/// `ACL_SIZE_INFORMATION` 只用到 `AceCount`，其余字段保留占位，按 Win32 布局声明。
+#[cfg(windows)]
+#[repr(C)]
+struct AclSizeInfo {
+    ace_count: u32,
+    acl_bytes_in_use: u32,
+    acl_bytes_free: u32,
+}
+
+/// 直接声明 advapi32 的三个安全 API：只需要指针与原始字节，不依赖结构体字段名。
+/// （GetNamedSecurityInfoW 在 advapi32 也导出；GetAce / GetAclInformation 同理。）
+#[cfg(windows)]
+#[link(name = "advapi32")]
+extern "system" {
+    fn GetNamedSecurityInfoW(
+        object_name: *const u16,
+        object_type: i32,
+        security_info: u32,
+        owner: *mut *mut core::ffi::c_void,
+        group: *mut *mut core::ffi::c_void,
+        dacl: *mut *mut core::ffi::c_void,
+        sacl: *mut *mut core::ffi::c_void,
+        sd: *mut *mut core::ffi::c_void,
+    ) -> u32;
+    fn GetAce(acl: *const core::ffi::c_void, index: u32, ace: *mut *mut core::ffi::c_void) -> i32;
+    fn GetAclInformation(
+        acl: *const core::ffi::c_void,
+        info: *mut core::ffi::c_void,
+        info_len: u32,
+        info_class: i32,
+    ) -> i32;
+}
+
+/// `SE_FILE_OBJECT`
+#[cfg(windows)]
+const SE_FILE_OBJECT: i32 = 1;
+/// `OWNER_SECURITY_INFORMATION`
+#[cfg(windows)]
+const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
+/// `DACL_SECURITY_INFORMATION`
+#[cfg(windows)]
+const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+/// `AclSizeInformation`
+#[cfg(windows)]
+const ACL_SIZE_INFORMATION_CLASS: i32 = 2;
+/// `ACE_HEADER` 固定 4 字节：AceType(1) + AceFlags(1) + AceSize(2)，之后是 Mask(4) 与 SID。
+#[cfg(windows)]
+const ACCESS_ALLOWED_ACE_SID_OFFSET: usize = 8;
+
 /// 读取一个路径的所有者 SID 与 DACL(ACE 列表)；任何一步失败都返回 `None`。
 #[cfg(windows)]
 fn path_owner_and_dacl(path: &Path) -> Option<(String, Option<Vec<AceRecord>>)> {
-    // GetNamedSecurityInfoW / ConvertSidToStringSidW / SE_FILE_OBJECT 在 Security::Authorization；
-    // GetAce / GetAclInformation / ACL_SIZE_INFORMATION 在 Security；LocalFree 在 Foundation。
+    // ConvertSidToStringSidW 在 Security::Authorization（仓库已有用例）；LocalFree 在 Foundation。
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::Authorization::{
-        ConvertSidToStringSidW, GetNamedSecurityInfoW, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-        SE_FILE_OBJECT,
-    };
-    use windows_sys::Win32::Security::{
-        GetAce, GetAclInformation, ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION, AclSizeInformation, ACL,
-    };
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+
+    /// SID（PSID）→ 字符串；失败返回 None。
+    fn sid_to_string(sid: *mut c_void) -> Option<String> {
+        if sid.is_null() {
+            return None;
+        }
+        let mut raw: *mut u16 = std::ptr::null_mut();
+        // SAFETY: sid 由系统给出；字符串由 LocalFree 释放。
+        if unsafe { ConvertSidToStringSidW(sid, &mut raw) } == 0 || raw.is_null() {
+            return None;
+        }
+        let mut len = 0usize;
+        unsafe {
+            while *raw.add(len) != 0 {
+                len += 1;
+            }
+        }
+        let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(raw, len) });
+        unsafe { LocalFree(raw.cast()) };
+        Some(text)
+    }
 
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
     let mut owner: *mut c_void = std::ptr::null_mut();
-    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut dacl: *mut c_void = std::ptr::null_mut();
     let mut sd: *mut c_void = std::ptr::null_mut();
     // SAFETY: `wide` 以 NUL 结尾；输出指针由系统写入，安全描述符用 LocalFree 释放。
     let status = unsafe {
@@ -560,67 +623,44 @@ fn path_owner_and_dacl(path: &Path) -> Option<(String, Option<Vec<AceRecord>>)> 
         value
     };
 
-    let mut raw: *mut u16 = std::ptr::null_mut();
-    if unsafe { ConvertSidToStringSidW(owner, &mut raw) } == 0 {
+    let Some(owner_sid) = sid_to_string(owner) else {
         return finish(None);
-    }
-    let mut len = 0usize;
-    unsafe {
-        while *raw.add(len) != 0 {
-            len += 1;
-        }
-    }
-    let owner_sid = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(raw, len) });
-    unsafe { LocalFree(raw.cast()) };
+    };
 
     // NULL DACL：所有人都完全控制，直接按「无 DACL」上报。
     if dacl.is_null() {
         return finish(Some((owner_sid, None)));
     }
-    let mut info: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
+    let mut info = AclSizeInfo { ace_count: 0, acl_bytes_in_use: 0, acl_bytes_free: 0 };
     let ok = unsafe {
         GetAclInformation(
             dacl,
-            (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
-            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
-            AclSizeInformation,
+            (&mut info as *mut AclSizeInfo).cast(),
+            std::mem::size_of::<AclSizeInfo>() as u32,
+            ACL_SIZE_INFORMATION_CLASS,
         )
     };
     if ok == 0 {
         return finish(None);
     }
-    let mut aces: Vec<AceRecord> = Vec::with_capacity(info.AceCount as usize);
-    for index in 0..info.AceCount {
+    let mut aces: Vec<AceRecord> = Vec::with_capacity(info.ace_count as usize);
+    for index in 0..info.ace_count {
         let mut ace: *mut c_void = std::ptr::null_mut();
         if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
             return finish(None);
         }
-        // SAFETY: GetAce 返回的指针至少含 ACE_HEADER；allow ACE 才有 Mask/SidStart。
-        let header = unsafe { (ace as *const windows_sys::Win32::Security::ACE_HEADER).read() };
-        let mut record: AceRecord = (header.AceType, header.AceFlags, 0, String::new());
-        if header.AceType == ACE_TYPE_ACCESS_ALLOWED {
-            let allowed = unsafe { (ace as *const ACCESS_ALLOWED_ACE).read() };
-            let mut sid_raw: *mut u16 = std::ptr::null_mut();
-            // SID 起点是 ACE 里的 SidStart 字段。必须指向原始 ACE 缓冲区，不能指向
-            // `allowed` 这个栈上拷贝（那里只有 SID 的前 4 个字节）。
-            let sid_ptr = unsafe {
-                (ace as *const u8).add(std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart)) as *mut c_void
-            };
-            if unsafe { ConvertSidToStringSidW(sid_ptr, &mut sid_raw) } == 0 {
-                // 转换不了 SID：记为不可信主体（保证判定为失败），不中断整份 DACL。
-                record.2 = allowed.Mask;
-                record.3 = String::from("<unknown>");
-            } else {
-                let mut n = 0usize;
-                unsafe {
-                    while *sid_raw.add(n) != 0 {
-                        n += 1;
-                    }
-                }
-                record.2 = allowed.Mask;
-                record.3 = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(sid_raw, n) });
-                unsafe { LocalFree(sid_raw.cast()) };
-            }
+        // SAFETY: GetAce 返回的指针至少含 4 字节 ACE_HEADER；allow ACE 之后是 Mask 与 SID。
+        // 只按 Win32 固定布局读原始字节，避免依赖具体结构体定义。
+        let bytes = ace as *const u8;
+        let ace_type = unsafe { *bytes };
+        let ace_flags = unsafe { *bytes.add(1) };
+        let mut record: AceRecord = (ace_type, ace_flags, 0, String::new());
+        if ace_type == ACE_TYPE_ACCESS_ALLOWED {
+            let mask = unsafe { *(ace as *const u32).add(1) }; // 偏移 4：AccessMask
+            let sid = unsafe { bytes.add(ACCESS_ALLOWED_ACE_SID_OFFSET) as *mut c_void };
+            record.2 = mask;
+            // 转换不了 SID：记为不可信主体（保证判定为失败），不中断整份 DACL。
+            record.3 = sid_to_string(sid).unwrap_or_else(|| "<unknown>".to_string());
         }
         aces.push(record);
     }
@@ -652,7 +692,6 @@ fn path_acl_admin_only_write(path: &Path) -> bool {
 #[cfg(windows)]
 #[allow(dead_code)]
 fn custom_install_dir_admin_only(helper: &Path) -> bool {
-    use std::path::PathBuf;
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
@@ -669,8 +708,11 @@ fn custom_install_dir_admin_only(helper: &Path) -> bool {
     if !canonical_helper.is_file() {
         return false;
     }
-    let resources: PathBuf = exe_dir.join("resources");
-    let Ok(helper_dir) = std::fs::canonicalize(canonical_helper.parent().unwrap_or(&resources)) else {
+    let resources = exe_dir.join("resources");
+    let Some(helper_parent) = canonical_helper.parent() else {
+        return false;
+    };
+    let Ok(helper_dir) = std::fs::canonicalize(helper_parent) else {
         return false;
     };
     if !same_path(&helper_dir, &resources) {
@@ -687,6 +729,7 @@ fn custom_install_dir_admin_only(helper: &Path) -> bool {
 fn custom_install_dir_admin_only(_helper: &Path) -> bool {
     false
 }
+
 /// `%SystemRoot%\System32`（`GetSystemDirectoryW`）。
 #[cfg(windows)]
 fn system32_dir() -> Option<PathBuf> {
@@ -927,7 +970,7 @@ mod tests {
     }
     #[test]
     fn dacl_admin_only_write_rejects_non_plain_allow_aces() {
-        // ACCESS_ALLOWED_OBJECT_ACE_TYPEX（0x05）：带对象类型的 allow，无法确认授权对象。
+        // ACCESS_ALLOWED_OBJECT_ACE_TYPE（0x05）：带对象类型的 allow，无法确认授权对象。
         let aces = vec![(0x05u8, 0u8, FILE_ALL, SID_ADMINISTRATORS.to_string())];
         assert!(!dacl_admin_only_write(SID_ADMINISTRATORS, Some(&aces)));
         // 未知 ACE 类型：不能证明安全。
@@ -939,6 +982,13 @@ mod tests {
             (0x01u8, 0u8, FILE_ALL, "S-1-5-11".to_string()),
         ];
         assert!(dacl_admin_only_write(SID_ADMINISTRATORS, Some(&aces)));
+    }
+    #[test]
+    fn same_path_compares_directories_case_insensitively() {
+        assert!(same_path(Path::new(r"C:\Vega\resources"), Path::new(r"c:\vega\resources\")));
+        assert!(same_path(Path::new(r"\\?\D:\Vega"), Path::new(r"D:\Vega")));
+        assert!(!same_path(Path::new(r"D:\Vega\resources"), Path::new(r"D:\Vega")));
+        assert!(!same_path(Path::new(r"D:\Vega"), Path::new(r"D:\Vega2")));
     }
     #[test]
     fn dacl_error_text_is_the_documented_one() {
