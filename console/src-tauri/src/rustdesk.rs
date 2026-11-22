@@ -1938,12 +1938,13 @@ other = "keep"
         assert_eq!(view_size % 4, 1, "二维码边长必须是 4n+1");
         assert_eq!(modules.len(), view_size * view_size, "矩阵长度与尺寸不符");
         // 不改用外部解码器（会引入新依赖），只做定位图案结构校验：
-        // 三个角各有 7x7 的实心定位框，第 8 行/列是同一条静区白线。
+        // 三个角各有 7x7 定位框 = 1 圈深色外框 + 1 圈白环 + 3x3 深色实心中心。
         let at = |x: usize, y: usize| modules[y * view_size + x];
         for (ox, oy) in [(0usize, 0usize), (view_size - 7, 0), (0, view_size - 7)] {
-            assert!(at(ox, oy), "定位框外角应为深色");
-            assert!(at(ox + 6, oy), "定位框外角应为深色");
-            assert!(at(ox + 1, oy + 1), "定位框内圈应为深色");
+            assert!(at(ox, oy), "定位框外框应为深色");
+            assert!(at(ox + 6, oy), "定位框外框应为深色");
+            assert!(!at(ox + 1, oy + 1), "定位框白环应为浅色");
+            assert!(at(ox + 3, oy + 3), "定位框中心 3x3 应为深色");
         }
     }
 
