@@ -3,7 +3,8 @@
   vega-pwhelper.ps1 的单元测试（Pester 5）。见 docs/ui/console-design-v0.2.md 第 6 节「测试」。
   点源只加载函数、不执行 Main；rustdesk.exe 一律 Mock，载荷文件只落在 $TestDrive，文件名符合生产正则。
   断言重点：载荷名/重解析点/过期/字段校验全部退 10 且不碰 RustDesk、读取函数真正销毁文件、首次调用
-  RustDesk 时文件已不存在、`Done!` 缺失与回读不一致分别退 12/13，以及 stderr 与输出都不含密码。
+  RustDesk 时文件已不存在、`Done!` 缺失与回读不一致分别退 12/13、服务未运行退 12、修改前过期退 10、
+  调用超时退 14，以及 stderr 与输出都不含密码。
 #>
 
 BeforeAll {
@@ -123,6 +124,7 @@ Describe 'Main' {
         $script:firstCallExists = $null
         $script:effective = 'use-permanent-password'
         Mock Get-VegaRustDeskPath { 'C:\Fake\RustDesk\rustdesk.exe' }
+        Mock Test-VegaRustDeskService { $true }
         Mock Invoke-VegaRustDesk {
             $script:calls.Add(@($Arguments))
             if ($null -ne $script:payloadPath -and $null -eq $script:firstCallExists) {
@@ -281,5 +283,47 @@ Describe 'Main' {
         Main -InputFile $path | Should -Be 11
 
         Should -Invoke Invoke-VegaRustDesk -Times 0 -Exactly
+    }
+
+    It 'RustDesk 服务未运行时退 12 且不调用 RustDesk' {
+        $fields = & $script:baseFields
+        $path = & $script:newPayload -Fields $fields
+        Mock Test-VegaRustDeskService { $false }
+
+        Main -InputFile $path | Should -Be 12
+
+        Should -Invoke Invoke-VegaRustDesk -Times 0 -Exactly
+        ($script:captured -join "`n") | Should -Match '服务未运行'
+        Test-Path -LiteralPath $path | Should -BeFalse
+    }
+
+    It '解析后到期时，修改 RustDesk 之前退 10' {
+        $fields = & $script:baseFields
+        $path = & $script:newPayload -Fields $fields
+        # 第一次取时间是解析载荷，第二次已是复查：模拟等待 UAC 耗掉 30 秒。
+        $script:clockCalls = 0
+        Mock Get-VegaEpochSeconds {
+            $script:clockCalls++
+            if ($script:clockCalls -le 1) { return $script:now }
+            return $script:now + 120
+        }
+
+        Main -InputFile $path | Should -Be 10
+
+        Should -Invoke Invoke-VegaRustDesk -Times 0 -Exactly
+        ($script:captured -join "`n") | Should -Match '过期'
+    }
+
+    It '调用 RustDesk 超时退 14，摘要不含密码' {
+        $fields = & $script:baseFields
+        $fields.password = 'Sup3rSecret!x'
+        $path = & $script:newPayload -Fields $fields
+        Mock Invoke-VegaRustDesk { throw 'timeout' }
+
+        Main -InputFile $path | Should -Be 14
+
+        $text = $script:captured -join "`n"
+        $text | Should -Match '结果未知'
+        $text | Should -Not -Match 'Sup3rSecret'
     }
 }

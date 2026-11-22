@@ -57,6 +57,7 @@ pub fn map_exit_code(code: i32) -> Result<(), String> {
         11 => Err("找不到 RustDesk".into()),
         12 => Err("RustDesk 拒绝修改".into()),
         13 => Err("已改密码但验证方式回读不一致".into()),
+        14 => Err("RustDesk 无响应，结果未知".into()),
         other => Err(format!("助手失败（代码 {other}）")),
     }
 }
@@ -488,6 +489,7 @@ mod tests {
         assert_eq!(map_exit_code(11).unwrap_err(), "找不到 RustDesk");
         assert_eq!(map_exit_code(12).unwrap_err(), "RustDesk 拒绝修改");
         assert_eq!(map_exit_code(13).unwrap_err(), "已改密码但验证方式回读不一致");
+        assert_eq!(map_exit_code(14).unwrap_err(), "RustDesk 无响应，结果未知");
         assert_eq!(map_exit_code(7).unwrap_err(), "助手失败（代码 7）");
     }
     #[test]
