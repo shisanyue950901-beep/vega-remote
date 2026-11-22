@@ -64,6 +64,8 @@ pub struct UpdateView {
     pub latest: String,
     pub notes: String,
     pub error: String,
+    /// 只有一端答复且没有更新时的说明（例如「镜像已是最新，GitHub 暂不可达」）。
+    pub notice: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -79,6 +81,7 @@ fn view(current: &str, error: &str) -> UpdateView {
         latest: String::new(),
         notes: String::new(),
         error: error.to_string(),
+        notice: String::new(),
     }
 }
 
@@ -89,6 +92,7 @@ fn found(update: &Update) -> UpdateView {
         latest: update.version.clone(),
         notes: update.body.clone().unwrap_or_default(),
         error: String::new(),
+        notice: String::new(),
     }
 }
 
@@ -114,51 +118,81 @@ async fn check_via(app: &AppHandle, endpoint: &str) -> Result<Option<Update>, St
         .map_err(|_| "检查更新失败，请确认网络后重试".to_string())
 }
 
-/// 版本号比较键：只比较 `x.y.z` 数字段，预发布/构建后缀忽略。
-/// 插件只返回「比当前新」的版本，所以这里只需在两个候选之间排序。
-fn version_key(version: &str) -> (u64, u64, u64) {
-    let core = version.trim().trim_start_matches(|c| c == 'v' || c == 'V');
-    let core = core.split(|c| c == '-' || c == '+').next().unwrap_or("");
-    let mut parts = core.split('.').map(|part| part.parse::<u64>().unwrap_or(0));
-    (
-        parts.next().unwrap_or(0),
-        parts.next().unwrap_or(0),
-        parts.next().unwrap_or(0),
-    )
+fn parse_version(version: &str) -> Option<semver::Version> {
+    semver::Version::parse(version.trim().trim_start_matches(|c| c == 'v' || c == 'V')).ok()
 }
 
-fn is_newer(candidate: &str, other: &str) -> bool {
-    version_key(candidate) > version_key(other)
+/// 正式版不接收预发布候选；当前本身是预发布时才接受。解析失败的候选一律丢弃。
+fn acceptable(update: &Update, current_is_pre: bool) -> bool {
+    match parse_version(&update.version) {
+        Some(version) => current_is_pre || version.pre.is_empty(),
+        None => false,
+    }
 }
 
-/// 查询是否有新版本。两个端点都检查（镜像报错或没有更新也要问 GitHub），
-/// 都有结果时返回版本号更高的那个。
+/// 两个候选里取 semver 更高者；同号取镜像。
+fn github_wins(github: &Update, mirror: &Update) -> bool {
+    match (parse_version(&github.version), parse_version(&mirror.version)) {
+        (Some(g), Some(m)) => g > m,
+        _ => false,
+    }
+}
+
+enum Outcome {
+    Found(&'static str, Update),
+    /// 两端都答复且都没有可用更新。
+    UpToDate,
+    /// 只有一端答复且没有更新；参数是说明文字。
+    Partial(&'static str),
+    Failed,
+}
+
+/// 并发查询两个端点（各 15 秒超时）并按规则选出结果。
+async fn resolve(app: &AppHandle) -> Outcome {
+    let current_is_pre = parse_version(&app.package_info().version.to_string())
+        .map(|v| !v.pre.is_empty())
+        .unwrap_or(false);
+    let (mirror, github) = tokio::join!(
+        check_via(app, MIRROR_ENDPOINT),
+        check_via(app, GITHUB_ENDPOINT)
+    );
+    let mirror_ok = mirror.is_ok();
+    let github_ok = github.is_ok();
+    let pick = |r: Result<Option<Update>, String>| {
+        r.ok().flatten().filter(|u| acceptable(u, current_is_pre))
+    };
+    match (pick(mirror), pick(github)) {
+        (Some(m), Some(g)) => {
+            if github_wins(&g, &m) {
+                Outcome::Found(GITHUB_ENDPOINT, g)
+            } else {
+                Outcome::Found(MIRROR_ENDPOINT, m)
+            }
+        }
+        (Some(m), None) => Outcome::Found(MIRROR_ENDPOINT, m),
+        (None, Some(g)) => Outcome::Found(GITHUB_ENDPOINT, g),
+        (None, None) => match (mirror_ok, github_ok) {
+            (true, true) => Outcome::UpToDate,
+            (true, false) => Outcome::Partial("镜像已是最新，GitHub 暂不可达"),
+            (false, true) => Outcome::Partial("GitHub 已是最新，国内镜像暂不可达"),
+            (false, false) => Outcome::Failed,
+        },
+    }
+}
+
+/// 查询是否有新版本：两个端点同时查，都有结果时返回版本号更高的那个。
 #[tauri::command]
 pub async fn check_update(app: AppHandle) -> UpdateView {
     let current = app.package_info().version.to_string();
-    let mirror = check_via(&app, MIRROR_ENDPOINT).await;
-    let github = check_via(&app, GITHUB_ENDPOINT).await;
-    let both_failed = mirror.is_err() && github.is_err();
-
-    let mirror_update = mirror.as_ref().ok().and_then(|update| update.as_ref());
-    let github_update = github.as_ref().ok().and_then(|update| update.as_ref());
-
-    match (mirror_update, github_update) {
-        (Some(mirror_update), Some(github_update)) => {
-            if is_newer(&github_update.version, &mirror_update.version) {
-                found(github_update)
-            } else {
-                found(mirror_update)
-            }
+    match resolve(&app).await {
+        Outcome::Found(_, update) => found(&update),
+        Outcome::UpToDate => view(&current, ""),
+        Outcome::Partial(notice) => {
+            let mut v = view(&current, "");
+            v.notice = notice.to_string();
+            v
         }
-        (Some(update), None) | (None, Some(update)) => found(update),
-        (None, None) => {
-            if both_failed {
-                view(&current, "检查更新失败，请确认网络后重试")
-            } else {
-                view(&current, "")
-            }
-        }
+        Outcome::Failed => view(&current, "检查更新失败，请确认网络后重试"),
     }
 }
 
@@ -183,22 +217,13 @@ pub async fn install_update(
     Ok(())
 }
 
-/// 选择要安装的端点与更新：两个端点都检查，取更高版本；失败一端不阻塞另一端。
+/// 选择要安装的端点与更新：规则与 `check_update` 相同。
 async fn select_update(app: &AppHandle) -> Result<(&'static str, Update), String> {
-    let mirror = check_via(app, MIRROR_ENDPOINT).await;
-    let github = check_via(app, GITHUB_ENDPOINT).await;
-    match (mirror, github) {
-        (Ok(Some(mirror_update)), Ok(Some(github_update))) => {
-            if is_newer(&github_update.version, &mirror_update.version) {
-                Ok((GITHUB_ENDPOINT, github_update))
-            } else {
-                Ok((MIRROR_ENDPOINT, mirror_update))
-            }
-        }
-        (Ok(Some(update)), _) => Ok((MIRROR_ENDPOINT, update)),
-        (_, Ok(Some(update))) => Ok((GITHUB_ENDPOINT, update)),
-        (Err(_), Err(_)) => Err("检查更新失败，请确认网络后重试".to_string()),
-        _ => Err("当前已是最新版本".to_string()),
+    match resolve(app).await {
+        Outcome::Found(endpoint, update) => Ok((endpoint, update)),
+        Outcome::UpToDate => Err("当前已是最新版本".to_string()),
+        Outcome::Partial(notice) => Err(notice.to_string()),
+        Outcome::Failed => Err("检查更新失败，请确认网络后重试".to_string()),
     }
 }
 
@@ -219,9 +244,13 @@ async fn run_install(app: AppHandle) -> Result<(), String> {
 }
 
 async fn install_via(app: &AppHandle, endpoint: &str) -> Result<(), String> {
+    let current_is_pre = parse_version(&app.package_info().version.to_string())
+        .map(|v| !v.pre.is_empty())
+        .unwrap_or(false);
     let update = check_via(app, endpoint)
         .await?
-        .ok_or_else(|| "当前已是最新版本".to_string())?;
+        .filter(|u| acceptable(u, current_is_pre))
+        .ok_or_else(|| "备用端点没有可用的更新".to_string())?;
     download_and_install(app, update).await
 }
 

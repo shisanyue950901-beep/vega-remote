@@ -85,7 +85,7 @@
 1. 阿里云镜像 `http://60.205.95.98/vega/updates/latest.json`（国内优先，纯 HTTP）
 2. GitHub 固定 tag `vega-updates` 的 `https://github.com/shisanyue950901-beep/vega-remote/releases/download/vega-updates/latest.json`
 
-检查与安装都会同时问两个端点：任一端点报错或没有更新也继续检查另一端，两边都有更新时按版本号取较高者；
+检查与安装都会同时（并发）问两个端点，各 15 秒超时：任一端点报错或没有更新也看另一端，两边都有更新时按 semver 取较高者，同号取镜像；预发布版不推给正式版；只有一端答复时会明确提示另一端不可达，不会笼统说「已是最新」；
 安装从报告该版本的一端下载，下载/验签失败再换另一端重试一次。检查超时 15 秒，下载单独限时 10 分钟。
 镜像清单滞后不会隐藏 GitHub 上已发布的更高版本。
 

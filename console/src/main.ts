@@ -118,6 +118,8 @@ interface UpdateView {
   latest: string;
   notes: string;
   error: string;
+  /** 只有一端答复且没有更新时的说明。 */
+  notice?: string;
 }
 
 interface UpdateProgress {
@@ -1833,8 +1835,12 @@ function setupUpdater(): void {
     badge.textContent = view.available ? `有新版本 ${view.latest}` : "有新版本";
     setStatus(
       status,
-      view.available ? `发现新版本 v${view.latest}` : `当前已是最新版本（v${view.current}）`,
-      "ok",
+      view.available
+        ? `发现新版本 v${view.latest}`
+        : view.notice
+          ? `${view.notice}（v${view.current}）`
+          : `当前已是最新版本（v${view.current}）`,
+      view.available || !view.notice ? "ok" : "warn",
     );
     refreshInstallButton();
   };
