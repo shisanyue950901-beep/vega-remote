@@ -27,6 +27,8 @@ fn main() {
             "get_password_status",
             "set_permanent_password",
             "clear_permanent_password",
+            "check_update",
+            "install_update",
         ])),
     )
     .expect("tauri-build 失败");

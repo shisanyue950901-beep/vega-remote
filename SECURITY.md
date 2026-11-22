@@ -77,3 +77,19 @@
 - 安装/卸载脚本（`host/`、`client/`、`bootstrap.ps1`）不接收、不保存任何密码；Sunshine 管理密码由用户在本机界面设置；RustDesk 长期密码只经上面的提权助手一次性写入，控制台不读回内容
 - Sunshine 管理页只允许本机访问，防火墙不放行管理端口
 - 状态清单只按白名单回滚，读取前校验所有者与重解析点
+
+## 自动更新
+
+控制台内置 `tauri-plugin-updater`，启动后静默检查一次，设置页可手动检查与安装。更新源按顺序尝试：
+
+1. 阿里云镜像 `http://60.205.95.98/vega/updates/latest.json`（国内优先，纯 HTTP）
+2. GitHub Release `https://github.com/shisanyue950901-beep/vega-remote/releases/latest/download/latest.json`
+
+**镜像走明文 HTTP 是刻意的**：镜像只节省带宽和连接时间，不承担信任。更新包使用 minisign 签名，
+公钥在构建时由 CI 通过 `VEGA_UPDATER_PUBKEY` 注入配置（源码里是占位符）；客户端安装前会校验
+`latest.json` 里每个平台的 `signature` 与安装包内容。公钥不在更新通道上传输，因此能改 `latest.json`
+或替换安装包的一方没有私钥，篡改后的包无法通过校验，也就无法被安装。私钥只存在于 CI secrets，
+不进入仓库与任何构建产物。
+
+明文通道的残余风险：攻击者可以看到「谁在何时检查更新」以及版本号，也可以让更新检查失败（拒绝服务）。
+若需要隐藏元数据，请改用 HTTPS 镜像；本项目的签名校验不依赖传输层。
