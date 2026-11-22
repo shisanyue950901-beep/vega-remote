@@ -254,3 +254,43 @@
 - P2 定位图案断言：`assert_valid_matrix` 改成外框 (ox,oy)/(ox+6,oy) 为黑、白环 (ox+1,oy+1) 为白、中心 (ox+3,oy+3) 为黑，三个矩阵用例不再卡在 CI。
 - P2 上下文丢失：`drawMobileQr` 绘制前查 `ctx.isContextLost?.()`，为真按绘制失败返回；弹层打开期间监听 canvas 的 `contextlost`，一触发即置绘制失败并作废在途请求，关闭（含 Esc）时摘掉监听。
 - P3 未做（待加固）：冒烟清单的「绘制失败」目前只覆盖 Rust 输入错误，建议补独立解码器从矩阵读回原始 `config=` 文本（含/不含中继），前端注入长度错误的矩阵与不可用上下文断言状态仍为错误。
+
+## T6 控制台自动更新（阿里云镜像优先）
+- `tauri-plugin-updater` 接入：`check_update` / `install_update`，后台下载推送 `vega://update-progress`，同一时间只允许一个安装（`AtomicBool`）。Windows 上安装完成后由被动安装器用 `/R` 拉起新版本；`app.restart()` 只是非 Windows 或安装器未接管时的兜底，不是主路径。
+- 端点地址：`http://60.205.95.98/vega/updates/latest.json` 与 GitHub 固定 tag `vega-updates` 的 `releases/download/vega-updates/latest.json`；镜像明文 HTTP，信任由 minisign 签名承担（公钥提交在 `tauri.conf.json` 的 `plugins.updater.pubkey`，篡改包无法安装）。
+- 端点策略（t6-fix4）：两个端点都检查（镜像 + GitHub 固定 tag），任一端点报错或没有更新也检查另一端，按版本号取较高者；安装从报告该版本的一端下载，失败再换另一端重试。镜像清单滞后不会隐藏 GitHub 已发布的更新。
+- 前端：启动 5 秒后静默检查一次；侧栏徽标「有新版本 x.y.z」；设置页「软件更新」行含当前版本、检查、立即更新、进度条与失败原因。
+- CI：只构建未签名的 NSIS 安装包（`createUpdaterArtifacts: false`），不再注入更新公钥、不再读 `TAURI_SIGNING_PRIVATE_KEY`；`VEGA_UPDATER_PUBKEY` 与 `TAURI_SIGNING_*` 两个 secret 都不再使用，tag `v*` 也不产出 `latest.json`。
+- 运维：签名与发布都在维护者本机。`tools/publish-update.sh <tag> <setup.exe>` 用 `tauri signer sign` 签安装包、写 `latest.json`（GitHub 指向固定 tag `vega-updates` 的版本化资产，`latest-mirror.json` 指向镜像版本目录），打印 SHA256，再上传到 GitHub Release 与阿里云 `/opt/vega-relay/updates/`（安装包进 `<ver>/Vega-Setup-<ver>.exe` 且不可覆盖，清单最后原子改名，旧版本目录保留）；`relay/updates-nginx.md` 记录 `nginx:alpine` 只读挂载与 `autoindex off` 部署。
+- 版本统一 `0.6.0`（`console/package.json`、`tauri.conf.json`、`Cargo.toml`）。
+- 旧安装目录搬迁（t6-fix3b 重做，t6-fix4 加固）：安装路径固定为 `$PROGRAMFILES64\Vega` 后，旧版可能仍在旧安装器选的目录（如 `D:\Vega`）。目录页不再用 `!undef MUI_PAGE_DIRECTORY`（MUI2 在 include 时已展开，宏覆盖无效），改为定制模板 `console/src-tauri/windows/installer.nsi`（上游 tauri-cli v2.12.6）删除目录页与重装页，并在 `.onInit` 末尾强制 `$INSTDIR`。`NSIS_HOOK_PREINSTALL` 读 Tauri 卸载键的 `InstallLocation`/`UninstallString`，归一化后用 `GetFullPathNameW` + `GetLongPathNameW` 解析长路径，再与固定目录大小写不敏感比较；旧目录或其 `resources` 是重解析点时整段跳过；不同且旧目录含 `vega-console.exe` 时**不运行旧卸载器**（它会回滚 RustDesk），只删除已知 Vega 文件、非递归删 `resources` 与旧目录，指向旧目录的快捷方式一并删除；失败只写完成页提示不 Abort，长路径相同则不动，RustDesk 配置、`%ProgramData%\Vega`、用户 AppData 不在清理范围；`PREINSTALL` 里补 `SetOutPath $INSTDIR`。迁移在 `/UPDATE` 下也执行（只删文件，不回滚配置）。`POSTINSTALL` 用 PREINSTALL 记录的旧卸载键存在性区分：全新安装运行 RustDesk 脚本；重装或 `/UPDATE` 默认跳过（不下载、不改配置），只有 Program Files 下找不到 `rustdesk.exe` 时才补跑安装与配置。
+
+### T6-fix3（Codex 审计 t6-r1 修复）
+- P1 编译：`download_and_install` 的累计字节改为 `let mut downloaded`；对 `tauri-plugin-updater` 2 的 API 全面对齐（`updater_builder() -> UpdaterBuilder`、`endpoints(Vec<Url>) -> Result<Self>`、`Update::download_and_install(&self, on_chunk, on_finish) -> Result<()>`、`Update.timeout` 为 `pub` 字段）。
+- P2 权限：`capabilities/default.json` 去掉 `updater:default`（只用自定义命令），补 `core:event:allow-listen` / `core:event:allow-unlisten`。
+- P2 前端顺序：先 `await` 两个事件监听注册，成功后才放开「立即更新」；注册失败显示错误且按钮保持禁用。`install_update` 被拒（已有任务在跑等）时一律从「更新中」复位并清进度。
+- P2 超时与回退：检查按端点单建 updater，`timeout(15s)` 再包一层 `tokio::time::timeout`；先用镜像，检查失败/超时或后续下载/签名校验失败时改为只用 GitHub 固定 tag 重试一次（检查 + 下载各一次）。下载前把 `Update.timeout` 补成 10 分钟并再包 `tokio::time::timeout`。
+- P2 锁：`AtomicBool` 包成 `InstallGuard`（`Drop` 释放），成功、失败、提前返回都不会把界面卡在「更新中」。
+- P2 发布通道：GitHub 回退端点固定 `releases/download/vega-updates/latest.json`；`publish-update.sh` 把 `Vega-Setup-<ver>.exe`、`.sig`、`latest.json` 发到固定 tag `vega-updates`（缺则创建，资产覆盖）；镜像侧安装包先进 `<ver>/Vega-Setup-<ver>.exe`（存在即拒绝，永不覆盖），清单写临时名再原子 `mv`，`latest.json` 的 url 指向版本化文件，旧版本目录保留。
+- P3 进度：每次开始安装把进度宽度与 `aria-valuenow` 归零；总大小未知时加 `is-indeterminate` 走不确定态（删 `aria-valuenow`），不再用固定 40% 假装进度。
+- P3 文档：`updater.rs` 头注释改为「公钥提交在仓库」，不再写成 CI 注入。
+
+### T6-fix3b（架构裁定：NSIS 安装器整改）
+- 目录页：删除无效的 `!undef MUI_PAGE_DIRECTORY`；新增定制模板 `console/src-tauri/windows/installer.nsi`（基于 tauri-cli v2.12.6 上游），只删目录页及回调，并在 `.onInit` 末尾强制 `$INSTDIR = $PROGRAMFILES64\Vega`；`bundle.windows.nsis.template` 指向该模板。
+- 旧目录迁移：绝不运行旧卸载器（会回滚 RustDesk）；`PREINSTALL` 只删已知 Vega 文件与非递归删目录，快捷方式按目标判断，失败仅提示。
+- `/UPDATE`：`POSTINSTALL` 完全跳过 RustDesk 安装脚本，在线更新不改写中继配置。
+
+### T6-fix4（架构裁定：安装器与发布流程整改）
+- 安装器模板删除上游「重新安装 / 已安装」页（`PageReinstall`、`PageReinstallUpdateSelection`、`PageLeaveReinstall`、`Var ReinstallPageCheck`）：永不运行旧卸载器，也不再询问卸载/重装，直接在固定目录覆盖安装；历史 `WixMode` 分支与 `choowHowToInstall` LangString 兜底一并删除，降级检查改为所有模式生效。
+- `POSTINSTALL` 只在全新安装时运行 RustDesk 脚本。`PREINSTALL` 在 Tauri 重写卸载键之前记录「是否已有 Vega 卸载键」到 Var；重装与 `/UPDATE` 默认跳过，只有 Program Files 下找不到 `rustdesk.exe`（64 位与 x86 都查）时才补跑安装与配置。
+- 旧目录迁移在 `/UPDATE` 下也执行（只删文件）：比较前对两条路径依次调用 `GetFullPathNameW` + `GetLongPathNameW`；旧目录或 `old\resources` 带 `FILE_ATTRIBUTE_REPARSE_POINT` 时整段跳过；长路径相同则不动。
+- `tools/publish-update.sh`：镜像先传 `<file>.part` 再远端 `mv`；版本化文件已存在时，远程 SHA256 相同才允许重跑，不同则中止。GitHub Release 用 `--latest=false` 创建，已存在则 `gh api PATCH make_latest=false`；版本化 exe/.sig 不用 `--clobber`，已存在且 SHA256 不同在触碰镜像前中止，相同则跳过；两个通道都完成安装包校验/上传后才切清单（GitHub：上传 `latest.json.new` → 删除旧 `latest.json` → `gh api -X PATCH .../assets/<id> -f name=latest.json`；镜像：临时名 → 原子 `mv`）。
+- 前端 `check_update` 增加代际/状态守卫：安装开始或监听注册失败后，在途检查结果直接丢弃，不再覆盖下载状态或监听错误提示。
+
+### T6 加固（待做）
+- 磁盘写满时的安装/在线更新：NSIS 覆盖写入中途耗尽空间会留下截断的 `vega-console.exe` / `uninstall.exe` 与指向它的卸载入口（与 Tauri 默认模板相同）。后续：安装前检查剩余空间、先写临时名再替换，或写入失败时回滚注册表（迁移路径已回滚）。
+- 发布脚本不支持同一版本并行发布（单维护者手动运行；镜像 test→mv 之间无锁）。需要时在镜像端加 flock 或 `mv -n`。
+- 被动更新（`/P`）跳过完成页：旧 EXE 被占用、旧目录未清理的告警用户看不到。后续把告警写入 `%ProgramData%\Vega\install-notes.txt`，控制台启动时在设置页提示。
+- P2 响应大小（架构裁决：插件 API 无法设上限，本轮不修）：恶意大响应可使控制台 OOM，仅 DoS，签名仍保证不装恶意包。启动静默检查会整份缓冲清单，下载会整份缓冲安装包；现有 15 秒 / 10 分钟超时只限时间不限字节。
+- P2 签名/版本（架构裁决：本轮不修）：HTTP 镜像可被中间人回放更早的已签名 Vega 版本（降级）；后续用签名内绑定版本 / `requireSignedVersion` 或 HTTPS 镜像。
+- P3 Windows 重启语义：被动安装器自己用 `/R` 拉起新版本，`app.restart()` 只是非 Windows / 安装器未接管时的兜底，文档不再把它写成主路径。

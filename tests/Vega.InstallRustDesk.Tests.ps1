@@ -2107,7 +2107,11 @@ Describe 't3-fix9 P1 NSIS 宏展开后标签唯一' {
                 $match = [regex]::Match($text, $insertPattern)
                 if (-not $match.Success) { break }
                 $name = $match.Groups[1].Value
-                if (-not $Macros.ContainsKey($name)) { break }
+                if (-not $Macros.ContainsKey($name)) {
+                    # 外部宏（如 MUI/LogicLib）不展开：换成注释占位，继续展开后面的本地宏。
+                    $text = $text.Substring(0, $match.Index) + "; external $name" + $text.Substring($match.Index + $match.Length)
+                    continue
+                }
                 $arguments = @()
                 $argumentText = $match.Groups[2].Value.Trim()
                 if ($argumentText) { $arguments = @($argumentText -split '\s+') }

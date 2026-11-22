@@ -77,3 +77,35 @@
 - 安装/卸载脚本（`host/`、`client/`、`bootstrap.ps1`）不接收、不保存任何密码；Sunshine 管理密码由用户在本机界面设置；RustDesk 长期密码只经上面的提权助手一次性写入，控制台不读回内容
 - Sunshine 管理页只允许本机访问，防火墙不放行管理端口
 - 状态清单只按白名单回滚，读取前校验所有者与重解析点
+
+## 自动更新
+
+控制台内置 `tauri-plugin-updater`，启动后静默检查一次，设置页可手动检查与安装。更新源按顺序尝试：
+
+1. 阿里云镜像 `http://60.205.95.98/vega/updates/latest.json`（国内优先，纯 HTTP）
+2. GitHub 固定 tag `vega-updates` 的 `https://github.com/shisanyue950901-beep/vega-remote/releases/download/vega-updates/latest.json`
+
+检查与安装都会同时（并发）问两个端点，各 15 秒超时：任一端点报错或没有更新也看另一端，两边都有更新时按 semver 取较高者，同号取镜像；预发布版不推给正式版；只有一端答复时会明确提示另一端不可达，不会笼统说「已是最新」；
+安装从报告该版本的一端下载，下载/验签失败再换另一端重试一次。检查超时 15 秒，下载单独限时 10 分钟。
+镜像清单滞后不会隐藏 GitHub 上已发布的更高版本。
+
+**镜像走明文 HTTP 是刻意的**：镜像只节省带宽和连接时间，不承担信任。更新包使用 minisign 签名，
+公钥直接提交在 `console/src-tauri/tauri.conf.json` 的 `plugins.updater.pubkey` 里（源码可见，不靠 CI
+注入，也不用仓库 secret）；客户端安装前会校验 `latest.json` 里每个平台的 `signature` 与安装包内容。
+公钥不在更新通道上传输，因此能改 `latest.json` 或替换安装包的一方没有私钥，篡改后的包无法通过
+校验，也就无法被安装。
+
+**签名只在维护者本机做**：CI 只构建未签名的 NSIS 安装包（`createUpdaterArtifacts: false`，构建不读
+任何签名密钥，`TAURI_SIGNING_*` / `VEGA_UPDATER_PUBKEY` 都不再使用）。发布时维护者在本机运行
+`tools/publish-update.sh <tag> <setup.exe>`：脚本用 `tauri signer sign` 对安装包签名、写出 `latest.json`，
+再把安装包、`.sig` 与清单上传到阿里云 `/opt/vega-relay/updates/`（安装包进不可覆盖的 `<版本>/` 目录，
+清单最后原子替换）和 GitHub 固定 tag `vega-updates` 的 Release。私钥只存在于维护者本机的环境变量
+（`TAURI_SIGNING_PRIVATE_KEY`）里，不进仓库、CI 或脚本参数，脚本也不打印私钥内容。
+
+明文通道的残余风险：攻击者可以看到「谁在何时检查更新」以及版本号，也可以让更新检查失败（拒绝服务）。
+若需要隐藏元数据，请改用 HTTPS 镜像；本项目的签名校验不依赖传输层。
+
+**降级风险（已知，待加固，见 ROADMAP「T6 加固」）**：能改 `latest.json` 的一方虽然造不出新包，但可以
+回放一个更早的、签名有效的 Vega 版本，客户端会把它当成可用更新装上去。后续用签名内绑定版本
+（`requireSignedVersion`）或 HTTPS 镜像消除；当前签名只证明「这个包确实是 Vega 官方签的」，不证明
+「它是最新版本」。

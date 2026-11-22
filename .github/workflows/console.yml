@@ -4,6 +4,7 @@ name: Console
 on:
   push:
     branches: [main]
+    tags: ["v*"]
     paths:
       - "console/**"
       - "host/**"
@@ -78,6 +79,8 @@ jobs:
       # TODO(m2b): Cargo.lock 提交后追加 --locked，保证依赖可复现。
       # tauri.conf.json 里 bundle.targets = ["nsis"]，perMachine 只提权一次；
       # 安装包会带上 host/install-rustdesk.ps1 与 resources/vega-defaults.json。
+      # 构建完全不需要签名密钥：更新包由维护者在本地用 `tauri signer sign` 签，
+      # 见 tools/publish-update.sh。CI 只产出未签名的安装包。
       - name: 构建（NSIS 安装包）
         run: npm run tauri build -- --bundles nsis
 
@@ -92,7 +95,7 @@ jobs:
           src=$(ls src-tauri/target/release/bundle/nsis/*-setup.exe | head -n 1)
           mkdir -p "$RUNNER_TEMP/vega"
           cp "$src" "$RUNNER_TEMP/vega/Vega-Setup.exe"
-          ls -l "$RUNNER_TEMP/vega/Vega-Setup.exe"
+          ls -l "$RUNNER_TEMP/vega/"
 
       - name: 上传 Vega-Setup.exe（真机试跑用安装包）
         uses: actions/upload-artifact@v4

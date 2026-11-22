@@ -13,6 +13,9 @@ interface TauriGlobal {
   window?: { getCurrentWindow(): TauriWindowHandle };
   core?: { invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> };
   clipboardManager?: { writeText(text: string): Promise<void> };
+  event?: {
+    listen<T>(event: string, handler: (event: { payload: T }) => void): Promise<() => void>;
+  };
 }
 
 declare global {
@@ -106,6 +109,22 @@ interface DoctorReport {
   snapshotId: number;
   snapshotAvailable: boolean;
   items: DoctorItem[];
+}
+
+/** `check_update` 返回值；`error` 非空时其余字段不可信。 */
+interface UpdateView {
+  available: boolean;
+  current: string;
+  latest: string;
+  notes: string;
+  error: string;
+  /** 只有一端答复且没有更新时的说明。 */
+  notice?: string;
+}
+
+interface UpdateProgress {
+  downloaded: number;
+  total: number | null;
 }
 
 let currentDeviceCode = "";
@@ -1728,6 +1747,208 @@ function setupIncomingDialog(): void {
   }, 1000);
 }
 
+/* ---------- 自动更新 ---------- */
+function setupUpdater(): void {
+  const status = byId<HTMLSpanElement>("update-status");
+  const badge = byId<HTMLButtonElement>("update-badge");
+  const checkButton = byId<HTMLButtonElement>("update-check");
+  const installButton = byId<HTMLButtonElement>("update-install");
+  const progress = byId<HTMLDivElement>("update-progress");
+  const bar = byId<HTMLSpanElement>("update-progress-bar");
+
+  let latest = "";
+  let installing = false;
+  let autoChecked = false;
+  /** 事件监听注册成功前不放行安装，否则进度和失败都收不到。 */
+  let eventsReady = false;
+  /** 监听注册失败时不再让检查结果覆盖错误提示。 */
+  let listenerError = false;
+  /**
+   * 每次检查的代号。安装开始或新检查发起后，旧请求的回包直接丢弃，
+   * 不会把「下载中」或监听错误界面刷回「发现新版本」。
+   */
+  let checkGeneration = 0;
+  /** 手动检查在途标记：静默检查不得插队，否则手动请求的结果会被作废。 */
+  let manualCheckInFlight = false;
+  /** 空闲态文案（版本号）。静默检查失败时原样恢复，不把界面留在「正在检查」。 */
+  let idleStatusText = status.textContent ?? "";
+
+  /** 只在界面仍停在「正在检查更新…」时恢复；已显示的手动结果或错误不被静默检查抹掉。 */
+  const restoreIdleStatus = (): void => {
+    if (status.textContent === "正在检查更新…") setStatus(status, idleStatusText);
+  };
+
+  const refreshInstallButton = (): void => {
+    installButton.disabled = installing || !latest || !eventsReady;
+  };
+
+  /** 每次开始安装/失败复位：进度条归零，且不残留上一次的百分比。 */
+  const resetProgress = (): void => {
+    bar.style.width = "0%";
+    progress.classList.remove("is-indeterminate");
+    progress.setAttribute("aria-valuenow", "0");
+  };
+
+  const setInstalling = (value: boolean): void => {
+    installing = value;
+    if (value) {
+      // 让在途的检查结果失效：安装开始后不接受任何旧的更新视图。
+      checkGeneration += 1;
+    }
+    checkButton.disabled = value;
+    refreshInstallButton();
+  };
+
+  const showProgress = (payload: UpdateProgress): void => {
+    progress.classList.remove("is-hidden");
+    const total = payload.total ?? 0;
+    if (total > 0) {
+      const percent = Math.min(100, Math.round((payload.downloaded / total) * 100));
+      progress.classList.remove("is-indeterminate");
+      bar.style.width = `${percent}%`;
+      progress.setAttribute("aria-valuenow", String(percent));
+    } else {
+      // 服务端没给 Content-Length：只走不确定态，不编造百分比。
+      progress.classList.add("is-indeterminate");
+      progress.removeAttribute("aria-valuenow");
+    }
+    const mb = (payload.downloaded / (1024 * 1024)).toFixed(1);
+    const totalMb = (total / (1024 * 1024)).toFixed(1);
+    setStatus(status, total > 0 ? `正在下载更新… ${mb} / ${totalMb} MB` : `正在下载更新… ${mb} MB`);
+  };
+
+  const render = (view: UpdateView | null, silent: boolean): void => {
+    if (!view) {
+      if (!silent) setStatus(status, "当前环境不支持自动更新", "warn");
+      return;
+    }
+    if (view.current) {
+      byId<HTMLSpanElement>("about-version").textContent = `v${view.current}`;
+      idleStatusText = `当前版本 v${view.current}`;
+    }
+    if (view.error) {
+      if (!silent) setStatus(status, view.error, "error");
+      else restoreIdleStatus();
+      return;
+    }
+    latest = view.available ? view.latest : "";
+    badge.classList.toggle("is-hidden", !view.available);
+    badge.textContent = view.available ? `有新版本 ${view.latest}` : "有新版本";
+    setStatus(
+      status,
+      view.available
+        ? `发现新版本 v${view.latest}`
+        : view.notice
+          ? `${view.notice}（v${view.current}）`
+          : `当前已是最新版本（v${view.current}）`,
+      view.available || !view.notice ? "ok" : "warn",
+    );
+    refreshInstallButton();
+  };
+
+  badge.addEventListener("click", () => navigateTo("settings"));
+
+  const check = async (silent: boolean): Promise<void> => {
+    if (installing || listenerError) return;
+    // 手动检查在途时不插静默检查：否则手动回包会被新一轮代号作废。
+    if (silent && manualCheckInFlight) return;
+    const generation = ++checkGeneration;
+    if (!silent) manualCheckInFlight = true;
+    checkButton.disabled = true;
+    if (!silent) setStatus(status, "正在检查更新…");
+    let view: UpdateView | null;
+    try {
+      view = await invoke<UpdateView>("check_update");
+    } catch {
+      if (!silent) manualCheckInFlight = false;
+      if (generation === checkGeneration) {
+        checkButton.disabled = installing || listenerError;
+        if (!installing && !listenerError) {
+          // 静默检查失败不弹错，但也不能把状态留在「正在检查更新…」。
+          if (silent) restoreIdleStatus();
+          else setStatus(status, "检查更新失败，请稍后重试", "error");
+        }
+      }
+      return;
+    }
+    if (!silent) manualCheckInFlight = false;
+    // 只有最新一次检查能改界面；安装中或监听错误时也不能覆盖已有状态。
+    if (generation !== checkGeneration) return;
+    checkButton.disabled = installing || listenerError;
+    if (installing || listenerError) return;
+    render(view, silent);
+  };
+
+  checkButton.addEventListener("click", () => {
+    void check(false);
+  });
+
+  installButton.addEventListener("click", () => {
+    if (installing || !latest || !eventsReady) return;
+    setInstalling(true);
+    resetProgress();
+    progress.classList.remove("is-hidden");
+    setStatus(status, "正在准备下载更新…");
+    const core = window.__TAURI__?.core;
+    if (!core) {
+      setInstalling(false);
+      resetProgress();
+      progress.classList.add("is-hidden");
+      setStatus(status, "当前环境不支持自动更新", "warn");
+      return;
+    }
+    core.invoke<void>("install_update").catch((error: unknown) => {
+      // 命令被拒（例如已有任务在跑）也要把界面从「更新中」复位。
+      const message = typeof error === "string" && error ? error : "启动更新失败，请稍后重试";
+      setInstalling(false);
+      resetProgress();
+      progress.classList.add("is-hidden");
+      setStatus(status, message, "error");
+    });
+  });
+
+  /** 注册事件监听；注册失败返回 false，安装按钮保持禁用。 */
+  const registerEvents = async (): Promise<boolean> => {
+    const event = window.__TAURI__?.event;
+    if (!event?.listen) return false;
+    try {
+      await event.listen<UpdateProgress>("vega://update-progress", (payload) => {
+        showProgress(payload.payload);
+      });
+      await event.listen<string>("vega://update-error", (payload) => {
+        setInstalling(false);
+        resetProgress();
+        progress.classList.add("is-hidden");
+        setStatus(status, payload.payload || "更新失败，请稍后重试", "error");
+      });
+      return true;
+    } catch {
+      listenerError = true;
+      // 让已经发出的检查回包失效，错误提示保持到重启应用。
+      checkGeneration += 1;
+      return false;
+    }
+  };
+
+  // 先把监听注册完，再放行「立即更新」；注册失败只报错，不放行安装，也不再跑检查。
+  void (async () => {
+    eventsReady = await registerEvents();
+    if (!eventsReady && window.__TAURI__?.event) {
+      listenerError = true;
+      checkButton.disabled = true;
+      setStatus(status, "更新事件监听注册失败，请重启应用后重试", "error");
+    }
+    refreshInstallButton();
+  })();
+
+  // 启动 5 秒后静默检查一次；每次启动最多一次，失败不打扰用户。
+  window.setTimeout(() => {
+    if (autoChecked) return;
+    autoChecked = true;
+    void check(true);
+  }, 5000);
+}
+
 /* ---------- 自绘标题栏 ---------- */
 function setupWindowControls(): void {
   const current = window.__TAURI__?.window?.getCurrentWindow();
@@ -1753,6 +1974,7 @@ function main(): void {
   setupSettingsPage();
   setupStreamingPage();
   setupIncomingDialog();
+  setupUpdater();
   setupWindowControls();
 
   // 两页共用一份配置快照；启动时读一次，focus 时再刷新并复查设备码/安装状态。

@@ -7,10 +7,22 @@
 ## 安装（Windows，双击 Vega-Setup.exe）
 
 1. 从 GitHub Actions 的 `Console` 工作流下载 artifact **vega-setup-windows**，解压得到 `Vega-Setup.exe`（或从 Release 下载同名文件）。
-2. 双击运行，UAC 提权一次。安装包是 perMachine 模式，只在这一步要管理员权限。
-3. 安装过程会自动装好 RustDesk 并写入自建中继配置（默认 `60.205.95.98`，见 `console/src-tauri/resources/vega-defaults.json`）。RustDesk 是 AGPL，安装包里**不含**它的二进制，安装时从官方 GitHub Release 下载固定版本并校验 SHA256。
+2. 双击运行，UAC 提权一次。安装包是 perMachine 模式，只在这一步要管理员权限。安装路径固定为
+   `C:\Program Files\Vega`（`$PROGRAMFILES64\Vega`），安装器没有「选择安装目录」页（定制 `console/src-tauri/windows/installer.nsi`
+   删除了目录页，并在 `.onInit` 末尾强制该目录）；长期密码助手 `resources\vega-pwhelper.ps1` 必须落在系统 Program Files 下，
+   默认 ACL 只允许管理员写。
+3. 安装过程会自动装好 RustDesk 并写入自建中继配置（默认 `60.205.95.98`，见 `console/src-tauri/resources/vega-defaults.json`）。RustDesk 是 AGPL，安装包里**不含**它的二进制，安装时从官方 GitHub Release 下载固定版本并校验 SHA256。在线更新（安装器 `/UPDATE` 模式）与覆盖重装默认跳过这一步：不下载 RustDesk、不改写中继配置；只有 `C:\Program Files` 下找不到 `rustdesk.exe` 时才补装并配置。安装器没有上游的「重新安装 / 已安装」页，也不会运行旧卸载器。
 4. 如果 RustDesk 没装好（下载失败/哈希不符），Vega 仍会正常安装完成，并提示「RustDesk 未装好，请打开 Vega 按提示手动安装」；也可以直接到 <https://rustdesk.com/download> 手动下载安装。
 5. 卸载 Vega 时，安装包会按 `%ProgramData%\Vega\host-state.json` 里的记录回滚 RustDesk 中继配置；只有记录标明「由 Vega 安装」时才会连带卸载 RustDesk。
+6. 旧版 Vega 可能装在别处（更早的安装器有「选择安装目录」页，例如 `D:\Vega`）。新版安装包在复制文件前读 Tauri 的卸载注册表项
+   `HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall\Vega 控制台` 的 `InstallLocation` / `UninstallString`，
+   归一化（去引号、去尾反斜杠、`GetFullPathNameW` + `GetLongPathNameW` 解析长路径）后与 `C:\Program Files\Vega` 不同、旧目录或其 `resources` 不是重解析点、旧目录里又有 `vega-console.exe` 时，
+   **不会运行旧卸载器**（旧卸载器会回滚 RustDesk 中继配置），只按清单删除旧目录里的已知 Vega 文件
+   （`vega-console.exe`、`uninstall.exe`、`resources\vega-pwhelper.ps1`、`resources\vega-defaults.json` 与 `resources\host\` 下的脚本/模块），
+   再非递归删除 `resources` 与旧目录；旧快捷方式只在指向旧目录时删除（Tauri 随后按新目录重建）。同一路径的重装/升级/`/UPDATE` 不做任何事（长路径相同即跳过）；
+   在线更新也会执行这段文件删除，所以用户以前装在别处的旧目录同样会被清掉。
+   目录里若有其他文件则保留并在完成页提示。整个清理只针对旧安装目录本身：RustDesk 配置（`%ProgramData%\RustDesk`、`%APPDATA%\RustDesk`）、
+   `%ProgramData%\Vega` 与用户 AppData 都不会被删除，任何失败都不会中断安装。
 
 **换成你自己的中继**：fork 后改 `console/src-tauri/resources/vega-defaults.json` 的 `rustdesk.idServer` / `relayServer` / `key`，重新构建安装包即可。这个文件是公开信息，可以入库；构建清单里也把 `host/install-rustdesk.ps1` 与 `host/lib/Vega.Common.psm1` 一起打进 `resources\`。
 
@@ -56,6 +68,7 @@ Vega Remote 只下载官方发行版并写入配置，不修改、不打包上�
 - **两条线路**：主线 IPv6 / Tailscale 直连（低延迟），备线 RustDesk 自建中继（兜底）
 - **长期密码可控**：设置页可设置/清除 RustDesk 长期密码；只在保存时通过 UAC 提权一次，密码经收紧权限的临时文件交给助手，不进日志与命令行
 - **手机控制电脑**：官方 RustDesk + 设置页扫码（二维码自动带好本机 ID 服务器、中继与公钥）
+- **自动更新**：启动静默检查、设置页可手动检查与安装；优先阿里云镜像、回落 GitHub Release，安装包经 minisign 签名校验
 - **零费用**：全部组件免费，中继服务器用你自己的 VPS
 
 ## 快速开始
@@ -154,6 +167,24 @@ Set-ExecutionPolicy -Scope Process Bypass -Force
 | 帧率 | 60（上行带宽 ≥ 30 Mbps 可试 120） |
 | 码率 | 默认（随分辨率帧率自动变化） |
 | 视频编码 | HEVC，硬件解码 |
+
+## 发布更新（维护者）
+
+CI 只构建未签名的安装包：`createUpdaterArtifacts: false`，工作流不读 `TAURI_SIGNING_PRIVATE_KEY`，
+也不用 `VEGA_UPDATER_PUBKEY` secret。更新公钥直接提交在 `console/src-tauri/tauri.conf.json` 的
+`plugins.updater.pubkey`，客户端拿它校验 `latest.json` 里的 `signature`。
+
+签名与发布由维护者在本机完成（私钥只在本地环境变量，不进仓库与 CI）：
+
+```bash
+export TAURI_SIGNING_PRIVATE_KEY="$(cat <私钥文件>)"
+export TAURI_SIGNING_PRIVATE_KEY_PASSWORD='…'
+tools/publish-update.sh v0.6.0 <path>/Vega-Setup.exe
+```
+
+脚本用 `tauri signer sign` 签安装包、写 `latest.json` 与 `latest-mirror.json`、打印 SHA256，再上传到
+GitHub Release 和阿里云 `/opt/vega-relay/updates/`（清单最后原子改名）。镜像部署见
+[relay/updates-nginx.md](relay/updates-nginx.md)，安全边界见 [SECURITY.md](SECURITY.md)。
 
 ## 文档
 

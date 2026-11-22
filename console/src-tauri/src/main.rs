@@ -6,6 +6,7 @@ mod peers;
 mod rustdesk;
 mod scm;
 mod streaming;
+mod updater;
 mod winpaths;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,7 +33,9 @@ fn set_close_to_tray(enabled: bool, state: State<'_, CloseToTray>) {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(CloseToTray::default())
+        .manage(updater::Updating::default())
         .invoke_handler(tauri::generate_handler![
             set_close_to_tray,
             rustdesk::get_device_id,
@@ -57,6 +60,8 @@ fn main() {
             password::get_password_status,
             password::set_permanent_password,
             password::clear_permanent_password,
+            updater::check_update,
+            updater::install_update,
         ])
         .setup(|app| {
             // 托盘菜单：显示主窗口 / 复制设备码 / 断开当前会话 / 退出
