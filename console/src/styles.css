@@ -703,6 +703,12 @@ code {
   padding: 14px 16px;
 }
 
+/* 连接测试行：配置路径可能很长，标题/状态占一行，按钮折到下一行右对齐，不压文字 */
+.row--test { flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px 12px; padding: 12px 16px; }
+.row--test .row__body { flex: 1 1 100%; min-width: 0; }
+.row--test .row__sub { overflow-wrap: anywhere; word-break: break-all; }
+.row--test .row__sub--path { font-family: var(--font-mono); font-size: 12px; line-height: 1.4; color: var(--text-2); }
+
 /* 警告行 */
 .row--warn {
   margin-top: 12px;
