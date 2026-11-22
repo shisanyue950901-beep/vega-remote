@@ -1098,7 +1098,7 @@ pub fn mobile_config_payload(server: &str, relay: &str, key: &str) -> Result<Str
         relay: &'a str,
         key: &'a str,
     }
-    let json = serde_json::to_string(&Payload { host: server, relay, key: &key })
+    let json = serde_json::to_string(&Payload { host: server, relay, key: key.as_str() })
         .map_err(|_| "生成二维码内容失败".to_string())?;
     let payload = format!("config={json}");
     // qrcode 只在分段完成后才判定容量；这里先按上限拒绝，省掉一次无效编码。
@@ -1987,10 +1987,8 @@ key = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='
         let host_ok = "a".repeat(MOBILE_FIELD_MAX_BYTES);
         let payload = mobile_config_payload(&host_ok, "", MOBILE_KEY).unwrap();
         assert!(payload.len() <= MOBILE_PAYLOAD_MAX_BYTES, "{}", payload.len());
-        assert_valid_matrix(
-            qr_matrix(&payload).unwrap().0,
-            &qr_matrix(&payload).unwrap().1,
-        );
+        let (size, modules) = qr_matrix(&payload).unwrap();
+        assert_valid_matrix(size, &modules);
 
         let host_bad = "a".repeat(MOBILE_FIELD_MAX_BYTES + 1);
         let err = mobile_config_payload(&host_bad, "", MOBILE_KEY).unwrap_err();
