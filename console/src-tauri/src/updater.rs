@@ -156,8 +156,7 @@ async fn install_via(app: &AppHandle, endpoint: &str) -> Result<(), String> {
     download_and_install(app, update).await
 }
 
-async fn download_and_install(app: &AppHandle, update: Update) -> Result<(), String> {
-    let mut update = update;
+async fn download_and_install(app: &AppHandle, mut update: Update) -> Result<(), String> {
     // builder 的超时不会带进下载请求（`Update.timeout` 默认 None），这里单独补 10 分钟。
     update.timeout = Some(DOWNLOAD_TIMEOUT);
 
