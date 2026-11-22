@@ -13,6 +13,9 @@ interface TauriGlobal {
   window?: { getCurrentWindow(): TauriWindowHandle };
   core?: { invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> };
   clipboardManager?: { writeText(text: string): Promise<void> };
+  event?: {
+    listen<T>(event: string, handler: (event: { payload: T }) => void): Promise<() => void>;
+  };
 }
 
 declare global {
@@ -106,6 +109,20 @@ interface DoctorReport {
   snapshotId: number;
   snapshotAvailable: boolean;
   items: DoctorItem[];
+}
+
+/** `check_update` 返回值；`error` 非空时其余字段不可信。 */
+interface UpdateView {
+  available: boolean;
+  current: string;
+  latest: string;
+  notes: string;
+  error: string;
+}
+
+interface UpdateProgress {
+  downloaded: number;
+  total: number | null;
 }
 
 let currentDeviceCode = "";
@@ -1728,6 +1745,111 @@ function setupIncomingDialog(): void {
   }, 1000);
 }
 
+/* ---------- 自动更新 ---------- */
+function setupUpdater(): void {
+  const status = byId<HTMLSpanElement>("update-status");
+  const badge = byId<HTMLButtonElement>("update-badge");
+  const checkButton = byId<HTMLButtonElement>("update-check");
+  const installButton = byId<HTMLButtonElement>("update-install");
+  const progress = byId<HTMLDivElement>("update-progress");
+  const bar = byId<HTMLSpanElement>("update-progress-bar");
+
+  let latest = "";
+  let installing = false;
+  let autoChecked = false;
+
+  const setInstalling = (value: boolean): void => {
+    installing = value;
+    checkButton.disabled = value;
+    installButton.disabled = value || !latest;
+  };
+
+  const showProgress = (payload: UpdateProgress): void => {
+    progress.classList.remove("is-hidden");
+    const total = payload.total ?? 0;
+    const percent = total > 0 ? Math.min(100, Math.round((payload.downloaded / total) * 100)) : 40;
+    bar.style.width = `${percent}%`;
+    progress.setAttribute("aria-valuenow", String(percent));
+    const mb = (payload.downloaded / (1024 * 1024)).toFixed(1);
+    const totalMb = (total / (1024 * 1024)).toFixed(1);
+    setStatus(status, total > 0 ? `正在下载更新… ${mb} / ${totalMb} MB` : `正在下载更新… ${mb} MB`);
+  };
+
+  const render = (view: UpdateView | null, silent: boolean): void => {
+    if (!view) {
+      if (!silent) setStatus(status, "当前环境不支持自动更新", "warn");
+      return;
+    }
+    if (view.current) {
+      byId<HTMLSpanElement>("about-version").textContent = `v${view.current}`;
+    }
+    if (view.error) {
+      if (!silent) setStatus(status, view.error, "error");
+      return;
+    }
+    latest = view.available ? view.latest : "";
+    badge.classList.toggle("is-hidden", !view.available);
+    badge.textContent = view.available ? `有新版本 ${view.latest}` : "有新版本";
+    setStatus(
+      status,
+      view.available ? `发现新版本 v${view.latest}` : `当前已是最新版本（v${view.current}）`,
+      "ok",
+    );
+    installButton.disabled = !view.available || installing;
+  };
+
+  badge.addEventListener("click", () => navigateTo("settings"));
+
+  const check = async (silent: boolean): Promise<void> => {
+    if (installing) return;
+    checkButton.disabled = true;
+    if (!silent) setStatus(status, "正在检查更新…");
+    const view = await invoke<UpdateView>("check_update");
+    checkButton.disabled = false;
+    render(view, silent);
+  };
+
+  checkButton.addEventListener("click", () => {
+    void check(false);
+  });
+
+  installButton.addEventListener("click", () => {
+    if (installing || !latest) return;
+    setInstalling(true);
+    progress.classList.remove("is-hidden");
+    setStatus(status, "正在准备下载更新…");
+    const core = window.__TAURI__?.core;
+    if (!core) {
+      setInstalling(false);
+      setStatus(status, "当前环境不支持自动更新", "warn");
+      return;
+    }
+    core.invoke<void>("install_update").catch((error: unknown) => {
+      const message = typeof error === "string" && error ? error : "启动更新失败，请稍后重试";
+      setInstalling(false);
+      progress.classList.add("is-hidden");
+      setStatus(status, message, "error");
+    });
+  });
+
+  const listen = window.__TAURI__?.event?.listen;
+  if (listen) {
+    void listen<UpdateProgress>("vega://update-progress", (event) => showProgress(event.payload));
+    void listen<string>("vega://update-error", (event) => {
+      setInstalling(false);
+      progress.classList.add("is-hidden");
+      setStatus(status, event.payload || "更新失败，请稍后重试", "error");
+    });
+  }
+
+  // 启动 5 秒后静默检查一次；每次启动最多一次，失败不打扰用户。
+  window.setTimeout(() => {
+    if (autoChecked) return;
+    autoChecked = true;
+    void check(true);
+  }, 5000);
+}
+
 /* ---------- 自绘标题栏 ---------- */
 function setupWindowControls(): void {
   const current = window.__TAURI__?.window?.getCurrentWindow();
@@ -1753,6 +1875,7 @@ function main(): void {
   setupSettingsPage();
   setupStreamingPage();
   setupIncomingDialog();
+  setupUpdater();
   setupWindowControls();
 
   // 两页共用一份配置快照；启动时读一次，focus 时再刷新并复查设备码/安装状态。
