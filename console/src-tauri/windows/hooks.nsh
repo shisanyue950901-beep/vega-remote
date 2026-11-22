@@ -29,9 +29,12 @@
 ;     控制台 password.rs 在每次提权前校验助手父目录的 ACL。
 ;   * t6b-fix2（架构裁定）：ACL 锁定改到解包之前——安装节在校验通过后先
 ;     CreateDirectory $INSTDIR 并 Call VegaLockInstallDir，任一 icacls 失败立即
-;     SetErrorLevel 2 + Abort，不会把文件解到未锁定的目录；POSTINSTALL 再锁一次
+;     SetErrorLevel 2 + Abort，不会把文件解到未锁定的目录；POSTINSTALL 再收紧一次
 ;     （第二次失败只写完成页告警）。VegaValidateTarget 同时拒绝目标树里的重解析点
 ;     和无法枚举的目录；/D= 判定改为 .onInit 开头备份 $INSTDIR（$CMDLINE 里已无 /D=）。
+;   * t6b-fix3（架构裁定 2）：解包之后禁止再 `/reset`——解包后只用
+;     VegaTightenInstallDir（setowner + inheritance:r/grant:r 两条，每条检查退出码），
+;     `/reset` 只允许出现在解包前的预锁定 VegaLockInstallDir 里。
 ;   * t6-fix2（用户 2026-11-22）：旧安装器有目录选择页，旧版可能装在 D:\Vega 这类固定目录
 ;     之外。PREINSTALL 从 Tauri 的卸载注册表项读出旧安装目录，清理旧目录，避免机器上
 ;     两份 Vega 并存。旧目录清理失败只提示，不阻断安装；RustDesk 配置、%ProgramData%\Vega
@@ -464,6 +467,16 @@ vega_reparse_done_${ID}_${__LINE__}:
 ; 失败结果写进 $vegaAclWarning（空 = 三条都成功）：安装节开头的预锁定调用据此
 ; SetErrorLevel 2 + Abort（此时还没解包任何文件）；POSTINSTALL 的第二次调用只把
 ; 它追加到完成页（程序已经装好了）。$SYSDIR 绝对路径调用 icacls：提权上下文里
+;
+; t6b-fix3（架构裁定 2）：**解包之后不许再 `/reset`。** 这一条最要命：解包出来的
+; 文件/目录此刻靠继承拿到正确 ACL，`/reset` 先把它们打回继承态（目录被改成可继承
+; 之前先「无 ACE」的一瞬）再靠 `/T` 重新下发；盘根继承了 Users 写权限的机器上，
+; 普通账户就在这个窗口里能替换刚写好的 vega-console.exe / 提权助手，等于把 runas
+; 执行权交出去。所以：
+;   * VegaLockInstallDir（解包前预锁定）保留三条命令，含唯一允许的 `/reset /T`
+;     —— 那时目标目录还是空壳，清的是上一版遗留的显式 ACE；
+;   * VegaTightenInstallDir（解包后，POSTINSTALL 调用）只有 setowner 与
+;     inheritance:r / grant:r 两条，绝不动 `/reset`。
 ; 按名称搜索会被 PATH 劫持。
 Function VegaLockInstallDir
   Push $0
@@ -487,6 +500,32 @@ vega_acl_fail:
   DetailPrint "$vegaAclWarning"
 vega_acl_done:
   Pop $2
+  Pop $1
+  Pop $0
+FunctionEnd
+
+; t6b-fix3（架构裁定 2）：解包后的第二次收紧。只有两条命令，没有 `/reset`：
+;   * /setowner *S-1-5-32-544 /T —— 所有者仍是 Administrators；
+;   * /inheritance:r /grant:r ... /T —— 重新断开继承并按 SID 下发最终 ACL。
+; 解包出来的文件本来就继承了目录 ACL，这一步只覆盖解包期间新增/改写的子项，
+; 顺带把中途出现的继承标记再断一次。每条都检查退出码，失败只写 $vegaAclWarning
+; （POSTINSTALL 期间程序已经装好，Abort 只会留下半装状态），完成页会显示它。
+Function VegaTightenInstallDir
+  Push $0
+  Push $1
+  StrCpy $vegaAclWarning ""
+  DetailPrint "收紧安装目录权限（解包后，仅管理员可写）：$INSTDIR"
+  nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR" /setowner *S-1-5-32-544 /T /C /Q'
+  Pop $0
+  nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /T /C /Q'
+  Pop $1
+  StrCmp $0 "0" 0 vega_acl_post_fail
+  StrCmp $1 "0" 0 vega_acl_post_fail
+  Goto vega_acl_post_done
+vega_acl_post_fail:
+  StrCpy $vegaAclWarning "安装目录权限设置失败（icacls 返回 $0/$1），长期密码不可用"
+  DetailPrint "$vegaAclWarning"
+vega_acl_post_done:
   Pop $1
   Pop $0
 FunctionEnd
@@ -727,10 +766,11 @@ vega_preinstall_dir_done:
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
-  ; t6b-fix2：第二次 ACL 锁定。安装节开头已经预锁定过（失败会 Abort），这里对
-  ; 解包出来的文件再锁一遍（文件本来就会继承目录 ACL，主要覆盖解包期间新增/改写
-  ; 的子项）；失败只写完成页告警，不 Abort（程序已经装好了）。
-  Call VegaLockInstallDir
+  ; t6b-fix3（架构裁定 2）：这里只调 VegaTightenInstallDir——setowner +
+  ; inheritance:r / grant:r 两条，**没有 `/reset`**。解包后 `/reset` 会把刚写好的
+  ; 文件打回继承态再重新下发，中间那一瞬在盘根继承 Users 写权限的机器上可被替换。
+  ; 失败只写完成页告警，不 Abort（程序已经装好了）。
+  Call VegaTightenInstallDir
   ; 新文件已就位：此时才清理旧目录、改快捷方式（见 VegaFinishPreviousInstall）。
   !insertmacro VegaFinishPreviousInstall
   ; t6-fix4（架构裁定）：
