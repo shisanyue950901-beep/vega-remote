@@ -10,9 +10,17 @@
 ## 0.5 安装包（Vega-Setup.exe）
 - [ ] Actions → Console → Artifacts 下载 `vega-setup-windows`，解压得 `Vega-Setup.exe`。
 - [ ] 双击后只弹一次 UAC；安装界面是简体中文且没有语言选择框，**有「选择安装目录」页**，默认 `C:\Program Files\Vega`（T6b 恢复该页；允许的位置只有 `C:\Program Files\Vega` 或 `X:\Vega`）。
-- [ ] 选 `D:\Vega` 安装：装完后 `icacls D:\Vega` 里所有者是 `BUILTIN\Administrators`，只有 SYSTEM/Administrators 完全控制、`BUILTIN\Users` 只有 `(OI)(CI)(RX)`，且没有继承来的 Users 写权限（`(I)` 拒绝项不该出现写权限）。
+- [ ] 选 `D:\Vega` 安装：装完后 `icacls D:\Vega` 里所有者是 `BUILTIN\Administrators`，只有 SYSTEM/Administrators 完全控制、`BUILTIN\Users` 只有 `(OI)(CI)(RX)`，三条都是非继承的显式 ACE（不带 `(I)`，模板为受保护 DACL），也不该出现任何继承来的 Users 写权限。
 - [ ] 选 `C:\Program Files\Vega` 安装（默认位置）后 `icacls "C:\Program Files\Vega"`：发生的是「根 `/setowner` → 根 DACL 用 SDDL 精确替换（受保护 DACL）→ `/setowner /T` → 子项 `\*` `/reset /T`」四步的最终结果，即没有额外的显式 ACE，只剩 SYSTEM/Administrators 完全控制与 Users 只读执行（ACL 对两种位置都执行，不再跳过 Program Files）。
-- [ ] 0.6.2 回归（空 DACL bug）：`icacls D:\Vega\vega-console.exe` 必须**不是**空 DACL——只有继承来的 `(I)` ACE（SYSTEM/Administrators `(F)`、Users `(RX)`，都没有 `(OI)(CI)` 之外的显式项）；双击能直接启动，普通用户可运行，管理员可覆盖重装，`del` 能删除。`icacls D:\Vega\resources\vega-pwhelper.ps1` 同理（只有继承 ACE）。
+- [ ] 0.6.2 回归（空 DACL bug），以 `D:\Vega` 为例逐条对：
+      - 根目录 `icacls D:\Vega`：**恰好三条** ACE，全部是 `(OI)(CI)` 且**不带 `(I)`**（即非继承的显式 ACE）——
+        `NT AUTHORITY\SYSTEM:(OI)(CI)(F)`、`BUILTIN\Administrators:(OI)(CI)(F)`、`BUILTIN\Users:(OI)(CI)(RX)`；
+        因为根 DACL 是受保护 DACL，不该出现任何 `(I)` 继承项（也不该出现 Users 的写/修改权限或额外拒绝项）。
+      - `icacls D:\Vega\vega-console.exe` 与 `icacls D:\Vega\resources\vega-pwhelper.ps1`：**三条 ACE 全部带 `(I)`**
+        （`(I)(F)` / `(I)(F)` / `(I)(RX)`，文件上不会带 `(OI)(CI)`），且**没有任何非继承 ACE**——
+        即文件自身的 DACL 为空、只剩继承项。若是空 DACL（`icacls` 只打出文件名、没有 ACE）就是 0.6.1 的 bug 复现。
+      - 子目录（如 `icacls D:\Vega\resources`）：继承 ACE 可以带 `(OI)(CI)(I)`，同样不该有非继承 ACE。
+      - 行为：双击能直接启动，普通用户（Users）可运行，管理员可覆盖重装，`del` 能删除。
 - [ ] 在 D:\Vega 安装上设置长期密码成功（控制台通过自选目录的 ACL 校验）。
 - [ ] 手动 `icacls D:\Vega /grant *S-1-5-32-545:(OI)(CI)M` 放开 Users 写权限后，再设置长期密码被拒绝，提示「Vega 安装目录权限不安全，无法设置长期密码。请重新运行安装包修复。」；恢复 ACL（重新运行安装包或按上面的 icacls 收紧）后又能设置。
 - [ ] 目录页校验：填 `D:\tools\Vega` 或 `D:\任意目录` 会被自动改成 `D:\Vega` 并弹出「Vega 只能安装在 …已改为 D:\Vega」；填 `\\server\share\Vega`（UNC）、U 盘/光驱路径被拒绝；`D:\Vega` 本身已存在、非空、且没有 `vega-console.exe`（例如先建 `D:\Vega` 并放一个文件）时被拒绝并提示「已存在且不为空，但不是 Vega 安装目录」；`vega-console.exe` 是同名**目录**时同样按「不是 Vega 安装目录」拒绝。
