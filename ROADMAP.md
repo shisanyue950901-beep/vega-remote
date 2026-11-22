@@ -308,6 +308,20 @@
   写权限（非默认配置）时，这一瞬里 `X:\Vega` 可被换成 junction/symlink。安装器随后会再扫
   一次目标树（发现重解析点即退出码 2 中止），但扫描与替换之间依旧是 TOCTOU。彻底修法要么
   在创建前锁定父目录，要么改用 `\??\` 句柄级 API 建目录，留待后续；本轮按裁定只记录。
+- 枚举错误码取不到（t6b-fix3d 终检第 5 项）：NSIS 内置 `FindNext` / `FindFirst` 不暴露
+  `GetLastError`，调用后单独 `kernel32::GetLastError` 读到的是别的 API 留下的码。因此
+  `VegaScanReparseTree` 与 `VegaValidateTarget` 的 `FindNext` 只把「错误标志或空名」当
+  **枚举结束**：`FindNext` 中途失败（IO 错误等）与正常结束**无法区分**，会被当成扫完。
+  `FindFirst` 的失败同样无法区分「目录在扫描途中消失」与「拒绝访问」，一律 fail closed
+  中止（提示里的错误码写 0 = 无法取得）。彻底修法：用 `System::Call` 直接调
+  `FindFirstFileW` / `FindNextFileW`（句柄 + `?e` 取码，`ERROR_NO_MORE_FILES`=18 为正常
+  结束），替换内置枚举命令，留待后续。
+- 不存在盘符的显式 `/D=` 会被静默丢弃（t6b-fix3d 终检第 4 项）：NSIS 在脚本执行前
+  就把 `/D=` 从 `$CMDLINE` 移除并写进 `$INSTDIR`，而 `/D=Q:\Vega` 这类**盘符不存在**的
+  目标会被预处理成空。于是 `.onInit` 的备份 `$vegaCmdlineDir` 为空、`$CMDLINE` 里也搜不到
+  `/d=`，安装器按「未指定」回退默认 `$PROGRAMFILES64\Vega`：命令行给了路径却装到别处且无
+  提示。脚本层拿不到被丢弃的原值，修法只能绕开 `/D=`：改用自己解析的参数（如 `/TARGET=`），
+  或在外层（发布脚本 / 快捷方式）先用 `GetFullPathNameW` + `GetDriveTypeW` 校验再拉起安装器。
 - 发布脚本不支持同一版本并行发布（单维护者手动运行；镜像 test→mv 之间无锁）。需要时在镜像端加 flock 或 `mv -n`。
 - 被动更新（`/P`）跳过完成页：旧 EXE 被占用、旧目录未清理的告警用户看不到。后续把告警写入 `%ProgramData%\Vega\install-notes.txt`，控制台启动时在设置页提示。
 - P2 响应大小（架构裁决：插件 API 无法设上限，本轮不修）：恶意大响应可使控制台 OOM，仅 DoS，签名仍保证不装恶意包。启动静默检查会整份缓冲清单，下载会整份缓冲安装包；现有 15 秒 / 10 分钟超时只限时间不限字节。
