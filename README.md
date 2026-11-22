@@ -11,8 +11,10 @@
    `C:\Program Files\Vega`（`$PROGRAMFILES64\Vega`，默认）或某个本地固定 NTFS 磁盘根目录下的 `Vega`（`X:\Vega`）。
    安装器的「选择安装目录」页接受这类选择；填了别的路径（例如 `D:\Tools\Vega`、`D:\`）时会自动规范成 `D:\Vega` 并提示，
    UNC、U 盘/光驱/网络盘、非 NTFS 盘、以及已存在且非空又不是 Vega 的目录直接拒绝。静默安装（`/S`、`/P`、`/D=`）走同一份校验：
-   目标不合法时安装中止并以 `2` 退出。安装完成后安装器**总是**用 `icacls /reset` + `/setowner` + `/inheritance:r` 把安装目录
-   权限重置并锁成「只有管理员可写」（`C:\Program Files\Vega` 也一样），失败时完成页提示「安装目录权限设置失败，长期密码不可用」。
+   目标不合法时安装中止并以 `2` 退出。安装完成后安装器**总是**把安装目录锁成「只有管理员可写」（`C:\Program Files\Vega` 也一样）：
+   根目录 `icacls /inheritance:r /grant:r <SYSTEM/Administrators/Users 三条 SID>`（**不带 `/T`**）→ `/setowner *S-1-5-32-544 /T`
+   → 已有子项 `"$INSTDIR\*" /reset /T` 只靠继承。0.6.2 起不再对目录带 `/T` 做 `/inheritance:r`
+   （那会让子文件 DACL 变空，装完连 exe 都跑不起来）。失败时完成页提示「安装目录权限设置失败，长期密码不可用」。
 3. 安装过程会自动装好 RustDesk 并写入自建中继配置（默认 `60.205.95.98`，见 `console/src-tauri/resources/vega-defaults.json`）。RustDesk 是 AGPL，安装包里**不含**它的二进制，安装时从官方 GitHub Release 下载固定版本并校验 SHA256。在线更新（安装器 `/UPDATE` 模式）与覆盖重装默认跳过这一步：不下载 RustDesk、不改写中继配置；只有 `C:\Program Files` 下找不到 `rustdesk.exe` 时才补装并配置。安装器没有上游的「重新安装 / 已安装」页，也不会运行旧卸载器。
 4. 如果 RustDesk 没装好（下载失败/哈希不符），Vega 仍会正常安装完成，并提示「RustDesk 未装好，请打开 Vega 按提示手动安装」；也可以直接到 <https://rustdesk.com/download> 手动下载安装。
 5. 卸载 Vega 时，安装包会按 `%ProgramData%\Vega\host-state.json` 里的记录回滚 RustDesk 中继配置；只有记录标明「由 Vega 安装」时才会连带卸载 RustDesk。
