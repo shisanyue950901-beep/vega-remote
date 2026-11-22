@@ -1,6 +1,7 @@
 ﻿#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod doctor;
+mod peers;
 mod rustdesk;
 mod scm;
 mod streaming;
@@ -38,6 +39,9 @@ fn main() {
             rustdesk::get_relay_defaults,
             rustdesk::connect_peer,
             rustdesk::get_recent_peers,
+            peers::get_peer_aliases,
+            peers::set_peer_alias,
+            peers::remove_peer,
             rustdesk::open_rustdesk_window,
             rustdesk::open_rustdesk_download_page,
             rustdesk::get_rustdesk_status,
