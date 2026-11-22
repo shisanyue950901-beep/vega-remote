@@ -14,9 +14,13 @@
 - [ ] 选 `C:\Program Files\Vega` 安装（默认位置）后 `icacls "C:\Program Files\Vega"`：发生的是 `/reset` + `/setowner` + `/inheritance:r /grant:r` 的最终结果，即没有额外的显式 ACE，只剩 SYSTEM/Administrators 完全控制与 Users 只读执行（ACL 对两种位置都执行，不再跳过 Program Files）。
 - [ ] 在 D:\Vega 安装上设置长期密码成功（控制台通过自选目录的 ACL 校验）。
 - [ ] 手动 `icacls D:\Vega /grant *S-1-5-32-545:(OI)(CI)M` 放开 Users 写权限后，再设置长期密码被拒绝，提示「Vega 安装目录权限不安全，无法设置长期密码。请重新运行安装包修复。」；恢复 ACL（重新运行安装包或按上面的 icacls 收紧）后又能设置。
-- [ ] 目录页校验：填 `D:\tools\Vega` 或 `D:\任意目录` 会被自动改成 `D:\Vega` 并弹出「Vega 只能安装在 …已改为 D:\Vega」；填 `\\server\share\Vega`（UNC）、U 盘/光驱路径被拒绝；填 `D:\Test`（已存在且非空、且没有 `vega-console.exe`，例如先建目录并放一个文件）被拒绝并提示；`vega-console.exe` 是同名**目录**时同样按「不是 Vega 安装目录」拒绝。
+- [ ] 目录页校验：填 `D:\tools\Vega` 或 `D:\任意目录` 会被自动改成 `D:\Vega` 并弹出「Vega 只能安装在 …已改为 D:\Vega」；填 `\\server\share\Vega`（UNC）、U 盘/光驱路径被拒绝；`D:\Vega` 本身已存在、非空、且没有 `vega-console.exe`（例如先建 `D:\Vega` 并放一个文件）时被拒绝并提示「已存在且不为空，但不是 Vega 安装目录」；`vega-console.exe` 是同名**目录**时同样按「不是 Vega 安装目录」拒绝。
 - [ ] 已装在 `D:\Vega` 的机器上重装 / 在线更新（`/P` 被动模式）：目录页默认值、静默安装的 `$INSTDIR` 都仍是 `D:\Vega`，不会跳回 Program Files，且不触发旧目录迁移。
-- [ ] 静默/被动安装绕过保护已被堵住：`Vega-Setup.exe /S /D=D:\Test`（`D:\Test` 已存在且非空、不是 Vega）——安装中止，退出码 2，`D:\Test` 里的原有文件（尤其是 `uninstall.exe`）没有被覆盖、ACL 也没有被改。
+- [ ] 静默/被动安装的 `/D=` 必须是允许的位置（t6b-fix3 起 `D:\Test` 不再被静默改到 `D:\Vega`，而是按无效目标中止）：
+      `Vega-Setup.exe /S /D=D:\Test`（`D:\Test` 已存在且非空、不是 Vega；`D:\Test` 不是 `X:\Vega` 形状）——安装中止，**退出码 2**，`D:\Test` 里的原有文件（尤其是 `uninstall.exe`）没有被覆盖、ACL 也没有被改，`D:\Vega` 里没有多出任何东西。
+- [ ] `Vega-Setup.exe /S /D=Q:\Vega`（Q: 盘不存在 / 未格式化）——安装中止，**退出码 2**，没有任何文件被写入。
+- [ ] `Vega-Setup.exe /S /D=`（空值，或 `/D="D:\Vega"` 带引号这种非法写法）——安装中止，**退出码 2**，不静默回落到 `C:\Program Files\Vega`。
+- [ ] 对照：`Vega-Setup.exe /S /D=D:\Vega` 与 `/S /D=C:\Program Files\Vega`（这两个就是允许的位置）正常装完，退出码 0。
 - [ ] 装完 `<安装目录>\resources\vega-defaults.json`（默认位置是 `C:\Program Files\Vega\resources\`）存在，且与仓库里的默认中继一致。
 - [ ] `<安装目录>\resources\host\install-rustdesk.ps1` 与 `...\host\lib\Vega.Common.psm1` 都存在。
 - [ ] `%ProgramData%\Vega\logs\setup.log` 有本次安装记录和 `[nsis] install-rustdesk.ps1 exit code:` 一行。

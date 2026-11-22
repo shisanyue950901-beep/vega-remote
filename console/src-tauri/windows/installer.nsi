@@ -411,12 +411,22 @@ Function .onInit
   ; 本项目当前是 perMachine，该 !if 不展开，位置对结果没有影响。
   ;
   ; /D= 优先级（架构裁定 4）：$vegaCmdlineDir 是 .onInit 第一行对 $INSTDIR 的备份。
-  ;   * 非空 —— 命令行给了 /D=，保留（随后由安装节开头的 VegaValidateTarget
-  ;     校验/规范化；无效目标的静默安装以退出码 2 结束）；
+  ;   * 非空 —— 命令行给了 /D=，必须**原样**落在允许的位置上（见下面 vega_init_cmdline_dir）；
   ;   * 空   —— 先试卸载注册表里的旧安装位置（校验通过才沿用），否则用默认位置。
   ; 交互模式下目录页的选择会覆盖这里，离页时同样走 VegaValidateTarget。
   StrCmp $vegaCmdlineDir "" 0 vega_init_cmdline_dir
 
+  ; t6b-fix3（架构裁定 4）：显式给了 /D= 却拿不到值（备份为空），不能静默回落到默认
+  ; 位置——用户以为自己指定了目录，装到别处比失败更糟。只**检测** `/D=` 是否还在
+  ; $CMDLINE 里，不用它解析路径：NSIS 要求 /D= 是最后一个参数，合法时会把它写进
+  ; $INSTDIR 并从 $CMDLINE 摘掉；`/D=` 空值、`/D="D:\Test"`（带引号）这类写法会留下痕迹。
+  ${StrCase} $R1 "$CMDLINE" "L"
+  ${StrLoc} $R0 "$R1" "/d=" ">"
+  StrCmp $R0 "" vega_init_no_cmdline_dir
+    StrCpy $vegaTargetError "命令行 /D= 指定的安装目录无效（/D= 必须是最后一个参数、不能带引号，且要有实际路径）。请去掉 /D=，或改成 /D=X:\Vega 后重试。"
+    Goto vega_init_cmdline_invalid
+
+vega_init_no_cmdline_dir:
   ; 没有 /D=：沿用上一次的安装位置，但必须能通过同一份目标校验（旧版可能装在
   ; t6b 之前任意自定义目录里；那种位置不再允许，回落到默认位置，旧目录由
   ; PREINSTALL 的迁移逻辑清理）。
@@ -434,7 +444,27 @@ Function .onInit
 vega_init_cmdline_dir:
   ; 恢复备份值：MULTIUSER_INIT 可能已经重写过 $INSTDIR，以 /D= 为准。
   StrCpy $INSTDIR "$vegaCmdlineDir"
+  ; t6b-fix3（架构裁定 4）：显式 /D= 必须是**有效目标**。这里跑同一份 VegaValidateTarget：
+  ;   * 有错误（不是本地固定 NTFS 盘、UNC、盘根写错……）→ 无效目标；
+  ;   * 被规范化（`D:\Test` 这种不是 <盘符>:\Vega 的路径会被改成 `D:\Vega`）→ 也算
+  ;     「用户给的 /D= 不是允许的位置」，不静默改到别处，直接按无效目标结束。
+  ; 交互模式下用户还能改目录页，但 /D= 与界面选择打架只会更混乱，同样中止。
+  Call VegaValidateTarget
+  StrCmp $vegaTargetError "" 0 vega_init_cmdline_invalid
+  StrCmp $vegaTargetChanged "1" vega_init_cmdline_moved
   Goto vega_init_dir_done
+
+vega_init_cmdline_moved:
+  StrCpy $vegaTargetError "命令行 /D= 指定的安装目录不是允许的位置（只能是 $PROGRAMFILES64\Vega 或 X:\Vega）。/D=X:\Vega 中的盘符必须是本地固定 NTFS 盘。"
+vega_init_cmdline_invalid:
+  DetailPrint "安装已中止：$vegaTargetError"
+  ${If} $PassiveMode = 1
+  ${OrIf} ${Silent}
+    SetErrorLevel 2
+  ${Else}
+    MessageBox MB_OK|MB_ICONSTOP "$vegaTargetError"
+  ${EndIf}
+  Abort
 
 vega_init_default:
   StrCpy $INSTDIR "$PROGRAMFILES64\Vega"
