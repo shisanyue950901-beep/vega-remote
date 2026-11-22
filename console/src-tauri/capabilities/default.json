@@ -24,6 +24,9 @@
     "allow-open-sunshine-settings",
     "allow-start-moonlight-stream",
     "allow-run-doctor",
-    "allow-export-doctor-log"
+    "allow-export-doctor-log",
+    "allow-get-password-status",
+    "allow-set-permanent-password",
+    "allow-clear-permanent-password"
   ]
 }
