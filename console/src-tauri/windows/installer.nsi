@@ -1109,10 +1109,12 @@ vega_validate_tree:
   ${StrCase} $vegaTmp2 "$vegaTmp2" "L"
   StrCmp $vegaTmp1 $vegaTmp2 vega_validate_parent_pf
   StrCpy $vegaTmp3 "$INSTDIR" 3
-  !insertmacro VegaIsReparsePoint parent "$vegaTmp3" $vegaTmp1
+  ; t6b-fix3（架构裁定 1）：两个插入点用不同 ID。以前都用 parent，同一个函数里两次展开
+  ; 产生重复标签 vega_reparse_check_parent，NSIS 直接报错（阻断构建）。
+  !insertmacro VegaIsReparsePoint parent_root "$vegaTmp3" $vegaTmp1
   Goto vega_validate_parent_checked
 vega_validate_parent_pf:
-  !insertmacro VegaIsReparsePoint parent "$PROGRAMFILES64" $vegaTmp1
+  !insertmacro VegaIsReparsePoint parent_pf "$PROGRAMFILES64" $vegaTmp1
 vega_validate_parent_checked:
   StrCmp $vegaTmp1 "0" vega_validate_walk
   StrCpy $vegaTargetError "安装目录的上一级（盘根或 Program Files）是重解析点（junction 或符号链接），出于安全原因拒绝安装。"
