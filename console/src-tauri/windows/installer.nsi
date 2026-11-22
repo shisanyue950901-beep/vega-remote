@@ -931,18 +931,28 @@ FunctionEnd
 ; FILE_ATTRIBUTE_REPARSE_POINT（0x400，junction / symlink / mount point）。
 ;   * 目标本身、其下任意目录或文件命中 → $vegaWalkFound=1，立即停止；
 ;   * 命中重解析目录不再向下展开（不跟随链接）；
-;   * 已存在的目录 FindFirst 失败（错误标志或空句柄）→ $vegaWalkError=1，
-;     绝不当作空目录继续（裁定 3）；路径不存在（INVALID_FILE_ATTRIBUTES）不算错误。
+;   * 无法枚举 → $vegaWalkError=1，绝不当作空目录继续（裁定 3）。
+;
+; t6b-fix3（架构裁定 5）：**「读不到」和「不存在」必须分开。**
+;   * 每次 GetFileAttributesW 都用 `?e` 把 GetLastError 取到 $vegaWalkErrCode；
+;     只有 2 (ERROR_FILE_NOT_FOUND) / 3 (ERROR_PATH_NOT_FOUND) 才算「真不存在」
+;     （新装目标、枚举途中被删的子项），其它错误码（5 拒绝访问、32 占用、206 太长、
+;     IO 错误……）一律中止：读不了属性就说明这棵树不可信，跳过等于放行。
+;   * FindNext 失败时取 GetLastError，只有 18 (ERROR_NO_MORE_FILES) 是正常结束；
+;     其它错误码中止。FindFirst 失败同理（先取码，2/3 视为目录已消失，其余中止）。
+;   * 子项属性读取失败也按上面的规则处理，绝不静默跳过。
 ; 用 NSIS 栈做迭代式深度优先：底部压哨兵，顶层压根；每弹出一个目录就枚举，
 ; 子目录压回栈顶。退出前（无论命中/出错/正常结束）都把栈清到哨兵，保持平衡。
-; 函数进出 Push/Pop $0-$4，不污染调用方。
+; 函数进出 Push/Pop $0-$5，不污染调用方。
 Function VegaScanReparseTree
   Push $0
   Push $1
   Push $2
   Push $3
   Push $4
+  Push $5
 
+  StrCpy $vegaWalkErrCode "0"
   Push "__VEGA_WALK_END__"
   Push "$vegaWalkPath"
 
@@ -952,9 +962,17 @@ vega_walk_pop:
   Pop $vegaWalkPath
   StrCmp $vegaWalkPath "__VEGA_WALK_END__" vega_walk_done
 
-  ; 不存在的路径（新装目标 / 枚举途中被删的子项）直接跳过。
-  System::Call 'kernel32::GetFileAttributesW(w "$vegaWalkPath") i .r0'
-  IntCmpU $0 0xFFFFFFFF vega_walk_pop
+  ; 属性 + GetLastError 一起取（?e 捕获调用后的错误码）。
+  System::Call 'kernel32::GetFileAttributesW(w "$vegaWalkPath") i .r0 ?e .r1'
+  IntCmpU $0 0xFFFFFFFF vega_walk_attrs_missing vega_walk_attrs_ok vega_walk_attrs_ok
+vega_walk_attrs_missing:
+  ; 只有 2 / 3 是「真不存在」；其它错误码一律中止，不跳过。
+  StrCmp $1 "2" vega_walk_pop
+  StrCmp $1 "3" vega_walk_pop
+  StrCpy $vegaWalkErrCode "$1"
+  StrCpy $vegaWalkError "1"
+  Goto vega_walk_pop
+vega_walk_attrs_ok:
   IntOp $1 ${FILE_ATTRIBUTE_REPARSE_POINT} & $0
   StrCmp $1 "0" vega_walk_not_reparse
     StrCpy $vegaWalkFound "1"
@@ -972,8 +990,17 @@ vega_walk_entry:
   StrCmp $2 "." vega_walk_next
   StrCmp $2 ".." vega_walk_next
   StrCpy $3 "$vegaWalkPath\$2"
-  System::Call 'kernel32::GetFileAttributesW(w "$3") i .r4'
-  IntCmpU $4 0xFFFFFFFF vega_walk_next
+  ; 子项属性同样带 ?e：读不到就中止，不静默跳过（裁定 5）。
+  System::Call 'kernel32::GetFileAttributesW(w "$3") i .r4 ?e .r5'
+  IntCmpU $4 0xFFFFFFFF vega_walk_child_missing vega_walk_child_ok vega_walk_child_ok
+vega_walk_child_missing:
+  ; 2 / 3：枚举期间被删，跳过这一项；其它错误码中止整次扫描。
+  StrCmp $5 "2" vega_walk_next
+  StrCmp $5 "3" vega_walk_next
+  StrCpy $vegaWalkErrCode "$5"
+  StrCpy $vegaWalkError "1"
+  Goto vega_walk_scan_done
+vega_walk_child_ok:
   IntOp $0 ${FILE_ATTRIBUTE_REPARSE_POINT} & $4
   StrCmp $0 "0" vega_walk_child
     StrCpy $vegaWalkFound "1"
@@ -983,13 +1010,27 @@ vega_walk_child:
   StrCmp $0 "0" vega_walk_next
   Push "$3"
 vega_walk_next:
+  ClearErrors
   FindNext $1 $2
+  IfErrors vega_walk_next_error
   StrCmp $2 "" vega_walk_scan_done
   Goto vega_walk_entry
+vega_walk_next_error:
+  ; 只有 18 (ERROR_NO_MORE_FILES) 是正常结束；其余错误码中止。
+  System::Call 'kernel32::GetLastError() i .r5'
+  StrCmp $5 "18" vega_walk_scan_done
+  StrCpy $vegaWalkErrCode "$5"
+  StrCpy $vegaWalkError "1"
+  Goto vega_walk_scan_done
 vega_walk_scan_done:
   FindClose $1
   Goto vega_walk_pop
 vega_walk_find_error:
+  ; FindFirst 失败：取错误码；2 / 3 说明目录在扫描中途消失（等同于不存在），其它中止。
+  System::Call 'kernel32::GetLastError() i .r5'
+  StrCmp $5 "2" vega_walk_pop
+  StrCmp $5 "3" vega_walk_pop
+  StrCpy $vegaWalkErrCode "$5"
   StrCpy $vegaWalkError "1"
   Goto vega_walk_pop
 
@@ -999,6 +1040,7 @@ vega_walk_cleanup:
   Goto vega_walk_cleanup
 
 vega_walk_done:
+  Pop $5
   Pop $4
   Pop $3
   Pop $2
@@ -1120,8 +1162,16 @@ vega_validate_programfiles:
 vega_validate_nonempty:
   ; 裁定 3：目标已存在时，FindFirst 失败（错误标志或空句柄）说明读不了目录，
   ; 不能当作空目录放行；只有确认路径不存在才走「空目录」语义。
-  System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR") i .r0'
-  IntCmpU $0 0xFFFFFFFF vega_validate_tree
+  ; t6b-fix3（架构裁定 5）：这个「不存在」也只认 GetLastError 2 / 3——其它错误码
+  ; （拒绝访问、IO 错误……）是读不了，按错误中止，不能当成空目录往下走。
+  System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR") i .r0 ?e .r2'
+  IntCmpU $0 0xFFFFFFFF vega_validate_attrs_missing vega_validate_scan_open vega_validate_scan_open
+vega_validate_attrs_missing:
+  StrCmp $2 "2" vega_validate_tree
+  StrCmp $2 "3" vega_validate_tree
+  StrCpy $vegaWalkErrCode "$2"
+  Goto vega_validate_scan_error
+vega_validate_scan_open:
   ClearErrors
   FindFirst $0 $1 "$INSTDIR\*.*"
   IfErrors vega_validate_scan_error
@@ -1132,9 +1182,18 @@ vega_validate_scan:
   StrCpy $vegaTargetEmpty "0"
   Goto vega_validate_scan_done
 vega_validate_scan_next:
+  ClearErrors
   FindNext $0 $1
+  IfErrors vega_validate_scan_next_error
   StrCmp $1 "" vega_validate_scan_done
   Goto vega_validate_scan
+vega_validate_scan_next_error:
+  ; 只有 18 (ERROR_NO_MORE_FILES) 是正常结束；其它错误码按读不了处理。
+  System::Call 'kernel32::GetLastError() i .r2'
+  StrCmp $2 "18" vega_validate_scan_done
+  StrCpy $vegaWalkErrCode "$2"
+  FindClose $0
+  Goto vega_validate_scan_error
 vega_validate_scan_done:
   FindClose $0
   StrCmp $vegaTargetEmpty "1" vega_validate_tree
@@ -1151,7 +1210,8 @@ vega_validate_not_vega:
   Goto vega_validate_done
 
 vega_validate_scan_error:
-  StrCpy $vegaTargetError "无法读取安装目录内容，请确认该目录存在且当前账户有读取权限。"
+  ; t6b-fix3（架构裁定 5）：错误码写进提示，便于区分「拒绝访问」和「IO 错误」。
+  StrCpy $vegaTargetError "无法读取安装目录内容（错误码 $vegaWalkErrCode），请确认该目录存在且当前账户有读取权限。"
   Goto vega_validate_done
 
 vega_validate_tree:
@@ -1183,7 +1243,7 @@ vega_validate_walk:
   StrCmp $vegaWalkFound "1" vega_validate_reparse
   Goto vega_validate_ok
 vega_validate_walk_error:
-  StrCpy $vegaTargetError "无法读取安装目录内容，请确认该目录存在且当前账户有读取权限。"
+  StrCpy $vegaTargetError "无法读取安装目录内容（错误码 $vegaWalkErrCode），请确认该目录存在且当前账户有读取权限。"
   Goto vega_validate_done
 vega_validate_reparse:
   StrCpy $vegaTargetError "安装目录或其子项是重解析点（junction 或符号链接），解包和 ACL 会跟着链接跑到目录外，出于安全原因拒绝安装。请移除链接后重试。"
