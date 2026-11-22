@@ -543,12 +543,31 @@ vega_old_done:
   StrCmp $vegaMigratePending "1" 0 vega_mig_done
   StrCpy $vegaMigratePending "0"
   ; 双保险：新主程序必须已在固定目录里，否则保留旧版不动。
+  ; 同名目录也会让 IfFileExists 成立：用「路径\*.*」排除目录，只认真正的文件。
+  IfFileExists "${VEGA_INSTALL_DIR}\uninstall.exe\*.*" vega_mig_new_missing
+  IfFileExists "${VEGA_INSTALL_DIR}\vega-console.exe\*.*" vega_mig_new_missing
   IfFileExists "${VEGA_INSTALL_DIR}\uninstall.exe" 0 vega_mig_new_missing
-  IfFileExists "${VEGA_INSTALL_DIR}\vega-console.exe" vega_mig_new_ok
+  IfFileExists "${VEGA_INSTALL_DIR}\vega-console.exe" vega_mig_new_same_check
 vega_mig_new_missing:
     StrCpy $vegaOldInstallWarning "新版主程序或卸载器没有写入 ${VEGA_INSTALL_DIR}，旧版 $vegaOldInstallDir 保持原样，请重新运行安装包。"
     DetailPrint "$vegaOldInstallWarning"
     Goto vega_mig_done
+vega_mig_new_same_check:
+  ; 盘符别名（subst）、挂载点等让两个字符串不同的路径指向同一目录：在固定目录写一个
+  ; 探针文件，再从旧路径看它是否出现。出现即同一目录，绝不删除。
+  ClearErrors
+  FileOpen $R0 "${VEGA_INSTALL_DIR}\.vega-migrate-probe" w
+  IfErrors vega_mig_probe_failed
+  FileClose $R0
+  IfFileExists "$vegaOldInstallDir\.vega-migrate-probe" 0 vega_mig_probe_differs
+    Delete "${VEGA_INSTALL_DIR}\.vega-migrate-probe"
+    DetailPrint "旧版目录 $vegaOldInstallDir 与 ${VEGA_INSTALL_DIR} 是同一目录（别名），不清理。"
+    Goto vega_mig_done
+vega_mig_probe_failed:
+    DetailPrint "无法在 ${VEGA_INSTALL_DIR} 写入迁移探针，为安全起见不清理旧目录。"
+    Goto vega_mig_done
+vega_mig_probe_differs:
+  Delete "${VEGA_INSTALL_DIR}\.vega-migrate-probe"
 vega_mig_new_ok:
   DetailPrint "发现旧版 Vega 装在 $vegaOldInstallDir，删除旧程序文件（不运行旧卸载器，RustDesk 与配置保持原样）…"
 
