@@ -82,20 +82,29 @@ pub(crate) fn write_recent_at(path: &Path, list: &[String]) -> Result<(), String
         serde_json::to_string_pretty(&payload).map_err(|e| format!("序列化最近设备码失败：{e}"))?;
     rustdesk::write_atomic(path, &text)
 }
+/// 删除本地记录：先删别名，再写 recent。
+///
+/// 别名残留是无害的（下次改名会覆盖、列表里也不会再出现），recent 残留则会让
+/// 设备在「最近连接」里再次显示，所以把易失败的那一步放前面：别名写失败直接
+/// 返回、recent 保持原样；recent 写失败则明确告知别名已移除、需要重试。
+/// 不做跨实例锁（见 ROADMAP「T4 加固」）。
 pub(crate) fn remove_peer_at(recent: &Path, aliases: &Path, peer_id: &str) -> Result<bool, String> {
     let id = normalize_peer_id(peer_id)?;
+    let mut map = read_aliases_at(aliases);
+    let alias_removed = map.remove(&id).is_some();
+    if alias_removed {
+        write_aliases_at(aliases, &map)
+            .map_err(|e| format!("移除本地别名失败，最近记录未改动：{e}"))?;
+    }
     let mut list = rustdesk::read_recent_peers_at(recent);
     let before = list.len();
     list.retain(|entry| entry != &id);
-    let removed = list.len() != before;
-    if removed {
-        write_recent_at(recent, &list)?;
+    let recent_removed = list.len() != before;
+    if recent_removed {
+        write_recent_at(recent, &list)
+            .map_err(|e| format!("写入最近设备记录失败（别名已移除，请重试）：{e}"))?;
     }
-    let mut map = read_aliases_at(aliases);
-    if map.remove(&id).is_some() {
-        write_aliases_at(aliases, &map)?;
-    }
-    Ok(removed)
+    Ok(alias_removed || recent_removed)
 }
 fn aliases_for_app(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(aliases_path(&rustdesk::recent_path(app)?))
@@ -181,6 +190,16 @@ mod tests {
         assert_eq!(read_aliases_at(&aliases).get("123456789").map(String::as_str), Some("书房"));
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "不应留下临时文件");
         assert!(!set_alias_at(&aliases, "123456789", "   ").unwrap());
+        assert!(read_aliases_at(&aliases).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn remove_peer_with_only_alias_succeeds() {
+        let dir = temp_dir("alias-only");
+        let recent = dir.join("recent-ids.json");
+        let aliases = dir.join(ALIAS_FILE);
+        set_alias_at(&aliases, "123456789", "只剩别名").unwrap();
+        assert!(remove_peer_at(&recent, &aliases, "123456789").unwrap());
         assert!(read_aliases_at(&aliases).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
