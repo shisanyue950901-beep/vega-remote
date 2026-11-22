@@ -17,6 +17,10 @@
 ;     读取并显示，读完删除。
 ;   * t3-fix9 P2：去掉日志 WARN 兜底解析。结果文件缺失（旧脚本 / 写失败）时完成页
 ;     显示固定中文指引：完全退出 RustDesk、在 RustDesk 里启用服务后重新运行 Vega 安装。
+;   * t6-fix（用户 2026-11-22）：安装器不再显示“选择安装目录”页，安装路径固定为
+;     $PROGRAMFILES64\Vega。原因：长期密码助手 resources\vega-pwhelper.ps1 必须位于
+;     系统 Program Files 下（默认 ACL 只允许管理员写），用户自选目录可能落在普通用户
+;     可写的位置，UAC 之后拉起该目录里的脚本就等于把提权执行权交给普通用户。
 ;
 ; 注意：本文件在 tauri 的 installer.nsi 顶部（MUI 页面插入之前）被 include，
 ; 所以这里的 !define 能影响完成页文案；MUI_FINISHPAGE_TEXT 里放的是运行时变量。
@@ -31,6 +35,21 @@ Var vegaLogArgument
 Var vegaRetryCommand
 Var vegaResultFile
 Var vegaResultReason
+
+; t6-fix：安装路径固定。$PROGRAMFILES64 保留原生 Program Files（Tauri 的 NSIS stub 是
+; 32 位进程，$PROGRAMFILES 会被重定向到 Program Files (x86)，所以这里不用它）。
+!ifndef VEGA_INSTALL_DIR
+  !define VEGA_INSTALL_DIR "$PROGRAMFILES64\Vega"
+!endif
+
+; t6-fix：去掉“选择安装目录”页。本文件在 installer.nsi 顶部、MUI 页面插入之前被 include，
+; MUI2 这时已经定义好 MUI_PAGE_DIRECTORY 宏，把宏换成空实现后安装器就不再插入目录页。
+; 即使将来模板顺序变化、目录页仍然出现，$INSTDIR 也会在 PREINSTALL 里被改写回固定路径。
+!ifdef MUI_PAGE_DIRECTORY
+  !undef MUI_PAGE_DIRECTORY
+  !macro MUI_PAGE_DIRECTORY
+  !macroend
+!endif
 
 ; 安装失败时改写完成页文案（$vegaFinishText 在页面显示时按当时的值展开）。
 ; MUI2 在 include 时已给出默认 MUI_FINISHPAGE_TEXT，这里先 undef 再定义，避免重定义告警。
@@ -288,6 +307,17 @@ vega_unsetup_failed:
     DetailPrint "RustDesk 回滚未完成（退出码 $0），安装记录已保留。"
     DetailPrint "可重试：$vegaRetryCommand"
 vega_unsetup_skip:
+!macroend
+
+; t6-fix：安装路径固定。Tauri 在 PREINSTALL 之后才复制文件、写注册表与快捷方式，
+; 所以在这里改写 $INSTDIR 就足以让整个安装（含 UninstallString、更新器的安装位置）
+; 落到 $PROGRAMFILES64\Vega；/D 参数、旧版注册表里的 InstallLocation、目录页的选择
+; 都不会改变结果。
+!macro NSIS_HOOK_PREINSTALL
+  StrCmp $INSTDIR "${VEGA_INSTALL_DIR}" vega_preinstall_dir_done
+    DetailPrint "安装目录固定为 ${VEGA_INSTALL_DIR}（忽略请求的 $INSTDIR）"
+    StrCpy $INSTDIR "${VEGA_INSTALL_DIR}"
+vega_preinstall_dir_done:
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
