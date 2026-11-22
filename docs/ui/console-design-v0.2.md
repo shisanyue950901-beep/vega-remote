@@ -29,7 +29,7 @@
 - 下面分组列表「访问密码」：
   - 行 1 临时密码：右侧「查看」→ 打开 RustDesk 主窗口（控制台不读取临时密码，保持原约束）。
   - 行 2 长期密码：未设置显示「未设置 ›」，已设置显示「已设置 ›」；点击进入设置页长期密码区。
-  - 行 3 验证方式：分段控件「临时 / 长期 / 两者」，对应 RustDesk `verification-method` = use-temporary-password / use-permanent-password / use-both-passwords；长期密码未设置时只能选「临时」。
+  - 行 3 验证方式：分段控件「临时 / 长期 / 两者」只读显示 RustDesk `verification-method` 当前生效值（use-temporary-password / use-permanent-password / use-both-passwords）；点击任一段跳到设置页长期密码表单，验证方式与密码一起提交，协助页不再单独修改。
 - 主按钮「复制邀请」（原“复制并分享”）：复制一段文字（设备码 + 提示对方用临时密码），不含任何密码。
 - 分组列表「连接其他设备」：一个大输入框（圆角 14，高 52，占位「输入对方设备码」，不截断——宽度自适应），右侧圆形渐变箭头按钮发起连接；下方分段控件「远程控制 / 文件传输」；输入框聚焦时下拉最近 10 条（已有 get_recent_peers）。
 - 删掉：WinGet 提示整段（安装包已自带 RustDesk 下载）；孤立的「来自」标签。RustDesk 未安装时才在 hero 卡下显示一条警告行「未检测到 RustDesk · 重新运行安装程序」。

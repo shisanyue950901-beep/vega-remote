@@ -6,7 +6,7 @@
   载荷字段 {mode,password,verification,expires}：mode 为 set|clear，30 秒内有效，clear 不带 password。
   修改 RustDesk 之前先确认服务 RustDesk 存在且 Running，并在每次 CLI 修改前重新复核 expires。
   退出码 0 成功 / 10 载荷无效、过期或无法清理 / 11 找不到 RustDesk / 12 RustDesk 拒绝修改或服务未运行 /
-  13 验证方式回读不一致 / 14 调用 RustDesk 超时（结果未知）。
+  13 密码已改但验证方式未更新或回读不一致 / 14 调用 RustDesk 超时（结果未知）。
   stderr 只写固定短句，不输出异常原文，也不输出密码；--password 在提权进程中短暂可见（见 SECURITY.md）。
   点源只加载函数、不执行 Main，供 tests/vega-pwhelper.Tests.ps1 单测。
 #>
@@ -147,8 +147,9 @@ function Test-VegaRustDeskService {
     return ($service.Status -eq [System.ServiceProcess.ServiceControllerStatus]::Running)
 }
 # 唯一外部调用点，测试 Mock 它；stdout+stderr 合并成文本，便于确认 `Done!` 与回读值。
-# 用 [Diagnostics.Process] 加 $script:CallTimeoutSeconds 超时：RustDesk 卡住时不能把提权助手一起挂死，
-# 超时抛固定 'timeout'，由 Main 映射为 14（结果未知）。参数逐个别名加引号，密码字符集不含引号与空格。
+# 用 [Diagnostics.Process] 加 $script:CallTimeoutSeconds 超时：RustDesk 卡住时不能把提权助手一起挂死。
+# 进程退出与两个读取任务共用一个截止时间：超时先 Kill（让管道关闭）再限时读输出，任何一步超时都抛
+# 固定 'timeout'，由 Main 映射为 14（结果未知）。参数逐个别名加引号，密码字符集不含引号与空格。
 function Invoke-VegaRustDesk {
     param([string[]]$Arguments = @())
     $exe = Get-VegaRustDeskPath
@@ -164,12 +165,20 @@ function Invoke-VegaRustDesk {
     $process.StartInfo = $start
     if (-not $process.Start()) { throw 'rustdesk' }
     try {
+        $deadline = (Get-Date).AddSeconds($script:CallTimeoutSeconds)
         $out = $process.StandardOutput.ReadToEndAsync()
         $err = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit($script:CallTimeoutSeconds * 1000)) {
+        $remaining = [int][Math]::Max(0, ($deadline - (Get-Date)).TotalMilliseconds)
+        $exited = $process.WaitForExit($remaining)
+        if (-not $exited) {
+            # 先杀进程：子进程不退时管道不会关闭，读取任务会一直挂住。
             try { $process.Kill() } catch { }
-            throw 'timeout'
+            try { $null = $process.WaitForExit(2000) } catch { }
         }
+        $remaining = [int][Math]::Max(0, ($deadline - (Get-Date)).TotalMilliseconds)
+        # 读输出也必须限时：ReadToEndAsync().Result 在管道未关时会无限等。
+        if (-not $out.Wait($remaining) -or -not $err.Wait($remaining)) { throw 'timeout' }
+        if (-not $exited) { throw 'timeout' }
         return ([string]$out.Result + [string]$err.Result)
     } finally {
         $process.Dispose()
@@ -203,7 +212,8 @@ function Main {
         $output = [string](Invoke-VegaRustDesk -Arguments @('--password', $password))
         if ($output -notmatch 'Done!') { Write-VegaHelperError 'RustDesk 拒绝修改密码'; return 12 }
         # 第二次 CLI 修改前再复核一次期限：等待 UAC 与首次调用都可能耗掉 30 秒。
-        if (-not (Test-VegaPayloadFresh -Expires $expires)) { Write-VegaHelperError '载荷已过期'; return 10 }
+        # 此时密码已经改成，不能再报「载荷无效或过期」；13 表示密码已改、验证方式未更新。
+        if (-not (Test-VegaPayloadFresh -Expires $expires)) { Write-VegaHelperError '密码已修改，验证方式未更新'; return 13 }
         $null = Invoke-VegaRustDesk -Arguments @('--option', 'verification-method', $verification)
         $back = [string](Invoke-VegaRustDesk -Arguments @('--option', 'verification-method'))
     } catch {

@@ -4,7 +4,7 @@
   点源只加载函数、不执行 Main；rustdesk.exe 一律 Mock，载荷文件只落在 $TestDrive，文件名符合生产正则。
   断言重点：载荷名/重解析点/过期/字段校验全部退 10 且不碰 RustDesk、读取函数真正销毁文件、首次调用
   RustDesk 时文件已不存在、`Done!` 缺失与回读不一致分别退 12/13、服务未运行退 12、修改前过期退 10、
-  调用超时退 14，以及 stderr 与输出都不含密码。
+  调用超时退 14、Done! 之后到期退 13，以及 stderr 与输出都不含密码。
 #>
 
 BeforeAll {
@@ -174,6 +174,19 @@ Describe 'Main' {
         $text | Should -Match '拒绝修改'
         $text | Should -Not -Match 'Sup3rSecret'
         Test-Path -LiteralPath $path | Should -BeFalse
+    }
+
+    It 'Done! 之后到期退 13（密码已改、验证方式未更新）' {
+        $fields = & $script:baseFields
+        $path = & $script:newPayload -Fields $fields
+        # 第一次复核（改密码前）通过，第二次（写验证方式前）已过期。
+        $script:freshCalls = 0
+        Mock Test-VegaPayloadFresh { $script:freshCalls++; return ($script:freshCalls -le 1) }
+
+        Main -InputFile $path | Should -Be 13
+
+        Should -Invoke Invoke-VegaRustDesk -Times 1 -Exactly
+        ($script:captured -join "`n") | Should -Match '密码已修改'
     }
 
     It '验证方式回读不一致时退 13' {

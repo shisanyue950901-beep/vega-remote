@@ -14,6 +14,8 @@ const SYMBOLS: &str = "!#$%&*+,-./:;<=>?@^_~";
 const CLEAR_VERIFICATION: &str = "use-temporary-password";
 const SW_HIDE: i32 = 0;
 const ERROR_CANCELLED: u32 = 1223;
+/// `RPC_E_CHANGED_MODE`（0x80010106）：线程已用别的模型初始化 COM，此时不再 CoUninitialize。
+const RPC_E_CHANGED_MODE: i32 = 0x8001_0106u32 as i32;
 /// 句柄/等待相关常量：与 `Win32::System::Threading` 的定义一致，此处本地定义以免误导入。
 const WAIT_OBJECT_0: u32 = 0;
 const WAIT_TIMEOUT: u32 = 258;
@@ -179,6 +181,30 @@ fn remove_if_exists(path: &Path) -> Result<(), String> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err.to_string()),
     }
+}
+/// 去掉 `\\?\` 扩展路径前缀（`\\?\UNC\srv\share` 还原成 `\\srv\share`）。
+/// `canonicalize` 在 Windows 上返回的正是带前缀的形式，PowerShell 的 `-File` 与路径比较都用去掉后的。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn strip_extended_prefix(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) => PathBuf::from(rest),
+        None => path.to_path_buf(),
+    }
+}
+/// 纯函数：规范化后的助手路径是否落在任一受信任根内。返回去掉 `\\?\` 的最终路径。
+/// 根与路径都先去前缀再比较，避免 `\\?\C:\Program Files` 与 `c:\program files` 因形式不同而漏判。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn trusted_helper_path(canonical: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
+    let final_path = strip_extended_prefix(canonical);
+    roots
+        .iter()
+        .map(|root| strip_extended_prefix(root))
+        .any(|root| under_root(&final_path, &root))
+        .then_some(final_path)
 }
 /// `path` 是否落在 `root` 目录内（Windows 路径按 ASCII 忽略大小写比较）。
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -356,22 +382,22 @@ fn helper_script(app: &tauri::AppHandle) -> Option<PathBuf> {
         dev.is_file().then_some(dev)
     })
 }
-/// 发行版必须把助手装在受保护目录（`%ProgramFiles%` / `%ProgramFiles(x86)%`）内：
+/// 发行版必须把助手装在受保护目录（系统 `Program Files`）内：
 /// 否则同用户进程可以改写这个 PowerShell 脚本，提权即被劫持。
+/// 根目录取自 `winpaths::program_files_dirs()`（已知文件夹 + 系统卷校验），不读可被启动环境改写的环境变量。
+/// 返回规范化并去掉 `\\?\` 的最终路径，交给 `-File` 使用。
 #[cfg(all(windows, not(debug_assertions)))]
-fn ensure_helper_location(helper: &Path) -> Result<(), String> {
+fn ensure_helper_location(helper: &Path) -> Result<PathBuf, String> {
     let canonical = std::fs::canonicalize(helper).map_err(|_| "无法定位提权助手".to_string())?;
-    let roots: Vec<PathBuf> = ["ProgramFiles", "ProgramFiles(x86)"]
-        .iter()
-        .filter_map(|key| std::env::var_os(key).map(PathBuf::from))
-        .collect();
-    let trusted = roots.iter().any(|root| {
-        std::fs::canonicalize(root).map(|root| under_root(&canonical, &root)).unwrap_or(false)
-    });
-    if trusted { Ok(()) } else { Err("Vega 未安装在受保护目录，无法设置长期密码".into()) }
+    let roots = crate::winpaths::program_files_dirs();
+    if roots.is_empty() {
+        return Err("无法确定系统 Program Files 目录，无法设置长期密码".into());
+    }
+    trusted_helper_path(&canonical, &roots)
+        .ok_or_else(|| "Vega 未安装在受保护目录，无法设置长期密码".into())
 }
 #[cfg(all(windows, debug_assertions))]
-fn ensure_helper_location(_: &Path) -> Result<(), String> { Ok(()) }
+fn ensure_helper_location(helper: &Path) -> Result<PathBuf, String> { Ok(strip_extended_prefix(helper)) }
 /// `%SystemRoot%\System32`（`GetSystemDirectoryW`）。
 #[cfg(windows)]
 fn system32_dir() -> Option<PathBuf> {
@@ -400,7 +426,7 @@ fn run_helper(app: &tauri::AppHandle, payload: &Path) -> Result<(), String> {
     };
 
     let helper = helper_script(app).ok_or_else(|| "找不到提权助手 vega-pwhelper.ps1".to_string())?;
-    ensure_helper_location(&helper)?;
+    let helper = ensure_helper_location(&helper)?;
     let system32 = system32_dir().ok_or_else(|| "找不到 System32 目录".to_string())?;
     let powershell = powershell_path().ok_or_else(|| "找不到系统 PowerShell".to_string())?;
     let args = build_helper_args(&helper, payload)?;
@@ -417,6 +443,11 @@ fn run_helper(app: &tauri::AppHandle, payload: &Path) -> Result<(), String> {
             (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
         )
     };
+    // 初始化失败且不是「本线程已是别的套间」时直接返回：没有 COM 就不能调 ShellExecuteExW。
+    // RPC_E_CHANGED_MODE 不增加引用计数，也不需要 CoUninitialize。
+    if hr < 0 && hr != RPC_E_CHANGED_MODE {
+        return Err(format!("无法初始化 COM（错误码 0x{:08X}）", hr as u32));
+    }
     let com_ready = hr >= 0;
 
     let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
@@ -498,6 +529,35 @@ mod tests {
             assert_eq!(map_verify(given).unwrap(), want);
         }
         assert!(map_verify("use-both-passwords").is_err() && map_verify("").is_err());
+    }
+    #[test]
+    fn trusted_helper_path_strips_verbatim_and_checks_prefix() {
+        let roots = vec![PathBuf::from(r"C:\Program Files"), PathBuf::from(r"\\?\C:\Program Files (x86)")];
+        let cases = [
+            (r"\\?\C:\Program Files\Vega\resources\vega-pwhelper.ps1", Some(r"C:\Program Files\Vega\resources\vega-pwhelper.ps1")),
+            (r"\\?\c:\program files\vega\resources\vega-pwhelper.ps1", Some(r"c:\program files\vega\resources\vega-pwhelper.ps1")),
+            (r"\\?\C:\Program Files (x86)\Vega\h.ps1", Some(r"C:\Program Files (x86)\Vega\h.ps1")),
+        ];
+        for (given, want) in cases {
+            assert_eq!(trusted_helper_path(Path::new(given), &roots), want.map(PathBuf::from), "{given}");
+        }
+        // 前缀必须按目录边界：`C:\Program Files Evil\` 不能冒充 `C:\Program Files\`。
+        for bad in [
+            r"\\?\C:\Program Files Evil\h.ps1",
+            r"C:\Program FilesEvil\h.ps1",
+            r"\\?\C:\Users\me\Program Files\Vega\h.ps1",
+            r"\\?\C:\Program FilesX\Vega\h.ps1",
+        ] {
+            assert_eq!(trusted_helper_path(Path::new(bad), &roots), None, "{bad}");
+        }
+        assert_eq!(trusted_helper_path(Path::new(r"C:\Program Files\Vega\h.ps1"), &[]), None);
+        assert_eq!(trusted_helper_path(Path::new(r"\\?\C:\Program Files"), &roots), Some(PathBuf::from(r"C:\Program Files")));
+    }
+    #[test]
+    fn strip_extended_prefix_handles_verbatim_forms() {
+        assert_eq!(strip_extended_prefix(Path::new(r"\\?\C:\Vega\h.ps1")), PathBuf::from(r"C:\Vega\h.ps1"));
+        assert_eq!(strip_extended_prefix(Path::new(r"\\?\UNC\srv\share\h.ps1")), PathBuf::from(r"\\srv\share\h.ps1"));
+        assert_eq!(strip_extended_prefix(Path::new(r"C:\Vega\h.ps1")), PathBuf::from(r"C:\Vega\h.ps1"));
     }
     #[test]
     fn under_root_is_case_insensitive_and_boundary_aware() {

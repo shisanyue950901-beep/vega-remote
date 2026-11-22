@@ -114,13 +114,15 @@ interface PasswordStatus {
   verifyMethod: string;
 }
 
-/** 验证方式：协助页分段选，设置页提交长期密码时一起带给 Rust。 */
+/** 验证方式：协助页只读显示，设置页提交长期密码时一起带给 Rust。 */
 type VerifyMethod = "temporary" | "permanent" | "both";
 
 let selectedVerify: VerifyMethod = "temporary";
+/** 设置页或清除进行中（含等待 UAC）：任何输入事件都不能把提交按钮重新点亮。 */
+let pwBusy = false;
 /** 设置页读到的密码状态刷新；协助页「未设置」文案由它统一更新。 */
 let refreshPasswordStatus: (() => void) | null = null;
-/** 协助页注册：验证方式分段的可选性与提示跟随密码状态。 */
+/** 协助页注册：验证方式只读展示跟随密码状态。 */
 let applyPasswordAvailability: ((status: PasswordStatus) => void) | null = null;
 /** 设置页注册：展开长期密码内联表单（主页「设置」跳转时用）。 */
 let openFixedPasswordForm: (() => void) | null = null;
@@ -129,16 +131,9 @@ function asVerifyMethod(raw: string): VerifyMethod {
   return raw === "permanent" || raw === "both" ? raw : "temporary";
 }
 
-let hasPermanentPassword = false;
-
-/** 未设长期密码时「长期」「两者」不可选：RustDesk 会拒绝这两种验证方式。 */
-function isVerifyMethodAvailable(method: VerifyMethod): boolean {
-  return method === "temporary" || hasPermanentPassword;
-}
-
 /** 只改分段的高亮与记忆值，不写 RustDesk：写盘发生在设置长期密码时。 */
 function selectVerifyMethod(method: VerifyMethod): void {
-  selectedVerify = isVerifyMethodAvailable(method) ? method : "temporary";
+  selectedVerify = method;
   const group = document.getElementById("verify-method");
   if (!group) {
     return;
@@ -605,33 +600,29 @@ function setupAssistPage(): void {
     });
   });
 
-  // 验证方式分段：只记住选择；真正写进 RustDesk 是在设置页提交长期密码时一起做。
+  // 验证方式分段只读：显示 RustDesk 里当前生效的值，点击一律跳到设置页的长期密码表单。
+  // 写盘只发生在设置/清除长期密码时，协助页不再单独改这个值。
   const verifyGroup = byId<HTMLDivElement>("verify-method");
   const verifyHint = byId<HTMLSpanElement>("verify-hint");
   const verifyButtons = Array.from(
     verifyGroup.querySelectorAll<HTMLButtonElement>(".seg__btn[data-verify]"),
   );
+  verifyGroup.setAttribute("aria-readonly", "true");
   verifyButtons.forEach((btn) => {
     btn.setAttribute("aria-pressed", btn.classList.contains("is-active") ? "true" : "false");
+    // 只读按钮仍可点：点击不是「选择」，而是跳到能改它的地方。
     btn.addEventListener("click", () => {
-      const value = btn.dataset.verify;
-      if (value === "temporary" || value === "permanent" || value === "both") {
-        if (isVerifyMethodAvailable(value)) {
-          selectVerifyMethod(value);
-        }
-      }
+      navigateTo("settings");
+      openFixedPasswordForm?.();
     });
   });
 
-  // 没设长期密码时「长期」「两者」是死路：禁用并给出原因，高亮退回「临时」。
+  // 高亮跟随已生效的验证方式；未设长期密码时给出「先设置长期密码」提示。
   applyPasswordAvailability = (status: PasswordStatus): void => {
-    hasPermanentPassword = status.hasPermanent;
     verifyButtons.forEach((btn) => {
-      const blocked = !isVerifyMethodAvailable(asVerifyMethod(btn.dataset.verify ?? ""));
-      btn.disabled = blocked;
-      btn.setAttribute("aria-disabled", blocked ? "true" : "false");
+      btn.removeAttribute("aria-disabled");
     });
-    verifyHint.classList.toggle("is-hidden", hasPermanentPassword);
+    verifyHint.classList.toggle("is-hidden", status.hasPermanent);
     selectVerifyMethod(asVerifyMethod(status.verifyMethod));
   };
 
@@ -1209,11 +1200,13 @@ function setupSettingsPage(): void {
   const refreshSubmitState = (): void => {
     const value = fixedPasswordInput.value;
     const confirm = fixedPasswordConfirm.value;
-    fixedPasswordButton.disabled = !(passwordValid(value) && value === confirm);
+    // 进行中始终禁用：input/confirm 的编辑事件会反复调用这里，不能把按钮重新点亮。
+    fixedPasswordButton.disabled = pwBusy || !(passwordValid(value) && value === confirm);
   };
 
   // 设置或清除进行中（含等待 UAC）时，三个控件全部禁用，避免状态写入乱序。
   const setPasswordBusy = (busy: boolean): void => {
+    pwBusy = busy;
     formVerifyButtons.forEach((btn) => {
       btn.disabled = busy;
     });
