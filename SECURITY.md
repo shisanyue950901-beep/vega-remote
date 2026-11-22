@@ -85,8 +85,9 @@
 1. 阿里云镜像 `http://60.205.95.98/vega/updates/latest.json`（国内优先，纯 HTTP）
 2. GitHub 固定 tag `vega-updates` 的 `https://github.com/shisanyue950901-beep/vega-remote/releases/download/vega-updates/latest.json`
 
-检查与下载都是两步：先只用镜像，检查失败/超时（15 秒）或后续下载、签名校验失败时，改为只用 GitHub
-固定 tag 重新检查并下载一次。下载单独限时 10 分钟。
+检查与安装都会同时问两个端点：任一端点报错或没有更新也继续检查另一端，两边都有更新时按版本号取较高者；
+安装从报告该版本的一端下载，下载/验签失败再换另一端重试一次。检查超时 15 秒，下载单独限时 10 分钟。
+镜像清单滞后不会隐藏 GitHub 上已发布的更高版本。
 
 **镜像走明文 HTTP 是刻意的**：镜像只节省带宽和连接时间，不承担信任。更新包使用 minisign 签名，
 公钥直接提交在 `console/src-tauri/tauri.conf.json` 的 `plugins.updater.pubkey` 里（源码可见，不靠 CI
