@@ -298,6 +298,12 @@
                     autocomplete="new-password"
                     aria-label="确认长期密码"
                   />
+                  <span class="row__sub">设置后的验证方式</span>
+                  <div id="pw-form-verify" class="seg seg--full" role="group" aria-label="设置后的验证方式">
+                    <button class="seg__btn" type="button" data-pw-verify="temporary">临时</button>
+                    <button class="seg__btn" type="button" data-pw-verify="permanent">长期</button>
+                    <button class="seg__btn is-active" type="button" data-pw-verify="both">两者</button>
+                  </div>
                   <div class="row__actions">
                     <button id="save-fixed-password" class="btn btn--primary btn--sm" type="button">设置</button>
                     <button id="clear-fixed-password" class="link link--danger" type="button">清除长期密码</button>

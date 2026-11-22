@@ -870,7 +870,33 @@ function setupSettingsPage(): void {
   const clearPasswordButton = byId<HTMLButtonElement>("clear-fixed-password");
   const togglePasswordButton = byId<HTMLButtonElement>("toggle-fixed-password");
   const passwordForm = byId<HTMLDivElement>("fixed-password-form");
+  const formVerifyGroup = byId<HTMLDivElement>("pw-form-verify");
+  const formVerifyButtons = Array.from(
+    formVerifyGroup.querySelectorAll<HTMLButtonElement>(".seg__btn[data-pw-verify]"),
+  );
   const trayCheckbox = byId<HTMLInputElement>("set-tray");
+
+  // 表单里的验证方式：默认「两者」，提交时和密码一起发出，避免「先设密码、再改验证方式」两步。
+  // formVerifyPending 只在用户点过分段时为 true，此时焦点刷新不能覆盖他的选择。
+  let formVerify: VerifyMethod = "both";
+  let formVerifyPending = false;
+
+  const renderFormVerify = (): void => {
+    formVerifyButtons.forEach((btn) => {
+      const active = btn.dataset.pwVerify === formVerify;
+      btn.classList.toggle("is-active", active);
+      btn.setAttribute("aria-pressed", active ? "true" : "false");
+    });
+  };
+
+  formVerifyButtons.forEach((btn) => {
+    btn.setAttribute("aria-pressed", btn.classList.contains("is-active") ? "true" : "false");
+    btn.addEventListener("click", () => {
+      formVerify = asVerifyMethod(btn.dataset.pwVerify ?? "");
+      formVerifyPending = true;
+      renderFormVerify();
+    });
+  });
 
   // 长期密码表单默认折叠：只在用户点开或从主页跳过来时展开。
   const setPasswordFormOpen = (open: boolean): void => {
@@ -1186,6 +1212,19 @@ function setupSettingsPage(): void {
     fixedPasswordButton.disabled = !(passwordValid(value) && value === confirm);
   };
 
+  // 设置或清除进行中（含等待 UAC）时，三个控件全部禁用，避免状态写入乱序。
+  const setPasswordBusy = (busy: boolean): void => {
+    formVerifyButtons.forEach((btn) => {
+      btn.disabled = busy;
+    });
+    clearPasswordButton.disabled = busy;
+    if (busy) {
+      fixedPasswordButton.disabled = true;
+    } else {
+      refreshSubmitState();
+    }
+  };
+
   const applyPasswordStatus = (status: PasswordStatus): void => {
     if (assistPasswordStatus) {
       setStatus(
@@ -1196,6 +1235,11 @@ function setupSettingsPage(): void {
     }
     // 分段高亮跟随 RustDesk 里实际生效的验证方式；可用性由协助页按 hasPermanent 决定。
     selectVerifyMethod(asVerifyMethod(status.verifyMethod));
+    // 设置页表单的分段：用户已选但还没提交时保持原样，否则跟随状态（首次设置默认「两者」）。
+    if (!formVerifyPending) {
+      formVerify = status.hasPermanent ? asVerifyMethod(status.verifyMethod) : "both";
+      renderFormVerify();
+    }
     applyPasswordAvailability?.(status);
   };
 
@@ -1251,43 +1295,51 @@ function setupSettingsPage(): void {
       setStatus(passwordResult, "两次输入的密码不一致", "error");
       return;
     }
-    fixedPasswordButton.disabled = true;
+    setPasswordBusy(true);
     setStatus(passwordResult, "正在请求管理员确认（Windows 会弹一次 UAC）…");
-    void invoke<OpResult>("set_permanent_password", { password, verify: selectedVerify }).then((result) => {
-      // 无论成败都立刻清空两个输入框：密码不在页面上多留一秒。
-      fixedPasswordInput.value = "";
-      fixedPasswordConfirm.value = "";
-      fixedPasswordButton.disabled = true;
-      if (!result) {
-        setStatus(passwordResult, "浏览器预览：命令不可用", "warn");
-        return;
-      }
-      setStatus(passwordResult, result.message, result.ok ? "ok" : "error");
-      if (result.ok) {
-        loadPasswordStatus();
-      }
-    });
+    void invoke<OpResult>("set_permanent_password", { password, verify: formVerify })
+      .then((result) => {
+        if (!result) {
+          setStatus(passwordResult, "浏览器预览：命令不可用", "warn");
+          return;
+        }
+        setStatus(passwordResult, result.message, result.ok ? "ok" : "error");
+        if (result.ok) {
+          loadPasswordStatus();
+        }
+      })
+      .finally(() => {
+        // 无论成败都立刻清空两个输入框并恢复控件：密码不在页面上多留一秒。
+        fixedPasswordInput.value = "";
+        fixedPasswordConfirm.value = "";
+        formVerifyPending = false;
+        setPasswordBusy(false);
+      });
   });
 
   clearPasswordButton.addEventListener("click", () => {
     if (!window.confirm("清除长期密码后将只能用临时密码连接，确定清除吗？")) {
       return;
     }
-    clearPasswordButton.disabled = true;
+    setPasswordBusy(true);
     setStatus(passwordResult, "正在请求管理员确认（Windows 会弹一次 UAC）…");
-    void invoke<OpResult>("clear_permanent_password").then((result) => {
-      clearPasswordButton.disabled = false;
-      if (!result) {
-        setStatus(passwordResult, "浏览器预览：命令不可用", "warn");
-        return;
-      }
-      setStatus(passwordResult, result.message, result.ok ? "ok" : "error");
-      if (result.ok) {
-        loadPasswordStatus();
-      }
-    });
+    void invoke<OpResult>("clear_permanent_password")
+      .then((result) => {
+        if (!result) {
+          setStatus(passwordResult, "浏览器预览：命令不可用", "warn");
+          return;
+        }
+        setStatus(passwordResult, result.message, result.ok ? "ok" : "error");
+        if (result.ok) {
+          loadPasswordStatus();
+        }
+      })
+      .finally(() => {
+        setPasswordBusy(false);
+      });
   });
 
+  renderFormVerify();
   refreshSubmitState();
   loadPasswordStatus();
 }
