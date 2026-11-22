@@ -13,6 +13,7 @@ const ALIAS_MAX_CHARS: usize = 32;
 const PEER_MIN_DIGITS: usize = 6;
 const PEER_MAX_DIGITS: usize = 16;
 const PEER_ID_ERROR: &str = "设备码需为 6-16 位数字";
+const ALIAS_READ_ERROR: &str = "读取设备别名失败，请稍后重试";
 
 pub(crate) fn aliases_path(recent: &Path) -> PathBuf {
     match recent.parent() {
@@ -78,9 +79,14 @@ pub(crate) fn write_aliases_at(path: &Path, aliases: &BTreeMap<String, String>) 
     rustdesk::write_atomic(path, &text)
 }
 
+/// 改名或清除别名：先严格读，读失败不写盘。
+///
+/// 读取或解析失败时返回「读取设备别名失败，请稍后重试」，避免把读坏的别名文件
+/// 当成空表再覆盖回去（那样会把其它设备的别名一起丢掉）。
 pub(crate) fn set_alias_at(path: &Path, peer_id: &str, alias: &str) -> Result<bool, String> {
     let id = normalize_peer_id(peer_id)?;
-    let mut aliases = read_aliases_at(path);
+    let mut aliases = read_aliases_strict_at(path)
+        .map_err(|_| ALIAS_READ_ERROR.to_string())?;
     let stripped: String = alias.chars().filter(|c| !c.is_control()).collect();
     if stripped.trim().is_empty() {
         if aliases.remove(&id).is_some() {
@@ -199,6 +205,23 @@ mod tests {
         std::fs::write(&path, "{not json").unwrap();
         assert!(read_aliases_at(&path).is_empty());
         assert!(read_aliases_at(&dir.join("missing.json")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn set_alias_refuses_when_aliases_corrupted() {
+        let dir = temp_dir("set-alias-corrupt");
+        let aliases = dir.join(ALIAS_FILE);
+        std::fs::write(&aliases, "{not json").unwrap();
+        let err = set_alias_at(&aliases, "123456789", "新别名").unwrap_err();
+        assert_eq!(err, ALIAS_READ_ERROR, "{err}");
+        assert_eq!(std::fs::read_to_string(&aliases).unwrap(), "{not json", "损坏的别名文件不能被改写");
+        // 清除别名走的是同一条严格读取路径，同样不能写盘。
+        assert_eq!(set_alias_at(&aliases, "123456789", "  ").unwrap_err(), ALIAS_READ_ERROR);
+        assert_eq!(std::fs::read_to_string(&aliases).unwrap(), "{not json");
+        // 文件不存在仍按空表处理，可以正常写入。
+        let fresh = dir.join("fresh.json");
+        assert!(set_alias_at(&fresh, "123456789", "书房").unwrap());
+        assert_eq!(read_aliases_at(&fresh).get("123456789").map(String::as_str), Some("书房"));
         let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
