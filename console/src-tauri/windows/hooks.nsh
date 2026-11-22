@@ -28,6 +28,11 @@
 ;   * t6-fix3b（架构裁定）：目录页必须改模板，!undef 宏不生效，已删除该死代码；
 ;     旧版迁移绝不运行旧卸载器（旧卸载器会回滚 RustDesk），只在 PREINSTALL 里删除
 ;     已知程序文件；/UPDATE 模式完全跳过 RustDesk 安装脚本。
+;   * t6-fix4（架构裁定）：安装器模板删除重装页，永不运行旧卸载器；PREINSTALL 先用
+;     Var 记住「安装前是否已有 Vega 卸载注册表项」，POSTINSTALL 只在全新安装时运行
+;     RustDesk 脚本；重装与 /UPDATE 默认跳过，只有 Program Files 下找不到 rustdesk.exe
+;     时才补跑（补装并配置）。旧目录迁移在 /UPDATE 下也执行（只删文件）；比较前用
+;     GetLongPathNameW 解析 8.3 短名，旧目录或旧 resources 是重解析点时整段跳过。
 ;
 ; 注意：本文件在 tauri 的 installer.nsi 顶部（MUI 页面插入之前）被 include，
 ; 所以这里的 !define 能影响完成页文案；MUI_FINISHPAGE_TEXT 里放的是运行时变量。
@@ -45,6 +50,7 @@ Var vegaResultReason
 Var vegaOldInstallDir
 Var vegaOldInstallWarning
 Var vegaFixedDir
+Var vegaHadPreviousInstall
 
 ; t6-fix：安装路径固定。$PROGRAMFILES64 保留原生 Program Files（Tauri 的 NSIS stub 是
 ; 32 位进程，$PROGRAMFILES 会被重定向到 Program Files (x86)，所以这里不用它）。
@@ -355,9 +361,14 @@ vega_trim_done_${ID}:
 ; Tauri 自己也是用这个键的 InstallLocation / UninstallString 判断旧安装，读同一个值不会跑偏。
 ;
 ; 行为约定：
-;   * 只在非 /UPDATE 模式处理；/UPDATE 时旧版就在固定目录，无需迁移。
+;   * 只在「新安装目录」与旧版记录不同时处理；/UPDATE 也执行（只删文件，不碰注册表）。
+;     /UPDATE 时旧版通常就在固定目录，比较后相等即跳过；若用户曾把旧版装在别处，
+;     这次在线更新也会清掉那个旧目录，避免残留可执行文件。
 ;   * InstallLocation / UninstallString 先归一化（去引号、去尾反斜杠），再用 Win32
-;     GetFullPathNameW 规范化，与 ${VEGA_INSTALL_DIR} 大小写不敏感比较；相同则不做。
+;     GetFullPathNameW + GetLongPathNameW 规范化（解析 8.3 短名、. / .. 与重复分隔符），
+;     与 ${VEGA_INSTALL_DIR} 大小写不敏感比较；长路径相同则不做。
+;   * 旧目录本身或旧目录 \resources 是重解析点（junction/symlink）时整段跳过：
+;     否则逐文件 Delete 会跟着链接删到旧目录之外。
 ;   * 盘根、UNC、Windows/ProgramData/用户配置目录一律拒绝（护栏）。
 ;   * 旧目录里必须有 vega-console.exe，否则一概不碰。
 ;   * 先把 $OUTDIR 指到固定目录，再 Delete 已知文件、非递归 RMDir 子目录与旧目录。
@@ -365,24 +376,44 @@ vega_trim_done_${ID}:
 ;   * 旧快捷方式只有指向旧目录时才删除（Tauri 随后按新目录重建）。
 ;   * 任何失败都只追加完成页提示，绝不 Abort；卸载注册表键由新安装重写。
 ;   * FileFunc.nsh v3.4 没有 GetFullPathName 宏，这里直接调 Win32。
+;   * GetLongPathNameW 对不存在的路径返回 0（缓冲区内容不可靠），失败时保留
+;     GetFullPathNameW 的结果；真正要比较的旧目录通常存在，不存在时后续也删不到东西。
 !macro VegaCanonicalDir ID VAR
   StrCpy $R0 "${VAR}"
   System::Call 'kernel32::GetFullPathNameW(w r0, i 1024, w .r1, i 0) i .r2'
   StrCmp $R2 "0" vega_canon_done_${ID}
     StrCpy ${VAR} "$R1"
+    ; 8.3 短名（PROGRA~1）与长名是两个不同字符串，先解析成长名再比较。
+    System::Call 'kernel32::GetLongPathNameW(w r1, w .r3, i 1024) i .r4'
+    StrCmp $R4 "0" vega_canon_trim_${ID}
+      StrCpy ${VAR} "$R3"
+vega_canon_trim_${ID}:
     !insertmacro VegaTrimDirPath canon_${ID} ${VAR}
 vega_canon_done_${ID}:
+!macroend
+
+!define FILE_ATTRIBUTE_REPARSE_POINT 0x400
+
+; 检查路径是否带 FILE_ATTRIBUTE_REPARSE_POINT（junction / symlink / mount point）。
+; 不存在（GetFileAttributesW 返回 INVALID_FILE_ATTRIBUTES = -1）不算重解析点。
+!macro VegaIsReparsePoint ID PATH VAR
+  StrCpy ${VAR} "0"
+  System::Call 'kernel32::GetFileAttributesW(w "${PATH}") i .r5'
+  ; INVALID_FILE_ATTRIBUTES（0xFFFFFFFF）表示路径不存在，不算重解析点。
+  IntCmpU $R5 0xFFFFFFFF vega_reparse_done_${ID} vega_reparse_check_${ID} vega_reparse_done_${ID}
+vega_reparse_check_${ID}:
+  IntOp $R6 ${FILE_ATTRIBUTE_REPARSE_POINT} & $R5
+  StrCmp $R6 "0" vega_reparse_done_${ID}
+    StrCpy ${VAR} "1"
+vega_reparse_done_${ID}:
 !macroend
 
 !macro VegaRemovePreviousInstall
   StrCpy $vegaOldInstallDir ""
   StrCpy $vegaOldInstallWarning ""
 
-  StrCmp $UpdateMode "1" 0 vega_old_read_reg
-    DetailPrint "更新模式：跳过旧目录迁移（旧版就在 ${VEGA_INSTALL_DIR}）。"
-    Goto vega_old_done
-
-vega_old_read_reg:
+  ; t6-fix4：/UPDATE 也走这里。迁移只做文件删除，不会回滚 RustDesk 配置；
+  ; 若旧版就在固定目录，下面的长路径比较会直接跳过。
   StrCpy $R7 "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCTNAME}"
   ReadRegStr $R8 SHCTX "$R7" "InstallLocation"
   StrCmp $R8 "" 0 vega_old_have_path
@@ -415,6 +446,13 @@ vega_old_have_path:
     Goto vega_old_done
 
 vega_old_differs:
+  ; 护栏零：旧目录或其 resources 是重解析点（junction/symlink）时不删任何东西，
+  ; 否则 Delete 会沿着链接越出旧目录。
+  !insertmacro VegaIsReparsePoint old_dir "$vegaOldInstallDir" $R0
+  StrCmp $R0 "1" vega_old_reparse
+  !insertmacro VegaIsReparsePoint old_res "$vegaOldInstallDir\resources" $R0
+  StrCmp $R0 "1" vega_old_reparse
+
   ; 护栏一：UNC（\\server\share）不处理。
   StrCpy $R1 "$vegaOldInstallDir" 2
   StrCmp $R1 "\\" vega_old_refused
@@ -435,6 +473,10 @@ vega_old_guard_config:
   ${StrCase} $R6 "$PROFILE" "L"
   StrCmp $R8 $R6 vega_old_refused
   Goto vega_old_check_binary
+
+vega_old_reparse:
+  DetailPrint "旧版目录 $vegaOldInstallDir 或其 resources 是重解析点，跳过清理。"
+  Goto vega_old_done
 
 vega_old_refused:
   DetailPrint "旧版记录指向 $vegaOldInstallDir，看起来不是安装目录，跳过清理。"
@@ -500,6 +542,17 @@ vega_old_done:
 ; 落到 $PROGRAMFILES64\Vega；/D 参数、旧版注册表里的 InstallLocation、目录页的选择
 ; 都不会改变结果。
 !macro NSIS_HOOK_PREINSTALL
+  ; t6-fix4：Tauri 在 PREINSTALL 之后才复制文件并重写卸载注册表项。先在这里
+  ; 记录「安装前是否已有 Vega 卸载键」，POSTINSTALL 据此区分全新安装与重装/更新。
+  StrCpy $vegaHadPreviousInstall "0"
+  StrCpy $R0 "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCTNAME}"
+  ReadRegStr $R1 SHCTX "$R0" ""
+  ReadRegStr $R2 SHCTX "$R0" "UninstallString"
+  ReadRegStr $R3 SHCTX "$R0" "InstallLocation"
+  StrCmp "$R1$R2$R3" "" vega_preinstall_no_previous
+    StrCpy $vegaHadPreviousInstall "1"
+vega_preinstall_no_previous:
+
   ; 先处理旧安装目录。$INSTDIR 已在模板 .onInit 末尾强制为固定目录；这里从注册表
   ; 读旧安装记录做迁移，但不运行旧卸载器。
   !insertmacro VegaRemovePreviousInstall
@@ -513,10 +566,22 @@ vega_preinstall_dir_done:
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
-  ; t6-fix3b：/UPDATE 只替换 Vega 程序文件，RustDesk 的安装与中继配置原样保留，
-  ; 因此完全跳过安装脚本（不下载、不改配置），避免在线更新把中继配置改写。
-  StrCmp $UpdateMode "1" vega_postinstall_done
-    !insertmacro VegaRunInstallRustDesk
+  ; t6-fix4（架构裁定）：
+  ;   * 全新安装（PREINSTALL 没读到旧卸载键）→ 照旧运行 RustDesk 安装/配置脚本。
+  ;   * 重装或 /UPDATE → 默认完全跳过脚本，不下载、不改中继配置；只有 Program Files
+  ;     下找不到 rustdesk.exe 时才补跑（此时必须安装并配置，否则新控制台没有可用的
+  ;     RustDesk）。$PROGRAMFILES 在 32 位 stub 里是 (x86)，两个都查。
+  StrCmp $vegaHadPreviousInstall "1" vega_postinstall_skip
+  StrCmp $UpdateMode "1" vega_postinstall_skip
+  Goto vega_postinstall_run
+
+vega_postinstall_skip:
+  IfFileExists "$PROGRAMFILES64\RustDesk\rustdesk.exe" vega_postinstall_done
+  IfFileExists "$PROGRAMFILES\RustDesk\rustdesk.exe" vega_postinstall_done
+  DetailPrint "已有 Vega 安装记录，但 Program Files 下没有 rustdesk.exe：补装并配置 RustDesk。"
+
+vega_postinstall_run:
+  !insertmacro VegaRunInstallRustDesk
 vega_postinstall_done:
 !macroend
 
