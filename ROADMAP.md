@@ -257,9 +257,23 @@
 
 ## T6 控制台自动更新（阿里云镜像优先）
 - `tauri-plugin-updater` 接入：`check_update` / `install_update`，后台下载推送 `vega://update-progress`，同一时间只允许一个安装（`AtomicBool`），完成后 `app.restart()`。
-- 端点顺序：`http://60.205.95.98/vega/updates/latest.json` → GitHub Release；镜像明文 HTTP，信任由 minisign 签名承担（公钥提交在 `tauri.conf.json` 的 `plugins.updater.pubkey`，篡改包无法安装）。
+- 端点顺序：`http://60.205.95.98/vega/updates/latest.json` → GitHub 固定 tag `vega-updates` 的 `releases/download/vega-updates/latest.json`；镜像明文 HTTP，信任由 minisign 签名承担（公钥提交在 `tauri.conf.json` 的 `plugins.updater.pubkey`，篡改包无法安装）。
 - 前端：启动 5 秒后静默检查一次；侧栏徽标「有新版本 x.y.z」；设置页「软件更新」行含当前版本、检查、立即更新、进度条与失败原因。
 - CI：只构建未签名的 NSIS 安装包（`createUpdaterArtifacts: false`），不再注入更新公钥、不再读 `TAURI_SIGNING_PRIVATE_KEY`；`VEGA_UPDATER_PUBKEY` 与 `TAURI_SIGNING_*` 两个 secret 都不再使用，tag `v*` 也不产出 `latest.json`。
-- 运维：签名与发布都在维护者本机。`tools/publish-update.sh <tag> <setup.exe>` 用 `tauri signer sign` 签安装包、写 `latest.json`（GitHub 指向 tag 资产，`latest-mirror.json` 指向镜像），打印 SHA256，再上传到 GitHub Release 与阿里云 `/opt/vega-relay/updates/`（清单最后原子改名）；`relay/updates-nginx.md` 记录 `nginx:alpine` 只读挂载与 `autoindex off` 部署。
+- 运维：签名与发布都在维护者本机。`tools/publish-update.sh <tag> <setup.exe>` 用 `tauri signer sign` 签安装包、写 `latest.json`（GitHub 指向固定 tag `vega-updates` 的版本化资产，`latest-mirror.json` 指向镜像版本目录），打印 SHA256，再上传到 GitHub Release 与阿里云 `/opt/vega-relay/updates/`（安装包进 `<ver>/Vega-Setup-<ver>.exe` 且不可覆盖，清单最后原子改名，旧版本目录保留）；`relay/updates-nginx.md` 记录 `nginx:alpine` 只读挂载与 `autoindex off` 部署。
 - 版本统一 `0.6.0`（`console/package.json`、`tauri.conf.json`、`Cargo.toml`）。
 - 旧安装目录搬迁（t6-fix2）：安装路径固定为 `$PROGRAMFILES64\Vega` 后，旧版可能仍在旧安装器选的目录（如 `D:\Vega`）。`NSIS_HOOK_PREINSTALL` 读 Tauri 卸载键 `...\Uninstall\${PRODUCTNAME}` 的 `InstallLocation`/`UninstallString`，归一化（去引号、去尾反斜杠、大小写不敏感）后与固定目录不同且 `uninstall.exe` 存在时，`ExecWait '"<old>\uninstall.exe" /S _?=<old>'` 静默卸载，再删残留卸载器并非递归 `RMDir` 旧目录；失败只写完成页提示不 Abort，同路径重装与 `/UPDATE` 不动，RustDesk 配置、`%ProgramData%\Vega`、用户 AppData 不在清理范围；`PREINSTALL` 里补 `SetOutPath $INSTDIR`，否则 `$OUTDIR` 仍指向旧目录会让 `File` 解到旧路径。
+
+### T6-fix3（Codex 审计 t6-r1 修复）
+- P1 编译：`download_and_install` 的累计字节改为 `let mut downloaded`；对 `tauri-plugin-updater` 2 的 API 全面对齐（`updater_builder() -> UpdaterBuilder`、`endpoints(Vec<Url>) -> Result<Self>`、`Update::download_and_install(&self, on_chunk, on_finish) -> Result<()>`、`Update.timeout` 为 `pub` 字段）。
+- P2 权限：`capabilities/default.json` 去掉 `updater:default`（只用自定义命令），补 `core:event:allow-listen` / `core:event:allow-unlisten`。
+- P2 前端顺序：先 `await` 两个事件监听注册，成功后才放开「立即更新」；注册失败显示错误且按钮保持禁用。`install_update` 被拒（已有任务在跑等）时一律从「更新中」复位并清进度。
+- P2 超时与回退：检查按端点单建 updater，`timeout(15s)` 再包一层 `tokio::time::timeout`；先用镜像，检查失败/超时或后续下载/签名校验失败时改为只用 GitHub 固定 tag 重试一次（检查 + 下载各一次）。下载前把 `Update.timeout` 补成 10 分钟并再包 `tokio::time::timeout`。
+- P2 锁：`AtomicBool` 包成 `InstallGuard`（`Drop` 释放），成功、失败、提前返回都不会把界面卡在「更新中」。
+- P2 发布通道：GitHub 回退端点固定 `releases/download/vega-updates/latest.json`；`publish-update.sh` 把 `Vega-Setup-<ver>.exe`、`.sig`、`latest.json` 发到固定 tag `vega-updates`（缺则创建，资产覆盖）；镜像侧安装包先进 `<ver>/Vega-Setup-<ver>.exe`（存在即拒绝，永不覆盖），清单写临时名再原子 `mv`，`latest.json` 的 url 指向版本化文件，旧版本目录保留。
+- P3 进度：每次开始安装把进度宽度与 `aria-valuenow` 归零；总大小未知时加 `is-indeterminate` 走不确定态（删 `aria-valuenow`），不再用固定 40% 假装进度。
+- P3 文档：`updater.rs` 头注释改为「公钥提交在仓库」，不再写成 CI 注入。
+
+### T6 加固（待做）
+- P2 签名/版本（架构裁决：本轮不修）：HTTP 镜像可被中间人回放更早的已签名 Vega 版本（降级）；后续用签名内绑定版本 / `requireSignedVersion` 或 HTTPS 镜像。
+- P3 Windows 重启语义：被动安装器自己用 `/R` 拉起新版本，`app.restart()` 只是非 Windows / 安装器未接管时的兜底，文档不再把它写成主路径。
