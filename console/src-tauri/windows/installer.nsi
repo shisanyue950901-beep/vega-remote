@@ -6,10 +6,13 @@
 ;   https://github.com/tauri-apps/tauri/blob/tauri-cli-v2.12.6/crates/tauri-bundler/src/bundle/windows/nsis/installer.nsi
 ;
 ; 与上游的差异（全部列出，其余原样保留，便于逐版本重新同步）：
-;   1. 删除「选择安装目录」页：移除 MUI_PAGE_DIRECTORY 的插入及其
-;      MUI_PAGE_CUSTOMFUNCTION_PRE SkipIfPassive 定义。
-;   2. .onInit 末尾强制 $INSTDIR = $PROGRAMFILES64\Vega，位置在所有注册表读取
-;      （RestorePreviousInstallLocation 等）之后，旧安装记录与 /D 参数都无法改变它。
+;   1. 恢复「选择安装目录」页（上游的 MUI_PAGE_DIRECTORY +
+;      MUI_PAGE_CUSTOMFUNCTION_PRE SkipIfPassive），并加 LEAVE 校验 VegaDirectoryLeave：
+;      只允许本地固定 NTFS 目录、非盘根、非空目录必须已是 Vega（含 vega-console.exe）；
+;      末段不是 Vega 时自动补 \Vega。原因见 hooks.nsh 的 t6b 说明（ACL 由安装器收紧）。
+;   2. .onInit 末尾设置 $INSTDIR 默认值（$PROGRAMFILES64\Vega）：命令行 /D= 给定目录时
+;      保留命令行值；否则若卸载注册表的 InstallLocation 指向一个仍含 vega-console.exe 的目录，
+;      就地沿用该目录（更新/重装留在用户选的位置，含 /P 被动模式）。
 ;   3. 删除「重新安装 / 已安装」页（PageReinstall、PageReinstallUpdateSelection、
 ;      PageLeaveReinstall 及 Var ReinstallPageCheck）。安装器永远不运行旧卸载器，
 ;      也不再询问卸载/重装，直接在固定目录上覆盖安装。
@@ -237,8 +240,12 @@ Function FindWixInstall
   wix_loop_done:
 FunctionEnd
 
-; 5. (目录页已删除 —— Vega 安装路径固定在 hooks.nsh 的 ${VEGA_INSTALL_DIR}，
-;     见文件头注释。保留编号以便与上游逐行对照。)
+; 5. Directory page（t6b：用户要求可装到 D: 等本地固定 NTFS 目录，恢复该页）
+;    用户可改安装目录；LEAVE 校验见文件末尾的 VegaDirectoryLeave。
+;    静默 / 被动安装（/S、/P、/UPDATE）跳过该页，$INSTDIR 由 .onInit 决定。
+!define MUI_PAGE_CUSTOMFUNCTION_PRE SkipIfPassive
+!define MUI_PAGE_CUSTOMFUNCTION_LEAVE VegaDirectoryLeave
+!insertmacro MUI_PAGE_DIRECTORY
 
 ; 6. Start menu shortcut page
 Var AppStartMenuFolder
@@ -402,11 +409,32 @@ Function .onInit
     ${EndIf}
   !endif
 
-  ; --- Vega customization (t6-fix3b) --------------------------------------
-  ; 安装路径固定为 $PROGRAMFILES64\Vega。放在 .onInit 末尾，确保所有注册表读取
-  ; （上面的 RestorePreviousInstallLocation、MULTIUSER_INIT）都已完成，旧安装位置
-  ; 与命令行 /D 都无法改变最终目录。hooks.nsh 的 PREINSTALL 会再断言一次并 SetOutPath。
-  StrCpy $INSTDIR "$PROGRAMFILES64\Vega"
+  ; --- Vega customization (t6b) -------------------------------------------
+  ; 安装路径不再固定，但默认值仍是 $PROGRAMFILES64\Vega（$PROGRAMFILES64 取原生 Program
+  ; Files：Tauri 的 NSIS stub 是 32 位进程，$PROGRAMFILES 会被重定向到 (x86)）。
+  ; 规则，按优先级：
+  ;   1. 命令行 /D=<dir> 已把 $INSTDIR 设成非占位值 —— 保留，不覆盖。
+  ;   2. 卸载注册表里的 InstallLocation（去引号/去尾反斜杠）指向一个仍含
+  ;      vega-console.exe 的目录 —— 沿用，更新/重装（含 /P 被动模式）留在原位置。
+  ;   3. 否则默认 $PROGRAMFILES64\Vega。
+  ; 交互模式下列表页选择会覆盖这里的值，并由 VegaDirectoryLeave 校验。
+  ${If} $INSTDIR == "${PLACEHOLDER_INSTALL_DIR}"
+    StrCpy $INSTDIR "$PROGRAMFILES64\Vega"
+  ${EndIf}
+  ; 沿用已有安装位置：InstallLocation 去引号、去尾反斜杠后必须仍含 vega-console.exe。
+  ; 只有 $INSTDIR 仍是默认值时才会被替换，命令行 /D=<其它目录> 与 MANUPRODUCTKEY
+  ; 里读到的旧位置都保持原样（后者本身就是用户上次选的目录）。
+  ReadRegStr $R0 SHCTX "${UNINSTKEY}" "InstallLocation"
+  StrCmp $R0 "" vega_initdir_done
+  !insertmacro VegaTrimDirPath initdir $R0
+  StrCmp $R0 "" vega_initdir_done
+  IfFileExists "$R0\vega-console.exe" 0 vega_initdir_done
+  ${StrCase} $R1 "$INSTDIR" "L"
+  ${StrCase} $R2 "$PROGRAMFILES64\Vega" "L"
+  StrCmp $R1 $R2 0 vega_initdir_done
+  StrCpy $INSTDIR "$R0"
+  DetailPrint "沿用已安装的 Vega 目录：$INSTDIR"
+vega_initdir_done:
   ; ------------------------------------------------------------------------
 FunctionEnd
 
@@ -780,6 +808,78 @@ Function SkipIfPassive
 FunctionEnd
 Function un.SkipIfPassive
   ${IfThen} $PassiveMode = 1  ${|} Abort ${|}
+FunctionEnd
+
+; t6b：目录页离开时的校验。用户可以把 Vega 装到任意本地固定 NTFS 目录（例如 D:\Vega），
+; 前提是这个目录能被安装器收成「只有管理员可写」，因为提权助手 resources\vega-pwhelper.ps1
+; 就在里面（见 hooks.nsh 的 VegaLockInstallDirAcl 与控制台 password.rs 的 ACL 校验）。
+; 拒绝的情况：
+;   * 不是 `X:\...` 本地绝对路径（含 UNC `\\server\share`）；
+;   * 驱动器类型不是 3（DRIVE_FIXED：硬盘/固定盘，排除 U 盘、光驱、网络盘、内存盘）；
+;   * 文件系统不是 NTFS（FAT32/exFAT 没有可用的 DACL）；
+;   * 路径就是盘根（如 `D:\`）——盘根的继承 ACL 无法安全收紧；
+;   * 目录已存在、非空，且里面没有 vega-console.exe（否则等于把任意用户目录锁成
+;     管理员独占，可能破坏用户已有数据）。
+; 末段不是 `Vega` 时自动补 `\Vega`，避免装进 `D:\` 或用户随手选的父目录。
+Function VegaDirectoryLeave
+  StrLen $R0 "$INSTDIR"
+  IntCmp $R0 2 vega_dir_bad vega_dir_bad vega_dir_shape
+vega_dir_shape:
+  StrCpy $R1 "$INSTDIR" 1 1
+  StrCmp $R1 ":" 0 vega_dir_bad
+  StrCpy $R1 "$INSTDIR" 2
+  StrCmp $R1 "\\" vega_dir_bad
+  StrCpy $R1 "$INSTDIR" 1 2
+  StrCmp $R1 "\" 0 vega_dir_bad
+  ; 统一去掉尾部反斜杠（VegaTrimDirPath 保留 `D:\` 这种盘根，下面单独拒绝）。
+  !insertmacro VegaTrimDirPath dir_leave $INSTDIR
+  StrLen $R0 "$INSTDIR"
+  IntCmp $R0 3 vega_dir_bad_root vega_dir_bad_root vega_dir_check_drive
+
+vega_dir_check_drive:
+  StrCpy $R0 "$INSTDIR" 2
+  StrCpy $R0 "$R0\"
+  System::Call 'kernel32::GetDriveTypeW(w r0) i .r1'
+  StrCmp $R1 "3" 0 vega_dir_bad_drive
+  ; GetVolumeInformationW(lpRootPathName, lpVolumeNameBuffer, nVolumeNameSize,
+  ;   lpVolumeSerialNumber, lpMaximumComponentLength, lpFileSystemFlags,
+  ;   lpFileSystemNameBuffer, nFileSystemNameSize)
+  System::Call 'kernel32::GetVolumeInformationW(w r0, w .r2, i 260, i 0, i 0, i 0, w .r3, i 260) i .r4'
+  StrCmp $R4 "0" vega_dir_bad_fs
+  StrCmp $R3 "NTFS" vega_dir_fs_ok 0
+  StrCmp $R3 "ntfs" vega_dir_fs_ok vega_dir_bad_fs
+
+vega_dir_fs_ok:
+  ; 末段不是 Vega 时补 \Vega。
+  StrCpy $R1 "$INSTDIR" 5 -5
+  ${StrCase} $R1 "$R1" "L"
+  StrCmp $R1 "\vega" vega_dir_name_ok
+    StrCpy $INSTDIR "$INSTDIR\Vega"
+vega_dir_name_ok:
+  ; 已存在且非空的目录只接受已有的 Vega 安装（含 vega-console.exe）。
+  IfFileExists "$INSTDIR\*.*" 0 vega_dir_ok
+  IfFileExists "$INSTDIR\vega-console.exe" vega_dir_ok
+  MessageBox MB_OK|MB_ICONSTOP "目录 $INSTDIR 已存在且不为空，但不是 Vega 安装目录。请选择空目录（或新建一个），或选择已有的 Vega 目录。"
+  Abort
+
+vega_dir_ok:
+  Return
+
+vega_dir_bad:
+  MessageBox MB_OK|MB_ICONSTOP "安装路径必须是本地磁盘上的绝对路径，例如 D:\Vega。不支持网络路径（\\server\share）。"
+  Abort
+
+vega_dir_bad_root:
+  MessageBox MB_OK|MB_ICONSTOP "不能直接安装到驱动器根目录（如 D:\）。请选择其下的子目录，例如 D:\Vega。"
+  Abort
+
+vega_dir_bad_drive:
+  MessageBox MB_OK|MB_ICONSTOP "安装目录必须位于本地固定磁盘（硬盘）。U 盘、光驱、网络盘和内存盘都不支持。"
+  Abort
+
+vega_dir_bad_fs:
+  MessageBox MB_OK|MB_ICONSTOP "安装目录所在磁盘必须是 NTFS 格式。长期密码依赖 NTFS 权限，其他格式无法保护提权助手。"
+  Abort
 FunctionEnd
 
 Function CreateOrUpdateStartMenuShortcut

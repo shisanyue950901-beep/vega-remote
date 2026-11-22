@@ -17,10 +17,14 @@
 ;     读取并显示，读完删除。
 ;   * t3-fix9 P2：去掉日志 WARN 兜底解析。结果文件缺失（旧脚本 / 写失败）时完成页
 ;     显示固定中文指引：完全退出 RustDesk、在 RustDesk 里启用服务后重新运行 Vega 安装。
-;   * t6-fix（用户 2026-11-22）：安装器不再显示“选择安装目录”页，安装路径固定为
+;   * t6-fix（用户 2026-11-22）：曾一度隐藏“选择安装目录”页、把安装路径固定为
 ;     $PROGRAMFILES64\Vega。原因：长期密码助手 resources\vega-pwhelper.ps1 必须位于
-;     系统 Program Files 下（默认 ACL 只允许管理员写），用户自选目录可能落在普通用户
-;     可写的位置，UAC 之后拉起该目录里的脚本就等于把提权执行权交给普通用户。
+;     非管理员不可写的目录，否则 UAC 之后拉起该脚本等于把提权执行权交给普通用户。
+;   * t6b（用户 2026-11-22，放开目录限制）：用户要求能装到 D: 等自选目录，因此恢复目录页，
+;     规则改为「任意本地固定 NTFS 目录都行，但安装器负责把目录 ACL 收紧成只有管理员可写」。
+;     目录页校验在模板 installer.nsi 的 VegaDirectoryLeave；安装完成后由下面的
+;     VegaLockInstallDirAcl 用 icacls 收紧 ACL（$INSTDIR 在 Program Files 下则不动，
+;     继承 ACL 已经正确）；控制台 password.rs 在每次提权前校验助手父目录的 ACL。
 ;   * t6-fix2（用户 2026-11-22）：旧安装器有目录选择页，旧版可能装在 D:\Vega 这类固定目录
 ;     之外。PREINSTALL 从 Tauri 的卸载注册表项读出旧安装目录，清理旧目录，避免机器上
 ;     两份 Vega 并存。旧目录清理失败只提示，不阻断安装；RustDesk 配置、%ProgramData%\Vega
@@ -55,16 +59,15 @@ Var vegaOldInstallDir
 Var vegaOldInstallWarning
 Var vegaFixedDir
 Var vegaHadPreviousInstall
+Var vegaAclWarning
 
-; t6-fix：安装路径固定。$PROGRAMFILES64 保留原生 Program Files（Tauri 的 NSIS stub 是
+; t6b：默认安装目录。$PROGRAMFILES64 保留原生 Program Files（Tauri 的 NSIS stub 是
 ; 32 位进程，$PROGRAMFILES 会被重定向到 Program Files (x86)，所以这里不用它）。
+; 只作为默认值使用；真正的安装目录是运行时 $INSTDIR（用户可在目录页改，或命令行 /D=，
+; 或沿用卸载注册表里的 InstallLocation）。t6b 之前的代码把它当固定目录强制写入。
 !ifndef VEGA_INSTALL_DIR
   !define VEGA_INSTALL_DIR "$PROGRAMFILES64\Vega"
 !endif
-
-; t6-fix：去掉“选择安装目录”页。页面本体已从定制模板 windows/installer.nsi 中删除
-; （宏覆盖在 MUI2 include 时无效，见文件头 t6-fix3b）。$INSTDIR 在模板 .onInit 末尾与
-; 下面 PREINSTALL 里两处强制为固定目录。
 
 ; 安装失败时改写完成页文案（$vegaFinishText 在页面显示时按当时的值展开）。
 ; MUI2 在 include 时已给出默认 MUI_FINISHPAGE_TEXT，这里先 undef 再定义，避免重定义告警。
@@ -327,7 +330,7 @@ vega_unsetup_skip:
 
 ; t6-fix2：去掉首尾成对引号、去掉尾部反斜杠（"C:\" 这种盘根保持原样），结果写回传入变量。
 ; Tauri 的 installer.nsi 写注册表时 InstallLocation 是 "$\"$INSTDIR$\""（带引号），
-; 旧版 / 手改过的值可能是裸路径或带尾反斜杠，两种都要能对上 ${VEGA_INSTALL_DIR}。
+; 旧版 / 手改过的值可能是裸路径或带尾反斜杠，两种都要能对得上本次的 $INSTDIR。
 !macro VegaTrimDirPath ID VAR
   StrCpy $R0 ${VAR}
   StrCpy $R1 $R0 1
@@ -351,8 +354,8 @@ vega_trim_done_${ID}:
   StrCpy ${VAR} $R0
 !macroend
 
-; t6-fix3b（架构裁定）：旧版装在 ${VEGA_INSTALL_DIR} 之外（旧安装器有目录页，
-; 例如 D:\Vega）时，只删除旧目录里的 Vega 程序文件，绝不运行旧卸载器。
+; t6-fix3b（架构裁定）：旧版装在本次安装目录之外（例如用户这次选了 D:\Vega，
+; 旧版在 C:\Program Files\Vega）时，只删除旧目录里的 Vega 程序文件，绝不运行旧卸载器。
 ; 原因：旧卸载器会执行 install-rustdesk.ps1 -Uninstall，把 RustDesk 中继配置回滚掉，
 ; 等于用一次目录迁移毁掉现有远程协助。
 ;
@@ -363,23 +366,23 @@ vega_trim_done_${ID}:
 ;
 ; 行为约定：
 ;   * 只在「新安装目录」与旧版记录不同时处理；/UPDATE 也执行（只删文件，不碰注册表）。
-;     /UPDATE 时旧版通常就在固定目录，比较后相等即跳过；若用户曾把旧版装在别处，
+;     /UPDATE 时旧版通常就在原目录（= $INSTDIR），比较后相等即跳过；若用户改选了新目录，
 ;     这次在线更新也会清掉那个旧目录，避免残留可执行文件。
 ;   * InstallLocation / UninstallString 先归一化（去引号、去尾反斜杠），再用 Win32
 ;     GetFullPathNameW + GetLongPathNameW 规范化（解析 8.3 短名、. / .. 与重复分隔符），
-;     与 ${VEGA_INSTALL_DIR} 大小写不敏感比较；长路径相同则不做。
+;     与本次安装目录 $INSTDIR 大小写不敏感比较；长路径相同则不做。
 ;   * 旧目录本身、旧目录 \resources 以及 Vega 安装的每个 resources 子目录
 ;     (\resources\host、\resources\host\lib) 是重解析点（junction/symlink）时整段跳过：
 ;     否则逐文件 Delete 会跟着链接删到旧目录之外。旧目录的「祖先目录」不在检查范围
 ;     （架构裁定，见 ROADMAP「T6 加固」）。
 ;   * 盘根、UNC、Windows/ProgramData/用户配置目录一律拒绝（护栏）。
 ;   * 旧目录里必须有 vega-console.exe，否则一概不碰。
-;   * 先把 $OUTDIR 指到固定目录，再 Delete 已知文件、非递归 RMDir 子目录与旧目录。
+;   * 先把 $OUTDIR 指到本次安装目录，再 Delete 已知文件、非递归 RMDir 子目录与旧目录。
 ;     不加 /r，所以 RustDesk 配置、%ProgramData%\Vega、用户 AppData 都不会被删。
 ;   * 旧版还在运行导致主程序删不掉时，不做 taskkill / wmic / PowerShell 按映像路径
 ;     筛进程（架构裁定：安装器里不按路径杀进程），直接放弃整个旧目录清理，旧目录原样
 ;     保留，处理方式写进完成页提示。
-;   * 旧快捷方式只有指向旧目录时才删除，并且立刻按固定目录重建同名快捷方式
+;   * 旧快捷方式只有指向旧目录时才删除，并且立刻按本次安装目录重建同名快捷方式
 ;     （/UPDATE 下 Tauri 的 CreateOrUpdate*Shortcut 直接 Return，不重建就会没有快捷方式）。
 ;   * 任何失败都只追加完成页提示，绝不 Abort；卸载注册表键由新安装重写。
 ;   * FileFunc.nsh v3.4 没有 GetFullPathName 宏，这里直接调 Win32。
@@ -432,7 +435,55 @@ vega_reparse_done_${ID}:
   Pop $0
 !macroend
 
-; 旧快捷方式：只有确实指向旧目录的主程序时才删，删完立刻按固定目录重建同名快捷方式。
+; t6b：安装目录不在 Program Files 下时，用 icacls 把 ACL 收紧成「只有管理员可写」。
+; 为什么必须收紧：长期密码助手 resources\vega-pwhelper.ps1 由控制台以 runas 提权执行，
+; 如果普通用户能改这个文件（或把它换掉、把所在目录换成 junction），等于把提权执行权交给
+; 普通用户。Program Files 下的继承 ACL 本来就是管理员独占写，不需要动；D:\Vega 这类目录
+; 继承的是盘根 ACL（Users 有写权限），必须显式收紧。
+;   * /setowner 先把所有者改成 Administrators（BUILTIN\Administrators = S-1-5-32-544），
+;     否则原所有者仍可能改回 DACL。
+;   * /inheritance:r 去掉继承，/grant:r 只给 SYSTEM、Administrators 完全控制，
+;     Users 只读+执行（与 Program Files 的默认 ACL 等价）。
+;   * 按 SID 授权，中文/本地化系统里账户名不同也不会失配。
+;   * 两条命令的退出码都要检查；失败只写完成页提示，不 Abort（程序已经装好了）。
+;   * $SYSDIR 绝对路径调用 icacls：提权上下文里按名称搜索会被 PATH 劫持。
+!macro VegaLockInstallDirAcl
+  StrCpy $vegaAclWarning ""
+  StrCpy $R0 "$INSTDIR"
+  ${StrCase} $R0 "$R0" "L"
+  StrCpy $R1 "$PROGRAMFILES64"
+  ${StrCase} $R1 "$R1" "L"
+  StrLen $R2 "$R1"
+  StrCpy $R3 "$R0" $R2
+  StrCmp $R3 $R1 0 vega_acl_check_x86
+  StrCpy $R3 "$R0" 1 $R2
+  StrCmp $R3 "\" vega_acl_skip
+vega_acl_check_x86:
+  StrCpy $R1 "$PROGRAMFILES"
+  ${StrCase} $R1 "$R1" "L"
+  StrLen $R2 "$R1"
+  StrCpy $R3 "$R0" $R2
+  StrCmp $R3 $R1 0 vega_acl_lock
+  StrCpy $R3 "$R0" 1 $R2
+  StrCmp $R3 "\" vega_acl_skip
+
+vega_acl_lock:
+  DetailPrint "安装目录不在 Program Files 下，收紧目录权限（仅管理员可写）：$INSTDIR"
+  nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR" /setowner *S-1-5-32-544 /T /C /Q'
+  Pop $0
+  nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /T /C /Q'
+  Pop $1
+  StrCmp "$0$1" "00" vega_acl_done
+  StrCpy $vegaAclWarning "安装目录权限设置失败（icacls 返回 $0/$1），长期密码不可用"
+  DetailPrint "$vegaAclWarning"
+  Goto vega_acl_done
+
+vega_acl_skip:
+  DetailPrint "安装目录在 Program Files 下，沿用系统默认 ACL。"
+vega_acl_done:
+!macroend
+
+; 旧快捷方式：只有确实指向旧目录的主程序时才删，删完立刻按本次安装目录重建同名快捷方式。
 ; 这样 /UPDATE（Tauri 的 CreateOrUpdate*Shortcut 在 UpdateMode 下直接 Return）结束时
 ; 不会留下没有任何快捷方式的安装。$R5 由 IsShortcutTarget 压栈返回。
 ;   * 不重建到旧目录：旧目录正在被删除，指向它的快捷方式必然失效。
@@ -454,7 +505,7 @@ vega_sc_done_${ID}:
   StrCpy $vegaMigratePending "0"
 
   ; t6-fix4：/UPDATE 也走这里。迁移只做文件删除，不会回滚 RustDesk 配置；
-  ; 若旧版就在固定目录，下面的长路径比较会直接跳过。
+  ; 若旧版就在本次安装目录（t6b：$INSTDIR），下面的长路径比较会直接跳过。
   StrCpy $R7 "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCTNAME}"
   ; 原样保存旧卸载入口：迁移中止（新卸载器没写成）时在 POSTINSTALL 恢复，系统卸载入口不失效。
   ReadRegStr $vegaOldRegUninst SHCTX "$R7" "UninstallString"
@@ -480,14 +531,16 @@ vega_old_have_path:
   !insertmacro VegaCanonicalDir old_inst $vegaOldInstallDir
   StrCmp $vegaOldInstallDir "" vega_old_done
 
-  StrCpy $vegaFixedDir "${VEGA_INSTALL_DIR}"
+  ; t6b：比较对象是本次的最终安装目录 $INSTDIR（用户可能选在 D:\ 或沿用旧位置），
+  ; 不再是比较固定的 Program Files 目录。
+  StrCpy $vegaFixedDir "$INSTDIR"
   !insertmacro VegaCanonicalDir fixed $vegaFixedDir
 
   ; 大小写不敏感比较，尾部反斜杠已在上一步去掉。
   ${StrCase} $R8 "$vegaOldInstallDir" "L"
   ${StrCase} $R9 "$vegaFixedDir" "L"
   StrCmp $R8 $R9 0 vega_old_differs
-    DetailPrint "旧版安装目录就是 ${VEGA_INSTALL_DIR}，按就地升级处理。"
+    DetailPrint "旧版安装目录就是本次安装目录 $INSTDIR，按就地升级处理。"
     Goto vega_old_done
 
 vega_old_differs:
@@ -545,18 +598,18 @@ vega_old_no_binary:
 vega_old_done:
 !macroend
 
-; POSTINSTALL 调用：新文件已写入固定目录后再清理旧目录。
+; POSTINSTALL 调用：新文件已写入本次安装目录后再清理旧目录。
 !macro VegaFinishPreviousInstall
   StrCmp $vegaMigratePending "1" 0 vega_mig_done
   StrCpy $vegaMigratePending "0"
-  ; 双保险：新主程序必须已在固定目录里，否则保留旧版不动。
+  ; 双保险：新主程序必须已在本次安装目录 $INSTDIR 里，否则保留旧版不动。
   ; 同名目录也会让 IfFileExists 成立：用「路径\*.*」排除目录，只认真正的文件。
-  IfFileExists "${VEGA_INSTALL_DIR}\uninstall.exe\*.*" vega_mig_new_missing
-  IfFileExists "${VEGA_INSTALL_DIR}\vega-console.exe\*.*" vega_mig_new_missing
-  IfFileExists "${VEGA_INSTALL_DIR}\uninstall.exe" 0 vega_mig_new_missing
-  IfFileExists "${VEGA_INSTALL_DIR}\vega-console.exe" vega_mig_new_same_check
+  IfFileExists "$INSTDIR\uninstall.exe\*.*" vega_mig_new_missing
+  IfFileExists "$INSTDIR\vega-console.exe\*.*" vega_mig_new_missing
+  IfFileExists "$INSTDIR\uninstall.exe" 0 vega_mig_new_missing
+  IfFileExists "$INSTDIR\vega-console.exe" vega_mig_new_same_check
 vega_mig_new_missing:
-  ; 新卸载器/主程序无效（磁盘满、同名目录等）：模板已把卸载入口改到固定目录，
+  ; 新卸载器/主程序无效（磁盘满、同名目录等）：模板已把卸载入口改到 $INSTDIR，
   ; 这里改回旧版的原值，旧版仍可从「应用和功能」卸载。
   StrCmp $vegaOldRegUninst "" vega_mig_reg_restored
     WriteRegStr SHCTX "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCTNAME}" "UninstallString" "$vegaOldRegUninst"
@@ -564,30 +617,29 @@ vega_mig_new_missing:
     WriteRegStr SHCTX "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCTNAME}" "DisplayIcon" "$vegaOldRegIcon"
     DetailPrint "已把系统卸载入口恢复为旧版：$vegaOldRegUninst"
 vega_mig_reg_restored:
-    StrCpy $vegaOldInstallWarning "新版主程序或卸载器没有写入 ${VEGA_INSTALL_DIR}，旧版 $vegaOldInstallDir 保持原样，请重新运行安装包。"
+    StrCpy $vegaOldInstallWarning "新版主程序或卸载器没有写入 $INSTDIR，旧版 $vegaOldInstallDir 保持原样，请重新运行安装包。"
     DetailPrint "$vegaOldInstallWarning"
     Goto vega_mig_done
 vega_mig_new_same_check:
-  ; 盘符别名（subst）、挂载点等让两个字符串不同的路径指向同一目录：在固定目录写一个
+  ; 盘符别名（subst）、挂载点等让两个字符串不同的路径指向同一目录：在 $INSTDIR 写一个
   ; 探针文件，再从旧路径看它是否出现。出现即同一目录，绝不删除。
   ClearErrors
-  FileOpen $R0 "${VEGA_INSTALL_DIR}\.vega-migrate-probe" w
+  FileOpen $R0 "$INSTDIR\.vega-migrate-probe" w
   IfErrors vega_mig_probe_failed
   FileClose $R0
   IfFileExists "$vegaOldInstallDir\.vega-migrate-probe" 0 vega_mig_probe_differs
-    Delete "${VEGA_INSTALL_DIR}\.vega-migrate-probe"
-    DetailPrint "旧版目录 $vegaOldInstallDir 与 ${VEGA_INSTALL_DIR} 是同一目录（别名），不清理。"
+    Delete "$INSTDIR\.vega-migrate-probe"
+    DetailPrint "旧版目录 $vegaOldInstallDir 与 $INSTDIR 是同一目录（别名），不清理。"
     Goto vega_mig_done
 vega_mig_probe_failed:
-    DetailPrint "无法在 ${VEGA_INSTALL_DIR} 写入迁移探针，为安全起见不清理旧目录。"
+    DetailPrint "无法在 $INSTDIR 写入迁移探针，为安全起见不清理旧目录。"
     Goto vega_mig_done
 vega_mig_probe_differs:
-  Delete "${VEGA_INSTALL_DIR}\.vega-migrate-probe"
+  Delete "$INSTDIR\.vega-migrate-probe"
 vega_mig_new_ok:
   DetailPrint "发现旧版 Vega 装在 $vegaOldInstallDir，删除旧程序文件（不运行旧卸载器，RustDesk 与配置保持原样）…"
 
-  ; 先保证当前解包目录是固定目录，避免后续 File 落回旧目录。
-  StrCpy $INSTDIR "${VEGA_INSTALL_DIR}"
+  ; 先保证当前解包目录是本次安装目录，避免后续 File 落回旧目录。
   SetOutPath "$INSTDIR"
 
   ; 旧版还在运行（vega-console.exe 被占用）时 Delete 会失败。架构裁定：不做
@@ -596,7 +648,7 @@ vega_mig_new_ok:
   ; 只把处理方式写到完成页，旧目录原样保留。
   Delete "$vegaOldInstallDir\vega-console.exe"
   IfFileExists "$vegaOldInstallDir\vega-console.exe" 0 vega_old_delete_rest
-    StrCpy $vegaOldInstallWarning "旧版 Vega 仍在运行（$vegaOldInstallDir\vega-console.exe 被占用），旧目录未清理。请完全退出旧版 Vega（托盘图标 → 退出）后手动删除该目录；快捷方式已指向 ${VEGA_INSTALL_DIR}。"
+    StrCpy $vegaOldInstallWarning "旧版 Vega 仍在运行（$vegaOldInstallDir\vega-console.exe 被占用），旧目录未清理。请完全退出旧版 Vega（托盘图标 → 退出）后手动删除该目录；快捷方式已指向 $INSTDIR。"
     DetailPrint "$vegaOldInstallWarning"
     Goto vega_old_shortcuts
 
@@ -614,7 +666,7 @@ vega_old_delete_rest:
   RMDir "$vegaOldInstallDir"
 
 vega_old_shortcuts:
-  ; 快捷方式：指向旧目录的就地改成固定目录，删完立刻重建（/UPDATE 下 Tauri 不建快捷方式）。
+  ; 快捷方式：指向旧目录的就地改成本次安装目录，删完立刻重建（/UPDATE 下 Tauri 不建快捷方式）。
   !insertmacro VegaMigrateShortcut old_sc_sm "$SMPROGRAMS\${PRODUCTNAME}.lnk" "$SMPROGRAMS"
   StrCmp $AppStartMenuFolder "" vega_old_shortcut_sub_done
   !insertmacro VegaMigrateShortcut old_sc_sub "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk" "$SMPROGRAMS\$AppStartMenuFolder"
@@ -633,10 +685,10 @@ vega_old_cleaned:
 vega_mig_done:
 !macroend
 
-; t6-fix：安装路径固定。Tauri 在 PREINSTALL 之后才复制文件、写注册表与快捷方式，
-; 所以在这里改写 $INSTDIR 就足以让整个安装（含 UninstallString、更新器的安装位置）
-; 落到 $PROGRAMFILES64\Vega；/D 参数、旧版注册表里的 InstallLocation、目录页的选择
-; 都不会改变结果。
+; t6b：安装路径由模板 .onInit（/D=、卸载注册表 InstallLocation、默认
+; $PROGRAMFILES64\Vega）与目录页选择共同决定；Tauri 在 PREINSTALL 之后才复制文件、
+; 写注册表与快捷方式，所以这里只做兜底（$INSTDIR 为空时才用默认值）并 SetOutPath，
+; 不再改写用户的选择。
 !macro NSIS_HOOK_PREINSTALL
   ; t6-fix5 P3：完成页文案无条件先打底。VegaRunInstallRustDesk 在重装与 /UPDATE 下会被
   ; 跳过，如果只在脚本宏里初始化，/UPDATE 的完成页就是空白（MUI_FINISHPAGE_TEXT 引用
@@ -654,19 +706,21 @@ vega_mig_done:
     StrCpy $vegaHadPreviousInstall "1"
 vega_preinstall_no_previous:
 
-  ; 先处理旧安装目录。$INSTDIR 已在模板 .onInit 末尾强制为固定目录；这里从注册表
-  ; 读旧安装记录做迁移，但不运行旧卸载器。
-  !insertmacro VegaRemovePreviousInstall
-
-  StrCmp $INSTDIR "${VEGA_INSTALL_DIR}" vega_preinstall_dir_done
-    DetailPrint "安装目录固定为 ${VEGA_INSTALL_DIR}（忽略请求的 $INSTDIR）"
+  ; t6b：安装目录由 .onInit（/D、卸载注册表 InstallLocation、默认 Program Files）
+  ; 或目录页选择决定，这里只在极端情况下兜底，不再强制改写用户的选择。
+  StrCmp $INSTDIR "" 0 vega_preinstall_dir_done
+    DetailPrint "安装目录为空，使用默认目录 ${VEGA_INSTALL_DIR}"
+    StrCpy $INSTDIR "${VEGA_INSTALL_DIR}"
 vega_preinstall_dir_done:
-  StrCpy $INSTDIR "${VEGA_INSTALL_DIR}"
-  ; 双保险：让 $OUTDIR 指向固定目录，后续 File 一定解到新目录。
+  ; 先处理旧安装目录（与 $INSTDIR 比较）：从注册表读旧安装记录做迁移，但不运行旧卸载器。
+  !insertmacro VegaRemovePreviousInstall
+  ; 双保险：让 $OUTDIR 指向本次安装目录，后续 File 一定解到新目录。
   SetOutPath "$INSTDIR"
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
+  ; t6b：文件已全部写入，先收紧安装目录 ACL（Program Files 下不做），再清理旧目录。
+  !insertmacro VegaLockInstallDirAcl
   ; 新文件已就位：此时才清理旧目录、改快捷方式（见 VegaFinishPreviousInstall）。
   !insertmacro VegaFinishPreviousInstall
   ; t6-fix4（架构裁定）：
@@ -690,6 +744,9 @@ vega_postinstall_notes:
   ; t6-fix5 P3：迁移告警在「跑脚本」和「跳过脚本」两条路径下都要出现。
   StrCmp $vegaOldInstallWarning "" vega_postinstall_done
     StrCpy $vegaFinishText "$vegaFinishText$\r$\n$\r$\n$vegaOldInstallWarning"
+  ; t6b：ACL 收紧失败同样写进完成页（此时长期密码会被控制台拒绝）。
+  StrCmp $vegaAclWarning "" vega_postinstall_done
+    StrCpy $vegaFinishText "$vegaFinishText$\r$\n$\r$\n$vegaAclWarning"
 vega_postinstall_done:
 !macroend
 
