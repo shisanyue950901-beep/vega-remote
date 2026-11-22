@@ -86,10 +86,16 @@
 2. GitHub Release `https://github.com/shisanyue950901-beep/vega-remote/releases/latest/download/latest.json`
 
 **镜像走明文 HTTP 是刻意的**：镜像只节省带宽和连接时间，不承担信任。更新包使用 minisign 签名，
-公钥在构建时由 CI 通过 `VEGA_UPDATER_PUBKEY` 注入配置（源码里是占位符）；客户端安装前会校验
-`latest.json` 里每个平台的 `signature` 与安装包内容。公钥不在更新通道上传输，因此能改 `latest.json`
-或替换安装包的一方没有私钥，篡改后的包无法通过校验，也就无法被安装。私钥只存在于 CI secrets，
-不进入仓库与任何构建产物。
+公钥直接提交在 `console/src-tauri/tauri.conf.json` 的 `plugins.updater.pubkey` 里（源码可见，不靠 CI
+注入，也不用仓库 secret）；客户端安装前会校验 `latest.json` 里每个平台的 `signature` 与安装包内容。
+公钥不在更新通道上传输，因此能改 `latest.json` 或替换安装包的一方没有私钥，篡改后的包无法通过
+校验，也就无法被安装。
+
+**签名只在维护者本机做**：CI 只构建未签名的 NSIS 安装包（`createUpdaterArtifacts: false`，构建不读
+任何签名密钥，`TAURI_SIGNING_*` / `VEGA_UPDATER_PUBKEY` 都不再使用）。发布时维护者在本机运行
+`tools/publish-update.sh <tag> <setup.exe>`：脚本用 `tauri signer sign` 对安装包签名、写出 `latest.json`，
+再把安装包、`.sig` 与清单上传到阿里云 `/opt/vega-relay/updates/` 和 GitHub Release。私钥只存在于维护者
+本机的环境变量（`TAURI_SIGNING_PRIVATE_KEY`）里，不进仓库、CI 或脚本参数，脚本也不打印私钥内容。
 
 明文通道的残余风险：攻击者可以看到「谁在何时检查更新」以及版本号，也可以让更新检查失败（拒绝服务）。
 若需要隐藏元数据，请改用 HTTPS 镜像；本项目的签名校验不依赖传输层。
