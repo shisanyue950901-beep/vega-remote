@@ -1,15 +1,18 @@
 # 更新镜像（阿里云 `60.205.95.98`）
 
-控制台更新优先走这个镜像，失败再回落到 GitHub Release。镜像只托管三个静态文件：
+控制台更新优先走这个镜像，失败再回落到 GitHub 固定 tag `vega-updates`。安装包按版本进不可变目录，
+清单在根目录：
 
 ```
 /opt/vega-relay/updates/
-├── latest.json          # 客户端检查入口（由 latest-mirror.json 原子改名而来，内容见 publish-update.sh）
-├── Vega-Setup.exe       # NSIS 安装包
-└── Vega-Setup.exe.sig   # minisign 签名
+├── latest.json                    # 客户端检查入口（由 latest-mirror.json 原子改名而来）
+├── 0.6.0/
+│   ├── Vega-Setup-0.6.0.exe       # NSIS 安装包（只写一次，不覆盖）
+│   └── Vega-Setup-0.6.0.exe.sig   # minisign 签名
+└── 0.6.1/ …                       # 旧版本目录一直保留
 ```
 
-`latest.json` 里的 `url` 指向本目录下的 `Vega-Setup.exe`。传输是明文 HTTP，
+`latest.json` 里的 `url` 指向 `<版本>/Vega-Setup-<版本>.exe`。传输是明文 HTTP，
 信任来自安装包签名：客户端用编译进程序的公钥校验 `.sig`，篡改的包无法安装。
 
 ## nginx 容器
@@ -51,7 +54,7 @@ docker run -d --name vega-updates --restart unless-stopped \
 ```bash
 curl -fsS http://60.205.95.98/healthz
 curl -fsS http://60.205.95.98/vega/updates/latest.json
-curl -fsSI http://60.205.95.98/vega/updates/Vega-Setup.exe
+curl -fsSI http://60.205.95.98/vega/updates/<版本>/Vega-Setup-<版本>.exe
 ```
 
 ## 发布一次更新
@@ -72,10 +75,12 @@ curl -fsSI http://60.205.95.98/vega/updates/Vega-Setup.exe
    tools/publish-update.sh v0.6.0 <path>/Vega-Setup.exe
    ```
 
-   脚本用 `tauri signer sign` 生成 `Vega-Setup.exe.sig`，写出 `latest.json`（指向 GitHub tag 资产）
-   与 `latest-mirror.json`（指向本镜像），打印 SHA256，然后上传到 GitHub Release 和
-   `/opt/vega-relay/updates/`；镜像清单最后以 `.latest.json.tmp` 原子改名为 `latest.json`，
-   客户端不会读到半个文件。只想发一边时用 `VEGA_SKIP_GITHUB=1` / `VEGA_SKIP_MIRROR=1`。
+   脚本用 `tauri signer sign` 生成 `Vega-Setup-<版本>.exe.sig`，写出 `latest.json`（指向 GitHub
+   固定 tag `vega-updates` 的版本化资产）与 `latest-mirror.json`（指向本镜像的版本目录），打印
+   SHA256，然后把安装包与 `.sig` 传到 `/opt/vega-relay/updates/<版本>/`（已存在则拒绝，永不覆盖），
+   清单最后写临时名再原子 `mv` 成 `latest.json`，客户端不会读到半个文件；同名资产发到
+   GitHub Release `vega-updates` 时用 `--clobber` 覆盖清单。只想发一边时用
+   `VEGA_SKIP_GITHUB=1` / `VEGA_SKIP_MIRROR=1`；同时发不同版本请逐个跑，旧版本目录不动。
 3. 用上面的 `curl` 复查 `latest.json` 的 `version` 与 `url`。
 
 注意：漏签或改用手工 `scp` 时，务必连 `.sig` 一起传；`latest.json` 里的 `signature`
@@ -83,5 +88,6 @@ curl -fsSI http://60.205.95.98/vega/updates/Vega-Setup.exe
 
 ## 回滚
 
-把上一版 `latest.json`、`Vega-Setup.exe`、`.sig` 重新 `scp` 上去，同样先传临时名再
-`mv`。签名版本号必须高于客户端当前版本，客户端才会提示更新。
+改回上一版的清单即可：把对应的 `latest-mirror.json` 内容（url 指向旧版本目录）写临时名再原子
+`mv` 成 `latest.json`，安装包不用重传——旧版本目录一直在。签名版本号必须高于客户端当前版本，
+客户端才会提示更新。
