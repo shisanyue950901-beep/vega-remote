@@ -249,3 +249,8 @@
 - P2 超大配置：读取限 64 KiB、单字段 ≤255 字节、payload ≤1024 字节；`get_mobile_config_qr` 改 async，读/解析/序列化/QR 分段走 `spawn_blocking`；失败视图 `server` 与指纹一律置空。
 - P2 文案：扫码入口改为「底部『设置』→ 右上角扫码图标」，并写明扫完点「确定」保存。
 - P3 测试：加 TOML 样例→payload→矩阵（含/不含 relay）、公钥折行规范化、字段与文件超限用例；Windows 冒烟清单补手机实扫、键盘焦点与绘制失败三项。
+
+### T5-fix2（Codex 审计 t5-r2 修复）
+- P2 定位图案断言：`assert_valid_matrix` 改成外框 (ox,oy)/(ox+6,oy) 为黑、白环 (ox+1,oy+1) 为白、中心 (ox+3,oy+3) 为黑，三个矩阵用例不再卡在 CI。
+- P2 上下文丢失：`drawMobileQr` 绘制前查 `ctx.isContextLost?.()`，为真按绘制失败返回；弹层打开期间监听 canvas 的 `contextlost`，一触发即置绘制失败并作废在途请求，关闭（含 Esc）时摘掉监听。
+- P3 未做（待加固）：冒烟清单的「绘制失败」目前只覆盖 Rust 输入错误，建议补独立解码器从矩阵读回原始 `config=` 文本（含/不含中继），前端注入长度错误的矩阵与不可用上下文断言状态仍为错误。
