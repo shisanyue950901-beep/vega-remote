@@ -908,11 +908,18 @@ vega_validate_drive:
   StrCmp $2 "ntfs" vega_validate_normalize vega_validate_bad_fs
 
 vega_validate_normalize:
-  ; 系统盘 Program Files 下的 Vega 原样保留；其余一律 <盘符>:\Vega。
+  ; 落在系统盘 Program Files 里的选择统一收成 $PROGRAMFILES64\Vega（用户可能选的是
+  ; Program Files 本身、或它下面的子目录）；其余一律取盘符改成 <盘符>:\Vega。
   ${StrCase} $vegaTmp1 "$INSTDIR" "L"
-  ${StrCase} $vegaTmp2 "$PROGRAMFILES64\Vega" "L"
-  StrCmp $vegaTmp1 $vegaTmp2 vega_validate_keep_programfiles
+  ${StrCase} $vegaTmp2 "$PROGRAMFILES64" "L"
+  StrCmp $vegaTmp1 $vegaTmp2 vega_validate_programfiles
+  StrLen $vegaTmp3 "$vegaTmp2"
+  StrCpy $R1 "$vegaTmp1" $vegaTmp3
+  StrCmp $R1 $vegaTmp2 0 vega_validate_drive_path
+  StrCpy $R1 "$vegaTmp1" 1 $vegaTmp3
+  StrCmp $R1 "\" vega_validate_programfiles
 
+vega_validate_drive_path:
   StrCpy $vegaTmp3 "$INSTDIR" 2
   StrCpy $vegaTmp3 "$vegaTmp3\Vega"
   ${StrCase} $vegaTmp1 "$vegaTmp3" "L"
@@ -922,8 +929,14 @@ vega_validate_normalize:
   StrCpy $vegaTargetChanged "1"
   Goto vega_validate_nonempty
 
-vega_validate_keep_programfiles:
-  StrCpy $INSTDIR "$PROGRAMFILES64\Vega"
+vega_validate_programfiles:
+  StrCpy $vegaTmp3 "$PROGRAMFILES64\Vega"
+  ${StrCase} $vegaTmp1 "$vegaTmp3" "L"
+  ${StrCase} $vegaTmp2 "$INSTDIR" "L"
+  StrCmp $vegaTmp1 $vegaTmp2 vega_validate_nonempty
+  StrCpy $INSTDIR "$vegaTmp3"
+  StrCpy $vegaTargetChanged "1"
+  Goto vega_validate_nonempty
 
 vega_validate_nonempty:
   FindFirst $0 $1 "$INSTDIR\*.*"
