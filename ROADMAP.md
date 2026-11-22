@@ -386,3 +386,4 @@
   而 `Set-Acl` 的文件系统提供程序会先尝试持久化全部段；在具备审计写权限的提权令牌下，这可能清掉根目录
   已有的显式 SACL。理想方案同上：用 Win32 API 把写入范围限定在 Owner 和受保护 DACL（`SetSecurityInfo`
   只传 `OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION`）。
+- 更新检查的错误文案不区分原因（t6d 记录，未实现）：现在镜像不可达、被系统代理拦截、TLS/清单签名失败、超时都收敛成同一句「检查更新失败，请确认网络后重试」。t6d 已让镜像端点不走系统代理，但用户仍可能被别的代理/防火墙拦住。后续：按错误类型分流提示——连接被拒/域名或 IP 不可达、DNS 解析失败、超时、代理返回 407/502 这类「被代理拦截」，与签名校验失败、清单解析失败分开，镜像与 GitHub 两端分别给出具体原因而不是一句「请确认网络」。
