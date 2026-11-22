@@ -298,6 +298,7 @@
 - 迁移比较对象改为本次最终 `$INSTDIR`（不再固定 Program Files）；旧目录与 `$INSTDIR` 相同时不做迁移，其余安全检查（不运行旧卸载器、新 uninstall/vega-console 必须是文件、注册表回滚、重解析点、占用跳过）全部保留。
 - 控制台：`password.rs::ensure_helper_location` 除 Program Files 外，只接受「助手位于 `<exe_dir>\resources`」且 exe_dir / resources / 助手文件三层都不是重解析点、所有者与 DACL 都只允许 SYSTEM/Administrators/TrustedInstaller 写（`dacl_admin_only_write` 为纯函数并带单测）；否则返回「Vega 安装目录权限不安全，无法设置长期密码。请重新运行安装包修复。」
 - 版本：`0.6.0` → `0.6.1`。
+- t6b 第 1 轮审计修复（架构裁定，仅 NSIS 侧）：允许的安装位置收紧为 `$PROGRAMFILES64\Vega` 或 `X:\Vega`（本地固定 NTFS 盘根下的 Vega），其它输入规范成 `X:\Vega` 并在目录页提示；`VegaValidateTarget` 成为唯一校验入口，目录页回调与安装节开头（任何 `SetOutPath` 之前）都调用，静默 / 被动 / `/D=` 失败时 `SetErrorLevel 2` 并中止；非空目录用 `FindFirst`/`FindNext` 跳过 `.`/`..` 判定，只接受空目录或 `vega-console.exe` 确实是文件的已有 Vega；`System::Call` 输出寄存器统一 `.rN` 并读 `$N`；ACL 对两种位置都执行 `icacls /reset /T` → `/setowner *S-1-5-32-544 /T` → `/inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /T`，三条退出码都检查；`.onInit` 用 `$CMDLINE` 里的 `" /D="`（大小写不敏感）判定命令行是否指定目录，未指定时优先沿用校验通过的旧位置。
 
 ### T6 加固（待做）
 - 磁盘写满时的安装/在线更新：NSIS 覆盖写入中途耗尽空间会留下截断的 `vega-console.exe` / `uninstall.exe` 与指向它的卸载入口（与 Tauri 默认模板相同）。后续：安装前检查剩余空间、先写临时名再替换，或写入失败时回滚注册表（迁移路径已回滚）。
