@@ -742,8 +742,9 @@ vega_postinstall_run:
 
 vega_postinstall_notes:
   ; t6-fix5 P3：迁移告警在「跑脚本」和「跳过脚本」两条路径下都要出现。
-  StrCmp $vegaOldInstallWarning "" vega_postinstall_done
+  StrCmp $vegaOldInstallWarning "" vega_postinstall_acl
     StrCpy $vegaFinishText "$vegaFinishText$\r$\n$\r$\n$vegaOldInstallWarning"
+vega_postinstall_acl:
   ; t6b：ACL 收紧失败同样写进完成页（此时长期密码会被控制台拒绝）。
   StrCmp $vegaAclWarning "" vega_postinstall_done
     StrCpy $vegaFinishText "$vegaFinishText$\r$\n$\r$\n$vegaAclWarning"
