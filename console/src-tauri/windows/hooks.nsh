@@ -24,9 +24,14 @@
 ;     规则改为「只允许 $PROGRAMFILES64\Vega 或 <X>:\Vega（本地固定 NTFS 盘根下的 Vega），
 ;     安装器把目录 ACL 收紧成只有管理员可写」。
 ;     目标校验集中在模板 installer.nsi 的 VegaValidateTarget（目录页回调与安装节开头
-;     都调用）；安装完成后由下面的 VegaLockInstallDirAcl 用 icacls 收紧 ACL——**总是**执行，
+;     都调用）；安装目录由下面的 VegaLockInstallDir 用 icacls 收紧 ACL——**总是**执行，
 ;     Program Files 下也一样（先 /reset 清掉旧自定义目录留下的显式 ACE）；
 ;     控制台 password.rs 在每次提权前校验助手父目录的 ACL。
+;   * t6b-fix2（架构裁定）：ACL 锁定改到解包之前——安装节在校验通过后先
+;     CreateDirectory $INSTDIR 并 Call VegaLockInstallDir，任一 icacls 失败立即
+;     SetErrorLevel 2 + Abort，不会把文件解到未锁定的目录；POSTINSTALL 再锁一次
+;     （第二次失败只写完成页告警）。VegaValidateTarget 同时拒绝目标树里的重解析点
+;     和无法枚举的目录；/D= 判定改为 .onInit 开头备份 $INSTDIR（$CMDLINE 里已无 /D=）。
 ;   * t6-fix2（用户 2026-11-22）：旧安装器有目录选择页，旧版可能装在 D:\Vega 这类固定目录
 ;     之外。PREINSTALL 从 Tauri 的卸载注册表项读出旧安装目录，清理旧目录，避免机器上
 ;     两份 Vega 并存。旧目录清理失败只提示，不阻断安装；RustDesk 配置、%ProgramData%\Vega
@@ -451,9 +456,14 @@ vega_reparse_done_${ID}:
 ;   3. /inheritance:r /grant:r —— 只给 SYSTEM、Administrators 完全控制，Users 只读+执行
 ;                        （与 Program Files 的默认 ACL 等价）。
 ; 按 SID 授权，中文/本地化系统里账户名不同也不会失配。
-; 三条命令任一失败只写完成页提示，不 Abort（程序已经装好了）；$SYSDIR 绝对路径调用
-; icacls：提权上下文里按名称搜索会被 PATH 劫持。
-!macro VegaLockInstallDirAcl
+; 失败结果写进 $vegaAclWarning（空 = 三条都成功）：安装节开头的预锁定调用据此
+; SetErrorLevel 2 + Abort（此时还没解包任何文件）；POSTINSTALL 的第二次调用只把
+; 它追加到完成页（程序已经装好了）。$SYSDIR 绝对路径调用 icacls：提权上下文里
+; 按名称搜索会被 PATH 劫持。
+Function VegaLockInstallDir
+  Push $0
+  Push $1
+  Push $2
   StrCpy $vegaAclWarning ""
   DetailPrint "重置并锁定安装目录权限（仅管理员可写）：$INSTDIR"
   nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR" /reset /T /C /Q'
@@ -471,7 +481,10 @@ vega_acl_fail:
   StrCpy $vegaAclWarning "安装目录权限设置失败（icacls 返回 $0/$1/$2），长期密码不可用"
   DetailPrint "$vegaAclWarning"
 vega_acl_done:
-!macroend
+  Pop $2
+  Pop $1
+  Pop $0
+FunctionEnd
 
 ; 旧快捷方式：只有确实指向旧目录的主程序时才删，删完立刻按本次安装目录重建同名快捷方式。
 ; 这样 /UPDATE（Tauri 的 CreateOrUpdate*Shortcut 在 UpdateMode 下直接 Return）结束时
@@ -709,9 +722,10 @@ vega_preinstall_dir_done:
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
-  ; t6b-fix：文件已全部写入，先重置并锁定安装目录 ACL（两种允许位置都执行，见
-  ; VegaLockInstallDirAcl），再清理旧目录。
-  !insertmacro VegaLockInstallDirAcl
+  ; t6b-fix2：第二次 ACL 锁定。安装节开头已经预锁定过（失败会 Abort），这里对
+  ; 解包出来的文件再锁一遍（文件本来就会继承目录 ACL，主要覆盖解包期间新增/改写
+  ; 的子项）；失败只写完成页告警，不 Abort（程序已经装好了）。
+  Call VegaLockInstallDir
   ; 新文件已就位：此时才清理旧目录、改快捷方式（见 VegaFinishPreviousInstall）。
   !insertmacro VegaFinishPreviousInstall
   ; t6-fix4（架构裁定）：
