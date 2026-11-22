@@ -543,8 +543,10 @@ vega_old_done:
   StrCmp $vegaMigratePending "1" 0 vega_mig_done
   StrCpy $vegaMigratePending "0"
   ; 双保险：新主程序必须已在固定目录里，否则保留旧版不动。
+  IfFileExists "${VEGA_INSTALL_DIR}\uninstall.exe" 0 vega_mig_new_missing
   IfFileExists "${VEGA_INSTALL_DIR}\vega-console.exe" vega_mig_new_ok
-    StrCpy $vegaOldInstallWarning "新版主程序没有写入 ${VEGA_INSTALL_DIR}，旧版 $vegaOldInstallDir 保持原样，请重新运行安装包。"
+vega_mig_new_missing:
+    StrCpy $vegaOldInstallWarning "新版主程序或卸载器没有写入 ${VEGA_INSTALL_DIR}，旧版 $vegaOldInstallDir 保持原样，请重新运行安装包。"
     DetailPrint "$vegaOldInstallWarning"
     Goto vega_mig_done
 vega_mig_new_ok:

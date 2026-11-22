@@ -123,9 +123,16 @@ fn parse_version(version: &str) -> Option<semver::Version> {
 }
 
 /// 正式版不接收预发布候选；当前本身是预发布时才接受。解析失败的候选一律丢弃。
+/// 另外要求候选的 SemVer 优先级严格高于当前版本（忽略 +build），仅构建元数据不同不算更新。
 fn acceptable(update: &Update, current_is_pre: bool) -> bool {
+    let current = parse_version(&update.current_version);
     match parse_version(&update.version) {
-        Some(version) => current_is_pre || version.pre.is_empty(),
+        Some(version) => {
+            (current_is_pre || version.pre.is_empty())
+                && current
+                    .map(|c| version.cmp_precedence(&c) == std::cmp::Ordering::Greater)
+                    .unwrap_or(true)
+        }
         None => false,
     }
 }

@@ -64,6 +64,11 @@ esac
 [ -f "$SETUP" ] || { echo "找不到安装包: $SETUP" >&2; exit 1; }
 
 VERSION="${TAG#v}"
+# 架构裁定：更新通道只发正式版。两个端点的 latest.json 只有一份，发预览版会让
+# 正式版客户端（过滤预览版）看不到已发布的正式更新。
+case "$VERSION" in
+  *-*) echo "更新通道只接受正式版本号（${VERSION} 含预发布后缀），拒绝发布。" >&2; exit 1 ;;
+esac
 REPO="${VEGA_REPO:-shisanyue950901-beep/vega-remote}"
 RELEASE_TAG="${VEGA_RELEASE_TAG:-vega-updates}"
 MIRROR_HOST="${VEGA_MIRROR_HOST:-60.205.95.98}"
@@ -386,7 +391,20 @@ if [ "${VEGA_SKIP_GITHUB:-0}" != "1" ]; then
   old_id="$(gh_asset_id "$release_id" "latest.json")" || { echo "查询旧 latest.json 失败，旧清单保持不变。" >&2; exit 1; }
   gh_delete_asset "$old_id"
   # 改名为最终资产名：客户端只会看到完整的新清单。
-  gh api -X PATCH "repos/${REPO}/releases/assets/${new_id}" -f name=latest.json >/dev/null
+  # 旧清单已删：改名失败会让 GitHub 入口缺清单，所以重试 6 次（约 1 分钟），
+  # 仍失败就打印一条可直接执行的恢复命令（镜像清单尚未切换，客户端仍走镜像）。
+  renamed=0
+  for attempt in 1 2 3 4 5 6; do
+    if gh api -X PATCH "repos/${REPO}/releases/assets/${new_id}" -f name=latest.json >/dev/null; then
+      renamed=1; break
+    fi
+    echo "改名 latest.json 失败（第 ${attempt} 次），稍后重试…" >&2
+    sleep $((attempt * 3))
+  done
+  if [ "$renamed" != "1" ]; then
+    echo "GitHub 清单改名失败。API 恢复后执行：gh api -X PATCH repos/${REPO}/releases/assets/${new_id} -f name=latest.json" >&2
+    exit 1
+  fi
   echo "已切换 GitHub 清单 ${REPO} ${RELEASE_TAG}/latest.json。"
 fi
 
