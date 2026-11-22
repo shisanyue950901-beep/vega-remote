@@ -1222,8 +1222,8 @@ vega_validate_tree:
   ${StrCase} $vegaTmp2 "$vegaTmp2" "L"
   StrCmp $vegaTmp1 $vegaTmp2 vega_validate_parent_pf
   StrCpy $vegaTmp3 "$INSTDIR" 3
-  ; t6b-fix3（架构裁定 1）：两个插入点用不同 ID。以前都用 parent，同一个函数里两次展开
-  ; 产生重复标签 vega_reparse_check_parent，NSIS 直接报错（阻断构建）。
+  ; t6b-fix3c：宏内标签只用 ID，不再拼行号宏；同一函数内两次展开靠不同 ID 区分
+  ; （parent_root / parent_pf），否则会展开出同名标签 vega_reparse_check_* 而阻断构建。
   !insertmacro VegaIsReparsePoint parent_root "$vegaTmp3" $vegaTmp1
   Goto vega_validate_parent_checked
 vega_validate_parent_pf:

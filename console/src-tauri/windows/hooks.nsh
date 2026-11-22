@@ -430,22 +430,25 @@ vega_canon_done_${ID}:
 ; 不存在（GetFileAttributesW 返回 INVALID_FILE_ATTRIBUTES = -1）不算重解析点。
 ; 同样只用 $0/$1（System::Call 的 r0/r1），进出宏 Push/Pop。
 ;
-; t6b-fix3（架构裁定 1）：标签除了 ID 还要带 ${__LINE__}。ID 只是调用方给的语义名，
-; 同一个函数里两次用同一个 ID（VegaValidateTarget 里两次 parent）就会展开出同名标签，
-; NSIS 直接报重复标签错误。${__LINE__} 由编译器在插入点展开，加上它以后同一个 ID
-; 在同一行之外不可能重名；调用点仍然用不同 ID，两层保险。
+; t6b-fix3c（架构裁定）：标签只用调用方传入的 ID，**不再拼行号宏**。
+; 以前标签带行号宏，但它在宏展开时按行取值：跳转语句所在行与标签定义所在行得到的
+; 数字不同，于是 Goto/IntCmp 引用的名称与标签定义对不上，NSIS 报
+; could not resolve label "…_1194.6" 阻断构建。唯一性改由调用点保证：同一函数内每次
+; 插入都用不同的 ID（VegaValidateTarget: parent_root / parent_pf；
+; VegaRemovePreviousInstall: old_dir / old_res / old_res_host / old_res_host_lib）。
+; 宏体内每个跳转引用的标签名都与下面定义的完全一致。
 !macro VegaIsReparsePoint ID PATH VAR
   Push $0
   Push $1
   StrCpy ${VAR} "0"
   System::Call 'kernel32::GetFileAttributesW(w "${PATH}") i .r0'
   ; INVALID_FILE_ATTRIBUTES（0xFFFFFFFF）表示路径不存在，不算重解析点。
-  IntCmpU $0 0xFFFFFFFF vega_reparse_done_${ID}_${__LINE__} vega_reparse_check_${ID}_${__LINE__} vega_reparse_done_${ID}_${__LINE__}
-vega_reparse_check_${ID}_${__LINE__}:
+  IntCmpU $0 0xFFFFFFFF vega_reparse_done_${ID} vega_reparse_check_${ID} vega_reparse_done_${ID}
+vega_reparse_check_${ID}:
   IntOp $1 ${FILE_ATTRIBUTE_REPARSE_POINT} & $0
-  StrCmp $1 "0" vega_reparse_done_${ID}_${__LINE__}
+  StrCmp $1 "0" vega_reparse_done_${ID}
     StrCpy ${VAR} "1"
-vega_reparse_done_${ID}_${__LINE__}:
+vega_reparse_done_${ID}:
   Pop $1
   Pop $0
 !macroend
