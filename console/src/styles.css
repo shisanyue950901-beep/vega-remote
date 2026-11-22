@@ -1210,5 +1210,5 @@ dialog.modal:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 /* 自动更新：侧栏徽标 + 设置页进度条（复用既有按钮/颜色变量） */
 .update-badge{appearance:none;border:0;padding:2px 8px;border-radius:var(--radius-pill);background:var(--accent-soft);color:var(--accent);font:600 11px/1.4 var(--font);cursor:pointer;white-space:nowrap}
 .update-badge:hover{filter:brightness(1.06)}
-.progress{height:6px;margin-top:6px;border-radius:3px;background:var(--fill);overflow:hidden}
+.progress{display:block;height:6px;margin-top:6px;border-radius:3px;background:var(--fill);overflow:hidden}
 .progress__bar{display:block;height:100%;width:0;border-radius:3px;background:var(--accent);transition:width 160ms var(--ease)}
