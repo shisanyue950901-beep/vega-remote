@@ -13,9 +13,11 @@
 ;      $PROGRAMFILES64\Vega，其余按所选路径的盘符收成 <X>:\Vega。
 ;      原因见 hooks.nsh 的 t6b 说明（ACL 由安装器收紧）。
 ;   2. 目标校验只有一份：VegaValidateTarget 同时被目录页回调与安装节开头调用，
-;      静默 / 被动 / `/D=` 安装不会绕过。.onInit 用 $CMDLINE 里的 " /D=" 判定命令行是否
-;      指定了目录；没指定时优先沿用卸载注册表里校验通过的旧位置，否则默认
-;      $PROGRAMFILES64\Vega。
+;      静默 / 被动 / `/D=` 安装不会绕过。t6b-fix2 起 /D= 不再搜 $CMDLINE（NSIS 已把它
+;      写进 $INSTDIR 并从 $CMDLINE 移除），而是在 .onInit 第一行把 $INSTDIR 备份到
+;      $vegaCmdlineDir：非空即给了 /D=，否则优先沿用卸载注册表里校验通过的旧位置，
+;      最后才用 $PROGRAMFILES64\Vega。InstallDir 属性留空，避免内置占位路径混进判断。
+;      t6b-fix2 还让校验拒绝目标树里的重解析点、无法枚举的目录，以及是重解析点的父目录。
 ;   3. 删除「重新安装 / 已安装」页（PageReinstall、PageReinstallUpdateSelection、
 ;      PageLeaveReinstall 及 Var ReinstallPageCheck）。安装器永远不运行旧卸载器，
 ;      也不再询问卸载/重装，直接在安装目录上覆盖安装。
@@ -26,6 +28,8 @@
 ;   7. 保留 FindWixInstall：它仍用于降级检查时比较 WiX 安装的版本号，但不再触发卸载。
 ;   8. 安装节开头先 `Call VegaValidateTarget`（在任何 SetOutPath 之前）：静默 / 被动
 ;      / `/D=` 安装与交互安装共用同一份目标校验，失败 `SetErrorLevel 2` 并中止。
+;      t6b-fix2 接着 CreateDirectory + Call VegaLockInstallDir 预锁定 ACL，任何一条
+;      icacls 失败都在解包之前中止；POSTINSTALL 再锁第二次（失败只写完成页告警）。
 ;
 ; 为什么不用宏覆盖：MUI2.nsh 在 include 时就把 MUI_PAGE_DIRECTORY 展开成页面序号，
 ; hooks.nsh 里 !undef + 空宏不起作用（页面照样出现）。只能改模板本体。
@@ -115,6 +119,9 @@ Var OldMainBinaryName
 ; vegaTmp* 只用于跨 ${StrCase} 暂存，避免依赖 StrFunc 内部用到的寄存器。
 Var vegaTargetError
 Var vegaTargetChanged
+; t6b-fix2（架构裁定 4）：.onInit 第一行把 NSIS 预写的 $INSTDIR（= /D= 的值）备份
+; 到这里。非空 ⇔ 命令行给了 /D=；$CMDLINE 里的 /D= 已被 NSIS 移除，不能再搜。
+Var vegaCmdlineDir
 Var vegaTargetEmpty
 ; t6b-fix2（架构裁定 2/3）：VegaScanReparseTree 的输入/输出。
 ;   * $vegaWalkPath  当前待检查的目录（栈式遍历的工作变量，入口放 $INSTDIR）。
@@ -131,11 +138,12 @@ Name "${PRODUCTNAME}"
 BrandingText "${COPYRIGHT}"
 OutFile "${OUTFILE}"
 
-; We don't actually use this value as default install path,
-; it's just for nsis to append the product name folder in the directory selector
+; t6b-fix2（架构裁定 4）：InstallDir 留空。Tauri 模板原来放了一个占位路径
+; `placeholder\${PRODUCTNAME}`，NSIS 会先把它写进 $INSTDIR，再在 .onInit 之前把
+; `/D=` 覆盖上去，于是没法只凭 $INSTDIR 判断用户到底给没给 /D=。
+; 留空后：没给 /D= 时 $INSTDIR 为空，给了就是命令行目录；默认值统一在 .onInit 里赋值。
 ; https://nsis.sourceforge.io/Reference/InstallDir
-!define PLACEHOLDER_INSTALL_DIR "placeholder\${PRODUCTNAME}"
-InstallDir "${PLACEHOLDER_INSTALL_DIR}"
+InstallDir ""
 
 VIProductVersion "${VERSIONWITHBUILD}"
 VIAddVersionKey "ProductName" "${PRODUCTNAME}"
@@ -358,6 +366,11 @@ FunctionEnd
 {{/each}}
 
 Function .onInit
+  ; t6b-fix2（架构裁定 4）：在任何模板代码碰 $INSTDIR 之前备份它。NSIS 已在进入
+  ; .onInit 之前把 `/D=` 写进 $INSTDIR 并从 $CMDLINE 移除了该参数，所以这里
+  ; 非空 ⇔ 命令行给了 /D=。后面一律用 $vegaCmdlineDir 判断，不再搜 $CMDLINE。
+  StrCpy $vegaCmdlineDir "$INSTDIR"
+
   ${GetOptions} $CMDLINE "/P" $PassiveMode
   ${IfNot} ${Errors}
     StrCpy $PassiveMode 1
@@ -379,23 +392,27 @@ Function .onInit
 
   !insertmacro SetContext
 
-  ; --- Vega customization (t6b-fix) ---------------------------------------
+  !if "${INSTALLMODE}" == "both"
+    !insertmacro MULTIUSER_INIT
+  !endif
+
+  ; --- Vega customization (t6b-fix / t6b-fix2) ----------------------------
   ; 允许的安装位置只有两种（架构裁定）：
   ;   * $PROGRAMFILES64\Vega —— 默认；继承 ACL 已经是管理员独占写；
   ;   * <X>:\Vega —— 本地固定 NTFS 盘根目录下的 Vega；安装后由 icacls 收紧 ACL。
   ; 其它输入由 VegaValidateTarget 统一规范成 <X>:\Vega（取用户所选路径的盘符）。
   ;
-  ; /D= 优先级（架构裁定）：NSIS 会把 `/D=<dir>` 直接写进 $INSTDIR，之后无法再与默认值
-  ; 区分，所以一开始就在 $CMDLINE 里找 " /D="。整串先转大写，避免依赖 ${StrLoc} 的
-  ; 大小写默认值；前面补一个空格，这样 `/D=` 紧跟在程序名后面也能命中。
-  ;   * 给了 /D= —— 保留 $INSTDIR，不做任何覆盖（随后仍由安装节开头的
-  ;     VegaValidateTarget 校验/规范化）；
-  ;   * 没给   —— 先试卸载注册表里的旧安装位置（校验通过才沿用），否则用默认位置。
+  ; 这段必须放在 MULTIUSER_INIT 之后：installMode=both 时 MULTIUSER_INIT（及其
+  ; RestorePreviousInstallLocation）会按安装模式无条件重写 $INSTDIR（源码见
+  ; MultiUser.nsh 的 MULTIUSER_INSTALLMODE_ALLUSERS/CURRENTUSER），先写会被覆盖。
+  ; 本项目当前是 perMachine，该 !if 不展开，位置对结果没有影响。
+  ;
+  ; /D= 优先级（架构裁定 4）：$vegaCmdlineDir 是 .onInit 第一行对 $INSTDIR 的备份。
+  ;   * 非空 —— 命令行给了 /D=，保留（随后由安装节开头的 VegaValidateTarget
+  ;     校验/规范化；无效目标的静默安装以退出码 2 结束）；
+  ;   * 空   —— 先试卸载注册表里的旧安装位置（校验通过才沿用），否则用默认位置。
   ; 交互模式下目录页的选择会覆盖这里，离页时同样走 VegaValidateTarget。
-  StrCpy $vegaTmp2 " $CMDLINE"
-  ${StrCase} $vegaTmp2 "$vegaTmp2" "U"
-  ${StrLoc} $vegaTmp1 $vegaTmp2 " /D=" ">"
-  StrCmp $vegaTmp1 "" 0 vega_init_dir_done
+  StrCmp $vegaCmdlineDir "" 0 vega_init_cmdline_dir
 
   ; 没有 /D=：沿用上一次的安装位置，但必须能通过同一份目标校验（旧版可能装在
   ; t6b 之前任意自定义目录里；那种位置不再允许，回落到默认位置，旧目录由
@@ -411,16 +428,16 @@ Function .onInit
   DetailPrint "沿用上一次的安装目录：$INSTDIR"
   Goto vega_init_dir_done
 
+vega_init_cmdline_dir:
+  ; 恢复备份值：MULTIUSER_INIT 可能已经重写过 $INSTDIR，以 /D= 为准。
+  StrCpy $INSTDIR "$vegaCmdlineDir"
+  Goto vega_init_dir_done
+
 vega_init_default:
   StrCpy $INSTDIR "$PROGRAMFILES64\Vega"
 
 vega_init_dir_done:
   ; ------------------------------------------------------------------------
-
-
-  !if "${INSTALLMODE}" == "both"
-    !insertmacro MULTIUSER_INIT
-  !endif
 
   ; Abort downgrades if they are disabled. 重装页删除后，交互模式也没有「先卸载再降级」
   ; 的选择，因此与 silent / passive / update 一样，在 .onInit 直接拒绝。
