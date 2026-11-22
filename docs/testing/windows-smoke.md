@@ -10,15 +10,15 @@
 ## 0.5 安装包（Vega-Setup.exe）
 - [ ] Actions → Console → Artifacts 下载 `vega-setup-windows`，解压得 `Vega-Setup.exe`。
 - [ ] 双击后只弹一次 UAC；安装界面是简体中文且没有语言选择框，**有「选择安装目录」页**，默认 `C:\Program Files\Vega`（T6b 恢复该页；允许的位置只有 `C:\Program Files\Vega` 或 `X:\Vega`）。
-- [ ] 选 `D:\Vega` 安装：装完后 `icacls D:\Vega` 里所有者是 `BUILTIN\Administrators`，只有 SYSTEM/Administrators 完全控制、`BUILTIN\Users` 只有 `(OI)(CI)(RX)`，三条都是非继承的显式 ACE（不带 `(I)`，模板为受保护 DACL），也不该出现任何继承来的 Users 写权限。
-- [ ] 选 `C:\Program Files\Vega` 安装（默认位置）后 `icacls "C:\Program Files\Vega"`：发生的是「根 `/setowner` → 根 DACL 用 SDDL 精确替换（受保护 DACL）→ `/setowner /T` → 子项 `\*` `/reset /T`」四步的最终结果，即没有额外的显式 ACE，只剩 SYSTEM/Administrators 完全控制与 Users 只读执行（ACL 对两种位置都执行，不再跳过 Program Files）。
+- [ ] 选 `D:\Vega` 安装：装完后 `icacls D:\Vega` 里所有者是 `BUILTIN\Administrators`（可用 `(Get-Acl -LiteralPath 'D:\Vega').Owner` 核对），只有 SYSTEM/Administrators 完全控制、`BUILTIN\Users` 只有 `(OI)(CI)(RX)`，三条都是非继承的显式 ACE（不带 `(I)`，模板为受保护 DACL），也不该出现任何继承来的 Users 写权限。
+- [ ] 选 `C:\Program Files\Vega` 安装（默认位置）后 `icacls "C:\Program Files\Vega"`：发生的是「根 `/setowner` → 根 DACL 用 SDDL 精确替换（受保护 DACL）→ 子项 `\*` `/reset /T` → `/setowner /T`」四步的最终结果，即没有额外的显式 ACE，只剩 SYSTEM/Administrators 完全控制与 Users 只读执行（ACL 对两种位置都执行，不再跳过 Program Files）。
 - [ ] 0.6.2 回归（空 DACL bug），以 `D:\Vega` 为例逐条对：
       - 根目录 `icacls D:\Vega`：**恰好三条** ACE，全部是 `(OI)(CI)` 且**不带 `(I)`**（即非继承的显式 ACE）——
         `NT AUTHORITY\SYSTEM:(OI)(CI)(F)`、`BUILTIN\Administrators:(OI)(CI)(F)`、`BUILTIN\Users:(OI)(CI)(RX)`；
         因为根 DACL 是受保护 DACL，不该出现任何 `(I)` 继承项（也不该出现 Users 的写/修改权限或额外拒绝项）。
       - `icacls D:\Vega\vega-console.exe` 与 `icacls D:\Vega\resources\vega-pwhelper.ps1`：**三条 ACE 全部带 `(I)`**
         （`(I)(F)` / `(I)(F)` / `(I)(RX)`，文件上不会带 `(OI)(CI)`），且**没有任何非继承 ACE**——
-        即文件自身的 DACL 为空、只剩继承项。若是空 DACL（`icacls` 只打出文件名、没有 ACE）就是 0.6.1 的 bug 复现。
+        即 DACL 含三条继承 (I) ACE，显式 ACE 数为 0。若是空 DACL（`icacls` 只打出文件名、没有 ACE）就是 0.6.1 的 bug 复现。
       - 子目录（如 `icacls D:\Vega\resources`）：继承 ACE 可以带 `(OI)(CI)(I)`，同样不该有非继承 ACE。
       - 行为：双击能直接启动，普通用户（Users）可运行，管理员可覆盖重装，`del` 能删除。
 - [ ] 在 D:\Vega 安装上设置长期密码成功（控制台通过自选目录的 ACL 校验）。
