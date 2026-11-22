@@ -14,7 +14,14 @@ const SYMBOLS: &str = "!#$%&*+,-./:;<=>?@^_~";
 const CLEAR_VERIFICATION: &str = "use-temporary-password";
 const SW_HIDE: i32 = 0;
 const ERROR_CANCELLED: u32 = 1223;
+/// 句柄/等待相关常量：与 `Win32::System::Threading` 的定义一致，此处本地定义以免误导入。
+const WAIT_OBJECT_0: u32 = 0;
 const WAIT_TIMEOUT: u32 = 258;
+const WAIT_FAILED: u32 = 0xFFFF_FFFF;
+/// 卷标志 `FILE_PERSISTENT_ACLS`（支持按文件设置 DACL）。
+const FILE_PERSISTENT_ACLS: u32 = 0x0000_0008;
+/// `FILE_READ_ATTRIBUTES`：`GetVolumeInformationByHandleW` 要求句柄带此权限。
+const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PasswordStatus { pub has_permanent: bool, pub verify_method: String }
@@ -133,14 +140,15 @@ fn run_blocking(app: &tauri::AppHandle, mode: &str, password: Option<&str>, veri
     };
     spawn_watchdog(path.clone());
     let outcome = run_helper(app, &path);
-    let leftover = std::fs::remove_file(&path).is_err();
+    // 删除失败只在真错误时提起；NotFound 已在 remove_if_exists 里当成成功。
+    let leftover = remove_if_exists(&path).err();
     if let Err(mut msg) = outcome {
-        if leftover { msg.push_str(&format!("；临时文件未能删除：{}", path.display())); }
+        if let Some(err) = leftover { msg.push_str(&format!("；临时文件未能删除（{err}）：{}", path.display())); }
         return OpResult::err(msg);
     }
     let mut message = success.to_string();
     if let Err(e) = write_pw_state(app, state) { message.push_str(&format!("；状态记录失败：{e}")); }
-    if leftover { message.push_str(&format!("；临时文件未能删除：{}", path.display())); }
+    if let Some(err) = leftover { message.push_str(&format!("；临时文件未能删除（{err}）：{}", path.display())); }
     OpResult::ok(message)
 }
 #[cfg(windows)]
@@ -150,8 +158,36 @@ fn payload_dir() -> Result<PathBuf, String> {
     std::fs::create_dir_all(&dir).map_err(|_| "创建临时目录失败".to_string())?;
     Ok(dir)
 }
+/// 字符串转 NUL 结尾宽串（`OsStrExt::encode_wide`，不经过 UTF-8 假设）。
 #[cfg(windows)]
-fn wide(text: &str) -> Vec<u16> { text.encode_utf16().chain(std::iter::once(0)).collect() }
+fn wide(text: &str) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    std::ffi::OsStr::new(text).encode_wide().chain(std::iter::once(0)).collect()
+}
+/// 路径转 NUL 结尾宽串；用 `as_os_str()` 逐码元转换，避免 `to_string_lossy` 改写非法码点。
+#[cfg(windows)]
+fn wide_path(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+}
+/// 删除文件：`NotFound` 视为已删除成功，其余错误才返回原因。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn remove_if_exists(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+/// `path` 是否落在 `root` 目录内（Windows 路径按 ASCII 忽略大小写比较）。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn under_root(path: &Path, root: &Path) -> bool {
+    fn norm(path: &Path) -> String {
+        path.to_string_lossy().trim_end_matches(['\\', '/']).to_ascii_lowercase()
+    }
+    let (path, root) = (norm(path), norm(root));
+    !root.is_empty() && (path == root || path.starts_with(&format!("{root}\\")))
+}
 #[cfg(windows)]
 fn random_hex32() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -168,22 +204,38 @@ fn random_hex32() -> String {
 }
 #[cfg(windows)]
 fn current_user_sid() -> Result<String, String> {
+    // OpenProcessToken / GetCurrentProcess 在 System::Threading；LocalFree 在 Foundation；
+    // ConvertSidToStringSidW 在 Security::Authorization；GetTokenInformation 在 Security。
     use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE};
     use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
-    use windows_sys::Win32::Security::{GetTokenInformation, OpenProcessToken, TokenUser, TOKEN_QUERY, TOKEN_USER};
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
     let mut token: HANDLE = std::ptr::null_mut();
     // SAFETY: 令牌句柄由 API 写出，成功后才使用并关闭。
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 { return Err("无法获取当前进程令牌".into()); }
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err("无法获取当前进程令牌".into());
+    }
     let mut size = 0u32;
+    // 第一轮只为拿所需长度；返回 0 是预期结果。
     unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut size) };
-    let mut buf = vec![0usize; (size.max(1) as usize).div_ceil(std::mem::size_of::<usize>())];
+    if (size as usize) < std::mem::size_of::<TOKEN_USER>() {
+        unsafe { CloseHandle(token) };
+        return Err("无法读取令牌用户".into());
+    }
+    // 用 Vec<u64> 保证 8 字节对齐，容得下 TOKEN_USER（内含指针）。
+    let words = (size as usize).div_ceil(std::mem::size_of::<u64>());
+    let mut buf = vec![0u64; words.max(1)];
     let ok = unsafe { GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), size, &mut size) };
     unsafe { CloseHandle(token) };
-    if ok == 0 { return Err("无法读取令牌用户".into()); }
+    if ok == 0 {
+        return Err("无法读取令牌用户".into());
+    }
     let user = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
     let mut raw: *mut u16 = std::ptr::null_mut();
-    if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut raw) } == 0 { return Err("无法转换用户 SID".into()); }
+    if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut raw) } == 0 {
+        return Err("无法转换用户 SID".into());
+    }
     let mut len = 0usize;
     unsafe { while *raw.add(len) != 0 { len += 1; } }
     let sid = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(raw, len) });
@@ -191,38 +243,103 @@ fn current_user_sid() -> Result<String, String> {
     Ok(sid)
 }
 /// 带 DACL 一次性创建并写入载荷；任何失败都删除文件。
+///
+/// 写入前先用 `GetVolumeInformationByHandleW` 确认卷带 `FILE_PERSISTENT_ACLS`：
+/// FAT/exFAT 之类不支持按文件 DACL 的卷上，文件权限等于没设，直接拒绝。
 #[cfg(windows)]
 fn create_payload_file(dir: &Path, json: &str) -> Result<PathBuf, String> {
-    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
+    // GENERIC_WRITE 在 Foundation；CreateFileW/WriteFile/GetVolumeInformationByHandleW 在
+    // Storage::FileSystem（WriteFile 另需 feature Win32_System_IO）；LocalFree 在 Foundation。
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, WriteFile, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, GENERIC_WRITE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetVolumeInformationByHandleW, WriteFile, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
+    };
+
     let sddl = wide(&build_sddl(&current_user_sid()?));
     let path = dir.join(format!("vega-pw-{}.json", random_hex32()));
-    let path_w = wide(&path.to_string_lossy());
+    let path_w = wide_path(&path);
     let mut descriptor: *mut core::ffi::c_void = std::ptr::null_mut();
     // SAFETY: SDDL 以 NUL 结尾；descriptor 由系统分配，用完 LocalFree。
     unsafe {
-        if ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION_1, &mut descriptor, std::ptr::null_mut()) == 0 {
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        ) == 0
+        {
             return Err("无法构造文件安全描述符".into());
         }
-        let attrs = SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: descriptor, bInheritHandle: 0 };
-        let handle = CreateFileW(path_w.as_ptr(), GENERIC_WRITE, 0, &attrs, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, std::ptr::null_mut());
+        let attrs = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+        // FILE_READ_ATTRIBUTES 供随后的卷查询使用；DACL 给了 FA，包含该权限。
+        let handle = CreateFileW(
+            path_w.as_ptr(),
+            GENERIC_WRITE | FILE_READ_ATTRIBUTES,
+            0,
+            &attrs,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        );
         LocalFree(descriptor);
-        if handle == INVALID_HANDLE_VALUE { return Err("创建临时文件失败".into()); }
+        if handle == INVALID_HANDLE_VALUE {
+            return Err("创建临时文件失败".into());
+        }
+        let mut flags = 0u32;
+        let (mut serial, mut max_component) = (0u32, 0u32);
+        let volume = GetVolumeInformationByHandleW(
+            handle,
+            std::ptr::null_mut(),
+            0,
+            &mut serial,
+            &mut max_component,
+            &mut flags,
+            std::ptr::null_mut(),
+            0,
+        );
+        if volume == 0 || flags & FILE_PERSISTENT_ACLS == 0 {
+            CloseHandle(handle);
+            let _ = remove_if_exists(&path);
+            return Err(if volume == 0 {
+                "无法读取临时文件所在磁盘的属性".into()
+            } else {
+                "临时文件所在磁盘不支持权限控制".into()
+            });
+        }
         let mut written = 0u32;
-        let ok = WriteFile(handle, json.as_ptr(), json.len() as u32, &mut written, std::ptr::null_mut());
+        let ok = WriteFile(
+            handle,
+            json.as_ptr().cast(),
+            json.len() as u32,
+            &mut written,
+            std::ptr::null_mut(),
+        );
         CloseHandle(handle);
         if ok == 0 || written as usize != json.len() {
-            let _ = std::fs::remove_file(&path);
+            let _ = remove_if_exists(&path);
             return Err("写入临时文件失败".into());
         }
     }
     Ok(path)
 }
+/// 看门狗：TTL 到点后删掉载荷。删除失败不再静默吞掉，也不向上报假失败
+/// （项目未引入 log，故仅忽略错误码）。
 #[cfg(windows)]
 fn spawn_watchdog(path: PathBuf) {
-    std::thread::spawn(move || { std::thread::sleep(Duration::from_secs(PAYLOAD_TTL_SECS)); let _ = std::fs::remove_file(&path); });
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(PAYLOAD_TTL_SECS));
+        if remove_if_exists(&path).is_err() {
+            // 无 log crate：不打印路径（避免泄露），也不回报失败给前端。
+        }
+    });
 }
 #[cfg(windows)]
 fn installed_helper(app: &tauri::AppHandle) -> Option<PathBuf> {
@@ -238,44 +355,108 @@ fn helper_script(app: &tauri::AppHandle) -> Option<PathBuf> {
         dev.is_file().then_some(dev)
     })
 }
+/// 发行版必须把助手装在受保护目录（`%ProgramFiles%` / `%ProgramFiles(x86)%`）内：
+/// 否则同用户进程可以改写这个 PowerShell 脚本，提权即被劫持。
+#[cfg(all(windows, not(debug_assertions)))]
+fn ensure_helper_location(helper: &Path) -> Result<(), String> {
+    let canonical = std::fs::canonicalize(helper).map_err(|_| "无法定位提权助手".to_string())?;
+    let roots: Vec<PathBuf> = ["ProgramFiles", "ProgramFiles(x86)"]
+        .iter()
+        .filter_map(|key| std::env::var_os(key).map(PathBuf::from))
+        .collect();
+    let trusted = roots.iter().any(|root| {
+        std::fs::canonicalize(root).map(|root| under_root(&canonical, &root)).unwrap_or(false)
+    });
+    if trusted { Ok(()) } else { Err("Vega 未安装在受保护目录，无法设置长期密码".into()) }
+}
+#[cfg(all(windows, debug_assertions))]
+fn ensure_helper_location(_: &Path) -> Result<(), String> { Ok(()) }
+/// `%SystemRoot%\System32`（`GetSystemDirectoryW`）。
 #[cfg(windows)]
-fn powershell_path() -> Option<PathBuf> {
+fn system32_dir() -> Option<PathBuf> {
     use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
     let mut buffer = [0u16; 260];
     // SAFETY: 缓冲区按元素个数传入，返回值落在范围内才读。
     let len = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
     if len == 0 || len as usize >= buffer.len() { return None; }
-    Some(PathBuf::from(String::from_utf16_lossy(&buffer[..len as usize])).join("WindowsPowerShell").join("v1.0").join("powershell.exe"))
+    Some(PathBuf::from(String::from_utf16_lossy(&buffer[..len as usize])))
+}
+#[cfg(windows)]
+fn powershell_path() -> Option<PathBuf> {
+    system32_dir().map(|dir| dir.join("WindowsPowerShell").join("v1.0").join("powershell.exe"))
 }
 /// `ShellExecuteExW(runas)` 拉起助手并等待退出码。
 #[cfg(windows)]
 fn run_helper(app: &tauri::AppHandle, payload: &Path) -> Result<(), String> {
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+    use windows_sys::Win32::System::Com::{
+        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+    };
     use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
-    use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+    use windows_sys::Win32::UI::Shell::{
+        ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW,
+    };
+
     let helper = helper_script(app).ok_or_else(|| "找不到提权助手 vega-pwhelper.ps1".to_string())?;
+    ensure_helper_location(&helper)?;
+    let system32 = system32_dir().ok_or_else(|| "找不到 System32 目录".to_string())?;
     let powershell = powershell_path().ok_or_else(|| "找不到系统 PowerShell".to_string())?;
     let args = build_helper_args(&helper, payload)?;
-    let (file_w, verb_w, args_w) = (wide(&powershell.to_string_lossy()), wide("runas"), wide(&args));
+    let (file_w, dir_w, verb_w, args_w) = (
+        wide_path(&powershell),
+        wide_path(&system32),
+        wide("runas"),
+        wide(&args),
+    );
+    // ShellExecuteExW 要求调用线程已初始化 COM；S_FALSE(1) 也算成功，只需配对 CoUninitialize。
+    let hr = unsafe {
+        CoInitializeEx(
+            std::ptr::null_mut(),
+            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
+        )
+    };
+    let com_ready = hr >= 0;
+
     let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
     info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
-    info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    // SEE_MASK_NOASYNC：调用返回后仍持有 lpFile/lpParameters 指向的缓冲区（缓冲区还在栈上）。
+    info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
     info.lpVerb = verb_w.as_ptr();
     info.lpFile = file_w.as_ptr();
     info.lpParameters = args_w.as_ptr();
+    info.lpDirectory = dir_w.as_ptr();
     info.nShow = SW_HIDE;
     // SAFETY: info 已置零并填好 cbSize/字符串指针；进程句柄在成功后关闭。
     if unsafe { ShellExecuteExW(&mut info) } == 0 {
         let code = unsafe { GetLastError() };
+        if com_ready { unsafe { CoUninitialize() } }
         return Err(if code == ERROR_CANCELLED { "已取消".into() } else { format!("无法启动提权助手（错误码 {code}）") });
     }
+    if info.hProcess.is_null() {
+        if com_ready { unsafe { CoUninitialize() } }
+        return Err("提权助手未返回进程句柄".into());
+    }
     let waited = unsafe { WaitForSingleObject(info.hProcess, HELPER_TIMEOUT_MS) };
-    let mut code = 0u32;
-    let got = unsafe { GetExitCodeProcess(info.hProcess, &mut code) };
+    let result = match waited {
+        WAIT_OBJECT_0 => {
+            let mut code = 0u32;
+            if unsafe { GetExitCodeProcess(info.hProcess, &mut code) } == 0 {
+                Err("无法读取提权助手退出码".to_string())
+            } else {
+                map_exit_code(code as i32)
+            }
+        }
+        WAIT_TIMEOUT => Err("操作超时，结果未知，请稍后查看状态".to_string()),
+        WAIT_FAILED => {
+            let code = unsafe { GetLastError() };
+            Err(format!("等待提权助手失败（错误码 {code}）"))
+        }
+        other => Err(format!("等待提权助手返回未知状态（{other}）")),
+    };
     unsafe { CloseHandle(info.hProcess) };
-    if waited == WAIT_TIMEOUT { return Err("提权助手超时未完成".into()); }
-    if got == 0 { return Err("无法读取提权助手退出码".into()); }
-    map_exit_code(code as i32)
+    if com_ready { unsafe { CoUninitialize() } }
+    result
 }
 #[cfg(test)]
 mod tests {
@@ -315,5 +496,29 @@ mod tests {
             assert_eq!(map_verify(given).unwrap(), want);
         }
         assert!(map_verify("use-both-passwords").is_err() && map_verify("").is_err());
+    }
+    #[test]
+    fn under_root_is_case_insensitive_and_boundary_aware() {
+        let root = Path::new(r"C:\Program Files\Vega");
+        assert!(under_root(Path::new(r"C:\Program Files\Vega\resources\vega-pwhelper.ps1"), root));
+        assert!(under_root(Path::new(r"c:\program files\vega\resources\h.ps1"), root));
+        assert!(under_root(Path::new(r"C:\Program Files\Vega"), root));
+        assert!(under_root(Path::new(r"C:\Program Files\Vega\"), root));
+        assert!(!under_root(Path::new(r"C:\Program Files\Vega-evil\h.ps1"), root));
+        assert!(!under_root(Path::new(r"C:\Users\me\Vega\resources\h.ps1"), root));
+        assert!(!under_root(Path::new(r"C:\h.ps1"), root));
+        assert!(!under_root(Path::new(r"C:\Program Files\Vega\x"), Path::new("")));
+    }
+    #[test]
+    fn remove_missing_file_counts_as_success() {
+        let dir = std::env::temp_dir().join(format!("vega-pw-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("payload.json");
+        std::fs::write(&file, "{}").unwrap();
+        assert!(remove_if_exists(&file).is_ok());
+        assert!(!file.exists());
+        // 已不存在（NotFound）也算成功。
+        assert!(remove_if_exists(&file).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
