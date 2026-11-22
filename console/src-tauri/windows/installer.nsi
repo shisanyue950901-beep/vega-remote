@@ -5,11 +5,19 @@
 ;   crates/tauri-bundler/src/bundle/windows/nsis/installer.nsi
 ;   https://github.com/tauri-apps/tauri/blob/tauri-cli-v2.12.6/crates/tauri-bundler/src/bundle/windows/nsis/installer.nsi
 ;
-; 与上游的差异（仅此两处，其余原样保留，便于逐版本重新同步）：
+; 与上游的差异（全部列出，其余原样保留，便于逐版本重新同步）：
 ;   1. 删除「选择安装目录」页：移除 MUI_PAGE_DIRECTORY 的插入及其
 ;      MUI_PAGE_CUSTOMFUNCTION_PRE SkipIfPassive 定义。
 ;   2. .onInit 末尾强制 $INSTDIR = $PROGRAMFILES64\Vega，位置在所有注册表读取
 ;      （RestorePreviousInstallLocation 等）之后，旧安装记录与 /D 参数都无法改变它。
+;   3. 删除「重新安装 / 已安装」页（PageReinstall、PageReinstallUpdateSelection、
+;      PageLeaveReinstall 及 Var ReinstallPageCheck）。安装器永远不运行旧卸载器，
+;      也不再询问卸载/重装，直接在固定目录上覆盖安装。
+;   4. 删除 `Var WixMode` 及快捷方式里「从 WiX 迁移时强制重建」的分支（迁移路径已不存在）。
+;   5. 删除 `choowHowToInstall` 的 LangString 兜底与其注释（只有已删除的重装页会读它）。
+;   6. 降级检查（ALLOWDOWNGRADES=false）改为在所有模式执行：页面删除后，交互模式
+;      不再有「先卸载再降级」的选择，必须在 .onInit 直接拒绝。
+;   7. 保留 FindWixInstall：它仍用于降级检查时比较 WiX 安装的版本号，但不再触发卸载。
 ;
 ; 为什么不用宏覆盖：MUI2.nsh 在 include 时就把 MUI_PAGE_DIRECTORY 展开成页面序号，
 ; hooks.nsh 里 !undef + 空宏不起作用（页面照样出现）。只能改模板本体。
@@ -90,7 +98,6 @@ ${StrLoc}
 Var PassiveMode
 Var UpdateMode
 Var NoShortcutMode
-Var WixMode
 Var OldMainBinaryName
 
 Name "${PRODUCTNAME}"
@@ -198,10 +205,11 @@ VIAddVersionKey "ProductVersion" "${VERSION}"
   !insertmacro MULTIUSER_PAGE_INSTALLMODE
 !endif
 
-; 4. Custom page to ask user if he wants to reinstall/uninstall
-;    only if a previous installation was detected
-Var ReinstallPageCheck
-Page custom PageReinstall PageLeaveReinstall
+; 4. 上游的「重新安装 / 已安装」页（PageReinstall / PageLeaveReinstall /
+;    PageReinstallUpdateSelection）及其 Var ReinstallPageCheck 已整体删除：
+;    安装器永远不运行旧卸载器，也不询问是否卸载，直接在固定目录上覆盖安装。
+;    上游该页会先执行旧卸载器（旧卸载器会回滚 RustDesk 中继配置），这正是要杜绝的。
+;    编号保留，便于与上游逐行对照。
 
 ; Find a previous WiX installation and set $R6 to its uninstall registry key, or to "" if none.
 ;
@@ -210,10 +218,7 @@ Page custom PageReinstall PageLeaveReinstall
 ; `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall`
 ; and check if `DisplayName` and `Publisher` keys match ${PRODUCTNAME} and ${MANUFACTURER}
 ;
-; This has a potential issue that there maybe another installation that matches
-; our ${PRODUCTNAME} and ${MANUFACTURER} but wasn't installed by our WiX installer,
-; however, this should be fine since the user will have to confirm the uninstallation
-; and they can chose to abort it if doesn't make sense.
+; 本模板只在 .onInit 的降级检查里调用它来读取 DisplayVersion；不再据此运行 MSI 卸载器。
 Function FindWixInstall
   StrCpy $R6 ""
   StrCpy $0 0
@@ -230,200 +235,6 @@ Function FindWixInstall
     StrCmp $R0 0 0 wix_loop_done
     StrCpy $R6 "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\$1"
   wix_loop_done:
-FunctionEnd
-
-Function PageReinstall
-  ; Uninstall previous WiX installation if exists.
-  Call FindWixInstall
-  ${If} $R6 != ""
-    StrCpy $WixMode 1
-    Goto compare_version
-  ${EndIf}
-
-  ; Check if there is an existing installation, if not, abort the reinstall page
-  ReadRegStr $R0 SHCTX "${UNINSTKEY}" ""
-  ReadRegStr $R1 SHCTX "${UNINSTKEY}" "UninstallString"
-  ${IfThen} "$R0$R1" == "" ${|} Abort ${|}
-
-  ; Compare this installar version with the existing installation
-  ; and modify the messages presented to the user accordingly
-  compare_version:
-  StrCpy $R4 "$(older)"
-  ${If} $WixMode = 1
-    ReadRegStr $R0 HKLM "$R6" "DisplayVersion"
-  ${Else}
-    ReadRegStr $R0 SHCTX "${UNINSTKEY}" "DisplayVersion"
-  ${EndIf}
-  ${IfThen} $R0 == "" ${|} StrCpy $R4 "$(unknown)" ${|}
-
-  nsis_tauri_utils::SemverCompare "${VERSION}" $R0
-  Pop $R0
-
-  ; Read the install choice header through $R5 so a custom language file that only
-  ; defines the misspelled `choowHowToInstall` still shows its own text
-  ; TODO: remove the `choowHowToInstall` fallback in a future major version
-  StrCpy $R5 "$(chooseHowToInstall)"
-  ${IfThen} $R5 == "" ${|} StrCpy $R5 "$(choowHowToInstall)" ${|}
-
-  ; Reinstalling the same version
-  ${If} $R0 = 0
-    StrCpy $R1 "$(alreadyInstalledLong)"
-    StrCpy $R2 "$(addOrReinstall)"
-    StrCpy $R3 "$(uninstallApp)"
-    !insertmacro MUI_HEADER_TEXT "$(alreadyInstalled)" "$(chooseMaintenanceOption)"
-  ; Upgrading
-  ${ElseIf} $R0 = 1
-    StrCpy $R1 "$(olderOrUnknownVersionInstalled)"
-    StrCpy $R2 "$(uninstallBeforeInstalling)"
-    StrCpy $R3 "$(dontUninstall)"
-    !insertmacro MUI_HEADER_TEXT "$(alreadyInstalled)" "$R5"
-  ; Downgrading
-  ${ElseIf} $R0 = -1
-    StrCpy $R1 "$(newerVersionInstalled)"
-    StrCpy $R2 "$(uninstallBeforeInstalling)"
-    !if "${ALLOWDOWNGRADES}" == "true"
-      StrCpy $R3 "$(dontUninstall)"
-    !else
-      StrCpy $R3 "$(dontUninstallDowngrade)"
-    !endif
-    !insertmacro MUI_HEADER_TEXT "$(alreadyInstalled)" "$R5"
-  ${Else}
-    Abort
-  ${EndIf}
-
-  ; Skip showing the page if passive
-  ;
-  ; Note that we don't call this earlier at the beginning
-  ; of this function because we need to populate some variables
-  ; related to current installed version if detected and whether
-  ; we are downgrading or not.
-  ${If} $PassiveMode = 1
-    Call PageLeaveReinstall
-  ${Else}
-    nsDialogs::Create 1018
-    Pop $R4
-    ${IfThen} $(^RTL) = 1 ${|} nsDialogs::SetRTL $(^RTL) ${|}
-
-    ${NSD_CreateLabel} 0 0 100% 24u $R1
-    Pop $R1
-
-    ${NSD_CreateRadioButton} 30u 50u -30u 8u $R2
-    Pop $R2
-    ${NSD_OnClick} $R2 PageReinstallUpdateSelection
-
-    ${NSD_CreateRadioButton} 30u 70u -30u 8u $R3
-    Pop $R3
-    ; Disable this radio button if downgrading and downgrades are disabled
-    !if "${ALLOWDOWNGRADES}" == "false"
-      ${IfThen} $R0 = -1 ${|} EnableWindow $R3 0 ${|}
-    !endif
-    ${NSD_OnClick} $R3 PageReinstallUpdateSelection
-
-    ; Check the first radio button if this the first time
-    ; we enter this page or if the second button wasn't
-    ; selected the last time we were on this page
-    ${If} $ReinstallPageCheck <> 2
-      SendMessage $R2 ${BM_SETCHECK} ${BST_CHECKED} 0
-    ${Else}
-      SendMessage $R3 ${BM_SETCHECK} ${BST_CHECKED} 0
-    ${EndIf}
-
-    ${NSD_SetFocus} $R2
-    nsDialogs::Show
-  ${EndIf}
-FunctionEnd
-Function PageReinstallUpdateSelection
-  ${NSD_GetState} $R2 $R1
-  ${If} $R1 == ${BST_CHECKED}
-    StrCpy $ReinstallPageCheck 1
-  ${Else}
-    StrCpy $ReinstallPageCheck 2
-  ${EndIf}
-FunctionEnd
-Function PageLeaveReinstall
-  ${NSD_GetState} $R2 $R1
-
-  ; If migrating from Wix, always uninstall
-  ${If} $WixMode = 1
-    Goto reinst_uninstall
-  ${EndIf}
-
-  ; In update mode, always proceeds without uninstalling
-  ${If} $UpdateMode = 1
-    Goto reinst_done
-  ${EndIf}
-
-  ; $R0 holds whether same(0)/upgrading(1)/downgrading(-1) version
-  ; $R1 holds the radio buttons state:
-  ;   1 => first choice was selected
-  ;   0 => second choice was selected
-  ${If} $R0 = 0 ; Same version, proceed
-    ${If} $R1 = 1              ; User chose to add/reinstall
-      Goto reinst_done
-    ${Else}                    ; User chose to uninstall
-      Goto reinst_uninstall
-    ${EndIf}
-  ${ElseIf} $R0 = 1 ; Upgrading
-    ${If} $R1 = 1              ; User chose to uninstall
-      Goto reinst_uninstall
-    ${Else}
-      Goto reinst_done         ; User chose NOT to uninstall
-    ${EndIf}
-  ${ElseIf} $R0 = -1 ; Downgrading
-    ${If} $R1 = 1              ; User chose to uninstall
-      Goto reinst_uninstall
-    ${Else}
-      Goto reinst_done         ; User chose NOT to uninstall
-    ${EndIf}
-  ${EndIf}
-
-  reinst_uninstall:
-    HideWindow
-    ClearErrors
-
-    ${If} $WixMode = 1
-      ReadRegStr $R1 HKLM "$R6" "UninstallString"
-      ExecWait '$R1' $0
-    ${Else}
-      ReadRegStr $4 SHCTX "${MANUPRODUCTKEY}" ""
-      ReadRegStr $R1 SHCTX "${UNINSTKEY}" "UninstallString"
-      ${IfThen} $UpdateMode = 1 ${|} StrCpy $R1 "$R1 /UPDATE" ${|} ; append /UPDATE
-      ${IfThen} $PassiveMode = 1 ${|} StrCpy $R1 "$R1 /P" ${|} ; append /P
-      StrCpy $R1 "$R1 _?=$4" ; append uninstall directory
-      ExecWait '$R1' $0
-    ${EndIf}
-
-    BringToFront
-
-    ${IfThen} ${Errors} ${|} StrCpy $0 2 ${|} ; ExecWait failed, set fake exit code
-
-    ${If} $0 <> 0
-    ${OrIf} ${FileExists} "$INSTDIR\${MAINBINARYNAME}.exe"
-      ; User cancelled wix uninstaller? return to select un/reinstall page
-      ${If} $WixMode = 1
-      ${AndIf} $0 = 1602
-        Abort
-      ${EndIf}
-
-      ; User cancelled NSIS uninstaller? return to select un/reinstall page
-      ${If} $0 = 1
-        Abort
-      ${EndIf}
-
-      ; Other errors? show generic error message and return to select un/reinstall page
-      MessageBox MB_ICONEXCLAMATION "$(unableToUninstall)"
-      Abort
-    ${EndIf}
-
-    ; The NSIS uninstaller was run in place (`_?=`), so it cannot delete itself
-    ; and the install directory, clean them up here once the uninstall succeeded
-    ; https://nsis.sourceforge.io/Docs/Chapter3.html#:~:text=path%20contains%20spaces.-,3.2.3%20Examples,-installer.exe%20/NCRC
-    ${If} $WixMode = 0
-    ${AndIf} $4 != ""
-      Delete "$4\uninstall.exe"
-      RMDir "$4"
-    ${EndIf}
-  reinst_done:
 FunctionEnd
 
 ; 5. (目录页已删除 —— Vega 安装路径固定在 hooks.nsh 的 ${VEGA_INSTALL_DIR}，
@@ -507,15 +318,8 @@ FunctionEnd
 !insertmacro MUI_UNPAGE_INSTFILES
 
 ;Languages
-; PageReinstall reads the misspelled `choowHowToInstall` as a fallback, and makensis warns
-; about a language string that is read but never set, so default it to an empty string for
-; every language. This runs before the language files are included, so a custom language
-; file that only defines the old spelling overrides the default and the fallback shows its
-; text. `0` as the language id means the language inserted right above.
-; TODO: remove the `choowHowToInstall` fallback in a future major version
 {{#each languages}}
 !insertmacro MUI_LANGUAGE "{{this}}"
-LangString choowHowToInstall 0 ""
 {{/each}}
 !insertmacro MUI_RESERVEFILE_LANGDLL
 {{#each language_files}}
@@ -570,13 +374,10 @@ Function .onInit
     !insertmacro MULTIUSER_INIT
   !endif
 
-  ; Abort downgrades if they are disabled, in the modes that skip the reinstall page choice:
-  ; silent, passive and update
+  ; Abort downgrades if they are disabled. 重装页删除后，交互模式也没有「先卸载再降级」
+  ; 的选择，因此与 silent / passive / update 一样，在 .onInit 直接拒绝。
   !if "${ALLOWDOWNGRADES}" == "false"
-  ${If} ${Silent}
-  ${OrIf} $PassiveMode = 1
-  ${OrIf} $UpdateMode = 1
-    ; Compare with the same installation the reinstall page would: a WiX one first
+    ; Compare with the installed version: a WiX one first
     Call FindWixInstall
     ${If} $R6 != ""
       ReadRegStr $R0 HKLM "$R6" "DisplayVersion"
@@ -599,7 +400,6 @@ Function .onInit
       ${EndIf}
       Abort
     ${EndIf}
-  ${EndIf}
   !endif
 
   ; --- Vega customization (t6-fix3b) --------------------------------------
@@ -1002,12 +802,9 @@ Function CreateOrUpdateStartMenuShortcut
   ${EndIf}
 
   ; Skip creating shortcut if in update mode or no shortcut mode
-  ; but always create if migrating from wix
-  ${If} $WixMode = 0
-    ${If} $UpdateMode = 1
-    ${OrIf} $NoShortcutMode = 1
-      Return
-    ${EndIf}
+  ${If} $UpdateMode = 1
+  ${OrIf} $NoShortcutMode = 1
+    Return
   ${EndIf}
 
   !if "${STARTMENUFOLDER}" != ""
@@ -1031,12 +828,9 @@ Function CreateOrUpdateDesktopShortcut
   ${EndIf}
 
   ; Skip creating shortcut if in update mode or no shortcut mode
-  ; but always create if migrating from wix
-  ${If} $WixMode = 0
-    ${If} $UpdateMode = 1
-    ${OrIf} $NoShortcutMode = 1
-      Return
-    ${EndIf}
+  ${If} $UpdateMode = 1
+  ${OrIf} $NoShortcutMode = 1
+    Return
   ${EndIf}
 
   CreateShortcut "$DESKTOP\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
