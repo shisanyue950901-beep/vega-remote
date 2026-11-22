@@ -30,7 +30,7 @@
 ;     子项 /reset 清掉旧自定义目录留下的显式 ACE）；
 ;     控制台 password.rs 在每次提权前校验助手父目录的 ACL。
 ;   * t6b-fix2（架构裁定）：ACL 锁定改到解包之前——安装节在校验通过后先
-;     CreateDirectory $INSTDIR 并 Call VegaLockInstallDir，任一 icacls 失败立即
+;     CreateDirectory $INSTDIR 并 Call VegaLockInstallDir，任一步失败立即
 ;     SetErrorLevel 2 + Abort，不会把文件解到未锁定的目录；POSTINSTALL 再收紧一次
 ;     （第二次失败只写完成页告警）。VegaValidateTarget 同时拒绝目标树里的重解析点
 ;     和无法枚举的目录；/D= 判定改为 .onInit 开头备份 $INSTDIR（$CMDLINE 里已无 /D=）。
