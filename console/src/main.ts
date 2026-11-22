@@ -1759,6 +1759,13 @@ function setupUpdater(): void {
   let autoChecked = false;
   /** 事件监听注册成功前不放行安装，否则进度和失败都收不到。 */
   let eventsReady = false;
+  /** 监听注册失败时不再让检查结果覆盖错误提示。 */
+  let listenerError = false;
+  /**
+   * 每次检查的代号。安装开始或新检查发起后，旧请求的回包直接丢弃，
+   * 不会把「下载中」或监听错误界面刷回「发现新版本」。
+   */
+  let checkGeneration = 0;
 
   const refreshInstallButton = (): void => {
     installButton.disabled = installing || !latest || !eventsReady;
@@ -1773,6 +1780,10 @@ function setupUpdater(): void {
 
   const setInstalling = (value: boolean): void => {
     installing = value;
+    if (value) {
+      // 让在途的检查结果失效：安装开始后不接受任何旧的更新视图。
+      checkGeneration += 1;
+    }
     checkButton.disabled = value;
     refreshInstallButton();
   };
@@ -1821,11 +1832,24 @@ function setupUpdater(): void {
   badge.addEventListener("click", () => navigateTo("settings"));
 
   const check = async (silent: boolean): Promise<void> => {
-    if (installing) return;
+    if (installing || listenerError) return;
+    const generation = ++checkGeneration;
     checkButton.disabled = true;
     if (!silent) setStatus(status, "正在检查更新…");
-    const view = await invoke<UpdateView>("check_update");
-    checkButton.disabled = false;
+    let view: UpdateView;
+    try {
+      view = await invoke<UpdateView>("check_update");
+    } catch {
+      if (generation === checkGeneration) {
+        checkButton.disabled = installing || listenerError;
+        if (!installing && !listenerError) setStatus(status, "检查更新失败，请稍后重试", "error");
+      }
+      return;
+    }
+    // 只有最新一次检查能改界面；安装中或监听错误时也不能覆盖已有状态。
+    if (generation !== checkGeneration) return;
+    checkButton.disabled = installing || listenerError;
+    if (installing || listenerError) return;
     render(view, silent);
   };
 
@@ -1873,14 +1897,19 @@ function setupUpdater(): void {
       });
       return true;
     } catch {
+      listenerError = true;
+      // 让已经发出的检查回包失效，错误提示保持到重启应用。
+      checkGeneration += 1;
       return false;
     }
   };
 
-  // 先把监听注册完，再放行「立即更新」；注册失败只报错，不放行安装。
+  // 先把监听注册完，再放行「立即更新」；注册失败只报错，不放行安装，也不再跑检查。
   void (async () => {
     eventsReady = await registerEvents();
     if (!eventsReady && window.__TAURI__?.event) {
+      listenerError = true;
+      checkButton.disabled = true;
       setStatus(status, "更新事件监听注册失败，请重启应用后重试", "error");
     }
     refreshInstallButton();
