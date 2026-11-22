@@ -1162,3 +1162,26 @@ code {
 @keyframes vega-in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
 @media (prefers-reduced-motion:reduce){.dot--ok,.tabpanel,.modal__box{animation:none}}
 .is-hidden{display:none!important}
+
+/* 设备行：圆形极光头像（名称首字）+ 行尾文字操作 */
+.device__avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: var(--aurora);
+  color: #fff;
+  font-size: 15px;
+  font-weight: 600;
+  box-shadow: 0 4px 12px color-mix(in srgb, var(--accent) 28%, transparent);
+}
+.link[disabled] {
+  opacity: 0.45;
+  pointer-events: none;
+}
+/* 复制反馈：只换底色与 aria-label，不动按钮里的 SVG */
+.hero__copy.is-copied { background: color-mix(in srgb, var(--ok) 62%, rgba(255, 255, 255, 0.2)); }
+.hero__copy.is-copy-failed { background: color-mix(in srgb, var(--danger) 62%, rgba(255, 255, 255, 0.2)); }

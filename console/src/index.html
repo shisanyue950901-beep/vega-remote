@@ -69,7 +69,6 @@
 
           <div class="sidebar__footer">
             <span class="version">v0.5.0</span>
-            <button id="check-update" class="link" type="button">检查更新</button>
           </div>
         </aside>
 
@@ -83,10 +82,6 @@
               <div class="hero__stars" aria-hidden="true"></div>
               <div class="hero__top">
                 <span class="hero__label">本机设备码</span>
-                <label class="switch switch--light" title="请在 RustDesk 中控制">
-                  <input id="allow-assist" type="checkbox" checked disabled />
-                  <span class="switch__text">允许被控</span>
-                </label>
               </div>
 
               <div class="hero__code-line">
@@ -121,14 +116,16 @@
                 <span class="row__body">
                   <span class="row__label">临时密码</span>
                   <span class="row__sub">由 RustDesk 自己管理，控制台不读取、不记录。</span>
+                  <span id="temporary-password-status" class="row__sub" role="status" aria-live="polite"></span>
                 </span>
                 <button id="show-password" class="link" type="button">查看</button>
               </div>
-              <div class="row">
+              <div id="fixed-password-row" class="row">
                 <span class="row__body">
                   <span class="row__label">长期密码</span>
                   <span id="password-status" class="row__sub" role="status" aria-live="polite">未设置</span>
                 </span>
+                <button id="open-fixed-password" class="link" type="button" aria-label="到设置页设置长期密码">设置</button>
               </div>
               <div class="row row--stack">
                 <span class="row__label">验证方式</span>
@@ -137,6 +134,7 @@
                   <button class="seg__btn" type="button" data-verify="permanent">长期</button>
                   <button class="seg__btn" type="button" data-verify="both">两者</button>
                 </div>
+                <span id="verify-hint" class="row__sub is-hidden" role="status" aria-live="polite">先设置长期密码</span>
               </div>
             </div>
 
@@ -262,23 +260,10 @@
             <h2 class="group__title">常规</h2>
             <div class="group">
               <div class="row">
-                <label class="row__body row__label" for="set-autostart">开机自启</label>
-                <label class="switch">
-                  <input id="set-autostart" type="checkbox" />
-                </label>
-              </div>
-              <div class="row">
                 <label class="row__body row__label" for="set-tray">关闭窗口时最小化到托盘</label>
                 <label class="switch">
                   <input id="set-tray" type="checkbox" checked />
                 </label>
-              </div>
-              <div class="row">
-                <span class="row__label">语言</span>
-                <select id="set-language" class="select select--inline">
-                  <option selected>简体中文</option>
-                  <option>English</option>
-                </select>
               </div>
             </div>
 
@@ -287,12 +272,21 @@
               <div class="row row--stack">
                 <span class="row__label">长期密码</span>
                 <p class="row__sub">用于无人值守访问自己的电脑。设置时 Windows 会请求一次管理员确认。</p>
-                <div class="field-stack">
+                <div class="row__actions">
+                  <button
+                    id="toggle-fixed-password"
+                    class="link"
+                    type="button"
+                    aria-expanded="false"
+                    aria-controls="fixed-password-form"
+                  >设置长期密码</button>
+                </div>
+                <div id="fixed-password-form" class="field-stack is-hidden">
                   <input
                     id="set-fixed-password"
                     class="input"
                     type="password"
-                    placeholder="新密码（≥8 位，含字母和数字）"
+                    placeholder="新密码（8-64 位，字母+数字）"
                     autocomplete="new-password"
                     aria-label="新长期密码"
                   />
@@ -304,10 +298,10 @@
                     autocomplete="new-password"
                     aria-label="确认长期密码"
                   />
-                </div>
-                <div class="row__actions">
-                  <button id="save-fixed-password" class="btn btn--primary btn--sm" type="button">设置</button>
-                  <button id="clear-fixed-password" class="link link--danger" type="button">清除长期密码</button>
+                  <div class="row__actions">
+                    <button id="save-fixed-password" class="btn btn--primary btn--sm" type="button">设置</button>
+                    <button id="clear-fixed-password" class="link link--danger" type="button">清除长期密码</button>
+                  </div>
                 </div>
               </div>
             </div>

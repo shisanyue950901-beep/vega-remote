@@ -120,20 +120,31 @@ type VerifyMethod = "temporary" | "permanent" | "both";
 let selectedVerify: VerifyMethod = "temporary";
 /** 设置页读到的密码状态刷新；协助页「未设置」文案由它统一更新。 */
 let refreshPasswordStatus: (() => void) | null = null;
+/** 协助页注册：验证方式分段的可选性与提示跟随密码状态。 */
+let applyPasswordAvailability: ((status: PasswordStatus) => void) | null = null;
+/** 设置页注册：展开长期密码内联表单（主页「设置」跳转时用）。 */
+let openFixedPasswordForm: (() => void) | null = null;
 
 function asVerifyMethod(raw: string): VerifyMethod {
   return raw === "permanent" || raw === "both" ? raw : "temporary";
 }
 
+let hasPermanentPassword = false;
+
+/** 未设长期密码时「长期」「两者」不可选：RustDesk 会拒绝这两种验证方式。 */
+function isVerifyMethodAvailable(method: VerifyMethod): boolean {
+  return method === "temporary" || hasPermanentPassword;
+}
+
 /** 只改分段的高亮与记忆值，不写 RustDesk：写盘发生在设置长期密码时。 */
 function selectVerifyMethod(method: VerifyMethod): void {
-  selectedVerify = method;
+  selectedVerify = isVerifyMethodAvailable(method) ? method : "temporary";
   const group = document.getElementById("verify-method");
   if (!group) {
     return;
   }
   group.querySelectorAll<HTMLButtonElement>(".seg__btn[data-verify]").forEach((btn) => {
-    const active = btn.dataset.verify === method;
+    const active = btn.dataset.verify === selectedVerify;
     btn.classList.toggle("is-active", active);
     btn.setAttribute("aria-pressed", active ? "true" : "false");
   });
@@ -268,13 +279,20 @@ function syncCloseToTray(enabled: boolean): void {
   void invoke("set_close_to_tray", { enabled });
 }
 
-function flashLabel(button: HTMLButtonElement, text: string): void {
-  const original = button.dataset.originalLabel ?? button.textContent ?? "";
+/**
+ * 图标按钮的反馈：只切 aria-label 与 `.is-copied` 类。
+ * 不能写 textContent —— 会把按钮里的 SVG 直接删掉，计时结束后也只剩文字。
+ */
+function flashCopyState(button: HTMLButtonElement, ok: boolean | null): void {
+  const original = button.dataset.originalLabel ?? button.getAttribute("aria-label") ?? "";
   button.dataset.originalLabel = original;
-  button.textContent = text;
+  button.setAttribute("aria-label", ok === null ? "暂无设备码" : ok ? "已复制设备码" : "复制失败");
+  button.classList.toggle("is-copied", ok === true);
+  button.classList.toggle("is-copy-failed", ok === false);
   window.setTimeout(() => {
-    button.textContent = original;
-  }, 1600);
+    button.setAttribute("aria-label", original);
+    button.classList.remove("is-copied", "is-copy-failed");
+  }, 1500);
 }
 
 /**
@@ -345,7 +363,9 @@ function setupAssistPage(): void {
   const copyCodeButton = byId<HTMLButtonElement>("copy-code");
   const copyShareButton = byId<HTMLButtonElement>("copy-share");
   const showPasswordButton = byId<HTMLButtonElement>("show-password");
-  const passwordStatus = byId<HTMLSpanElement>("password-status");
+  // 两个独立元素：临时密码的「查看」结果绝不能写进长期密码状态行。
+  const temporaryPasswordStatus = byId<HTMLSpanElement>("temporary-password-status");
+  const openFixedPasswordButton = byId<HTMLButtonElement>("open-fixed-password");
   const idDot = byId<HTMLSpanElement>("id-dot");
   const idStatusText = byId<HTMLSpanElement>("id-status-text");
   const idTestButton = byId<HTMLButtonElement>("id-test");
@@ -487,11 +507,11 @@ function setupAssistPage(): void {
 
   copyCodeButton.addEventListener("click", () => {
     if (!currentDeviceCode) {
-      flashLabel(copyCodeButton, "暂无设备码");
+      flashCopyState(copyCodeButton, null);
       return;
     }
     void copyText(currentDeviceCode).then((ok) => {
-      flashLabel(copyCodeButton, ok ? "已复制" : "复制失败");
+      flashCopyState(copyCodeButton, ok);
     });
   });
 
@@ -513,15 +533,24 @@ function setupAssistPage(): void {
   });
 
   showPasswordButton.addEventListener("click", () => {
-    setStatus(passwordStatus, "正在打开 RustDesk…");
+    setStatus(temporaryPasswordStatus, "正在打开 RustDesk…");
     void invoke<OpResult>("open_rustdesk_window").then((result) => {
       if (!result) {
-        setStatus(passwordStatus, "浏览器预览：命令不可用", "warn");
+        setStatus(temporaryPasswordStatus, "浏览器预览：命令不可用", "warn");
         return;
       }
-      setStatus(passwordStatus, result.message, result.ok ? "ok" : "error");
+      setStatus(temporaryPasswordStatus, result.message, result.ok ? "ok" : "error");
     });
   });
+
+  // 主页「长期密码 · 设置」：跳到设置页并展开内联表单。
+  const gotoFixedPassword = (): void => {
+    navigateTo("settings");
+    openFixedPasswordForm?.();
+  };
+  openFixedPasswordButton.addEventListener("click", gotoFixedPassword);
+  const fixedPasswordRow = document.getElementById("fixed-password-row");
+  fixedPasswordRow?.addEventListener("click", gotoFixedPassword);
 
   openInstallPageButton.addEventListener("click", () => {
     // 安装入口只有一条：交给 Rust 侧用默认浏览器打开官方发行页，由用户手动安装。
@@ -578,15 +607,33 @@ function setupAssistPage(): void {
 
   // 验证方式分段：只记住选择；真正写进 RustDesk 是在设置页提交长期密码时一起做。
   const verifyGroup = byId<HTMLDivElement>("verify-method");
-  verifyGroup.querySelectorAll<HTMLButtonElement>(".seg__btn[data-verify]").forEach((btn) => {
+  const verifyHint = byId<HTMLSpanElement>("verify-hint");
+  const verifyButtons = Array.from(
+    verifyGroup.querySelectorAll<HTMLButtonElement>(".seg__btn[data-verify]"),
+  );
+  verifyButtons.forEach((btn) => {
     btn.setAttribute("aria-pressed", btn.classList.contains("is-active") ? "true" : "false");
     btn.addEventListener("click", () => {
       const value = btn.dataset.verify;
       if (value === "temporary" || value === "permanent" || value === "both") {
-        selectVerifyMethod(value);
+        if (isVerifyMethodAvailable(value)) {
+          selectVerifyMethod(value);
+        }
       }
     });
   });
+
+  // 没设长期密码时「长期」「两者」是死路：禁用并给出原因，高亮退回「临时」。
+  applyPasswordAvailability = (status: PasswordStatus): void => {
+    hasPermanentPassword = status.hasPermanent;
+    verifyButtons.forEach((btn) => {
+      const blocked = !isVerifyMethodAvailable(asVerifyMethod(btn.dataset.verify ?? ""));
+      btn.disabled = blocked;
+      btn.setAttribute("aria-disabled", blocked ? "true" : "false");
+    });
+    verifyHint.classList.toggle("is-hidden", hasPermanentPassword);
+    selectVerifyMethod(asVerifyMethod(status.verifyMethod));
+  };
 
   configHandlers.push(applyServerConfig);
   refreshAssistDevice = loadDeviceCode;
@@ -657,7 +704,7 @@ function setupDevicesPage(): void {
 
     // 头像：名称首字（别名优先，其次设备码首字）。
     const avatar = document.createElement("span");
-    avatar.className = "tag";
+    avatar.className = "device__avatar";
     avatar.setAttribute("aria-hidden", "true");
     avatar.textContent = Array.from(name)[0] ?? "?";
 
@@ -675,7 +722,7 @@ function setupDevicesPage(): void {
 
     const connect = document.createElement("button");
     connect.type = "button";
-    connect.className = "btn btn--sm";
+    connect.className = "link";
     connect.textContent = "连接";
     connect.addEventListener("click", () => {
       connect.disabled = true;
@@ -821,7 +868,25 @@ function setupSettingsPage(): void {
   const fixedPasswordInput = byId<HTMLInputElement>("set-fixed-password");
   const fixedPasswordConfirm = byId<HTMLInputElement>("set-fixed-password-confirm");
   const clearPasswordButton = byId<HTMLButtonElement>("clear-fixed-password");
+  const togglePasswordButton = byId<HTMLButtonElement>("toggle-fixed-password");
+  const passwordForm = byId<HTMLDivElement>("fixed-password-form");
   const trayCheckbox = byId<HTMLInputElement>("set-tray");
+
+  // 长期密码表单默认折叠：只在用户点开或从主页跳过来时展开。
+  const setPasswordFormOpen = (open: boolean): void => {
+    passwordForm.classList.toggle("is-hidden", !open);
+    togglePasswordButton.setAttribute("aria-expanded", open ? "true" : "false");
+    togglePasswordButton.textContent = open ? "收起" : "设置长期密码";
+    if (open) {
+      fixedPasswordInput.focus();
+    }
+  };
+  togglePasswordButton.addEventListener("click", () => {
+    setPasswordFormOpen(passwordForm.classList.contains("is-hidden"));
+  });
+  openFixedPasswordForm = (): void => {
+    setPasswordFormOpen(true);
+  };
 
   // 关闭到托盘：默认开启，启动时把当前勾选状态交给 Rust，变更时再同步。
   syncCloseToTray(trayCheckbox.checked);
@@ -1101,16 +1166,19 @@ function setupSettingsPage(): void {
   // 协助页的「长期密码」状态行：有就一起更新，没有（别的页面结构）就跳过。
   const assistPasswordStatus = document.getElementById("password-status");
 
-  /** 与 Rust 侧保持一致：8~64 位、含字母和数字、无控制字符。 */
-  const passwordValid = (value: string): boolean => {
-    if (value.length < 8 || value.length > 64) {
-      return false;
-    }
-    if (/[\u0000-\u001f\u007f]/.test(value)) {
-      return false;
-    }
-    return /\p{L}/u.test(value) && /\d/.test(value);
-  };
+  /**
+   * 与 Rust 侧保持一致：8-64 位、含字母和数字，
+   * 且只允许字母数字和 `!#$%&*+,-./:;<=>?@^_~`（其他符号会被 CLI 当成参数或转义）。
+   */
+  const PASSWORD_CHARS = /^[A-Za-z0-9!#$%&*+,\-./:;<=>?@^_~]+$/;
+  const PASSWORD_RULE =
+    "密码需 8-64 位，含字母和数字，只能用字母数字和 !#$%&*+,-./:;<=>?@^_~";
+  const passwordValid = (value: string): boolean =>
+    value.length >= 8 &&
+    value.length <= 64 &&
+    PASSWORD_CHARS.test(value) &&
+    /[A-Za-z]/.test(value) &&
+    /\d/.test(value);
 
   const refreshSubmitState = (): void => {
     const value = fixedPasswordInput.value;
@@ -1126,10 +1194,12 @@ function setupSettingsPage(): void {
         status.hasPermanent ? "ok" : undefined,
       );
     }
+    // 分段高亮跟随 RustDesk 里实际生效的验证方式；可用性由协助页按 hasPermanent 决定。
+    selectVerifyMethod(asVerifyMethod(status.verifyMethod));
+    applyPasswordAvailability?.(status);
   };
 
-  /** `syncVerify` 为真时才用 RustDesk 里的值覆盖分段高亮（焦点刷新不打断用户选择）。 */
-  const loadPasswordStatus = (syncVerify: boolean): void => {
+  const loadPasswordStatus = (): void => {
     void invoke<PasswordStatus>("get_password_status").then((status) => {
       if (!status) {
         if (assistPasswordStatus) {
@@ -1138,14 +1208,11 @@ function setupSettingsPage(): void {
         return;
       }
       applyPasswordStatus(status);
-      if (syncVerify) {
-        selectVerifyMethod(asVerifyMethod(status.verifyMethod));
-      }
     });
   };
 
   refreshPasswordStatus = (): void => {
-    loadPasswordStatus(false);
+    loadPasswordStatus();
   };
 
   fixedPasswordInput.addEventListener("input", () => {
@@ -1153,7 +1220,7 @@ function setupSettingsPage(): void {
     if (!fixedPasswordInput.value) {
       setStatus(passwordResult, "");
     } else if (!passwordValid(fixedPasswordInput.value)) {
-      setStatus(passwordResult, "密码需 8-64 位且同时包含字母和数字", "warn");
+      setStatus(passwordResult, PASSWORD_RULE, "warn");
     } else if (fixedPasswordConfirm.value && fixedPasswordInput.value !== fixedPasswordConfirm.value) {
       setStatus(passwordResult, "两次输入的密码不一致", "warn");
     } else {
@@ -1177,7 +1244,7 @@ function setupSettingsPage(): void {
   fixedPasswordButton.addEventListener("click", () => {
     const password = fixedPasswordInput.value;
     if (!passwordValid(password)) {
-      setStatus(passwordResult, "密码需 8-64 位且同时包含字母和数字", "error");
+      setStatus(passwordResult, PASSWORD_RULE, "error");
       return;
     }
     if (password !== fixedPasswordConfirm.value) {
@@ -1197,7 +1264,7 @@ function setupSettingsPage(): void {
       }
       setStatus(passwordResult, result.message, result.ok ? "ok" : "error");
       if (result.ok) {
-        loadPasswordStatus(true);
+        loadPasswordStatus();
       }
     });
   });
@@ -1216,13 +1283,13 @@ function setupSettingsPage(): void {
       }
       setStatus(passwordResult, result.message, result.ok ? "ok" : "error");
       if (result.ok) {
-        loadPasswordStatus(true);
+        loadPasswordStatus();
       }
     });
   });
 
   refreshSubmitState();
-  loadPasswordStatus(true);
+  loadPasswordStatus();
 }
 
 /* ---------- 我的设备：高性能串流 ---------- */
