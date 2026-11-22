@@ -478,14 +478,22 @@ vega_reparse_done_${ID}:
 ;
 ; t6c-fix1（审计 P2）：判断目录 $INSTDIR 下是否还有子项（跳过 `.` 与 `..`），三态输出：
 ;   "1" = 有子项；"0" = 确认为空；"E" = 枚举失败。
-; FindFirst 失败时无法从返回值区分原因，用 IfFileExists "${PATH}\*.*" 判断目录本身是否
-; 还存在：存在但枚举不了 → "E"（调用方按失败处理）；不存在/确认为空 → "0"。
+; t6c-fix2（架构裁定）：FindFirst 失败**或句柄为空一律输出 "E"**，不再用
+; `IfFileExists "${PATH}\*.*"` 二次判定。
+;   理由：此时目录刚由提权安装器 CreateDirectory 并改过 DACL，管理员枚举失败本身就是
+;   异常，不该被降级成「确认为空，跳过 /reset」。旧写法还有两个副作用：`IfFileExists`
+;   对**目录**的判断依赖通配符展开的语义，目录不存在与拒绝访问也分不开；多一次文件系统
+;   访问又把 TOCTOU 窗口拉长。所以调用方拿到的只有「有子项 / 空 / 失败」三态，失败即
+;   fail closed（第 4 步跳 vega_acl_fail）。
 ; FindNext 出错仍按「枚举结束」处理（NSIS 内置 FindNext 不暴露错误码，已在 ROADMAP 记录）。
+; $0 先清零再 FindFirst：句柄只有真正分配成功时才非空，出错路径上不会去 FindClose 一个
+; 调用方留下的陈旧句柄。
 ; 只用 $0/$1（句柄 / 文件名），进宏 Push，出宏 Pop；标签按调用方 ID 区分。
 !macro VegaHasChildEntries ID PATH VAR
   Push $0
   Push $1
   StrCpy ${VAR} "0"
+  StrCpy $0 ""
   ClearErrors
   FindFirst $0 $1 "${PATH}\*.*"
   IfErrors vega_has_child_first_error_${ID}
@@ -502,8 +510,8 @@ vega_has_child_next_${ID}:
   StrCmp $1 "" vega_has_child_done_${ID}
   Goto vega_has_child_loop_${ID}
 vega_has_child_first_error_${ID}:
-  IfFileExists "${PATH}\*.*" 0 vega_has_child_done_${ID}
-    StrCpy ${VAR} "E"
+  ; t6c-fix2：枚举失败一律 "E"，与「确认为空」不再混淆（见上方宏注释）。
+  StrCpy ${VAR} "E"
 vega_has_child_done_${ID}:
   StrCmp $0 "" vega_has_child_closed_${ID}
     FindClose $0
@@ -558,7 +566,11 @@ Function VegaApplyInstallDirAcl
   StrCpy $2 "-"
   StrCpy $3 "-"
   ; 0. $INSTDIR 不得含单引号（PowerShell 单引号字符串会被截断）。
-  StrStr $R0 "$INSTDIR" "'"
+  ;    NSIS 没有内置的 StrStr/StrLoc 指令，裸写 StrStr 会让 makensis 报
+  ;    `Invalid command: StrStr`（t6c-fix2 P1）。这里用 StrFunc.nsh 的 ${StrLoc}：
+  ;    installer.nsi 在第 70-72 行 `!include "StrFunc.nsh"` + `${StrLoc}` 之后才
+  ;    `!include` 本文件，宏已展开可用。${StrLoc} 找到返回下标（非空），找不到返回 ""。
+  ${StrLoc} $R0 "$INSTDIR" "'" ">"
   StrCmp $R0 "" vega_acl_no_quote
     StrCpy $R2 "quote"
     Goto vega_acl_fail
