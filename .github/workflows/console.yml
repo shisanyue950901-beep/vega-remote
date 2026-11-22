@@ -25,10 +25,6 @@ jobs:
     defaults:
       run:
         working-directory: console
-    env:
-      VEGA_UPDATER_PUBKEY: ${{ secrets.VEGA_UPDATER_PUBKEY }}
-      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -67,32 +63,6 @@ jobs:
           if (failed) process.exit(1);
           ' src-tauri/tauri.conf.json src-tauri/capabilities/default.json
 
-      - name: 注入更新公钥（配置了 secret 时）
-        if: env.VEGA_UPDATER_PUBKEY != ''
-        shell: bash
-        run: |
-          set -euo pipefail
-          key=$(printf '%s' "$VEGA_UPDATER_PUBKEY" | sed -e 's/[\\&|]/\\&/g')
-          sed -i "s|__VEGA_UPDATER_PUBKEY__|$key|" src-tauri/tauri.conf.json
-          if grep -q '__VEGA_UPDATER_PUBKEY__' src-tauri/tauri.conf.json; then
-            echo "::error::更新公钥注入失败"
-            exit 1
-          fi
-
-      # 没有签名私钥时（PR / fork）关闭更新产物，构建仍要能过；tag 发布时由 secret 打开。
-      - name: 无签名私钥时关闭更新产物
-        if: env.TAURI_SIGNING_PRIVATE_KEY == '' || env.VEGA_UPDATER_PUBKEY == ''
-        shell: bash
-        run: |
-          node -e '
-          const fs = require("fs");
-          const p = "src-tauri/tauri.conf.json";
-          const conf = JSON.parse(fs.readFileSync(p, "utf8"));
-          conf.bundle.createUpdaterArtifacts = false;
-          fs.writeFileSync(p, JSON.stringify(conf, null, 2) + "\n");
-          '
-          echo "未配置 TAURI_SIGNING_PRIVATE_KEY / VEGA_UPDATER_PUBKEY：本次跳过更新签名产物"
-
       # 仓库暂未提交 package-lock.json / Cargo.lock：离线环境无法生成，先保留 npm install。
       # TODO(m2b): 在联网机器上生成并提交 package-lock.json 与 src-tauri/Cargo.lock，
       # 然后把这里换成 `npm ci`，构建步骤换成 Cargo `--locked`（或 tauri build -- --locked）。
@@ -109,10 +79,9 @@ jobs:
       # TODO(m2b): Cargo.lock 提交后追加 --locked，保证依赖可复现。
       # tauri.conf.json 里 bundle.targets = ["nsis"]，perMachine 只提权一次；
       # 安装包会带上 host/install-rustdesk.ps1 与 resources/vega-defaults.json。
+      # 构建完全不需要签名密钥：更新包由维护者在本地用 `tauri signer sign` 签，
+      # 见 tools/publish-update.sh。CI 只产出未签名的安装包。
       - name: 构建（NSIS 安装包）
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npm run tauri build -- --bundles nsis
 
       # cargo test 的 build.rs（generate_context!）需要 ../dist，上面构建已生成。
@@ -126,10 +95,6 @@ jobs:
           src=$(ls src-tauri/target/release/bundle/nsis/*-setup.exe | head -n 1)
           mkdir -p "$RUNNER_TEMP/vega"
           cp "$src" "$RUNNER_TEMP/vega/Vega-Setup.exe"
-          if compgen -G "src-tauri/target/release/bundle/nsis/*.sig" > /dev/null; then
-            sig=$(ls src-tauri/target/release/bundle/nsis/*.sig | head -n 1)
-            cp "$sig" "$RUNNER_TEMP/vega/Vega-Setup.exe.sig"
-          fi
           ls -l "$RUNNER_TEMP/vega/"
 
       - name: 上传 Vega-Setup.exe（真机试跑用安装包）
@@ -140,15 +105,6 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: 上传更新签名产物
-        if: env.TAURI_SIGNING_PRIVATE_KEY != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: vega-updater-windows
-          path: ${{ runner.temp }}/vega/Vega-Setup.exe*
-          if-no-files-found: error
-          retention-days: 7
-
       - name: 上传控制台 exe（供真机试跑）
         uses: actions/upload-artifact@v4
         with:
@@ -156,57 +112,3 @@ jobs:
           path: console/src-tauri/target/release/vega-console.exe
           if-no-files-found: error
           retention-days: 14
-
-  release:
-    name: 发布更新清单（latest.json）
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: 下载签名产物
-        uses: actions/download-artifact@v4
-        with:
-          name: vega-updater-windows
-          path: dist
-
-      - name: 生成 latest.json 与镜像清单
-        shell: bash
-        env:
-          TAG: ${{ github.ref_name }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          version="${TAG#v}"
-          sig_file="dist/Vega-Setup.exe.sig"
-          if [ ! -f "$sig_file" ]; then
-            echo "::error::缺少 Vega-Setup.exe.sig：请配置 TAURI_SIGNING_PRIVATE_KEY"
-            exit 1
-          fi
-          sig=$(cat "$sig_file")
-          pub_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          notes="Vega 控制台 ${version}"
-          gh_url="https://github.com/${REPO}/releases/download/${TAG}/Vega-Setup.exe"
-          mirror_url="http://60.205.95.98/vega/updates/Vega-Setup.exe"
-
-          jq -n --arg v "$version" --arg n "$notes" --arg d "$pub_date" \
-            --arg s "$sig" --arg u "$gh_url" \
-            '{version:$v,notes:$n,pub_date:$d,platforms:{"windows-x86_64":{signature:$s,url:$u}}}' \
-            > latest.json
-          jq -n --arg v "$version" --arg n "$notes" --arg d "$pub_date" \
-            --arg s "$sig" --arg u "$mirror_url" \
-            '{version:$v,notes:$n,pub_date:$d,platforms:{"windows-x86_64":{signature:$s,url:$u}}}' \
-            > latest-mirror.json
-          cat latest.json
-          cat latest-mirror.json
-
-      - name: 发布到 GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          files: |
-            dist/Vega-Setup.exe
-            dist/Vega-Setup.exe.sig
-            latest.json
-            latest-mirror.json
