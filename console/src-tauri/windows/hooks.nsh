@@ -32,7 +32,7 @@
 ;     Var 记住「安装前是否已有 Vega 卸载注册表项」，POSTINSTALL 只在全新安装时运行
 ;     RustDesk 脚本；重装与 /UPDATE 默认跳过，只有 Program Files 下找不到 rustdesk.exe
 ;     时才补跑（补装并配置）。旧目录迁移在 /UPDATE 下也执行（只删文件）；比较前用
-;     GetLongPathNameW 解析 8.3 短名，旧目录或旧 resources 是重解析点时整段跳过。
+;     GetLongPathNameW 解析 8.3 短名，旧目录 / 旧 resources / 其子目录是重解析点时整段跳过。
 ;
 ; 注意：本文件在 tauri 的 installer.nsi 顶部（MUI 页面插入之前）被 include，
 ; 所以这里的 !define 能影响完成页文案；MUI_FINISHPAGE_TEXT 里放的是运行时变量。
@@ -367,8 +367,10 @@ vega_trim_done_${ID}:
 ;   * InstallLocation / UninstallString 先归一化（去引号、去尾反斜杠），再用 Win32
 ;     GetFullPathNameW + GetLongPathNameW 规范化（解析 8.3 短名、. / .. 与重复分隔符），
 ;     与 ${VEGA_INSTALL_DIR} 大小写不敏感比较；长路径相同则不做。
-;   * 旧目录本身或旧目录 \resources 是重解析点（junction/symlink）时整段跳过：
-;     否则逐文件 Delete 会跟着链接删到旧目录之外。
+;   * 旧目录本身、旧目录 \resources 以及 Vega 安装的每个 resources 子目录
+;     (\resources\host、\resources\host\lib) 是重解析点（junction/symlink）时整段跳过：
+;     否则逐文件 Delete 会跟着链接删到旧目录之外。旧目录的「祖先目录」不在检查范围
+;     （架构裁定，见 ROADMAP「T6 加固」）。
 ;   * 盘根、UNC、Windows/ProgramData/用户配置目录一律拒绝（护栏）。
 ;   * 旧目录里必须有 vega-console.exe，否则一概不碰。
 ;   * 先把 $OUTDIR 指到固定目录，再 Delete 已知文件、非递归 RMDir 子目录与旧目录。
@@ -463,11 +465,15 @@ vega_old_have_path:
     Goto vega_old_done
 
 vega_old_differs:
-  ; 护栏零：旧目录或其 resources 是重解析点（junction/symlink）时不删任何东西，
-  ; 否则 Delete 会沿着链接越出旧目录。
+  ; 护栏零：旧目录、旧 resources 以及 Vega 安装的每个 resources 子目录是重解析点
+  ; （junction/symlink）时不删任何东西，否则 Delete 会沿着链接越出旧目录。
   !insertmacro VegaIsReparsePoint old_dir "$vegaOldInstallDir" $R0
   StrCmp $R0 "1" vega_old_reparse
   !insertmacro VegaIsReparsePoint old_res "$vegaOldInstallDir\resources" $R0
+  StrCmp $R0 "1" vega_old_reparse
+  !insertmacro VegaIsReparsePoint old_res_host "$vegaOldInstallDir\resources\host" $R0
+  StrCmp $R0 "1" vega_old_reparse
+  !insertmacro VegaIsReparsePoint old_res_host_lib "$vegaOldInstallDir\resources\host\lib" $R0
   StrCmp $R0 "1" vega_old_reparse
 
   ; 护栏一：UNC（\\server\share）不处理。
@@ -492,7 +498,7 @@ vega_old_guard_config:
   Goto vega_old_check_binary
 
 vega_old_reparse:
-  DetailPrint "旧版目录 $vegaOldInstallDir 或其 resources 是重解析点，跳过清理。"
+  DetailPrint "旧版目录 $vegaOldInstallDir 或其 resources 子目录是重解析点，跳过清理。"
   Goto vega_old_done
 
 vega_old_refused:
