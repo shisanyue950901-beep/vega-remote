@@ -195,17 +195,6 @@ fn strip_extended_prefix(path: &Path) -> PathBuf {
         None => path.to_path_buf(),
     }
 }
-/// 纯函数：规范化后的助手路径是否落在任一受信任根内。返回去掉 `\\?\` 的最终路径。
-/// 根与路径都先去前缀再比较，避免 `\\?\C:\Program Files` 与 `c:\program files` 因形式不同而漏判。
-#[cfg_attr(not(windows), allow(dead_code))]
-fn trusted_helper_path(canonical: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
-    let final_path = strip_extended_prefix(canonical);
-    roots
-        .iter()
-        .map(|root| strip_extended_prefix(root))
-        .any(|root| under_root(&final_path, &root))
-        .then_some(final_path)
-}
 /// `path` 是否落在 `root` 目录内（Windows 路径按 ASCII 忽略大小写比较）。
 #[cfg_attr(not(windows), allow(dead_code))]
 fn under_root(path: &Path, root: &Path) -> bool {
@@ -382,25 +371,66 @@ fn helper_script(app: &tauri::AppHandle) -> Option<PathBuf> {
         dev.is_file().then_some(dev)
     })
 }
-/// 发行版只接受两类助手位置，返回规范化并去掉 `\\?\` 的最终路径交给 `-File` 使用：
-///   1. 系统 `Program Files`（含 x86）：根目录取自 `winpaths::program_files_dirs()`
-///      （已知文件夹 + 系统卷校验），不读可被启动环境改写的环境变量。这是默认安装位置。
-///   2. t6b 新增：任意本地安装目录，但必须满足 `custom_install_dir_admin_only` ——
-///      助手在 `<exe_dir>\resources` 里，且 exe_dir / resources / 助手文件三层的所有者与
-///      DACL 都只允许 SYSTEM、Administrators、TrustedInstaller 写入（安装器用 icacls 收紧）。
-/// 两条都不满足时返回固定文案 `INSECURE_INSTALL_DIR`，前端直接显示。
+/// 发行版只接受一种安装目录形状，返回规范化并去掉 `\\?\` 的助手路径交给 `-File` 使用：
+///   * `<X>:\Vega`（任意盘根的直接子目录），或
+///   * `<ProgramFiles>\Vega`，根目录取自 `winpaths::program_files_dirs()`
+///     （已知文件夹 + 系统卷校验，不读可被启动环境改写的环境变量）。
+///
+/// 位置对了不等于安全：`Program Files` 下被手工建出来的目录完全可以带宽松 ACL，
+/// 所以不再有「前缀命中就直接放行」的快路径，一律走完整校验：
+///   1. 安装目录形状必须是上面两条之一；
+///   2. exe、exe_dir、resources、助手文件四段原始路径都不是重解析点，
+///      且 `canonicalize` 结果与原始路径一致（校验途中不能被链接换走）；
+///   3. exe_dir 的每一级祖先（直到盘根，含 `Program Files` 根）所有者必须是
+///      SYSTEM / Administrators / TrustedInstaller，且不能把删除子项、改写 ACL、
+///      改所有者、完全控制授予其他主体（建子目录/建文件允许）；
+///   4. exe_dir、resources、助手文件三层的所有者与 DACL 只允许上面三个主体写入。
+/// 任何一条不满足都返回固定文案 `INSECURE_INSTALL_DIR`，前端直接显示。
 #[cfg(all(windows, not(debug_assertions)))]
 fn ensure_helper_location(helper: &Path) -> Result<PathBuf, String> {
-    let canonical = std::fs::canonicalize(helper).map_err(|_| "无法定位提权助手".to_string())?;
-    let roots = crate::winpaths::program_files_dirs();
-    if let Some(path) = trusted_helper_path(&canonical, &roots) {
-        return Ok(path);
+    validate_helper_location(helper).ok_or_else(|| INSECURE_INSTALL_DIR.to_string())
+}
+
+/// 完整校验一次助手位置；通过时返回去掉 `\\?\` 的助手路径。
+/// 发版路径里每次拉起提权助手前都要跑一遍（`run_helper` 在 `ShellExecuteExW` 紧前面再跑一次）。
+#[cfg(all(windows, not(debug_assertions)))]
+fn validate_helper_location(helper: &Path) -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let raw_exe_dir = exe.parent()?.to_path_buf();
+    let raw_resources = raw_exe_dir.join("resources");
+    // 1. 位置规则：`<X>:\Vega` 或 `<ProgramFiles>\Vega`。
+    if !allowed_install_dir(&raw_exe_dir, &crate::winpaths::program_files_dirs()) {
+        return None;
     }
-    let custom = strip_extended_prefix(&canonical);
-    if custom_install_dir_admin_only(&canonical) {
-        return Ok(custom);
+    // 2. 先按未规范化的原始路径验重解析点，再要求 canonicalize 结果与原始路径一致。
+    for raw in [exe.as_path(), raw_exe_dir.as_path(), raw_resources.as_path(), helper] {
+        if !raw_matches_canonical(raw) {
+            return None;
+        }
     }
-    Err(INSECURE_INSTALL_DIR.to_string())
+    // 3. 祖先链：exe_dir 的每一级父目录直到盘根，都不能把控制权交给非管理员。
+    for ancestor in ancestor_chain(&raw_exe_dir) {
+        if !path_ancestor_admin_only_control(&ancestor) {
+            return None;
+        }
+    }
+    // 4. 三层 DACL：安装目录、resources、助手文件；助手必须在 resources 里。
+    let canonical_exe_dir = std::fs::canonicalize(&raw_exe_dir).ok()?;
+    let canonical_resources = std::fs::canonicalize(&raw_resources).ok()?;
+    let canonical_helper = std::fs::canonicalize(helper).ok()?;
+    if !canonical_helper.is_file() {
+        return None;
+    }
+    if !same_path(canonical_helper.parent()?, &canonical_resources) {
+        return None;
+    }
+    if !path_acl_admin_only_write(&canonical_exe_dir)
+        || !path_acl_admin_only_write(&canonical_resources)
+        || !path_acl_admin_only_write(&canonical_helper)
+    {
+        return None;
+    }
+    Some(strip_extended_prefix(&canonical_helper))
 }
 #[cfg(all(windows, debug_assertions))]
 fn ensure_helper_location(helper: &Path) -> Result<PathBuf, String> { Ok(strip_extended_prefix(helper)) }
@@ -413,9 +443,17 @@ fn ensure_helper_location(helper: &Path) -> Result<PathBuf, String> { Ok(strip_e
 // runas 执行该脚本，脚本可写就等于把「管理员执行任意 PowerShell」交给任何本地用户。
 // t6b 放开目录限制（用户可以装到 D:\Vega），改由安装器用 icacls 把目录 ACL 收紧成
 // 「只有 SYSTEM / Administrators 可写」，控制台在每次提权前自己再验一遍：
+//   * 安装目录只能是 `<X>:\Vega` 或 `<ProgramFiles>\Vega`（`Program Files` 根来自
+//     `winpaths::program_files_dirs()`），更深或改名的目录不认；
+//   * 不再有「在 Program Files 前缀下就跳过检查」的快路径：`Program Files` 里被手工
+//     建出来、带宽松 ACL 的子目录一样危险，所以 `Program Files\Vega` 也必须过同一套校验；
 //   * 助手必须在 `<exe_dir>\resources` 里，exe_dir 是当前控制台 exe 的真实目录；
-//   * exe_dir、exe_dir\resources、助手文件三者都不能是重解析点（junction/symlink）；
-//   * 三者的所有者必须是 SYSTEM / Administrators / TrustedInstaller；
+//   * exe、exe_dir、exe_dir\resources、助手文件四段原始路径都不能是重解析点
+//     （junction/symlink），且 canonicalize 之后必须与原始路径一致；
+//   * exe_dir 的每一级祖先直到盘根（含 `Program Files` 根）都不能把删除子项、改写 ACL、
+//     改所有者、完全控制授予非管理员主体，所有者本身也必须是受信任主体；
+//   * exe_dir、exe_dir\resources、助手文件三者的所有者必须是 SYSTEM / Administrators /
+//     TrustedInstaller；
 //   * 三者的 DACL 里，凡是授予写权限的 allow ACE，被授权者只能是上面三个主体
 //     （CREATOR OWNER 只允许出现在 INHERIT_ONLY 的继承 ACE 上，它不作用于对象本身）。
 // 任何一条不满足都拒绝设置长期密码，并提示重新运行安装包修复。
@@ -448,6 +486,14 @@ const ACE_WRITE_BITS: u32 = 0x0000_0002 // FILE_WRITE_DATA / FILE_ADD_FILE
     | 0x0008_0000 // WRITE_OWNER
     | 0x1000_0000 // GENERIC_ALL
     | 0x4000_0000; // GENERIC_WRITE
+/// 祖先目录上「足以接管子项」的权限位：能删子项、能改 ACL、能改所有者、或直接完全控制。
+/// `FILE_ADD_SUBDIRECTORY` / `FILE_ADD_FILE`（0x4 / 0x2）不在其中：往盘根建目录是正常用法。
+const ACE_ANCESTOR_FORBIDDEN_BITS: u32 = 0x0001_0000 // DELETE
+    | 0x0000_0040 // FILE_DELETE_CHILD
+    | 0x0004_0000 // WRITE_DAC
+    | 0x0008_0000 // WRITE_OWNER
+    | 0x1000_0000 // GENERIC_ALL
+    | 0x4000_0000; // GENERIC_WRITE
 
 /// 一条 ACE：`(ace_type, ace_flags, access_mask, SID 字符串)`。
 type AceRecord = (u8, u8, u32, String);
@@ -460,16 +506,22 @@ fn is_trusted_sid(sid: &str) -> bool {
 }
 
 /// ACE 类型分类：`Some(true)` = allow，`Some(false)` = deny/audit（不影响判定），
-/// `None` = 未知类型（一律拒绝）。
+/// `None` = 未知或无法确认授权对象的类型（一律拒绝）。
+///
+/// 只有普通 `ACCESS_ALLOWED_ACE_TYPE`（0x00）算 allow。`ACCESS_ALLOWED_COMPOUND_ACE_TYPE`
+/// （0x04）以及 0x05/0x09/0x0B 等带对象或回调的 allow 类型，都无法用本文件的简单模型确认
+/// 授权对象，直接判为不安全。只有 deny（0x01 及其对象/回调变体）和 audit/alarm
+/// （0x02、0x03 及其对象/回调变体）可以跳过：它们不放行访问。
 fn ace_class(ace_type: u8) -> Option<bool> {
     match ace_type {
         // ACCESS_ALLOWED_ACE_TYPE
         0x00 => Some(true),
-        // ACCESS_ALLOWED_OBJECT / CALLBACK / CALLBACK_OBJECT：也是 allow，但带对象/回调，
-        // 无法用本函数的简单模型确认授权对象，直接判为不安全。
-        0x05 | 0x09 | 0x0B => Some(true),
-        // SYSTEM_AUDIT / DENY（0x01,0x02,0x03,0x06,0x07,0x08,0x0A,0x0C）：不放行访问。
-        0x01 | 0x02 | 0x03 | 0x04 | 0x06 | 0x07 | 0x08 | 0x0A | 0x0C => Some(false),
+        // ACCESS_DENIED_ACE_TYPE / SYSTEM_AUDIT_ACE_TYPE / SYSTEM_ALARM_ACE_TYPE，
+        // 以及它们的 OBJECT / CALLBACK / CALLBACK_OBJECT 变体：不放行访问。
+        0x01 | 0x02 | 0x03 | 0x06 | 0x07 | 0x08 | 0x0A | 0x0C | 0x0D | 0x0E | 0x0F | 0x10 => {
+            Some(false)
+        }
+        // 0x04 ACCESS_ALLOWED_COMPOUND、0x05 / 0x09 / 0x0B 等 allow 变体，以及未知类型：拒绝。
         _ => None,
     }
 }
@@ -507,6 +559,120 @@ fn dacl_admin_only_write(owner: &str, dacl: Option<&[AceRecord]>) -> bool {
         return false;
     }
     true
+}
+
+/// 祖先目录判定（纯函数）：`owner` 是对象所有者 SID，`dacl` 是 DACL 里的 ACE 列表。
+///
+/// 祖先目录只需要「不给别人接管子项的能力」：所有者必须是受信任主体，allow ACE 里不得把
+/// `DELETE` / `FILE_DELETE_CHILD` / `WRITE_DAC` / `WRITE_OWNER` / `GENERIC_ALL` /
+/// `GENERIC_WRITE` 授予其他主体。`FILE_ADD_SUBDIRECTORY` / `FILE_ADD_FILE` 允许：
+/// 盘根上给 `Authenticated Users` 建目录是 Windows 默认 ACL 的一部分。
+/// `INHERIT_ONLY` 的 ACE 只作用于子对象，不影响本目录，因此跳过。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn ancestor_admin_only_control(owner: &str, dacl: Option<&[AceRecord]>) -> bool {
+    if !is_trusted_sid(owner) {
+        return false;
+    }
+    let Some(aces) = dacl else {
+        return false; // NULL DACL：所有人完全控制。
+    };
+    for (ace_type, flags, mask, sid) in aces {
+        match ace_class(*ace_type) {
+            None => return false,
+            Some(false) => continue,
+            Some(true) => {}
+        }
+        // allow ACE 只接受普通 ACCESS_ALLOWED_ACE。
+        if *ace_type != ACE_TYPE_ACCESS_ALLOWED {
+            return false;
+        }
+        if mask & ACE_ANCESTOR_FORBIDDEN_BITS == 0 {
+            continue; // 只读/执行、建子目录、建文件都不足以接管。
+        }
+        if flags & ACE_FLAG_INHERIT_ONLY != 0 {
+            continue; // 只作用于子对象，不作用于祖先目录本身。
+        }
+        if is_trusted_sid(sid) {
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+/// `path` 是否就是盘根（`C:` / `C:\` / `\\?\C:\`），纯字符串判断，不依赖平台路径语法。
+#[allow(dead_code)]
+fn is_drive_root(path: &Path) -> bool {
+    let text = strip_extended_prefix(path).to_string_lossy().replace('/', "\\");
+    let trimmed = text.trim_end_matches('\\');
+    let bytes = trimmed.as_bytes();
+    bytes.len() == 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic()
+}
+
+/// 安装目录形状（纯函数）：`exe_dir` 必须正好是 `<X>:\Vega`，或 `<ProgramFiles>\Vega`
+/// 且 `ProgramFiles` 出现在 `program_files`（来自 `winpaths::program_files_dirs()`）里。
+/// 前缀相同但更深或改了名的目录一律不认。
+#[allow(dead_code)]
+fn allowed_install_dir(exe_dir: &Path, program_files: &[PathBuf]) -> bool {
+    let dir = strip_extended_prefix(exe_dir);
+    let text = dir.to_string_lossy().replace('/', "\\");
+    let text = text.trim_end_matches('\\');
+    let Some((parent_text, name)) = text.rsplit_once('\\') else {
+        return false;
+    };
+    if !name.eq_ignore_ascii_case("Vega") {
+        return false;
+    }
+    let parent = PathBuf::from(parent_text);
+    if is_drive_root(&parent) {
+        return true;
+    }
+    program_files
+        .iter()
+        .any(|root| same_path(&parent, &strip_extended_prefix(root)))
+}
+
+/// 原始路径不是重解析点，并且 `canonicalize` 之后与原始路径一致（去前缀、忽略大小写）。
+/// `winpaths::is_reparse_point` 在拿不到属性时也返回 true，因此这里不再单独处理
+/// `INVALID_FILE_ATTRIBUTES`。
+#[cfg(windows)]
+#[allow(dead_code)]
+fn raw_matches_canonical(raw: &Path) -> bool {
+    if crate::winpaths::is_reparse_point(raw) {
+        return false;
+    }
+    match std::fs::canonicalize(raw) {
+        Ok(canonical) => {
+            same_path(&strip_extended_prefix(&canonical), &strip_extended_prefix(raw))
+        }
+        Err(_) => false,
+    }
+}
+
+/// `exe_dir` 的祖先链：父目录、祖父目录……直到盘根（含）。
+#[cfg(windows)]
+#[allow(dead_code)]
+fn ancestor_chain(exe_dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut current = exe_dir.parent();
+    while let Some(path) = current {
+        out.push(path.to_path_buf());
+        current = path.parent();
+    }
+    out
+}
+
+/// 单个祖先目录的 ACL 是否「不能接管子项」。
+#[cfg(windows)]
+#[allow(dead_code)]
+fn path_ancestor_admin_only_control(path: &Path) -> bool {
+    if crate::winpaths::is_reparse_point(path) {
+        return false;
+    }
+    match path_owner_and_dacl(path) {
+        Some((owner, dacl)) => ancestor_admin_only_control(&owner, dacl.as_deref()),
+        None => false,
+    }
 }
 
 /// 两个路径是否指向同一目录（Windows 路径按 ASCII 忽略大小写，忽略 `\\?\` 前缀与尾部斜杠）。
@@ -689,49 +855,6 @@ fn path_acl_admin_only_write(path: &Path) -> bool {
     }
 }
 
-/// 非 Program Files 安装是否可信：助手必须直接位于 `<exe_dir>\resources` 下，
-/// 且 exe_dir、resources、助手文件三层 ACL 都只允许管理员写。
-#[cfg(windows)]
-#[allow(dead_code)]
-fn custom_install_dir_admin_only(helper: &Path) -> bool {
-    let Ok(exe) = std::env::current_exe() else {
-        return false;
-    };
-    let Some(exe_parent) = exe.parent() else {
-        return false;
-    };
-    let Ok(exe_dir) = std::fs::canonicalize(exe_parent) else {
-        return false;
-    };
-    let Ok(canonical_helper) = std::fs::canonicalize(helper) else {
-        return false;
-    };
-    // 助手文件必须真实存在且是文件（AllowSkipFile 之外的实现），并直接位于 resources 下。
-    if !canonical_helper.is_file() {
-        return false;
-    }
-    let resources = exe_dir.join("resources");
-    let Some(helper_parent) = canonical_helper.parent() else {
-        return false;
-    };
-    let Ok(helper_dir) = std::fs::canonicalize(helper_parent) else {
-        return false;
-    };
-    if !same_path(&helper_dir, &resources) {
-        return false;
-    }
-    // 三层逐一校验：安装目录、resources、助手文件。
-    path_acl_admin_only_write(&exe_dir)
-        && path_acl_admin_only_write(&resources)
-        && path_acl_admin_only_write(&canonical_helper)
-}
-
-#[cfg(not(windows))]
-#[allow(dead_code)]
-fn custom_install_dir_admin_only(_helper: &Path) -> bool {
-    false
-}
-
 /// `%SystemRoot%\System32`（`GetSystemDirectoryW`）。
 #[cfg(windows)]
 fn system32_dir() -> Option<PathBuf> {
@@ -760,15 +883,14 @@ fn run_helper(app: &tauri::AppHandle, payload: &Path) -> Result<(), String> {
     };
 
     let helper = helper_script(app).ok_or_else(|| "找不到提权助手 vega-pwhelper.ps1".to_string())?;
+    // 第一遍：尽早失败，错误文案统一。
     let helper = ensure_helper_location(&helper)?;
     let system32 = system32_dir().ok_or_else(|| "找不到 System32 目录".to_string())?;
     let powershell = powershell_path().ok_or_else(|| "找不到系统 PowerShell".to_string())?;
-    let args = build_helper_args(&helper, payload)?;
-    let (file_w, dir_w, verb_w, args_w) = (
+    let (file_w, dir_w, verb_w) = (
         wide_path(&powershell),
         wide_path(&system32),
         wide("runas"),
-        wide(&args),
     );
     // ShellExecuteExW 要求调用线程已初始化 COM；S_FALSE(1) 也算成功，只需配对 CoUninitialize。
     let hr = unsafe {
@@ -783,6 +905,28 @@ fn run_helper(app: &tauri::AppHandle, payload: &Path) -> Result<(), String> {
         return Err(format!("无法初始化 COM（错误码 0x{:08X}）", hr as u32));
     }
     let com_ready = hr >= 0;
+
+    // 紧挨着 ShellExecuteExW 再跑一遍完整校验：从第一次校验到这里之间，安装目录或助手文件
+    // 仍可能被换掉。这一遍给出的路径才是真正交给 PowerShell `-File` 的路径。
+    let revalidated = match ensure_helper_location(&helper) {
+        Ok(path) => path,
+        Err(err) => {
+            if com_ready { unsafe { CoUninitialize() } }
+            return Err(err);
+        }
+    };
+    if !same_path(&revalidated, &helper) {
+        if com_ready { unsafe { CoUninitialize() } }
+        return Err(INSECURE_INSTALL_DIR.to_string());
+    }
+    let args = match build_helper_args(&revalidated, payload) {
+        Ok(args) => args,
+        Err(err) => {
+            if com_ready { unsafe { CoUninitialize() } }
+            return Err(err);
+        }
+    };
+    let args_w = wide(&args);
 
     let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
     info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
@@ -864,28 +1008,52 @@ mod tests {
         }
         assert!(map_verify("use-both-passwords").is_err() && map_verify("").is_err());
     }
+    // ---- t6b-fix：安装目录形状（纯函数） ----
     #[test]
-    fn trusted_helper_path_strips_verbatim_and_checks_prefix() {
-        let roots = vec![PathBuf::from(r"C:\Program Files"), PathBuf::from(r"\\?\C:\Program Files (x86)")];
-        let cases = [
-            (r"\\?\C:\Program Files\Vega\resources\vega-pwhelper.ps1", Some(r"C:\Program Files\Vega\resources\vega-pwhelper.ps1")),
-            (r"\\?\c:\program files\vega\resources\vega-pwhelper.ps1", Some(r"c:\program files\vega\resources\vega-pwhelper.ps1")),
-            (r"\\?\C:\Program Files (x86)\Vega\h.ps1", Some(r"C:\Program Files (x86)\Vega\h.ps1")),
+    fn allowed_install_dir_accepts_only_drive_child_or_program_files_child() {
+        let roots = vec![
+            PathBuf::from(r"\\?\C:\Program Files"),
+            PathBuf::from(r"C:\Program Files (x86)"),
         ];
-        for (given, want) in cases {
-            assert_eq!(trusted_helper_path(Path::new(given), &roots), want.map(PathBuf::from), "{given}");
+        // 盘根的直接子目录 `X:\Vega`。
+        for ok in [r"C:\Vega", r"D:\Vega", r"c:\vega", r"\\?\E:\Vega", r"D:\Vega\"] {
+            assert!(allowed_install_dir(Path::new(ok), &roots), "{ok}");
         }
-        // 前缀必须按目录边界：`C:\Program Files Evil\` 不能冒充 `C:\Program Files\`。
-        for bad in [
-            r"\\?\C:\Program Files Evil\h.ps1",
-            r"C:\Program FilesEvil\h.ps1",
-            r"\\?\C:\Users\me\Program Files\Vega\h.ps1",
-            r"\\?\C:\Program FilesX\Vega\h.ps1",
+        // Program Files 根的直接子目录，大小写与 verbatim 前缀都不影响。
+        for ok in [
+            r"C:\Program Files\Vega",
+            r"\\?\C:\Program Files\Vega",
+            r"c:\program files\vega",
+            r"C:\Program Files (x86)\Vega",
         ] {
-            assert_eq!(trusted_helper_path(Path::new(bad), &roots), None, "{bad}");
+            assert!(allowed_install_dir(Path::new(ok), &roots), "{ok}");
         }
-        assert_eq!(trusted_helper_path(Path::new(r"C:\Program Files\Vega\h.ps1"), &[]), None);
-        assert_eq!(trusted_helper_path(Path::new(r"\\?\C:\Program Files"), &roots), Some(PathBuf::from(r"C:\Program Files")));
+        // 更深一层、改名、盘根下别的名字、名字只是前缀相同的目录：都不认。
+        for bad in [
+            r"C:\Vega\sub",
+            r"C:\Program Files\Vega\sub",
+            r"C:\Program Files\Vega2",
+            r"C:\Program Files\Vega-Evil",
+            r"C:\Vega2",
+            r"C:\Other",
+            r"C:\Program Files",
+            r"\\srv\share\Vega",
+            // 名字对但父目录不是盘根 / 不是 Program Files 根。
+            r"C:\Users\me\Vega",
+            r"C:\Program Files Evil\Vega",
+        ] {
+            assert!(!allowed_install_dir(Path::new(bad), &roots), "{bad}");
+        }
+        assert!(!allowed_install_dir(Path::new(r"C:\Program Files\Vega"), &[]));
+    }
+    #[test]
+    fn is_drive_root_matches_letter_colon_only() {
+        for ok in ["C:", r"C:\", r"\\?\D:\", "d:/"] {
+            assert!(is_drive_root(Path::new(ok)), "{ok}");
+        }
+        for bad in [r"C:\Vega", r"\\srv\share", "", r"C:temp"] {
+            assert!(!is_drive_root(Path::new(bad)), "{bad}");
+        }
     }
     #[test]
     fn strip_extended_prefix_handles_verbatim_forms() {
@@ -984,6 +1152,91 @@ mod tests {
             (0x01u8, 0u8, FILE_ALL, "S-1-5-11".to_string()),
         ];
         assert!(dacl_admin_only_write(SID_ADMINISTRATORS, Some(&aces)));
+    }
+    // ---- t6b-fix：祖先目录规则与 ACE 类型 ----
+    const SID_USERS: &str = "S-1-5-32-545";
+    const SID_AUTHENTICATED_USERS: &str = "S-1-5-11";
+    const FILE_ADD_FILE: u32 = 0x0000_0002;
+    const FILE_ADD_SUBDIRECTORY: u32 = 0x0000_0004;
+    const FILE_DELETE_CHILD: u32 = 0x0000_0040;
+    const DELETE: u32 = 0x0001_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
+    const WRITE_OWNER: u32 = 0x0008_0000;
+    #[test]
+    fn ancestor_allows_create_folder_on_drive_root() {
+        // 盘根默认 ACL：Authenticated Users 能建目录/建文件，Users 只读执行，
+        // CREATOR OWNER 只在 INHERIT_ONLY 里出现。这必须放行，否则盘根安装全被拒。
+        let aces = vec![
+            ace(SID_LOCAL_SYSTEM, FILE_ALL, 0),
+            ace(SID_ADMINISTRATORS, FILE_ALL, 0),
+            ace(SID_USERS, FILE_READ_EXEC, 0),
+            ace(SID_USERS, FILE_ADD_SUBDIRECTORY | FILE_ADD_FILE, 0),
+            ace(SID_AUTHENTICATED_USERS, FILE_ADD_SUBDIRECTORY | FILE_ADD_FILE, 0),
+            ace(SID_AUTHENTICATED_USERS, FILE_ALL, ACE_FLAG_INHERIT_ONLY),
+            ace(SID_CREATOR_OWNER, FILE_ALL, ACE_FLAG_INHERIT_ONLY),
+        ];
+        assert!(ancestor_admin_only_control(SID_LOCAL_SYSTEM, Some(&aces)));
+        // 空 DACL 同样安全。
+        assert!(ancestor_admin_only_control(SID_ADMINISTRATORS, Some(&[])));
+    }
+    #[test]
+    fn ancestor_rejects_users_modify_without_inherit_only() {
+        // Users 拿到 DELETE + WRITE_DAC：能删掉 `Vega` 再建同名目录 → 拒绝。
+        for mask in [
+            DELETE,
+            FILE_DELETE_CHILD,
+            WRITE_DAC,
+            WRITE_OWNER,
+            0x1000_0000, // GENERIC_ALL
+            0x4000_0000, // GENERIC_WRITE
+            DELETE | WRITE_DAC | FILE_DELETE_CHILD, // 「修改」档
+        ] {
+            let aces = vec![
+                ace(SID_ADMINISTRATORS, FILE_ALL, 0),
+                ace(SID_USERS, mask, 0),
+            ];
+            assert!(!ancestor_admin_only_control(SID_ADMINISTRATORS, Some(&aces)), "mask=0x{mask:08X}");
+        }
+        // 同样的权限只出现在 INHERIT_ONLY 的 ACE 上：不作用于祖先目录本身，放行。
+        let aces = vec![
+            ace(SID_ADMINISTRATORS, FILE_ALL, 0),
+            ace(SID_USERS, DELETE | WRITE_DAC | FILE_DELETE_CHILD, ACE_FLAG_INHERIT_ONLY),
+        ];
+        assert!(ancestor_admin_only_control(SID_ADMINISTRATORS, Some(&aces)));
+    }
+    #[test]
+    fn ancestor_rejects_user_owned_or_null_dacl() {
+        let aces = vec![ace(SID_ADMINISTRATORS, FILE_ALL, 0)];
+        // 所有者在普通用户手里：他能改回 DACL。
+        assert!(!ancestor_admin_only_control("S-1-5-21-1-2-3-1001", Some(&aces)));
+        assert!(!ancestor_admin_only_control("", Some(&aces)));
+        // NULL DACL。
+        assert!(!ancestor_admin_only_control(SID_ADMINISTRATORS, None));
+        // TrustedInstaller 作为所有者是允许的（Program Files 根就是）。
+        assert!(ancestor_admin_only_control(SID_TRUSTED_INSTALLER, Some(&aces)));
+    }
+    #[test]
+    fn ace_class_rejects_compound_and_other_allow_variants() {
+        // 只有普通 ACCESS_ALLOWED_ACE 算 allow。
+        assert_eq!(ace_class(0x00), Some(true));
+        // deny / audit / alarm 及其对象、回调变体：不放行访问，可跳过。
+        for skipped in [0x01u8, 0x02, 0x03, 0x06, 0x07, 0x08, 0x0A, 0x0C, 0x0D, 0x0E, 0x0F, 0x10] {
+            assert_eq!(ace_class(skipped), Some(false), "0x{skipped:02X}");
+        }
+        // ACCESS_ALLOWED_COMPOUND(0x04) 与其他 allow 变体、未知类型：一律拒绝。
+        for rejected in [0x04u8, 0x05, 0x09, 0x0B, 0x11, 0x7F] {
+            assert_eq!(ace_class(rejected), None, "0x{rejected:02X}");
+        }
+    }
+    #[test]
+    fn compound_allow_ace_is_rejected_by_both_dacl_rules() {
+        // 0x04 曾被当成 deny/audit 跳过；现在两条判定都必须拒绝。
+        let aces = vec![
+            ace(SID_ADMINISTRATORS, FILE_ALL, 0),
+            (0x04u8, 0u8, FILE_ALL, SID_ADMINISTRATORS.to_string()),
+        ];
+        assert!(!dacl_admin_only_write(SID_ADMINISTRATORS, Some(&aces)));
+        assert!(!ancestor_admin_only_control(SID_ADMINISTRATORS, Some(&aces)));
     }
     #[test]
     fn same_path_compares_directories_case_insensitively() {
