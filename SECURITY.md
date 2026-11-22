@@ -43,8 +43,9 @@
 - **只认打包目录内的助手**：发行版只使用 Tauri 资源目录里的 `vega-pwhelper.ps1`，没有源码目录回退；助手定位
   RustDesk 时只读 `[Environment]::GetFolderPath('ProgramFiles')` 下的固定路径，不接受 `VEGA_RUSTDESK_EXE` 等环境覆盖。
 - **安装目录权限（v0.6.1 / T6b）**：安装目录只允许两个位置——`C:\Program Files\Vega`（`$PROGRAMFILES64\Vega`，默认），
-  或某个本地固定 NTFS 磁盘根目录下的 `Vega`（`X:\Vega`）。目录页/静默安装/`/D=` 的其它输入都会被规范成 `X:\Vega`
-  （取所选路径的盘符）并提示；UNC、U 盘/光驱/网络盘/内存盘、非 NTFS、以及已存在且非空又不是 Vega 的目录会被拒绝。
+  或某个本地固定 NTFS 磁盘根目录下的 `Vega`（`X:\Vega`）。目录页/静默安装/`/D=` 的其它输入都会被规范化并提示：
+  落在系统盘 `Program Files` 里的收成 `$PROGRAMFILES64\Vega`，其余按所选路径的盘符收成 `X:\Vega`；UNC、U 盘/光驱/网络盘/
+  内存盘、非 NTFS、以及已存在且非空又不是 Vega 的目录会被拒绝（静默/被动安装直接中止，退出码 2）。
   为了让助手仍然只可能被管理员替换，做了两层约束：
   1. **安装器总是重置并锁死 ACL**：无论装到哪个允许的位置，安装完成后安装器都按固定顺序执行三条 `icacls`，
      每条都检查退出码——先 `/reset /T` 清掉所有显式 ACE（旧自定义目录残留的个人账户 / `Authenticated Users`
