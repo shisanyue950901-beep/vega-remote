@@ -254,3 +254,11 @@
 - P2 定位图案断言：`assert_valid_matrix` 改成外框 (ox,oy)/(ox+6,oy) 为黑、白环 (ox+1,oy+1) 为白、中心 (ox+3,oy+3) 为黑，三个矩阵用例不再卡在 CI。
 - P2 上下文丢失：`drawMobileQr` 绘制前查 `ctx.isContextLost?.()`，为真按绘制失败返回；弹层打开期间监听 canvas 的 `contextlost`，一触发即置绘制失败并作废在途请求，关闭（含 Esc）时摘掉监听。
 - P3 未做（待加固）：冒烟清单的「绘制失败」目前只覆盖 Rust 输入错误，建议补独立解码器从矩阵读回原始 `config=` 文本（含/不含中继），前端注入长度错误的矩阵与不可用上下文断言状态仍为错误。
+
+## T6 控制台自动更新（阿里云镜像优先）
+- `tauri-plugin-updater` 接入：`check_update` / `install_update`，后台下载推送 `vega://update-progress`，同一时间只允许一个安装（`AtomicBool`），完成后 `app.restart()`。
+- 端点顺序：`http://60.205.95.98/vega/updates/latest.json` → GitHub Release；镜像明文 HTTP，信任由 minisign 签名承担（公钥构建时注入，篡改包无法安装）。
+- 前端：启动 5 秒后静默检查一次；侧栏徽标「有新版本 x.y.z」；设置页「软件更新」行含当前版本、检查、立即更新、进度条与失败原因。
+- CI：有 `VEGA_UPDATER_PUBKEY` 时替换配置占位；`TAURI_SIGNING_PRIVATE_KEY` 存在时生成 `.sig`，缺失时 PR 构建关闭更新产物照常通过；tag `v*` 的 `release` job 生成并发布 `latest.json` 与 `latest-mirror.json`。
+- 运维：`tools/publish-update-mirror.sh <tag>` 下载产物、打印 SHA256、scp 到 `/opt/vega-relay/updates/` 并原子切换 `latest.json`；`relay/updates-nginx.md` 记录 `nginx:alpine` 只读挂载与 `autoindex off` 部署。
+- 版本统一 `0.6.0`（`console/package.json`、`tauri.conf.json`、`Cargo.toml`）。
