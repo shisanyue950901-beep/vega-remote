@@ -257,8 +257,8 @@
 
 ## T6 控制台自动更新（阿里云镜像优先）
 - `tauri-plugin-updater` 接入：`check_update` / `install_update`，后台下载推送 `vega://update-progress`，同一时间只允许一个安装（`AtomicBool`），完成后 `app.restart()`。
-- 端点顺序：`http://60.205.95.98/vega/updates/latest.json` → GitHub Release；镜像明文 HTTP，信任由 minisign 签名承担（公钥构建时注入，篡改包无法安装）。
+- 端点顺序：`http://60.205.95.98/vega/updates/latest.json` → GitHub Release；镜像明文 HTTP，信任由 minisign 签名承担（公钥提交在 `tauri.conf.json` 的 `plugins.updater.pubkey`，篡改包无法安装）。
 - 前端：启动 5 秒后静默检查一次；侧栏徽标「有新版本 x.y.z」；设置页「软件更新」行含当前版本、检查、立即更新、进度条与失败原因。
-- CI：有 `VEGA_UPDATER_PUBKEY` 时替换配置占位；`TAURI_SIGNING_PRIVATE_KEY` 存在时生成 `.sig`，缺失时 PR 构建关闭更新产物照常通过；tag `v*` 的 `release` job 生成并发布 `latest.json` 与 `latest-mirror.json`。
-- 运维：`tools/publish-update-mirror.sh <tag>` 下载产物、打印 SHA256、scp 到 `/opt/vega-relay/updates/` 并原子切换 `latest.json`；`relay/updates-nginx.md` 记录 `nginx:alpine` 只读挂载与 `autoindex off` 部署。
+- CI：只构建未签名的 NSIS 安装包（`createUpdaterArtifacts: false`），不再注入更新公钥、不再读 `TAURI_SIGNING_PRIVATE_KEY`；`VEGA_UPDATER_PUBKEY` 与 `TAURI_SIGNING_*` 两个 secret 都不再使用，tag `v*` 也不产出 `latest.json`。
+- 运维：签名与发布都在维护者本机。`tools/publish-update.sh <tag> <setup.exe>` 用 `tauri signer sign` 签安装包、写 `latest.json`（GitHub 指向 tag 资产，`latest-mirror.json` 指向镜像），打印 SHA256，再上传到 GitHub Release 与阿里云 `/opt/vega-relay/updates/`（清单最后原子改名）；`relay/updates-nginx.md` 记录 `nginx:alpine` 只读挂载与 `autoindex off` 部署。
 - 版本统一 `0.6.0`（`console/package.json`、`tauri.conf.json`、`Cargo.toml`）。
