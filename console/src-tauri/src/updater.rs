@@ -4,10 +4,13 @@
 //! （源码可见，不靠 CI 注入）；更新包必须通过 minisign 签名校验，因此镜像走明文
 //! HTTP 也不会被篡改成可安装的包。
 //!
-//! 通道顺序是显式的两步，不依赖插件的多端点轮询：
-//! 1. 只用镜像端点，检查超时 15 秒；
-//! 2. 检查失败/超时，或后续下载/校验失败，改成只用 GitHub 固定 tag 的端点，
-//!    重新检查 + 下载各一次。
+//! 通道顺序不是固定回退，而是「两个都问，取更高版本」：
+//! 1. 镜像端点与 GitHub 固定 tag 端点各自检查（检查超时 15 秒）；
+//! 2. 任一端点没有更新或报错，另一端点仍会检查；两边都有时按版本号取较高者；
+//! 3. 安装时从报告该版本的一端下载；失败再换另一端重试一次（可能装到较低版本，
+//!    但至少不会因为单端故障完全装不上）。
+//!
+//! 镜像清单滞后（仍指向旧版）时，GitHub 上已发布的更高版本不会被隐藏。
 //!
 //! 下载单独设 10 分钟超时：插件的 builder 超时只作用于请求，`Update.timeout`
 //! 默认是 `None`，所以下载前显式补上，再用 `tokio::time::timeout` 兜一层。
@@ -105,18 +108,51 @@ async fn check_via(app: &AppHandle, endpoint: &str) -> Result<Option<Update>, St
         .map_err(|_| "检查更新失败，请确认网络后重试".to_string())
 }
 
-/// 查询是否有新版本。先镜像后 GitHub；网络或配置错误只返回通用文案，不打断界面。
+/// 版本号比较键：只比较 `x.y.z` 数字段，预发布/构建后缀忽略。
+/// 插件只返回「比当前新」的版本，所以这里只需在两个候选之间排序。
+fn version_key(version: &str) -> (u64, u64, u64) {
+    let core = version.trim().trim_start_matches(|c| c == 'v' || c == 'V');
+    let core = core.split(|c| c == '-' || c == '+').next().unwrap_or("");
+    let mut parts = core.split('.').map(|part| part.parse::<u64>().unwrap_or(0));
+    (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    )
+}
+
+fn is_newer(candidate: &str, other: &str) -> bool {
+    version_key(candidate) > version_key(other)
+}
+
+/// 查询是否有新版本。两个端点都检查（镜像报错或没有更新也要问 GitHub），
+/// 都有结果时返回版本号更高的那个。
 #[tauri::command]
 pub async fn check_update(app: AppHandle) -> UpdateView {
     let current = app.package_info().version.to_string();
-    match check_via(&app, MIRROR_ENDPOINT).await {
-        Ok(Some(update)) => found(&update),
-        Ok(None) => view(&current, ""),
-        Err(_) => match check_via(&app, GITHUB_ENDPOINT).await {
-            Ok(Some(update)) => found(&update),
-            Ok(None) => view(&current, ""),
-            Err(_) => view(&current, "检查更新失败，请确认网络后重试"),
-        },
+    let mirror = check_via(&app, MIRROR_ENDPOINT).await;
+    let github = check_via(&app, GITHUB_ENDPOINT).await;
+    let both_failed = mirror.is_err() && github.is_err();
+
+    let mirror_update = mirror.as_ref().ok().and_then(|update| update.as_ref());
+    let github_update = github.as_ref().ok().and_then(|update| update.as_ref());
+
+    match (mirror_update, github_update) {
+        (Some(mirror_update), Some(github_update)) => {
+            if is_newer(&github_update.version, &mirror_update.version) {
+                found(github_update)
+            } else {
+                found(mirror_update)
+            }
+        }
+        (Some(update), None) | (None, Some(update)) => found(update),
+        (None, None) => {
+            if both_failed {
+                view(&current, "检查更新失败，请确认网络后重试")
+            } else {
+                view(&current, "")
+            }
+        }
     }
 }
 
@@ -141,11 +177,38 @@ pub async fn install_update(
     Ok(())
 }
 
-/// 镜像一次；失败（检查、下载或签名校验）再用 GitHub 固定 tag 重试一次。
+/// 选择要安装的端点与更新：两个端点都检查，取更高版本；失败一端不阻塞另一端。
+async fn select_update(app: &AppHandle) -> Result<(&'static str, Update), String> {
+    let mirror = check_via(app, MIRROR_ENDPOINT).await;
+    let github = check_via(app, GITHUB_ENDPOINT).await;
+    match (mirror, github) {
+        (Ok(Some(mirror_update)), Ok(Some(github_update))) => {
+            if is_newer(&github_update.version, &mirror_update.version) {
+                Ok((GITHUB_ENDPOINT, github_update))
+            } else {
+                Ok((MIRROR_ENDPOINT, mirror_update))
+            }
+        }
+        (Ok(Some(update)), _) => Ok((MIRROR_ENDPOINT, update)),
+        (_, Ok(Some(update))) => Ok((GITHUB_ENDPOINT, update)),
+        (Err(_), Err(_)) => Err("检查更新失败，请确认网络后重试".to_string()),
+        _ => Err("当前已是最新版本".to_string()),
+    }
+}
+
+/// 从报告更高版本的端点安装；下载或验签失败时换另一个端点重试一次。
 async fn run_install(app: AppHandle) -> Result<(), String> {
-    match install_via(&app, MIRROR_ENDPOINT).await {
+    let (endpoint, update) = select_update(&app).await?;
+    match download_and_install(&app, update).await {
         Ok(()) => Ok(()),
-        Err(_) => install_via(&app, GITHUB_ENDPOINT).await,
+        Err(_) => {
+            let fallback = if endpoint == MIRROR_ENDPOINT {
+                GITHUB_ENDPOINT
+            } else {
+                MIRROR_ENDPOINT
+            };
+            install_via(&app, fallback).await
+        }
     }
 }
 
