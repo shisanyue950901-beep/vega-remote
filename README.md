@@ -11,15 +11,16 @@
    `C:\Program Files\Vega`（`$PROGRAMFILES64\Vega`），安装器没有「选择安装目录」页（定制 `console/src-tauri/windows/installer.nsi`
    删除了目录页，并在 `.onInit` 末尾强制该目录）；长期密码助手 `resources\vega-pwhelper.ps1` 必须落在系统 Program Files 下，
    默认 ACL 只允许管理员写。
-3. 安装过程会自动装好 RustDesk 并写入自建中继配置（默认 `60.205.95.98`，见 `console/src-tauri/resources/vega-defaults.json`）。RustDesk 是 AGPL，安装包里**不含**它的二进制，安装时从官方 GitHub Release 下载固定版本并校验 SHA256。在线更新（安装器 `/UPDATE` 模式）完全跳过这一步：不下载 RustDesk、不改写中继配置。
+3. 安装过程会自动装好 RustDesk 并写入自建中继配置（默认 `60.205.95.98`，见 `console/src-tauri/resources/vega-defaults.json`）。RustDesk 是 AGPL，安装包里**不含**它的二进制，安装时从官方 GitHub Release 下载固定版本并校验 SHA256。在线更新（安装器 `/UPDATE` 模式）与覆盖重装默认跳过这一步：不下载 RustDesk、不改写中继配置；只有 `C:\Program Files` 下找不到 `rustdesk.exe` 时才补装并配置。安装器没有上游的「重新安装 / 已安装」页，也不会运行旧卸载器。
 4. 如果 RustDesk 没装好（下载失败/哈希不符），Vega 仍会正常安装完成，并提示「RustDesk 未装好，请打开 Vega 按提示手动安装」；也可以直接到 <https://rustdesk.com/download> 手动下载安装。
 5. 卸载 Vega 时，安装包会按 `%ProgramData%\Vega\host-state.json` 里的记录回滚 RustDesk 中继配置；只有记录标明「由 Vega 安装」时才会连带卸载 RustDesk。
 6. 旧版 Vega 可能装在别处（更早的安装器有「选择安装目录」页，例如 `D:\Vega`）。新版安装包在复制文件前读 Tauri 的卸载注册表项
    `HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall\Vega 控制台` 的 `InstallLocation` / `UninstallString`，
-   归一化（去引号、去尾反斜杠、`GetFullPathName`）后与 `C:\Program Files\Vega` 不同、旧目录里又有 `vega-console.exe` 时，
+   归一化（去引号、去尾反斜杠、`GetFullPathNameW` + `GetLongPathNameW` 解析长路径）后与 `C:\Program Files\Vega` 不同、旧目录或其 `resources` 不是重解析点、旧目录里又有 `vega-console.exe` 时，
    **不会运行旧卸载器**（旧卸载器会回滚 RustDesk 中继配置），只按清单删除旧目录里的已知 Vega 文件
    （`vega-console.exe`、`uninstall.exe`、`resources\vega-pwhelper.ps1`、`resources\vega-defaults.json` 与 `resources\host\` 下的脚本/模块），
-   再非递归删除 `resources` 与旧目录；旧快捷方式只在指向旧目录时删除（Tauri 随后按新目录重建）。同一路径的重装/升级不做任何事；
+   再非递归删除 `resources` 与旧目录；旧快捷方式只在指向旧目录时删除（Tauri 随后按新目录重建）。同一路径的重装/升级/`/UPDATE` 不做任何事（长路径相同即跳过）；
+   在线更新也会执行这段文件删除，所以用户以前装在别处的旧目录同样会被清掉。
    目录里若有其他文件则保留并在完成页提示。整个清理只针对旧安装目录本身：RustDesk 配置（`%ProgramData%\RustDesk`、`%APPDATA%\RustDesk`）、
    `%ProgramData%\Vega` 与用户 AppData 都不会被删除，任何失败都不会中断安装。
 
