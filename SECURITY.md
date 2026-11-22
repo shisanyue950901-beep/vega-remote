@@ -34,14 +34,51 @@
 替换自己 `%LOCALAPPDATA%` 下文件（或已拿到管理员）的本地攻击者**不在范围内**——那种对手本来就能读 RustDesk
 配置、改 `recent-ids.json`、或在 UAC 之后动助手输入，任何进程内校验都挡不住。所有验证方式回读都依赖 RustDesk
 服务处于运行状态：服务未运行时 `--option` 可能只写进 CLI 账户的本地配置，此时助手以 12 退出、不做「已生效」的结论。
-本节还假设安装目录保持 Program Files 的默认权限；管理员若人为放宽该目录权限（让普通用户可写），
-则长期密码助手可能被普通用户替换，这属于管理员误配置，不在本节防护范围内。
+本节假设安装目录的权限没有被管理员事后放宽（让普通用户可写）——见下面「安装目录权限」一条，
+控制台对**任何**安装目录（包括默认的 `Program Files\Vega`）都会在每次提权前自己校验 ACL。
 
 - **一次性 UAC**：控制台用 `ShellExecuteExW` 的 `runas` 直接拉起系统 PowerShell，参数只有
   `-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "<安装目录>\resources\vega-pwhelper.ps1" -InputFile "<载荷>"`，
   PowerShell 与助手都用系统绝对路径。只有助手进程是管理员，它读完载荷、设好密码就退出；控制台始终以普通用户身份运行。
 - **只认打包目录内的助手**：发行版只使用 Tauri 资源目录里的 `vega-pwhelper.ps1`，没有源码目录回退；助手定位
   RustDesk 时只读 `[Environment]::GetFolderPath('ProgramFiles')` 下的固定路径，不接受 `VEGA_RUSTDESK_EXE` 等环境覆盖。
+- **安装目录权限（v0.6.1 / T6b）**：安装目录只允许两个位置——`C:\Program Files\Vega`（`$PROGRAMFILES64\Vega`，默认），
+  或某个本地固定 NTFS 磁盘根目录下的 `Vega`（`X:\Vega`）。目录页/静默安装/`/D=` 的其它输入都会被规范化并提示：
+  落在系统盘 `Program Files` 里的收成 `$PROGRAMFILES64\Vega`，其余按所选路径的盘符收成 `X:\Vega`；UNC、U 盘/光驱/网络盘/
+  内存盘、非 NTFS、以及已存在且非空又不是 Vega 的目录会被拒绝（静默/被动安装直接中止，退出码 2）。
+  为了让助手仍然只可能被管理员替换，做了两层约束：
+  1. **安装器在解包前就锁死 ACL**：安装节校验目标通过后，先 `CreateDirectory $INSTDIR` 并调用
+     `VegaLockInstallDir`，然后才 `SetOutPath` / `File` 解包——文件绝不会落进未锁定的目录。
+     锁定按固定顺序执行三条 `icacls`，每条都检查退出码，任一失败立即 `SetErrorLevel 2` + `Abort`
+     （静默安装靠 `/SD IDOK` 直接中止）：先 `/reset /T` 清掉所有显式 ACE（旧自定义目录残留的个人账户 /
+     `Authenticated Users` 写权限就是这一步清掉的），再 `/setowner *S-1-5-32-544 /T` 把所有者改成
+     Administrators，最后
+     `/inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /T`
+     递归收紧成「SYSTEM、Administrators 完全控制，Users 只读执行」。安装完成后（POSTINSTALL）会用同一函数
+     对解包出来的文件再锁一遍；这一次失败只写进完成页告警，不再中止（程序已经装好）。
+  2. **控制台每次提权前都校验，没有 `Program Files` 快路径**：`ensure_helper_location` 对任何安装位置
+     （包括默认的 `Program Files\Vega`）都跑同一套完整校验，不存在「前缀命中就跳过」的分支——`Program Files`
+     下被手工建出来、带宽松 ACL 的目录同样危险。校验要求助手正好位于 `<控制台 exe 目录>\resources` 下，并依次检查：
+     - **位置**：控制台 exe 目录只能是 `<X>:\Vega` 或 `<ProgramFiles>\Vega`。`Program Files` 根按已知文件夹取
+       **原始路径**（不读可被启动环境改写的环境变量，也不预先 `canonicalize`），只做三项不涉及规范化的判定：
+       不是重解析点、目录名只能是 `Program Files` 或 `Program Files (x86)`、直接父级是盘根且与系统盘同盘。
+     - **重解析点（先用原始路径判完）**：控制台 exe、exe 目录、`resources` 目录、助手文件、`Program Files` 根，
+       以及 exe 目录直到盘根的每一级祖先，都不能是 junction/symlink。这一组检查全部基于 `current_exe` 给出的
+       未规范化路径先跑完，之后才 `canonicalize`，并要求规范化结果与原始路径一致，避免链接在校验途中换走路径。
+     - **路径绑定**：exe 目录、`resources`、助手文件（以及由规范化 exe 目录推出的祖先链）每个只规范化**一次**，
+       结果保存下来复用；DACL 判定、启动前的复验、以及交给 PowerShell `-File` 的路径全部用这同一组值，不再做
+       第二次 `canonicalize`——第二次规范化会跟随当时的链接状态，可能与第一次判过的不是同一条路径。
+     - **祖先规则（直到盘根，含 `Program Files` 根）**：`exe` 目录的每一级父目录，所有者必须是
+       SYSTEM / Administrators / TrustedInstaller，且 DACL 中不得把 `DELETE` / `FILE_DELETE_CHILD` /
+       `WRITE_DAC` / `WRITE_OWNER` / `GENERIC_WRITE` / `GENERIC_ALL` 授予其他主体；建子目录/建文件
+       （`FILE_ADD_SUBDIRECTORY` / `FILE_ADD_FILE`）允许，盘根上给 `Authenticated Users` 建目录是 Windows 默认 ACL。
+     - **三层 DACL**：控制台 exe 目录、`resources` 目录、助手文件三者的所有者必须是
+       SYSTEM / Administrators / TrustedInstaller，DACL 中所有带写权限（含 DELETE / WRITE_DAC / WRITE_OWNER /
+       GENERIC_WRITE 等）的 allow ACE 只能授给这三个主体（CREATOR OWNER 仅允许出现在 `INHERIT_ONLY` 的继承 ACE 上）；
+       只接受普通 `ACCESS_ALLOWED_ACE_TYPE`，复合/对象/回调类 allow ACE 与未知 ACE 类型一律判为不安全。
+     任一条不满足就拒绝设置长期密码，并提示「Vega 安装目录权限不安全，无法设置长期密码。请重新运行安装包修复。」
+  管理员事后手动放宽该目录权限（例如把 Users 加回写权限，或把某一级祖先的所有者改成普通用户）会命中第 2 层，
+  长期密码直接不可用而不是被静默劫持。
 - **载荷创建时即带 DACL**：载荷写在 `%LOCALAPPDATA%\Vega\pw\` 下的 `vega-pw-<32 位十六进制>.json`，由 Rust 侧用
   一次性 `CreateFileW` 以 SDDL `D:P(A;;FA;;;<当前用户>)(A;;FA;;;BA)(A;;FA;;;SY)` 创建——不继承父目录权限，只允许
   当前用户、Administrators、SYSTEM 完全控制，写完立即关闭句柄。控制台命令行里只有路径，没有密码；助手只接受

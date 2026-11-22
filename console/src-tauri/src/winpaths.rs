@@ -396,7 +396,7 @@ fn system_volume_root() -> Option<PathBuf> {
 /// 先验根再 canonicalize：否则 junction 在规范化后已经「看起来正常」。
 /// 拿不到属性一律当重解析点，宁可不信任。
 #[cfg(windows)]
-fn is_reparse_point(path: &Path) -> bool {
+pub(crate) fn is_reparse_point(path: &Path) -> bool {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         GetFileAttributesW, FILE_ATTRIBUTE_REPARSE_POINT, INVALID_FILE_ATTRIBUTES,
@@ -416,7 +416,8 @@ fn is_reparse_point(path: &Path) -> bool {
 }
 
 #[cfg(not(windows))]
-fn is_reparse_point(_path: &Path) -> bool {
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn is_reparse_point(_path: &Path) -> bool {
     // 非 Windows 上不做任何信任判断。
     true
 }

@@ -168,9 +168,13 @@
   「服务侧确认」落地后一并改为读实际生效值。
 - P2 集成测试缺口：真实 Windows DACL 生效验证、跨账户 UAC（标准用户 → 管理员）、助手 20 s 调用
   超时清理、PS 5.1 原生参数传递目前都靠 Mock 覆盖，需要在集成环境里跑一次真机用例。
-- P1 安装目录 ACL：安装器应对安装目录强制设置标准 ACL（或控制台发行版校验助手及其父目录不向
-  Users / Authenticated Users / Everyone 授予写权限），否则装进被放宽权限的已有目录时助手可被替换。
-  来源：Codex t4-r4 P1。
+- ~~P1 安装目录 ACL~~ **已完成（T6b）**：安装目录不再固定为 Program Files，用户可选任意本地固定
+  NTFS 目录；安装器在 POSTINSTALL 对非 Program Files 目录执行 `icacls /setowner` + `/inheritance:r`
+  + 只授予 SYSTEM/Administrators 完全控制、Users 只读执行，失败写完成页提示；控制台
+  `password.rs::ensure_helper_location` 在每次提权前校验 exe 目录 / `resources` / 助手文件三层的
+  所有者与 DACL（并要求不是重解析点），不满足即拒绝长期密码。原条目：安装器应对安装目录强制设置
+  标准 ACL（或控制台发行版校验助手及其父目录不向 Users / Authenticated Users / Everyone 授予写权限），
+  否则装进被放宽权限的已有目录时助手可被替换。来源：Codex t4-r4 P1。
 
 ## M3 进阶（v1.0）
 - 虚拟显示器自动安装（无显示器被控端）
@@ -287,8 +291,37 @@
 - `tools/publish-update.sh`：镜像先传 `<file>.part` 再远端 `mv`；版本化文件已存在时，远程 SHA256 相同才允许重跑，不同则中止。GitHub Release 用 `--latest=false` 创建，已存在则 `gh api PATCH make_latest=false`；版本化 exe/.sig 不用 `--clobber`，已存在且 SHA256 不同在触碰镜像前中止，相同则跳过；两个通道都完成安装包校验/上传后才切清单（GitHub：上传 `latest.json.new` → 删除旧 `latest.json` → `gh api -X PATCH .../assets/<id> -f name=latest.json`；镜像：临时名 → 原子 `mv`）。
 - 前端 `check_update` 增加代际/状态守卫：安装开始或监听注册失败后，在途检查结果直接丢弃，不再覆盖下载状态或监听错误提示。
 
+### T6b 安装目录放开（v0.6.1）
+- 目录页回归：定制模板恢复 `MUI_PAGE_DIRECTORY`（`PRE SkipIfPassive`），新增 `VegaDirectoryLeave` 校验——只接受 `X:\...` 本地路径、`GetDriveTypeW` 必须为 3（固定盘）、`GetVolumeInformationW` 必须是 NTFS、拒绝盘根、拒绝已存在且非空但不是 Vega（无 `vega-console.exe`）的目录；末段不是 `Vega` 时自动补 `\Vega`。UNC、U 盘/光驱/网络盘/内存盘都被拒。
+- `.onInit`：默认仍是 `$PROGRAMFILES64\Vega`；命令行 `/D=` 优先；否则卸载注册表 `InstallLocation`（去引号、去尾反斜杠）指向仍含 `vega-console.exe` 的目录时沿用（更新/重装、含 `/P` 被动更新都留在原位置）。`PREINSTALL` 只在 `$INSTDIR` 为空时兜底，不再强制改写。
+- 安装后收紧 ACL：`POSTINSTALL` 在迁移前，若 `$INSTDIR` 不在 `$PROGRAMFILES64`/`$PROGRAMFILES` 下，执行 `icacls /setowner *S-1-5-32-544 /T` 与 `/inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /T`；两条都要退出码 0，失败只写完成页提示「安装目录权限设置失败，长期密码不可用」，不 Abort。
+- 迁移比较对象改为本次最终 `$INSTDIR`（不再固定 Program Files）；旧目录与 `$INSTDIR` 相同时不做迁移，其余安全检查（不运行旧卸载器、新 uninstall/vega-console 必须是文件、注册表回滚、重解析点、占用跳过）全部保留。
+- 控制台：`password.rs::ensure_helper_location` 除 Program Files 外，只接受「助手位于 `<exe_dir>\resources`」且 exe_dir / resources / 助手文件三层都不是重解析点、所有者与 DACL 都只允许 SYSTEM/Administrators/TrustedInstaller 写（`dacl_admin_only_write` 为纯函数并带单测）；否则返回「Vega 安装目录权限不安全，无法设置长期密码。请重新运行安装包修复。」
+- 版本：`0.6.0` → `0.6.1`。
+- t6b 第 1 轮审计修复（架构裁定，仅 NSIS 侧）：允许的安装位置收紧为 `$PROGRAMFILES64\Vega` 或 `X:\Vega`（本地固定 NTFS 盘根下的 Vega），其它输入规范成 `X:\Vega` 并在目录页提示；`VegaValidateTarget` 成为唯一校验入口，目录页回调与安装节开头（任何 `SetOutPath` 之前）都调用，静默 / 被动 / `/D=` 失败时 `SetErrorLevel 2` 并中止；非空目录用 `FindFirst`/`FindNext` 跳过 `.`/`..` 判定，只接受空目录或 `vega-console.exe` 确实是文件的已有 Vega；`System::Call` 输出寄存器统一 `.rN` 并读 `$N`；ACL 对两种位置都执行 `icacls /reset /T` → `/setowner *S-1-5-32-544 /T` → `/inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /T`，三条退出码都检查；`.onInit` 用 `$CMDLINE` 里的 `" /D="`（大小写不敏感）判定命令行是否指定目录，未指定时优先沿用校验通过的旧位置。
+
 ### T6 加固（待做）
 - 磁盘写满时的安装/在线更新：NSIS 覆盖写入中途耗尽空间会留下截断的 `vega-console.exe` / `uninstall.exe` 与指向它的卸载入口（与 Tauri 默认模板相同）。后续：安装前检查剩余空间、先写临时名再替换，或写入失败时回滚注册表（迁移路径已回滚）。
+- 盘根 ACL 被改成普通账户可删除子项（非默认配置）时，`X:\Vega` 可被替换，卸载入口随之被劫持；后续安装器复用控制台的祖先 ACL 校验拒绝此类盘符。
+- 残余竞态（t6b-fix3 架构裁定 3）：预锁定是 `CreateDirectory $INSTDIR` 之后才执行
+  `/inheritance:r`，从创建目录到断继承之间有一瞬目录仍在继承盘根 ACL——盘根给 Users
+  写权限（非默认配置）时，这一瞬里 `X:\Vega` 可被换成 junction/symlink。安装器随后会再扫
+  一次目标树（发现重解析点即退出码 2 中止），但扫描与替换之间依旧是 TOCTOU。彻底修法要么
+  在创建前锁定父目录，要么改用 `\??\` 句柄级 API 建目录，留待后续；本轮按裁定只记录。
+- 枚举错误码取不到（t6b-fix3d 终检第 5 项）：NSIS 内置 `FindNext` / `FindFirst` 不暴露
+  `GetLastError`，调用后单独 `kernel32::GetLastError` 读到的是别的 API 留下的码。因此
+  `VegaScanReparseTree` 与 `VegaValidateTarget` 的 `FindNext` 只把「错误标志或空名」当
+  **枚举结束**：`FindNext` 中途失败（IO 错误等）与正常结束**无法区分**，会被当成扫完。
+  `FindFirst` 的失败同样无法区分「目录在扫描途中消失」与「拒绝访问」，一律 fail closed
+  中止（提示里的错误码写 0 = 无法取得）。彻底修法：用 `System::Call` 直接调
+  `FindFirstFileW` / `FindNextFileW`（句柄 + `?e` 取码，`ERROR_NO_MORE_FILES`=18 为正常
+  结束），替换内置枚举命令，留待后续。
+- 不存在盘符的显式 `/D=` 会被静默丢弃（t6b-fix3d 终检第 4 项）：NSIS 在脚本执行前
+  就把 `/D=` 从 `$CMDLINE` 移除并写进 `$INSTDIR`，而 `/D=Q:\Vega` 这类**盘符不存在**的
+  目标会被预处理成空。于是 `.onInit` 的备份 `$vegaCmdlineDir` 为空、`$CMDLINE` 里也搜不到
+  `/d=`，安装器按「未指定」回退默认 `$PROGRAMFILES64\Vega`：命令行给了路径却装到别处且无
+  提示。脚本层拿不到被丢弃的原值，修法只能绕开 `/D=`：改用自己解析的参数（如 `/TARGET=`），
+  或在外层（发布脚本 / 快捷方式）先用 `GetFullPathNameW` + `GetDriveTypeW` 校验再拉起安装器。
 - 发布脚本不支持同一版本并行发布（单维护者手动运行；镜像 test→mv 之间无锁）。需要时在镜像端加 flock 或 `mv -n`。
 - 被动更新（`/P`）跳过完成页：旧 EXE 被占用、旧目录未清理的告警用户看不到。后续把告警写入 `%ProgramData%\Vega\install-notes.txt`，控制台启动时在设置页提示。
 - P2 响应大小（架构裁决：插件 API 无法设上限，本轮不修）：恶意大响应可使控制台 OOM，仅 DoS，签名仍保证不装恶意包。启动静默检查会整份缓冲清单，下载会整份缓冲安装包；现有 15 秒 / 10 分钟超时只限时间不限字节。
