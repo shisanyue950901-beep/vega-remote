@@ -519,6 +519,7 @@ fn same_path(a: &Path, b: &Path) -> bool {
 /// `ACL_SIZE_INFORMATION` 只用到 `AceCount`，其余字段保留占位，按 Win32 布局声明。
 #[cfg(windows)]
 #[repr(C)]
+#[allow(dead_code)]
 struct AclSizeInfo {
     ace_count: u32,
     acl_bytes_in_use: u32,
