@@ -313,11 +313,16 @@
   2. 根 DACL 用 PowerShell `SetSecurityDescriptorSddlForm` **精确替换**为
      `O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)`（受保护 DACL，替换全部 ACE，
      包括继承、显式拒绝和其他 SID）；删除旧的 `/inheritance:r /grant:r` 调用；写入前检查 `$INSTDIR` 不含单引号；
-  3. `"$INSTDIR" /setowner *S-1-5-32-544 /T /C /Q`；
-  4. 仅当 `$INSTDIR` 下存在子项时（`VegaHasChildEntries` 三态：`1`=有子项、`0`=确认为空、`E`=枚举失败；
+  3. 仅当 `$INSTDIR` 下存在子项时（`VegaHasChildEntries` 三态：`1`=有子项、`0`=确认为空、`E`=枚举失败；
      t6c-fix2 起 `FindFirst` 失败或句柄为空一律记 `E`，不再用 `IfFileExists "$INSTDIR\*.*"` 二次判定）
-     `"$INSTDIR\*" /reset /T /C /Q`；`E` 即失败，`0` 跳过并视为成功。
-- 第 4 步的子项 `/reset` 经架构批准：它只把子项改回继承**已锁定的根目录**，不会让根目录重新继承盘根 ACL；
+     `"$INSTDIR\*" /reset /T /C /Q`；`E` 即失败，`0` 跳过并视为成功；
+  4. `"$INSTDIR" /setowner *S-1-5-32-544 /T /C /Q`。
+- t6c-fix3 调换第 3、4 步（先 `/reset` 后 `/setowner /T`）：0.6.1 留下的空 DACL 文件所有者已是
+  Administrators，但空 DACL 只给隐式 `WRITE_DAC`、没有 `WRITE_OWNER`，`icacls /setowner` 在缺
+  `WRITE_OWNER` 时不会主动启用接管特权，先 `/setowner /T` 会被拒绝访问，`/reset` 永远执行不到。
+  先 `/reset` 让子项继承根目录的 Administrators 完全控制、拿到 `WRITE_OWNER`，再 `/setowner /T` 即可。
+  每步仍 `Pop` 后立即检查、失败短路。
+- 第 3 步的子项 `/reset` 经架构批准：它只把子项改回继承**已锁定的根目录**，不会让根目录重新继承盘根 ACL；
   同时自愈旧版留下的空 DACL 文件（所有者已是 Administrators，可改 DACL）。t6b-fix3 的「解包之后禁止 `/reset`」被本条取代。
 - t6c-fix1（第 1 轮审计）：根 DACL 改为 SDDL 精确替换——旧的 `/inheritance:r /grant:r` 只删继承 ACE、只替换指定 SID
   的允许 ACE，旧目录上可继承的显式拒绝项和其他 SID 的可继承写权限会残留；每步 `Pop` 后立即检查（前置步骤失败
@@ -355,12 +360,13 @@
 - P2 响应大小（架构裁决：插件 API 无法设上限，本轮不修）：恶意大响应可使控制台 OOM，仅 DoS，签名仍保证不装恶意包。启动静默检查会整份缓冲清单，下载会整份缓冲安装包；现有 15 秒 / 10 分钟超时只限时间不限字节。
 - P2 签名/版本（架构裁决：本轮不修）：HTTP 镜像可被中间人回放更早的已签名 Vega 版本（降级）；后续用签名内绑定版本 / `requireSignedVersion` 或 HTTPS 镜像。
 - P3 Windows 重启语义：被动安装器自己用 `/R` 拉起新版本，`app.restart()` 只是非 Windows / 安装器未接管时的兜底，文档不再把它写成主路径。
-- `VegaHasChildEntries` 的「确认为空」判不准（t6c-fix2 审计，非阻断）：宏在 `FindFirst` 成功后直接进循环，
-  而循环开头只比较 `.` / `..` 就把名字当成子项，因此**空目录**与**首个实际子项之前 `FindNext` 就失败**
-  这两种情况都会返回 `1`（有子项），`0` 在这种写法下实际不可达。后果只是对空目录多跑一次
-  `"$INSTDIR\*" /reset /T`（无子项可重置，无害），不会放过应当失败的枚举。修法：`FindFirst` 之后先判
-  `StrCmp $1 ""` 再进循环，并把 `FindNext` 的失败原因区分出来（同下条，需换成 `System::Call` 的
-  `FindFirstFileW` / `FindNextFileW` + `?e`）。本轮按裁定只记录，不阻断 0.6.2。
+- `VegaHasChildEntries` 的「确认为空」区分不了中途 I/O 失败（t6c-fix2 审计，非阻断）：
+  宏在 `FindFirst` 成功后进入循环，开头跳过 `.` 与 `..`；空目录时 `FindNext` 正常耗尽（无更多项），
+  变量保持初始 `0`，调用方据此跳过 `/reset`——这一分支是正确的。遗留限制是 `FindNext` **中途**
+  失败（IO 错误等）也被当成正常耗尽，因此同样保留 `0` 并跳过 `/reset`，与「确认为空」无法区分；
+  但真正的枚举失败只在 `FindFirst`（失败或句柄为空）上判 `E`，不会放过应当失败的枚举。修法：换成
+  `System::Call` 的 `FindFirstFileW` / `FindNextFileW` + `?e`，用 `ERROR_NO_MORE_FILES`（18）区分
+  正常结束与中途错误。本轮按裁定只记录，不阻断 0.6.2。
 - 预锁定期间的替换窗口（t6c-fix2 架构裁定，非阻断）：`CreateDirectory $INSTDIR` → `icacls /setowner` →
   PowerShell 启动并 `SetSecurityDescriptorSddlForm` 写入受保护 DACL 这三步之间目录一直继承盘根 ACL，
   期间还额外起了一个 PowerShell 进程（启动开销把窗口拉长到数百毫秒级）。盘根给 Users 写权限（非默认配置）
@@ -370,3 +376,13 @@
   `\\?\` 句柄 + `SetSecurityInfo` 在**同一个目录句柄**上设置安全描述符（避免按路径二次打开被替换）；
   递归收紧时逐项打开、遇到 `FILE_ATTRIBUTE_REPARSE_POINT` 直接拒绝而不是跟随。以上都需要
   `System::Call` 或插件，本轮只记录。
+- App Control / WDAC 脚本强制下内联 PowerShell 会中止安装（t6c-fix3 审计，非阻断）：启用脚本强制后，
+  即使策略允许安装器和 `powershell.exe` 运行，内联 `-Command` 仍进入 `ConstrainedLanguage`；
+  `Get-Acl` 返回的实际类型是 `DirectorySecurity`，PowerShell 按实际类型检查实例方法，拒绝
+  `SetSecurityDescriptorSddlForm`，`$ErrorActionPreference='Stop'` 使该步以非零退出，安装器按
+  `SetErrorLevel 2` 中止。理想方案：改用 Win32 `SetNamedSecurityInfoW` 在同一个句柄上只写
+  Owner + 受保护 DACL，保留一次提权与逐步检查，不再依赖 PowerShell 语言模式。
+- `Set-Acl` 未带 `-Audit` 可能清掉根目录已有 SACL（t6c-fix3 审计，非阻断）：`Get-Acl` 未带 `-Audit`，
+  而 `Set-Acl` 的文件系统提供程序会先尝试持久化全部段；在具备审计写权限的提权令牌下，这可能清掉根目录
+  已有的显式 SACL。理想方案同上：用 Win32 API 把写入范围限定在 Owner 和受保护 DACL（`SetSecurityInfo`
+  只传 `OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION`）。
