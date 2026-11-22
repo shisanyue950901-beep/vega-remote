@@ -155,8 +155,9 @@ if [ "${VEGA_SKIP_GITHUB:-0}" != "1" ]; then
     gh release create "$RELEASE_TAG" --repo "$REPO" --latest=false \
       --title "Vega 更新通道" --notes "自动更新清单与安装包。由 tools/publish-update.sh 维护，请勿手工改动。"
   else
-    # 老 Release 可能曾被标成 latest，显式降回去。
-    gh api -X PATCH "repos/${REPO}/releases/tags/${RELEASE_TAG}" -f make_latest=false >/dev/null
+    # 老 Release 可能曾被标成 latest，显式降回去。Update release 只接受 release id。
+    release_id="$(gh_release_id)"
+    gh api -X PATCH "repos/${REPO}/releases/${release_id}" -f make_latest=false >/dev/null
   fi
   release_id="$(gh_release_id)"
 
