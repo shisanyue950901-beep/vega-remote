@@ -8,17 +8,20 @@
 
 1. 从 GitHub Actions 的 `Console` 工作流下载 artifact **vega-setup-windows**，解压得到 `Vega-Setup.exe`（或从 Release 下载同名文件）。
 2. 双击运行，UAC 提权一次。安装包是 perMachine 模式，只在这一步要管理员权限。安装路径固定为
-   `C:\Program Files\Vega`（`$PROGRAMFILES64\Vega`），安装器不再显示「选择安装目录」页；长期密码助手
-   `resources\vega-pwhelper.ps1` 必须落在系统 Program Files 下，默认 ACL 只允许管理员写。
-3. 安装过程会自动装好 RustDesk 并写入自建中继配置（默认 `60.205.95.98`，见 `console/src-tauri/resources/vega-defaults.json`）。RustDesk 是 AGPL，安装包里**不含**它的二进制，安装时从官方 GitHub Release 下载固定版本并校验 SHA256。
+   `C:\Program Files\Vega`（`$PROGRAMFILES64\Vega`），安装器没有「选择安装目录」页（定制 `console/src-tauri/windows/installer.nsi`
+   删除了目录页，并在 `.onInit` 末尾强制该目录）；长期密码助手 `resources\vega-pwhelper.ps1` 必须落在系统 Program Files 下，
+   默认 ACL 只允许管理员写。
+3. 安装过程会自动装好 RustDesk 并写入自建中继配置（默认 `60.205.95.98`，见 `console/src-tauri/resources/vega-defaults.json`）。RustDesk 是 AGPL，安装包里**不含**它的二进制，安装时从官方 GitHub Release 下载固定版本并校验 SHA256。在线更新（安装器 `/UPDATE` 模式）完全跳过这一步：不下载 RustDesk、不改写中继配置。
 4. 如果 RustDesk 没装好（下载失败/哈希不符），Vega 仍会正常安装完成，并提示「RustDesk 未装好，请打开 Vega 按提示手动安装」；也可以直接到 <https://rustdesk.com/download> 手动下载安装。
 5. 卸载 Vega 时，安装包会按 `%ProgramData%\Vega\host-state.json` 里的记录回滚 RustDesk 中继配置；只有记录标明「由 Vega 安装」时才会连带卸载 RustDesk。
 6. 旧版 Vega 可能装在别处（更早的安装器有「选择安装目录」页，例如 `D:\Vega`）。新版安装包在复制文件前读 Tauri 的卸载注册表项
    `HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall\Vega 控制台` 的 `InstallLocation` / `UninstallString`，
-   路径归一化后与 `C:\Program Files\Vega` 不同且旧目录里有 `uninstall.exe` 时，静默执行
-   `uninstall.exe /S _?=<旧目录>`，再删掉残留的 `uninstall.exe`、非递归删掉旧目录；同一路径的重装/升级不做任何事（走 Tauri 的就地升级）。
-   旧目录卸载失败（例如旧版正在运行）不会中断安装，只在完成页提示手动卸载。清理只针对旧安装目录本身：RustDesk 配置
-   （`%ProgramData%\RustDesk`、`%APPDATA%\RustDesk`）、`%ProgramData%\Vega` 与用户 AppData 都不会被删除。
+   归一化（去引号、去尾反斜杠、`GetFullPathName`）后与 `C:\Program Files\Vega` 不同、旧目录里又有 `vega-console.exe` 时，
+   **不会运行旧卸载器**（旧卸载器会回滚 RustDesk 中继配置），只按清单删除旧目录里的已知 Vega 文件
+   （`vega-console.exe`、`uninstall.exe`、`resources\vega-pwhelper.ps1`、`resources\vega-defaults.json` 与 `resources\host\` 下的脚本/模块），
+   再非递归删除 `resources` 与旧目录；旧快捷方式只在指向旧目录时删除（Tauri 随后按新目录重建）。同一路径的重装/升级不做任何事；
+   目录里若有其他文件则保留并在完成页提示。整个清理只针对旧安装目录本身：RustDesk 配置（`%ProgramData%\RustDesk`、`%APPDATA%\RustDesk`）、
+   `%ProgramData%\Vega` 与用户 AppData 都不会被删除，任何失败都不会中断安装。
 
 **换成你自己的中继**：fork 后改 `console/src-tauri/resources/vega-defaults.json` 的 `rustdesk.idServer` / `relayServer` / `key`，重新构建安装包即可。这个文件是公开信息，可以入库；构建清单里也把 `host/install-rustdesk.ps1` 与 `host/lib/Vega.Common.psm1` 一起打进 `resources\`。
 
