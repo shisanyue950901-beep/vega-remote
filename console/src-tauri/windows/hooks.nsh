@@ -375,7 +375,11 @@ vega_trim_done_${ID}:
 ;   * 旧目录里必须有 vega-console.exe，否则一概不碰。
 ;   * 先把 $OUTDIR 指到固定目录，再 Delete 已知文件、非递归 RMDir 子目录与旧目录。
 ;     不加 /r，所以 RustDesk 配置、%ProgramData%\Vega、用户 AppData 都不会被删。
-;   * 旧快捷方式只有指向旧目录时才删除（Tauri 随后按新目录重建）。
+;   * 旧版还在运行导致主程序删不掉时，不做 taskkill / wmic / PowerShell 按映像路径
+;     筛进程（架构裁定：安装器里不按路径杀进程），直接放弃整个旧目录清理，旧目录原样
+;     保留，处理方式写进完成页提示。
+;   * 旧快捷方式只有指向旧目录时才删除，并且立刻按固定目录重建同名快捷方式
+;     （/UPDATE 下 Tauri 的 CreateOrUpdate*Shortcut 直接 Return，不重建就会没有快捷方式）。
 ;   * 任何失败都只追加完成页提示，绝不 Abort；卸载注册表键由新安装重写。
 ;   * FileFunc.nsh v3.4 没有 GetFullPathName 宏，这里直接调 Win32。
 ;   * GetLongPathNameW 对不存在的路径返回 0（缓冲区内容不可靠），失败时保留
@@ -425,6 +429,22 @@ vega_reparse_check_${ID}:
 vega_reparse_done_${ID}:
   Pop $1
   Pop $0
+!macroend
+
+; 旧快捷方式：只有确实指向旧目录的主程序时才删，删完立刻按固定目录重建同名快捷方式。
+; 这样 /UPDATE（Tauri 的 CreateOrUpdate*Shortcut 在 UpdateMode 下直接 Return）结束时
+; 不会留下没有任何快捷方式的安装。$R5 由 IsShortcutTarget 压栈返回。
+;   * 不重建到旧目录：旧目录正在被删除，指向它的快捷方式必然失效。
+;   * 不用 SetLnkAppUserModelId：目标文件此刻还没从安装包里解出来，重建只保证路径正确。
+!macro VegaMigrateShortcut ID LINK DIR
+  !insertmacro IsShortcutTarget "${LINK}" "$vegaOldInstallDir\vega-console.exe"
+  Pop $R5
+  StrCmp $R5 "1" 0 vega_sc_done_${ID}
+    Delete "${LINK}"
+    CreateDirectory "${DIR}"
+    CreateShortcut "${LINK}" "$INSTDIR\vega-console.exe" "" "$INSTDIR\vega-console.exe" 0 SW_SHOWNORMAL "" "$INSTDIR"
+    DetailPrint "快捷方式 ${LINK} 已改指向 $INSTDIR\vega-console.exe"
+vega_sc_done_${ID}:
 !macroend
 
 !macro VegaRemovePreviousInstall
@@ -515,8 +535,18 @@ vega_old_check_binary:
   StrCpy $INSTDIR "${VEGA_INSTALL_DIR}"
   SetOutPath "$INSTDIR"
 
-  ; 只删 Tauri 安装的已知文件（主程序 + tauri.conf.json resources + 卸载器）。
+  ; 旧版还在运行（vega-console.exe 被占用）时 Delete 会失败。架构裁定：不做
+  ; taskkill / wmic / PowerShell 按映像路径筛选进程（那需要按路径匹配，容易误杀，
+  ; 也不该在安装器里调 PowerShell 找进程）；改成「先试删主程序，删不掉就整段放弃」，
+  ; 只把处理方式写到完成页，旧目录原样保留。
   Delete "$vegaOldInstallDir\vega-console.exe"
+  IfFileExists "$vegaOldInstallDir\vega-console.exe" 0 vega_old_delete_rest
+    StrCpy $vegaOldInstallWarning "旧版 Vega 仍在运行（$vegaOldInstallDir\vega-console.exe 被占用），旧目录未清理。请完全退出旧版 Vega（托盘图标 → 退出）后手动删除该目录；快捷方式已指向 ${VEGA_INSTALL_DIR}。"
+    DetailPrint "$vegaOldInstallWarning"
+    Goto vega_old_shortcuts
+
+vega_old_delete_rest:
+  ; 只删 Tauri 安装的已知文件（主程序 + tauri.conf.json resources + 卸载器）。
   Delete "$vegaOldInstallDir\uninstall.exe"
   Delete "$vegaOldInstallDir\resources\vega-pwhelper.ps1"
   Delete "$vegaOldInstallDir\resources\vega-defaults.json"
@@ -528,24 +558,16 @@ vega_old_check_binary:
   RMDir "$vegaOldInstallDir\resources"
   RMDir "$vegaOldInstallDir"
 
-  ; 旧快捷方式只在指向旧目录时删除；Tauri 安装完会按固定目录重建。
-  !insertmacro IsShortcutTarget "$SMPROGRAMS\${PRODUCTNAME}.lnk" "$vegaOldInstallDir\vega-console.exe"
-  Pop $R5
-  StrCmp $R5 "1" 0 vega_old_shortcut_sm_done
-    Delete "$SMPROGRAMS\${PRODUCTNAME}.lnk"
-vega_old_shortcut_sm_done:
+vega_old_shortcuts:
+  ; 快捷方式：指向旧目录的就地改成固定目录，删完立刻重建（/UPDATE 下 Tauri 不建快捷方式）。
+  !insertmacro VegaMigrateShortcut old_sc_sm "$SMPROGRAMS\${PRODUCTNAME}.lnk" "$SMPROGRAMS"
   StrCmp $AppStartMenuFolder "" vega_old_shortcut_sub_done
-  !insertmacro IsShortcutTarget "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk" "$vegaOldInstallDir\vega-console.exe"
-  Pop $R5
-  StrCmp $R5 "1" 0 vega_old_shortcut_sub_done
-    Delete "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk"
+  !insertmacro VegaMigrateShortcut old_sc_sub "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk" "$SMPROGRAMS\$AppStartMenuFolder"
 vega_old_shortcut_sub_done:
-  !insertmacro IsShortcutTarget "$DESKTOP\${PRODUCTNAME}.lnk" "$vegaOldInstallDir\vega-console.exe"
-  Pop $R5
-  StrCmp $R5 "1" 0 vega_old_shortcut_desk_done
-    Delete "$DESKTOP\${PRODUCTNAME}.lnk"
-vega_old_shortcut_desk_done:
+  !insertmacro VegaMigrateShortcut old_sc_desk "$DESKTOP\${PRODUCTNAME}.lnk" "$DESKTOP"
 
+  ; 主程序没删掉（仍在运行）时不再检查目录内容，上面的告警已经说明原因。
+  IfFileExists "$vegaOldInstallDir\vega-console.exe" vega_old_done
   IfFileExists "$vegaOldInstallDir\*.*" 0 vega_old_cleaned
     StrCpy $vegaOldInstallWarning "旧版目录 $vegaOldInstallDir 的程序文件已删除，但目录里仍有其他文件（可能不是 Vega 的），已保留，可手动删除。"
     DetailPrint "$vegaOldInstallWarning"
