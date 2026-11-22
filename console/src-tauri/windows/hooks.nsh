@@ -222,9 +222,8 @@ vega_result_delete_done_${ID}:
 !define VEGA_RESULT_MISSING_GUIDE "安装未完全成功，请完全退出 RustDesk、在 RustDesk 中启用服务后重新运行 Vega 安装；详细日志见 $COMMONPROGRAMDATA\Vega\logs\setup.log。"
 
 !macro VegaRunInstallRustDesk
-  ; 先用各语言默认文案打底；失败时才换成具体提示。
-  StrCpy $vegaFinishText "$(MUI_TEXT_FINISH_INFO_TEXT)"
-
+  ; 完成页文案已在 NSIS_HOOK_PREINSTALL 无条件打底（各语言默认文案），这里不再重置，
+  ; 否则会在重装/更新路径上把迁移告警抹掉。失败时下面才换成具体提示。
   !insertmacro VegaSelectPowerShell install
   !insertmacro VegaPrepareLogDirectory install
   !insertmacro VegaSelectLogArgument install
@@ -283,10 +282,8 @@ vega_install_failed:
 vega_install_failed_missing:
       StrCpy $vegaFinishText "$vegaFinishText$\r$\n$\r$\n${VEGA_RESULT_MISSING_GUIDE}"
 vega_install_finish_done:
-    ; t6-fix2：旧目录清理的告警不能盖掉 RustDesk 的文案，统一追加在最后。
-    StrCmp $vegaOldInstallWarning "" vega_install_finish_warned
-      StrCpy $vegaFinishText "$vegaFinishText$\r$\n$\r$\n$vegaOldInstallWarning"
-vega_install_finish_warned:
+    ; t6-fix2：迁移告警不在这里追加（跳过脚本的路径会漏），统一由
+    ; NSIS_HOOK_POSTINSTALL 末尾的 vega_postinstall_notes 追加在最后。
     ; 成功时脚本不写原因；统一清理占位/残留结果文件。
     !insertmacro VegaDeleteResultFile install
 !macroend
@@ -587,6 +584,11 @@ vega_old_done:
 ; 落到 $PROGRAMFILES64\Vega；/D 参数、旧版注册表里的 InstallLocation、目录页的选择
 ; 都不会改变结果。
 !macro NSIS_HOOK_PREINSTALL
+  ; t6-fix5 P3：完成页文案无条件先打底。VegaRunInstallRustDesk 在重装与 /UPDATE 下会被
+  ; 跳过，如果只在脚本宏里初始化，/UPDATE 的完成页就是空白（MUI_FINISHPAGE_TEXT 引用
+  ; 的是 $vegaFinishText 运行时值）。各语言默认文案在 .onInit 之后仍可用。
+  StrCpy $vegaFinishText "$(MUI_TEXT_FINISH_INFO_TEXT)"
+
   ; t6-fix4：Tauri 在 PREINSTALL 之后才复制文件并重写卸载注册表项。先在这里
   ; 记录「安装前是否已有 Vega 卸载键」，POSTINSTALL 据此区分全新安装与重装/更新。
   StrCpy $vegaHadPreviousInstall "0"
@@ -621,12 +623,17 @@ vega_preinstall_dir_done:
   Goto vega_postinstall_run
 
 vega_postinstall_skip:
-  IfFileExists "$PROGRAMFILES64\RustDesk\rustdesk.exe" vega_postinstall_done
-  IfFileExists "$PROGRAMFILES\RustDesk\rustdesk.exe" vega_postinstall_done
+  IfFileExists "$PROGRAMFILES64\RustDesk\rustdesk.exe" vega_postinstall_notes
+  IfFileExists "$PROGRAMFILES\RustDesk\rustdesk.exe" vega_postinstall_notes
   DetailPrint "已有 Vega 安装记录，但 Program Files 下没有 rustdesk.exe：补装并配置 RustDesk。"
 
 vega_postinstall_run:
   !insertmacro VegaRunInstallRustDesk
+
+vega_postinstall_notes:
+  ; t6-fix5 P3：迁移告警在「跑脚本」和「跳过脚本」两条路径下都要出现。
+  StrCmp $vegaOldInstallWarning "" vega_postinstall_done
+    StrCpy $vegaFinishText "$vegaFinishText$\r$\n$\r$\n$vegaOldInstallWarning"
 vega_postinstall_done:
 !macroend
 
