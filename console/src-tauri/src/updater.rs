@@ -95,7 +95,7 @@ async fn run_install(app: AppHandle) -> Result<(), String> {
         .ok_or_else(|| "当前已是最新版本".to_string())?;
 
     let progress_app = app.clone();
-    let mut downloaded: u64 = 0;
+    let downloaded: u64 = 0;
     let emit = move |chunk: usize, total: Option<u64>| {
         downloaded = downloaded.saturating_add(chunk as u64);
         let _ = progress_app.emit(
