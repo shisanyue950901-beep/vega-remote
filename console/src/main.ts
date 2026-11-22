@@ -51,6 +51,15 @@ interface RelayDefaultsView {
   error: string;
 }
 
+/** 设置页「手机扫码配置」：只给矩阵与指纹，完整公钥只在二维码内容里。 */
+interface MobileQrView {
+  size: number;
+  modules: boolean[];
+  server: string;
+  keyFingerprint: string;
+  error: string;
+}
+
 interface OpResult {
   ok: boolean;
   message: string;
@@ -1057,6 +1066,93 @@ function setupSettingsPage(): void {
         : `连接失败：${result.message}`;
       setStatus(testResult, text, result.ok ? "ok" : "error");
     });
+  });
+
+  // 手机扫码配置：把当前 RustDesk 配置画成官方 App 能扫的二维码。
+  const mobileButton = byId<HTMLButtonElement>("show-mobile-qr");
+  const mobileSheet = byId<HTMLDivElement>("mobile-qr-sheet");
+  const mobileCanvas = byId<HTMLCanvasElement>("mobile-qr-canvas");
+  const mobileStatus = byId<HTMLParagraphElement>("mobile-qr-status");
+  const mobileClose = byId<HTMLButtonElement>("mobile-qr-close");
+  const mobileContext = mobileCanvas.getContext("2d");
+  let mobileGeneration = 0;
+
+  const drawMobileQr = (view: MobileQrView): void => {
+    if (!mobileContext) {
+      setStatus(mobileStatus, "当前环境不支持 canvas", "error");
+      return;
+    }
+    const canvasSize = mobileCanvas.width;
+    mobileContext.fillStyle = "#fff";
+    mobileContext.fillRect(0, 0, canvasSize, canvasSize);
+    const size = view.size;
+    if (size <= 0 || view.modules.length !== size * size) {
+      setStatus(mobileStatus, "二维码数据不完整，请重试", "error");
+      return;
+    }
+    // 四周 4 模块静区；整数像素缩放后居中，避免半像素糊边。
+    const total = size + 8;
+    const scale = Math.max(1, Math.floor(canvasSize / total));
+    const offset = Math.floor((canvasSize - scale * total) / 2);
+    mobileContext.fillStyle = "#000";
+    for (let row = 0; row < size; row += 1) {
+      for (let col = 0; col < size; col += 1) {
+        if (!view.modules[row * size + col]) {
+          continue;
+        }
+        mobileContext.fillRect(
+          offset + (col + 4) * scale,
+          offset + (row + 4) * scale,
+          scale,
+          scale,
+        );
+      }
+    }
+  };
+
+  const closeMobileSheet = (): void => {
+    mobileGeneration += 1;
+    mobileSheet.classList.add("is-hidden");
+    mobileButton.focus();
+  };
+
+  const openMobileSheet = (): void => {
+    const generation = ++mobileGeneration;
+    mobileSheet.classList.remove("is-hidden");
+    mobileClose.focus();
+    if (mobileContext) {
+      mobileContext.fillStyle = "#fff";
+      mobileContext.fillRect(0, 0, mobileCanvas.width, mobileCanvas.height);
+    }
+    if (!window.__TAURI__?.core) {
+      setStatus(mobileStatus, "浏览器预览下不可用", "warn");
+      return;
+    }
+    setStatus(mobileStatus, "生成中…");
+    void invoke<MobileQrView>("get_mobile_config_qr").then((view) => {
+      if (generation !== mobileGeneration || mobileSheet.classList.contains("is-hidden")) {
+        return;
+      }
+      if (!view) {
+        setStatus(mobileStatus, "读取 RustDesk 配置失败，请重试", "error");
+        return;
+      }
+      if (view.error) {
+        setStatus(mobileStatus, view.error, "warn");
+        return;
+      }
+      drawMobileQr(view);
+      setStatus(mobileStatus, `当前 ID 服务器：${view.server}`, "ok");
+    });
+  };
+
+  mobileButton.addEventListener("click", openMobileSheet);
+  mobileClose.addEventListener("click", closeMobileSheet);
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !mobileSheet.classList.contains("is-hidden")) {
+      event.preventDefault();
+      closeMobileSheet();
+    }
   });
 
   const doctorResults = byId<HTMLUListElement>("doctor-results");
