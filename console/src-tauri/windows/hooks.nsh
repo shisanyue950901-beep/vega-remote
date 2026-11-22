@@ -21,10 +21,12 @@
 ;     $PROGRAMFILES64\Vega。原因：长期密码助手 resources\vega-pwhelper.ps1 必须位于
 ;     非管理员不可写的目录，否则 UAC 之后拉起该脚本等于把提权执行权交给普通用户。
 ;   * t6b（用户 2026-11-22，放开目录限制）：用户要求能装到 D: 等自选目录，因此恢复目录页，
-;     规则改为「任意本地固定 NTFS 目录都行，但安装器负责把目录 ACL 收紧成只有管理员可写」。
-;     目录页校验在模板 installer.nsi 的 VegaDirectoryLeave；安装完成后由下面的
-;     VegaLockInstallDirAcl 用 icacls 收紧 ACL（$INSTDIR 在 Program Files 下则不动，
-;     继承 ACL 已经正确）；控制台 password.rs 在每次提权前校验助手父目录的 ACL。
+;     规则改为「只允许 $PROGRAMFILES64\Vega 或 <X>:\Vega（本地固定 NTFS 盘根下的 Vega），
+;     安装器把目录 ACL 收紧成只有管理员可写」。
+;     目标校验集中在模板 installer.nsi 的 VegaValidateTarget（目录页回调与安装节开头
+;     都调用）；安装完成后由下面的 VegaLockInstallDirAcl 用 icacls 收紧 ACL——**总是**执行，
+;     Program Files 下也一样（先 /reset 清掉旧自定义目录留下的显式 ACE）；
+;     控制台 password.rs 在每次提权前校验助手父目录的 ACL。
 ;   * t6-fix2（用户 2026-11-22）：旧安装器有目录选择页，旧版可能装在 D:\Vega 这类固定目录
 ;     之外。PREINSTALL 从 Tauri 的卸载注册表项读出旧安装目录，清理旧目录，避免机器上
 ;     两份 Vega 并存。旧目录清理失败只提示，不阻断安装；RustDesk 配置、%ProgramData%\Vega
@@ -435,51 +437,34 @@ vega_reparse_done_${ID}:
   Pop $0
 !macroend
 
-; t6b：安装目录不在 Program Files 下时，用 icacls 把 ACL 收紧成「只有管理员可写」。
+; t6b-fix（架构裁定）：安装完成后**总是**用 icacls 重置并锁定安装目录 ACL。
 ; 为什么必须收紧：长期密码助手 resources\vega-pwhelper.ps1 由控制台以 runas 提权执行，
 ; 如果普通用户能改这个文件（或把它换掉、把所在目录换成 junction），等于把提权执行权交给
-; 普通用户。Program Files 下的继承 ACL 本来就是管理员独占写，不需要动；D:\Vega 这类目录
-; 继承的是盘根 ACL（Users 有写权限），必须显式收紧。
-;   * /setowner 先把所有者改成 Administrators（BUILTIN\Administrators = S-1-5-32-544），
-;     否则原所有者仍可能改回 DACL。
-;   * /inheritance:r 去掉继承，/grant:r 只给 SYSTEM、Administrators 完全控制，
-;     Users 只读+执行（与 Program Files 的默认 ACL 等价）。
-;   * 按 SID 授权，中文/本地化系统里账户名不同也不会失配。
-;   * 两条命令的退出码都要检查；失败只写完成页提示，不 Abort（程序已经装好了）。
-;   * $SYSDIR 绝对路径调用 icacls：提权上下文里按名称搜索会被 PATH 劫持。
+; 普通用户。$PROGRAMFILES64\Vega 靠继承 ACL 本来是对的，但旧版自选目录（D:\Vega 之类）
+; 和继承了盘根 Users 写权限的目录都不可信，而且同一台机器上可能残留旧的显式 ACE，
+; 所以两种位置一视同仁，顺序固定三条命令，每条都检查退出码：
+;   1. /reset /T      —— 先清掉所有显式 ACE 与继承标记，回到继承状态；旧自定义目录里
+;                        残留的个人账户 / Authenticated Users 显式写权限就是这一步清掉的
+;                        （/inheritance:r 与 /grant:r 只覆盖列出的 SID，清不掉别的 ACE）。
+;   2. /setowner      —— 所有者改成 Administrators（BUILTIN\Administrators = S-1-5-32-544），
+;                        否则原所有者仍可能改回 DACL。
+;   3. /inheritance:r /grant:r —— 只给 SYSTEM、Administrators 完全控制，Users 只读+执行
+;                        （与 Program Files 的默认 ACL 等价）。
+; 按 SID 授权，中文/本地化系统里账户名不同也不会失配。
+; 三条命令任一失败只写完成页提示，不 Abort（程序已经装好了）；$SYSDIR 绝对路径调用
+; icacls：提权上下文里按名称搜索会被 PATH 劫持。
 !macro VegaLockInstallDirAcl
   StrCpy $vegaAclWarning ""
-  StrCpy $R0 "$INSTDIR"
-  ${StrCase} $R0 "$R0" "L"
-  StrCpy $R1 "$PROGRAMFILES64"
-  ${StrCase} $R1 "$R1" "L"
-  StrLen $R2 "$R1"
-  StrCpy $R3 "$R0" $R2
-  StrCmp $R3 $R1 0 vega_acl_check_x86
-  StrCpy $R3 "$R0" 1 $R2
-  StrCmp $R3 "\" vega_acl_skip
-vega_acl_check_x86:
-  StrCpy $R1 "$PROGRAMFILES"
-  ${StrCase} $R1 "$R1" "L"
-  StrLen $R2 "$R1"
-  StrCpy $R3 "$R0" $R2
-  StrCmp $R3 $R1 0 vega_acl_lock
-  StrCpy $R3 "$R0" 1 $R2
-  StrCmp $R3 "\" vega_acl_skip
-
-vega_acl_lock:
-  DetailPrint "安装目录不在 Program Files 下，收紧目录权限（仅管理员可写）：$INSTDIR"
-  nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR" /setowner *S-1-5-32-544 /T /C /Q'
+  DetailPrint "重置并锁定安装目录权限（仅管理员可写）：$INSTDIR"
+  nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR" /reset /T /C /Q'
   Pop $0
-  nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /T /C /Q'
+  nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR" /setowner *S-1-5-32-544 /T /C /Q'
   Pop $1
-  StrCmp "$0$1" "00" vega_acl_done
-  StrCpy $vegaAclWarning "安装目录权限设置失败（icacls 返回 $0/$1），长期密码不可用"
+  nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /T /C /Q'
+  Pop $2
+  StrCmp "$0$1$2" "000" vega_acl_done
+  StrCpy $vegaAclWarning "安装目录权限设置失败（icacls 返回 $0/$1/$2），长期密码不可用"
   DetailPrint "$vegaAclWarning"
-  Goto vega_acl_done
-
-vega_acl_skip:
-  DetailPrint "安装目录在 Program Files 下，沿用系统默认 ACL。"
 vega_acl_done:
 !macroend
 
@@ -719,7 +704,8 @@ vega_preinstall_dir_done:
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
-  ; t6b：文件已全部写入，先收紧安装目录 ACL（Program Files 下不做），再清理旧目录。
+  ; t6b-fix：文件已全部写入，先重置并锁定安装目录 ACL（两种允许位置都执行，见
+  ; VegaLockInstallDirAcl），再清理旧目录。
   !insertmacro VegaLockInstallDirAcl
   ; 新文件已就位：此时才清理旧目录、改快捷方式（见 VegaFinishPreviousInstall）。
   !insertmacro VegaFinishPreviousInstall
