@@ -241,3 +241,11 @@
   内容为官方格式 `config={"host":…,"relay":…,"key":…}`（serde_json 生成，relay 为空省略）。完整公钥只进二维码，视图只回公钥指纹；
   canvas 白底黑块、4 模块静区、整数像素缩放居中；Esc 与关闭按钮关闭并归还焦点，浏览器预览显示不可用。
 - 单测覆盖 payload（含/不含 relay、空 server、无效 key、JSON 转义）；命令已登记 `build.rs` AppManifest 与 `capabilities/default.json`。
+
+### T5-fix1（Codex 审计 t5-r1 修复）
+- P2 焦点：弹层改原生 `<dialog>` + `showModal()`，遮罩用 `::backdrop`，Esc 与关闭都归还焦点到「显示二维码」，Shift+Tab 退不到遮罩下的设置控件。
+- P2 绘制：`drawMobileQr` 返回成功与否，只有画成功才写 ok；绘制前校验边长（21..=177 且 4n+1）、矩阵长度与画布能否容下四周各 4 模块静区，失败时清掉残码。
+- P2 公钥：`mobile_config_payload` 直接序列化 `validate_key` 的规范化结果（剔除内部空白），带折行的公钥不会再被手机端原样保留。
+- P2 超大配置：读取限 64 KiB、单字段 ≤255 字节、payload ≤1024 字节；`get_mobile_config_qr` 改 async，读/解析/序列化/QR 分段走 `spawn_blocking`；失败视图 `server` 与指纹一律置空。
+- P2 文案：扫码入口改为「底部『设置』→ 右上角扫码图标」，并写明扫完点「确定」保存。
+- P3 测试：加 TOML 样例→payload→矩阵（含/不含 relay）、公钥折行规范化、字段与文件超限用例；Windows 冒烟清单补手机实扫、键盘焦点与绘制失败三项。
