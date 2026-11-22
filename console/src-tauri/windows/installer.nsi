@@ -9,7 +9,8 @@
 ;   1. 恢复「选择安装目录」页（上游的 MUI_PAGE_DIRECTORY +
 ;      MUI_PAGE_CUSTOMFUNCTION_PRE SkipIfPassive），并加 LEAVE 回调 VegaDirectoryLeave。
 ;      允许的位置只有两种：$PROGRAMFILES64\Vega，或 <X>:\Vega（本地固定 NTFS 盘根目录下的
-;      Vega）。其它选择由 VegaValidateTarget 规范成 <X>:\Vega 并提示用户。
+;      Vega）。其它选择由 VegaValidateTarget 规范化并提示用户：落在 Program Files 里的收成
+;      $PROGRAMFILES64\Vega，其余按所选路径的盘符收成 <X>:\Vega。
 ;      原因见 hooks.nsh 的 t6b 说明（ACL 由安装器收紧）。
 ;   2. 目标校验只有一份：VegaValidateTarget 同时被目录页回调与安装节开头调用，
 ;      静默 / 被动 / `/D=` 安装不会绕过。.onInit 用 $CMDLINE 里的 " /D=" 判定命令行是否
@@ -841,8 +842,9 @@ FunctionEnd
 ; 允许的安装位置只有两种：
 ;   * $PROGRAMFILES64\Vega —— 默认位置，继承 ACL 已经是管理员独占写；
 ;   * <X>:\Vega —— 本地固定 NTFS 盘根目录下的 Vega（安装后由 icacls 收紧 ACL）。
-; 用户选/输的其它路径一律规范成 <X>:\Vega（取该路径的盘符）；规范化确实改变了用户的
-; 选择时置 $vegaTargetChanged=1，由目录页回调提示。
+; 用户选/输的其它路径一律规范化（取该路径的盘符）：落在 $PROGRAMFILES64 里（含 Program
+; Files 本身与其子目录）的收成 $PROGRAMFILES64\Vega，其余收成 <X>:\Vega。规范化确实改变
+; 了用户的选择时置 $vegaTargetChanged=1，由目录页回调提示。
 ;
 ; 拒绝：空路径、相对路径、UNC（\\server\share）、驱动器类型不是 3（DRIVE_FIXED，排除
 ; U 盘/光驱/网络盘/内存盘）、文件系统不是 NTFS（FAT32/exFAT 没有可用的 DACL）。
