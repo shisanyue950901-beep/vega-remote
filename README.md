@@ -158,6 +158,24 @@ Set-ExecutionPolicy -Scope Process Bypass -Force
 | 码率 | 默认（随分辨率帧率自动变化） |
 | 视频编码 | HEVC，硬件解码 |
 
+## 发布更新（维护者）
+
+CI 只构建未签名的安装包：`createUpdaterArtifacts: false`，工作流不读 `TAURI_SIGNING_PRIVATE_KEY`，
+也不用 `VEGA_UPDATER_PUBKEY` secret。更新公钥直接提交在 `console/src-tauri/tauri.conf.json` 的
+`plugins.updater.pubkey`，客户端拿它校验 `latest.json` 里的 `signature`。
+
+签名与发布由维护者在本机完成（私钥只在本地环境变量，不进仓库与 CI）：
+
+```bash
+export TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.tauri/vega.key)"
+export TAURI_SIGNING_PRIVATE_KEY_PASSWORD='…'
+tools/publish-update.sh v0.6.0 <path>/Vega-Setup.exe
+```
+
+脚本用 `tauri signer sign` 签安装包、写 `latest.json` 与 `latest-mirror.json`、打印 SHA256，再上传到
+GitHub Release 和阿里云 `/opt/vega-relay/updates/`（清单最后原子改名）。镜像部署见
+[relay/updates-nginx.md](relay/updates-nginx.md)，安全边界见 [SECURITY.md](SECURITY.md)。
+
 ## 文档
 
 - [网络与直连排查](docs/network.md)
