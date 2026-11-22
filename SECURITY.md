@@ -58,9 +58,13 @@
         只有 SYSTEM、Administrators 完全控制与 Users 只读执行三条 ACE；旧的继承项、显式拒绝项和其他 SID
         的可继承写权限全部被替换，不会被子项 `/reset` 带到程序文件上。删除旧的 `/inheritance:r /grant:r`
         调用；写入前检查 `$INSTDIR` 不含单引号；
-     3. `/setowner *S-1-5-32-544 /T` 把所有者（含子树）改成 Administrators；
-     4. 子项三态枚举（`1`=有子项 / `0`=确认为空 / `E`=枚举失败）：`E` 即失败；`1` 时
-        `"$INSTDIR\*" /reset /T`，让子树回到「只继承」并自愈旧版留下的空 DACL 文件；`0` 跳过视为成功。
+     3. 子项三态枚举（`1`=有子项 / `0`=确认为空 / `E`=枚举失败）：`E` 即失败；`1` 时
+        `"$INSTDIR\*" /reset /T`，让子树回到「只继承」并自愈旧版留下的空 DACL 文件；`0` 跳过视为成功；
+     4. `/setowner *S-1-5-32-544 /T` 把所有者（含子树）改成 Administrators。
+     先 `/reset` 后 `/setowner /T`：0.6.1 留下的空 DACL 文件所有者已是 Administrators，但空 DACL 只给
+     隐式 `WRITE_DAC`、没有 `WRITE_OWNER`，`icacls /setowner` 在缺 `WRITE_OWNER` 时不会主动启用接管
+     特权；先 `/reset` 让子项继承根目录的 Administrators 完全控制（拿到 `WRITE_OWNER`），再改所有者
+     就不会被拒绝。每步仍然 `Pop` 后立即检查、失败短路。
      绝不能写成对 `"$INSTDIR"` 带 `/T` 的 `/inheritance:r`（0.6.1 的真实 bug）：对文件 `/inheritance:r` 会删掉
      全部继承 ACE，而 `(OI)(CI)` 授权落不到文件上（`/C` 吞错），结果 `vega-console.exe` 的 DACL 为空——用户跑不起来、
      管理员安装器也覆盖不了。安装完成后（POSTINSTALL）用同样的四步再收紧一次；这一次失败只写进完成页告警，
