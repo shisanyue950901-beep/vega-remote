@@ -1092,7 +1092,8 @@ function setupSettingsPage(): void {
     if (!mobileContext) {
       return false;
     }
-    const isLost = mobileContext.isContextLost;
+    // TS 5.4 的 DOM 声明里没有 isContextLost，按可选方法读取。
+    const isLost = (mobileContext as unknown as { isContextLost?: () => boolean }).isContextLost;
     if (typeof isLost !== "function") {
       return false;
     }
@@ -1186,7 +1187,6 @@ function setupSettingsPage(): void {
 
   const closeMobileSheet = (): void => {
     mobileGeneration += 1;
-    mobileCanvas.removeEventListener("contextlost", handleMobileContextLost);
     if (mobileSheet.open) {
       mobileSheet.close();
     }
@@ -1198,6 +1198,10 @@ function setupSettingsPage(): void {
    * 并作废进行中的请求，免得迟到的结果又把状态写回 ok。
    */
   const handleMobileContextLost = (): void => {
+    // 监听常驻；弹层没开时不处理，避免异步 close 与重开之间的竞态。
+    if (!mobileSheet.open) {
+      return;
+    }
     mobileGeneration += 1;
     setStatus(mobileStatus, "绘制二维码失败，请重试", "error");
   };
@@ -1207,7 +1211,6 @@ function setupSettingsPage(): void {
     if (!mobileSheet.open) {
       mobileSheet.showModal();
     }
-    mobileCanvas.addEventListener("contextlost", handleMobileContextLost);
     mobileClose.focus();
     clearMobileCanvas();
     if (!window.__TAURI__?.core) {
@@ -1235,6 +1238,7 @@ function setupSettingsPage(): void {
     });
   };
 
+  mobileCanvas.addEventListener("contextlost", handleMobileContextLost);
   mobileButton.addEventListener("click", openMobileSheet);
   mobileClose.addEventListener("click", closeMobileSheet);
   // 浏览器对 showModal() 的弹层自己处理 Esc（cancel → close），
@@ -1244,8 +1248,6 @@ function setupSettingsPage(): void {
   });
   mobileSheet.addEventListener("close", () => {
     mobileGeneration += 1;
-    // Esc / cancel 走的是浏览器自己关弹层，这里统一摘掉 contextlost 监听。
-    mobileCanvas.removeEventListener("contextlost", handleMobileContextLost);
     mobileButton.focus();
   });
 
