@@ -7,7 +7,9 @@
 ## 安装（Windows，双击 Vega-Setup.exe）
 
 1. 从 GitHub Actions 的 `Console` 工作流下载 artifact **vega-setup-windows**，解压得到 `Vega-Setup.exe`（或从 Release 下载同名文件）。
-2. 双击运行，UAC 提权一次。安装包是 perMachine 模式，只在这一步要管理员权限。
+2. 双击运行，UAC 提权一次。安装包是 perMachine 模式，只在这一步要管理员权限。安装路径固定为
+   `C:\Program Files\Vega`（`$PROGRAMFILES64\Vega`），安装器不再显示「选择安装目录」页；长期密码助手
+   `resources\vega-pwhelper.ps1` 必须落在系统 Program Files 下，默认 ACL 只允许管理员写。
 3. 安装过程会自动装好 RustDesk 并写入自建中继配置（默认 `60.205.95.98`，见 `console/src-tauri/resources/vega-defaults.json`）。RustDesk 是 AGPL，安装包里**不含**它的二进制，安装时从官方 GitHub Release 下载固定版本并校验 SHA256。
 4. 如果 RustDesk 没装好（下载失败/哈希不符），Vega 仍会正常安装完成，并提示「RustDesk 未装好，请打开 Vega 按提示手动安装」；也可以直接到 <https://rustdesk.com/download> 手动下载安装。
 5. 卸载 Vega 时，安装包会按 `%ProgramData%\Vega\host-state.json` 里的记录回滚 RustDesk 中继配置；只有记录标明「由 Vega 安装」时才会连带卸载 RustDesk。
