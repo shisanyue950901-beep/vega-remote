@@ -14,8 +14,17 @@
 #
 # 重跑规则（t6-fix4 架构裁定）：
 #   * 版本化安装包若已存在，远程 SHA256 与本地相同 → 跳过；不同 → 中止，绝不覆盖。
-#   * GitHub 资产不用 --clobber 上传；上传中断留下的同名资产会被 SHA256 校验拦下。
+#   * 同一个 exe（SHA256 相同）永不重签：签名按 exe SHA256 缓存在仓库外的
+#     VEGA_SIG_CACHE（默认 ~/.cache/vega-sig），重跑先查缓存；缓存未命中时若
+#     GitHub/镜像已有字节相同的 exe，就下载它的 .sig 复用，只有全新 exe 才本地签名。
+#     Tauri 会把签名时间写进 .sig，重签会改变 .sig 哈希，导致已发布版本无法重跑。
+#   * GitHub 资产上传走 Release 的 upload_url（uploads.github.com），不接受
+#     api.github.com 的 assets POST；改名才用 api.github.com 的 PATCH。
+#   * GitHub 资产不用 --clobber 上传；上传中断留下的同名 0 字节资产会被清掉重传，
+#     其他同名资产按 SHA256 校验拦下。
 #   * 镜像先传 <file>.part，传完再远端 mv 成最终名；中断只会留下 .part。
+#   * SSH 探测只认 0=存在、1=不存在；其他退出码（含连接失败的 255）一律中止，
+#     绝不能把连接失败当成“文件不存在”而覆盖镜像上已发布的同版本包。
 #   * Release 用 --latest=false 创建；已存在则 PATCH make_latest=false，避免顶掉
 #     一键安装用的源码 Release。
 #   * 清单最后换：先上传 latest.json.new → 删除旧 latest.json → PATCH 改名为 latest.json。
@@ -30,6 +39,7 @@
 #   VEGA_MIRROR_HOST    默认 60.205.95.98
 #   VEGA_MIRROR_DIR     默认 /opt/vega-relay/updates（即 nginx 的 updates 根目录）
 #   VEGA_MIRROR_URL     默认 http://<VEGA_MIRROR_HOST>/vega/updates
+#   VEGA_SIG_CACHE      签名缓存目录（仓库外），默认 ~/.cache/vega-sig
 #   VEGA_SKIP_GITHUB / VEGA_SKIP_MIRROR 置 1 可跳过对应通道
 #
 # 私钥只在本地环境变量里，绝不进仓库、CI 或脚本参数；脚本也不打印私钥内容。
@@ -94,12 +104,30 @@ gh_asset_id() {
   gh api "repos/${REPO}/releases/${release_id}/assets" --paginate \
     --jq ".[] | select(.name == \"${name}\") | .id"
 }
+gh_asset_size() {
+  local release_id="$1" name="$2"
+  gh api "repos/${REPO}/releases/${release_id}/assets" --paginate \
+    --jq ".[] | select(.name == \"${name}\") | .size"
+}
+gh_delete_asset() {
+  local id="$1"
+  [ -n "$id" ] || return 0
+  gh api -X DELETE "repos/${REPO}/releases/assets/${id}" >/dev/null
+}
 # 资产已存在时下载并比对 SHA256；相同返回 0，不同返回 1。不存在返回 2。
+# 上传中断可能留下同名 0 字节资产（GitHub 的 "starter" 占位）：按不存在处理，
+# 先删掉再让调用方重新上传，否则会被当成“内容不同”而永久卡住重跑。
 gh_verify_asset() {
   local release_id="$1" name="$2" want="$3" dest="$4"
-  local id
+  local id size
   id="$(gh_asset_id "$release_id" "$name")"
   if [ -z "$id" ]; then
+    return 2
+  fi
+  size="$(gh_asset_size "$release_id" "$name")"
+  if [ "${size:-0}" = "0" ]; then
+    echo "GitHub 上的 ${name} 是 0 字节残留资产（上次上传中断），删除后重传。" >&2
+    gh_delete_asset "$id"
     return 2
   fi
   gh release download "$RELEASE_TAG" --repo "$REPO" --pattern "$name" --output "$dest" --clobber
@@ -111,12 +139,21 @@ gh_verify_asset() {
   return 1
 }
 # 上传走 Release 的 upload_url（GitHub.com 上是 uploads.github.com）。相对路径的
-# `gh api -X POST repos/.../assets` 发到 api.github.com，上传端点不接受，会失败。
-# 资产改名仍然走 api.github.com 的 PATCH。
+# `gh api -X POST repos/.../assets` 会发到 api.github.com，上传端点不接受，必然失败。
+# 这里用 gh 的 token 直接 POST 到 upload_url，并能指定资产名（gh release upload 只能
+# 用文件基名）。资产改名仍走 api.github.com 的 PATCH。
 gh_upload_asset() {
   local file="$1" name="$2"
-  gh release upload "$RELEASE_TAG" "$file" --repo "$REPO"
-  echo "已上传 GitHub ${name}（经 upload_url）。"
+  local token upload_url
+  token="$(gh auth token)"
+  upload_url="$(gh api "repos/${REPO}/releases/${release_id}" --jq .upload_url)"
+  upload_url="${upload_url%\{*}"  # 去掉 {?name,label} 模板
+  curl -sS -f -X POST "${upload_url}?name=${name}" \
+    -H "Authorization: token ${token}" \
+    -H "Accept: application/vnd.github+json" \
+    -H "Content-Type: application/octet-stream" \
+    --data-binary "@${file}" >/dev/null
+  echo "已上传 GitHub ${name}（经 upload_url ${upload_url}）。"
 }
 
 # SSH 探测：0=存在，1=不存在，其他（含连接失败的 255）一律中止。
@@ -304,18 +341,14 @@ fi
 # --- 4. 两个通道都换清单（最后一步） ----------------------------------------
 if [ "${VEGA_SKIP_GITHUB:-0}" != "1" ]; then
   new_name="latest.json.new"
-  # 上次中断可能留下 latest.json.new：先删掉同名临时资产。
+  # 上次中断可能留下 latest.json.new（含 0 字节 starter）：先删掉同名临时资产。
   stale_id="$(gh_asset_id "$release_id" "$new_name")"
-  if [ -n "$stale_id" ]; then
-    gh api -X DELETE "repos/${REPO}/releases/assets/${stale_id}" >/dev/null
-  fi
-  # 上传为临时名（API 不能直接覆盖已存在同名资产）。
-  gh api -X POST "repos/${REPO}/releases/${release_id}/assets?name=${new_name}" \
-    -H "Content-Type: application/octet-stream" --input "${work}/latest.json" >/dev/null
+  gh_delete_asset "$stale_id"
+  # 上传为临时名：gh_upload_asset 走 upload_url，文件基名即资产名。
+  cp "${work}/latest.json" "${work}/${new_name}"
+  gh_upload_asset "${work}/${new_name}" "$new_name"
   old_id="$(gh_asset_id "$release_id" "latest.json")"
-  if [ -n "$old_id" ]; then
-    gh api -X DELETE "repos/${REPO}/releases/assets/${old_id}" >/dev/null
-  fi
+  gh_delete_asset "$old_id"
   new_id="$(gh_asset_id "$release_id" "$new_name")"
   [ -n "$new_id" ] || { echo "上传 latest.json.new 失败。" >&2; exit 1; }
   # 改名为最终资产名：客户端只会看到完整的新清单。
