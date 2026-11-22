@@ -42,14 +42,16 @@
   PowerShell 与助手都用系统绝对路径。只有助手进程是管理员，它读完载荷、设好密码就退出；控制台始终以普通用户身份运行。
 - **只认打包目录内的助手**：发行版只使用 Tauri 资源目录里的 `vega-pwhelper.ps1`，没有源码目录回退；助手定位
   RustDesk 时只读 `[Environment]::GetFolderPath('ProgramFiles')` 下的固定路径，不接受 `VEGA_RUSTDESK_EXE` 等环境覆盖。
-- **安装目录权限（v0.6.1 / T6b）**：安装目录不再固定为 `C:\Program Files\Vega`，用户可以在安装包里选任意
-  本地固定磁盘的 NTFS 目录（例如 `D:\Vega`；UNC、U 盘/光驱/网络盘、盘根、已存在且非空的非 Vega 目录会被拒绝）。
+- **安装目录权限（v0.6.1 / T6b）**：安装目录只允许两个位置——`C:\Program Files\Vega`（`$PROGRAMFILES64\Vega`，默认），
+  或某个本地固定 NTFS 磁盘根目录下的 `Vega`（`X:\Vega`）。目录页/静默安装/`/D=` 的其它输入都会被规范成 `X:\Vega`
+  （取所选路径的盘符）并提示；UNC、U 盘/光驱/网络盘/内存盘、非 NTFS、以及已存在且非空又不是 Vega 的目录会被拒绝。
   为了让助手仍然只可能被管理员替换，做了两层约束：
-  1. **安装器收紧 ACL**：安装完成后，只要安装目录不在 `Program Files` 下，安装器就用
-     `icacls /setowner *S-1-5-32-544` 把所有者改成 Administrators，再用
-     `/inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX`
-     递归收紧成「SYSTEM、Administrators 完全控制，Users 只读执行」——等价于 Program Files 的默认权限。
-     失败时安装照常完成，但完成页明确提示「安装目录权限设置失败，长期密码不可用」。
+  1. **安装器总是重置并锁死 ACL**：无论装到哪个允许的位置，安装完成后安装器都按固定顺序执行三条 `icacls`，
+     每条都检查退出码——先 `/reset /T` 清掉所有显式 ACE（旧自定义目录残留的个人账户 / `Authenticated Users`
+     写权限就是这一步清掉的），再 `/setowner *S-1-5-32-544 /T` 把所有者改成 Administrators，最后
+     `/inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /T`
+     递归收紧成「SYSTEM、Administrators 完全控制，Users 只读执行」。
+     任一条失败时安装照常完成，但完成页明确提示「安装目录权限设置失败，长期密码不可用」。
   2. **控制台每次提权前校验**：`ensure_helper_location` 只接受两类助手位置——`Program Files`（含 x86），
      或「助手正好位于 `<控制台 exe 目录>\resources` 下」。走后者时，还要对控制台 exe 目录、`resources`
      目录、助手文件三者逐一检查：都不能是重解析点（junction/symlink），所有者必须是
