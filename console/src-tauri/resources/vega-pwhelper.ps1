@@ -115,6 +115,7 @@ function Find-VegaRustDeskExe {
 }
 # 返回退出码而不是 exit：点源后可直接断言。finally 里再兜底删一次载荷文件。
 function Main {
+    param([string]$Mode = '', [string]$Payload = '')
     $argumentError = Get-VegaHelperArgError -Mode $Mode -Payload $Payload
     if ($argumentError) { Write-VegaHelperError $argumentError; return 2 }
     try {
@@ -143,4 +144,4 @@ function Main {
     }
 }
 
-if ($MyInvocation.InvocationName -ne '.') { exit (Main) }
+if ($MyInvocation.InvocationName -ne '.') { exit (Main -Mode $Mode -Payload $Payload) }

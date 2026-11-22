@@ -56,6 +56,14 @@
   - 前端：串流页去掉假主机列表与内置 PIN 输入，改为真实状态/显卡/固定入口；设置页 doctor 与「诊断网络」跳转；
     Assist/Settings 共用一份配置快照并在 focus 时重查设备码与安装状态；设置页探测复位结果并恢复按钮
   - 旧清单 `RustDesk.RustDesk` 包按已下线处理：提示手动卸载、销账后继续回滚；host/client 各有 Pester 覆盖
+- T4d 长期密码（设置页）：
+  - Rust 后端 `password.rs`：密码只经 DACL 收紧的临时文件交给一次性提权的助手；校验 8~64 位且含字母和数字，
+    验证方式映射 temporary/permanent/both；状态只回答「是否已设置」与 `verification-method`，不读密码内容
+  - 助手 `console/src-tauri/resources/vega-pwhelper.ps1`（随包 resources，`-Mode set|clear`）：点源可测，
+    读后立即用同长度空白覆盖并删除载荷，用官方 `rustdesk.exe --password` 设密码、`--option verification-method`
+    写验证方式；清除时设 32 位随机密码并把验证方式改回临时密码；退出码 0/非 0，stderr 只写脱敏原因
+  - 测试：`password.rs` 单测覆盖密码规则/验证方式映射/icacls 参数；`tests/vega-pwhelper.Tests.ps1` 覆盖参数校验、
+    读后删除、密码规则与「失败摘要不含密码」；风险与取舍见 `SECURITY.md`「长期密码」
 - 安装包冒烟测试仍延后：M2c 阶段 CI 只跑 `tauri build --no-bundle`；T3 起改为产出 `Vega-Setup.exe`，真机检查项见 `docs/testing/windows-smoke.md`
 
 ## T3 一键安装包（v0.6，Vega-Setup.exe）
