@@ -1212,3 +1212,6 @@ dialog.modal:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 .update-badge:hover{filter:brightness(1.06)}
 .progress{display:block;height:6px;margin-top:6px;border-radius:3px;background:var(--fill);overflow:hidden}
 .progress__bar{display:block;height:100%;width:0;border-radius:3px;background:var(--accent);transition:width 160ms var(--ease)}
+/* 总大小未知：跑不确定态，不显示假百分比 */
+.progress.is-indeterminate .progress__bar{width:35%;transition:none;animation:progress-slide 1.2s var(--ease) infinite}
+@keyframes progress-slide{from{transform:translateX(-100%)}to{transform:translateX(200%)}}

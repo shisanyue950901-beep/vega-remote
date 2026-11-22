@@ -1757,19 +1757,39 @@ function setupUpdater(): void {
   let latest = "";
   let installing = false;
   let autoChecked = false;
+  /** 事件监听注册成功前不放行安装，否则进度和失败都收不到。 */
+  let eventsReady = false;
+
+  const refreshInstallButton = (): void => {
+    installButton.disabled = installing || !latest || !eventsReady;
+  };
+
+  /** 每次开始安装/失败复位：进度条归零，且不残留上一次的百分比。 */
+  const resetProgress = (): void => {
+    bar.style.width = "0%";
+    progress.classList.remove("is-indeterminate");
+    progress.setAttribute("aria-valuenow", "0");
+  };
 
   const setInstalling = (value: boolean): void => {
     installing = value;
     checkButton.disabled = value;
-    installButton.disabled = value || !latest;
+    refreshInstallButton();
   };
 
   const showProgress = (payload: UpdateProgress): void => {
     progress.classList.remove("is-hidden");
     const total = payload.total ?? 0;
-    const percent = total > 0 ? Math.min(100, Math.round((payload.downloaded / total) * 100)) : 40;
-    bar.style.width = `${percent}%`;
-    progress.setAttribute("aria-valuenow", String(percent));
+    if (total > 0) {
+      const percent = Math.min(100, Math.round((payload.downloaded / total) * 100));
+      progress.classList.remove("is-indeterminate");
+      bar.style.width = `${percent}%`;
+      progress.setAttribute("aria-valuenow", String(percent));
+    } else {
+      // 服务端没给 Content-Length：只走不确定态，不编造百分比。
+      progress.classList.add("is-indeterminate");
+      progress.removeAttribute("aria-valuenow");
+    }
     const mb = (payload.downloaded / (1024 * 1024)).toFixed(1);
     const totalMb = (total / (1024 * 1024)).toFixed(1);
     setStatus(status, total > 0 ? `正在下载更新… ${mb} / ${totalMb} MB` : `正在下载更新… ${mb} MB`);
@@ -1795,7 +1815,7 @@ function setupUpdater(): void {
       view.available ? `发现新版本 v${view.latest}` : `当前已是最新版本（v${view.current}）`,
       "ok",
     );
-    installButton.disabled = !view.available || installing;
+    refreshInstallButton();
   };
 
   badge.addEventListener("click", () => navigateTo("settings"));
@@ -1814,33 +1834,57 @@ function setupUpdater(): void {
   });
 
   installButton.addEventListener("click", () => {
-    if (installing || !latest) return;
+    if (installing || !latest || !eventsReady) return;
     setInstalling(true);
+    resetProgress();
     progress.classList.remove("is-hidden");
     setStatus(status, "正在准备下载更新…");
     const core = window.__TAURI__?.core;
     if (!core) {
       setInstalling(false);
+      resetProgress();
+      progress.classList.add("is-hidden");
       setStatus(status, "当前环境不支持自动更新", "warn");
       return;
     }
     core.invoke<void>("install_update").catch((error: unknown) => {
+      // 命令被拒（例如已有任务在跑）也要把界面从「更新中」复位。
       const message = typeof error === "string" && error ? error : "启动更新失败，请稍后重试";
       setInstalling(false);
+      resetProgress();
       progress.classList.add("is-hidden");
       setStatus(status, message, "error");
     });
   });
 
-  const listen = window.__TAURI__?.event?.listen;
-  if (listen) {
-    void listen<UpdateProgress>("vega://update-progress", (event) => showProgress(event.payload));
-    void listen<string>("vega://update-error", (event) => {
-      setInstalling(false);
-      progress.classList.add("is-hidden");
-      setStatus(status, event.payload || "更新失败，请稍后重试", "error");
-    });
-  }
+  /** 注册事件监听；注册失败返回 false，安装按钮保持禁用。 */
+  const registerEvents = async (): Promise<boolean> => {
+    const event = window.__TAURI__?.event;
+    if (!event?.listen) return false;
+    try {
+      await event.listen<UpdateProgress>("vega://update-progress", (payload) => {
+        showProgress(payload.payload);
+      });
+      await event.listen<string>("vega://update-error", (payload) => {
+        setInstalling(false);
+        resetProgress();
+        progress.classList.add("is-hidden");
+        setStatus(status, payload.payload || "更新失败，请稍后重试", "error");
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  // 先把监听注册完，再放行「立即更新」；注册失败只报错，不放行安装。
+  void (async () => {
+    eventsReady = await registerEvents();
+    if (!eventsReady && window.__TAURI__?.event) {
+      setStatus(status, "更新事件监听注册失败，请重启应用后重试", "error");
+    }
+    refreshInstallButton();
+  })();
 
   // 启动 5 秒后静默检查一次；每次启动最多一次，失败不打扰用户。
   window.setTimeout(() => {
