@@ -551,7 +551,7 @@ pub(crate) fn spawn_detached(exe: &Path, args: &[&str]) -> Result<(), String> {
 /* 最近设备码存储（JSON，不含任何密钥）                                  */
 /* ------------------------------------------------------------------ */
 
-fn recent_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn recent_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_config_dir()
         .map(|dir| dir.join(RECENT_FILE))
@@ -600,7 +600,7 @@ fn save_recent_peers(app: &tauri::AppHandle, list: &[String]) -> Result<(), Stri
 
 /// 原子写：同目录临时文件 + rename。临时文件用 `create_new` 独占创建，
 /// 文件名带进程号与序号，两个 Vega 实例不会互相踩到对方的临时文件。
-fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
+pub(crate) fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "目标路径没有父目录".to_string())?;
@@ -710,13 +710,13 @@ pub struct OpResult {
 }
 
 impl OpResult {
-    fn ok(message: impl Into<String>) -> Self {
+    pub(crate) fn ok(message: impl Into<String>) -> Self {
         Self {
             ok: true,
             message: message.into(),
         }
     }
-    fn err(message: impl Into<String>) -> Self {
+    pub(crate) fn err(message: impl Into<String>) -> Self {
         Self {
             ok: false,
             message: message.into(),
