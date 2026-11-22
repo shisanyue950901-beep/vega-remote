@@ -262,7 +262,7 @@
 - CI：只构建未签名的 NSIS 安装包（`createUpdaterArtifacts: false`），不再注入更新公钥、不再读 `TAURI_SIGNING_PRIVATE_KEY`；`VEGA_UPDATER_PUBKEY` 与 `TAURI_SIGNING_*` 两个 secret 都不再使用，tag `v*` 也不产出 `latest.json`。
 - 运维：签名与发布都在维护者本机。`tools/publish-update.sh <tag> <setup.exe>` 用 `tauri signer sign` 签安装包、写 `latest.json`（GitHub 指向固定 tag `vega-updates` 的版本化资产，`latest-mirror.json` 指向镜像版本目录），打印 SHA256，再上传到 GitHub Release 与阿里云 `/opt/vega-relay/updates/`（安装包进 `<ver>/Vega-Setup-<ver>.exe` 且不可覆盖，清单最后原子改名，旧版本目录保留）；`relay/updates-nginx.md` 记录 `nginx:alpine` 只读挂载与 `autoindex off` 部署。
 - 版本统一 `0.6.0`（`console/package.json`、`tauri.conf.json`、`Cargo.toml`）。
-- 旧安装目录搬迁（t6-fix2）：安装路径固定为 `$PROGRAMFILES64\Vega` 后，旧版可能仍在旧安装器选的目录（如 `D:\Vega`）。`NSIS_HOOK_PREINSTALL` 读 Tauri 卸载键 `...\Uninstall\${PRODUCTNAME}` 的 `InstallLocation`/`UninstallString`，归一化（去引号、去尾反斜杠、大小写不敏感）后与固定目录不同且 `uninstall.exe` 存在时，`ExecWait '"<old>\uninstall.exe" /S _?=<old>'` 静默卸载，再删残留卸载器并非递归 `RMDir` 旧目录；失败只写完成页提示不 Abort，同路径重装与 `/UPDATE` 不动，RustDesk 配置、`%ProgramData%\Vega`、用户 AppData 不在清理范围；`PREINSTALL` 里补 `SetOutPath $INSTDIR`，否则 `$OUTDIR` 仍指向旧目录会让 `File` 解到旧路径。
+- 旧安装目录搬迁（t6-fix3b 重做）：安装路径固定为 `$PROGRAMFILES64\Vega` 后，旧版可能仍在旧安装器选的目录（如 `D:\Vega`）。目录页不再用 `!undef MUI_PAGE_DIRECTORY`（MUI2 在 include 时已展开，宏覆盖无效），改为定制模板 `console/src-tauri/windows/installer.nsi`（上游 tauri-cli v2.12.6）删除目录页，并在 `.onInit` 末尾强制 `$INSTDIR`。`NSIS_HOOK_PREINSTALL` 读 Tauri 卸载键的 `InstallLocation`/`UninstallString`，归一化 + `GetFullPathNameW` 后与固定目录大小写不敏感比较；不同且旧目录含 `vega-console.exe` 时**不运行旧卸载器**（它会回滚 RustDesk），只删除已知 Vega 文件、非递归删 `resources` 与旧目录，指向旧目录的快捷方式一并删除；失败只写完成页提示不 Abort，同路径重装与 `/UPDATE` 不动，RustDesk 配置、`%ProgramData%\Vega`、用户 AppData 不在清理范围；`PREINSTALL` 里补 `SetOutPath $INSTDIR`。`/UPDATE` 模式在 `POSTINSTALL` 完全跳过 RustDesk 安装脚本（不下载、不改配置）。
 
 ### T6-fix3（Codex 审计 t6-r1 修复）
 - P1 编译：`download_and_install` 的累计字节改为 `let mut downloaded`；对 `tauri-plugin-updater` 2 的 API 全面对齐（`updater_builder() -> UpdaterBuilder`、`endpoints(Vec<Url>) -> Result<Self>`、`Update::download_and_install(&self, on_chunk, on_finish) -> Result<()>`、`Update.timeout` 为 `pub` 字段）。
@@ -273,6 +273,11 @@
 - P2 发布通道：GitHub 回退端点固定 `releases/download/vega-updates/latest.json`；`publish-update.sh` 把 `Vega-Setup-<ver>.exe`、`.sig`、`latest.json` 发到固定 tag `vega-updates`（缺则创建，资产覆盖）；镜像侧安装包先进 `<ver>/Vega-Setup-<ver>.exe`（存在即拒绝，永不覆盖），清单写临时名再原子 `mv`，`latest.json` 的 url 指向版本化文件，旧版本目录保留。
 - P3 进度：每次开始安装把进度宽度与 `aria-valuenow` 归零；总大小未知时加 `is-indeterminate` 走不确定态（删 `aria-valuenow`），不再用固定 40% 假装进度。
 - P3 文档：`updater.rs` 头注释改为「公钥提交在仓库」，不再写成 CI 注入。
+
+### T6-fix3b（架构裁定：NSIS 安装器整改）
+- 目录页：删除无效的 `!undef MUI_PAGE_DIRECTORY`；新增定制模板 `console/src-tauri/windows/installer.nsi`（基于 tauri-cli v2.12.6 上游），只删目录页及回调，并在 `.onInit` 末尾强制 `$INSTDIR = $PROGRAMFILES64\Vega`；`bundle.windows.nsis.template` 指向该模板。
+- 旧目录迁移：绝不运行旧卸载器（会回滚 RustDesk）；`PREINSTALL` 只删已知 Vega 文件与非递归删目录，快捷方式按目标判断，失败仅提示。
+- `/UPDATE`：`POSTINSTALL` 完全跳过 RustDesk 安装脚本，在线更新不改写中继配置。
 
 ### T6 加固（待做）
 - P2 签名/版本（架构裁决：本轮不修）：HTTP 镜像可被中间人回放更早的已签名 Vega 版本（降级）；后续用签名内绑定版本 / `requireSignedVersion` 或 HTTPS 镜像。
