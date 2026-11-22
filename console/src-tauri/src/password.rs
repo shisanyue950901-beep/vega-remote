@@ -529,6 +529,7 @@ struct AclSizeInfo {
 /// 直接声明 advapi32 的三个安全 API：只需要指针与原始字节，不依赖结构体字段名。
 /// （GetNamedSecurityInfoW 在 advapi32 也导出；GetAce / GetAclInformation 同理。）
 #[cfg(windows)]
+#[allow(non_snake_case)]
 #[link(name = "advapi32")]
 extern "system" {
     fn GetNamedSecurityInfoW(
