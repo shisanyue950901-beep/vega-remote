@@ -1,4 +1,4 @@
-// Vega 控制台 M2b：RustDesk 接入
+// Vega 控制台 T4：设备列表、长期密码与验证方式接入
 // 约束：设备码/服务器配置来自 Rust 侧；密码永不进入前端与日志。
 // 非 Tauri 环境（浏览器预览）下所有命令静默降级为「预览」提示。
 
@@ -105,7 +105,39 @@ let currentDeviceCode = "";
 let refreshStreaming: (() => void) | null = null;
 let refreshAssistDevice: (() => void) | null = null;
 let refreshAssistStatus: (() => void) | null = null;
+let refreshDeviceList: (() => void) | null = null;
 let runDoctorAction: (() => void) | null = null;
+
+/** 长期密码状态（`get_password_status`）。密码本身永不出现在这里。 */
+interface PasswordStatus {
+  hasPermanent: boolean;
+  verifyMethod: string;
+}
+
+/** 验证方式：协助页分段选，设置页提交长期密码时一起带给 Rust。 */
+type VerifyMethod = "temporary" | "permanent" | "both";
+
+let selectedVerify: VerifyMethod = "temporary";
+/** 设置页读到的密码状态刷新；协助页「未设置」文案由它统一更新。 */
+let refreshPasswordStatus: (() => void) | null = null;
+
+function asVerifyMethod(raw: string): VerifyMethod {
+  return raw === "permanent" || raw === "both" ? raw : "temporary";
+}
+
+/** 只改分段的高亮与记忆值，不写 RustDesk：写盘发生在设置长期密码时。 */
+function selectVerifyMethod(method: VerifyMethod): void {
+  selectedVerify = method;
+  const group = document.getElementById("verify-method");
+  if (!group) {
+    return;
+  }
+  group.querySelectorAll<HTMLButtonElement>(".seg__btn[data-verify]").forEach((btn) => {
+    const active = btn.dataset.verify === method;
+    btn.classList.toggle("is-active", active);
+    btn.setAttribute("aria-pressed", active ? "true" : "false");
+  });
+}
 
 /** 设置页与远程协助页共用同一份配置快照，避免 focus 时各读一遍。 */
 type ConfigHandler = (config: ServerConfigView | null) => void;
@@ -149,6 +181,8 @@ async function refreshOnFocus(): Promise<void> {
   // 从 RustDesk 安装/改配置回来时，设备码与安装状态也要跟着重查。
   refreshAssistDevice?.();
   refreshAssistStatus?.();
+  refreshDeviceList?.();
+  refreshPasswordStatus?.();
   refreshStreaming?.();
 }
 
@@ -265,6 +299,10 @@ function navigateTo(page: string): void {
   const pages = Array.from(document.querySelectorAll<HTMLElement>(".page"));
   items.forEach((item) => item.classList.toggle("is-active", item.dataset.page === page));
   pages.forEach((target) => target.classList.toggle("is-active", target.id === `page-${page}`));
+  // 回到「我的设备」时重读：连接/改名/删除可能都发生在别的页面。
+  if (page === "devices") {
+    refreshDeviceList?.();
+  }
 }
 
 function setupNav(): void {
@@ -362,7 +400,8 @@ function setupAssistPage(): void {
       currentDeviceCode = info.formattedId;
       if (info.installed && info.formattedId) {
         codeEl.textContent = info.formattedId;
-        setStatus(codeStatus, `来自 ${info.path}`, "ok");
+        // 不再回显 RustDesk 安装路径：状态行只表示可用性。
+        codeStatus.textContent = "";
       } else {
         codeEl.textContent = "—";
         setStatus(codeStatus, info.error || "未安装 RustDesk", "error");
@@ -485,8 +524,7 @@ function setupAssistPage(): void {
   });
 
   openInstallPageButton.addEventListener("click", () => {
-    // WinGet 已下架 RustDesk：不再复制安装命令，交给 Rust 侧用默认浏览器
-    // 打开写死的官方发行页，由用户手动安装。
+    // 安装入口只有一条：交给 Rust 侧用默认浏览器打开官方发行页，由用户手动安装。
     setStatus(serviceStatusText, "正在打开 RustDesk 官方下载页…");
     void invoke<OpResult>("open_rustdesk_download_page").then((result) => {
       if (!result) {
@@ -538,12 +576,233 @@ function setupAssistPage(): void {
     });
   });
 
+  // 验证方式分段：只记住选择；真正写进 RustDesk 是在设置页提交长期密码时一起做。
+  const verifyGroup = byId<HTMLDivElement>("verify-method");
+  verifyGroup.querySelectorAll<HTMLButtonElement>(".seg__btn[data-verify]").forEach((btn) => {
+    btn.setAttribute("aria-pressed", btn.classList.contains("is-active") ? "true" : "false");
+    btn.addEventListener("click", () => {
+      const value = btn.dataset.verify;
+      if (value === "temporary" || value === "permanent" || value === "both") {
+        selectVerifyMethod(value);
+      }
+    });
+  });
+
   configHandlers.push(applyServerConfig);
   refreshAssistDevice = loadDeviceCode;
   refreshAssistStatus = loadStatus;
   loadDeviceCode();
   loadStatus();
   loadRecents();
+}
+
+/* ---------- 我的设备：远程协助设备列表 ---------- */
+/**
+ * 数据全部来自 Rust：`get_recent_peers` 给设备码，`get_peer_aliases` 给别名。
+ * 列表行整段用 createElement + textContent 拼，别名是用户输入，绝不能进 innerHTML。
+ */
+function setupDevicesPage(): void {
+  const list = byId<HTMLDivElement>("device-list");
+  // 空状态是 index.html 里的节点：有设备时摘下，列表空了再原样放回。
+  const emptyState = list.querySelector<HTMLDivElement>(".empty");
+  emptyState?.remove();
+
+  const statusLine = document.createElement("p");
+  statusLine.className = "row__sub";
+  statusLine.setAttribute("role", "status");
+  statusLine.setAttribute("aria-live", "polite");
+
+  const showStatus = (text: string, kind?: "ok" | "warn" | "error"): void => {
+    setStatus(statusLine, text, kind);
+    if (text && statusLine.parentElement !== list) {
+      list.append(statusLine);
+    }
+  };
+
+  const connectMode = (): string =>
+    document.querySelector<HTMLInputElement>('input[name="connect-mode"]:checked')?.value ??
+    "control";
+
+  /** 别名的键是规范化后的设备码；两种写法都查一遍。 */
+  const aliasOf = (aliases: Record<string, string>, id: string): string =>
+    aliases[id] ?? aliases[parsePeerId(id) ?? id] ?? "";
+
+  let openMenu: HTMLDivElement | null = null;
+  const closeMenu = (): void => {
+    openMenu?.remove();
+    openMenu = null;
+  };
+
+  const load = (): void => {
+    void Promise.all([
+      invoke<string[]>("get_recent_peers"),
+      invoke<Record<string, string>>("get_peer_aliases"),
+    ]).then(([ids, aliases]) => {
+      const peers = ids ?? [];
+      const map = aliases ?? {};
+      render(peers, map);
+      if (!ids) {
+        showStatus("浏览器预览：命令不可用", "warn");
+      }
+    });
+  };
+
+  const buildRow = (id: string, aliases: Record<string, string>): HTMLDivElement => {
+    const alias = aliasOf(aliases, id);
+    const code = formatDeviceCode(parsePeerId(id) ?? id);
+    const name = alias || code;
+
+    const row = document.createElement("div");
+    row.className = "row";
+
+    // 头像：名称首字（别名优先，其次设备码首字）。
+    const avatar = document.createElement("span");
+    avatar.className = "tag";
+    avatar.setAttribute("aria-hidden", "true");
+    avatar.textContent = Array.from(name)[0] ?? "?";
+
+    const body = document.createElement("span");
+    body.className = "row__body";
+    const label = document.createElement("span");
+    label.className = "row__label";
+    label.textContent = name;
+    const codeLine = document.createElement("span");
+    codeLine.className = "row__sub";
+    const codeEl = document.createElement("code");
+    codeEl.textContent = code;
+    codeLine.append(codeEl);
+    body.append(label, codeLine);
+
+    const connect = document.createElement("button");
+    connect.type = "button";
+    connect.className = "btn btn--sm";
+    connect.textContent = "连接";
+    connect.addEventListener("click", () => {
+      connect.disabled = true;
+      connect.textContent = "连接中";
+      void invoke<OpResult>("connect_peer", { peerId: parsePeerId(id) ?? id, mode: connectMode() }).then(
+        (result) => {
+          connect.disabled = false;
+          connect.textContent = "连接";
+          if (!result) {
+            showStatus("浏览器预览：命令不可用", "warn");
+            return;
+          }
+          showStatus(result.ok ? `正在连接 ${name}…` : result.message, result.ok ? "ok" : "error");
+          if (result.ok) {
+            load();
+          }
+        },
+      );
+    });
+
+    const menu = document.createElement("button");
+    menu.type = "button";
+    menu.className = "link";
+    menu.textContent = "…";
+    menu.setAttribute("aria-label", `${name} 的更多操作`);
+    menu.addEventListener("click", (event) => {
+      // 不拦住冒泡的话，下面文档级监听会在同一轮里把刚开的菜单关掉。
+      event.stopPropagation();
+      openPeerMenu(menu, id, alias, code);
+    });
+
+    row.append(avatar, body, connect, menu);
+    return row;
+  };
+
+  const openPeerMenu = (anchor: HTMLElement, id: string, alias: string, code: string): void => {
+    closeMenu();
+    const menu = document.createElement("div");
+    menu.className = "group";
+    menu.style.position = "fixed";
+    menu.style.zIndex = "70";
+    menu.style.minWidth = "132px";
+    menu.style.padding = "4px";
+    menu.style.boxShadow = "0 14px 34px rgba(0, 0, 0, 0.18)";
+
+    const rename = document.createElement("button");
+    rename.type = "button";
+    rename.className = "link";
+    rename.textContent = "改名";
+    rename.addEventListener("click", () => {
+      closeMenu();
+      const input = window.prompt("设备名称（留空则清除别名）", alias);
+      if (input === null) {
+        return;
+      }
+      void invoke<OpResult>("set_peer_alias", { peerId: parsePeerId(id) ?? id, alias: input }).then(
+        (result) => {
+          if (!result) {
+            showStatus("浏览器预览：命令不可用", "warn");
+            return;
+          }
+          showStatus(result.message, result.ok ? "ok" : "error");
+          if (result.ok) {
+            load();
+          }
+        },
+      );
+    });
+
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "link link--danger";
+    remove.textContent = "删除";
+    remove.addEventListener("click", () => {
+      closeMenu();
+      if (!window.confirm(`从本地记录中删除 ${alias || code}？不会影响对方设备本身。`)) {
+        return;
+      }
+      void invoke<OpResult>("remove_peer", { peerId: parsePeerId(id) ?? id }).then((result) => {
+        if (!result) {
+          showStatus("浏览器预览：命令不可用", "warn");
+          return;
+        }
+        showStatus(result.message, result.ok ? "ok" : "error");
+        if (result.ok) {
+          load();
+        }
+      });
+    });
+
+    menu.append(rename, remove);
+    document.body.append(menu);
+    // 菜单贴着「…」按钮右下角；超出窗口右侧时向左收。
+    const rect = anchor.getBoundingClientRect();
+    const width = menu.offsetWidth || 132;
+    const left = Math.max(8, Math.min(rect.right - width, window.innerWidth - width - 8));
+    menu.style.top = `${Math.round(rect.bottom + 6)}px`;
+    menu.style.left = `${Math.round(left)}px`;
+    openMenu = menu;
+  };
+
+  const render = (ids: string[], aliases: Record<string, string>): void => {
+    list.textContent = "";
+    if (ids.length === 0) {
+      if (emptyState) {
+        list.append(emptyState);
+      }
+    } else {
+      ids.forEach((id) => list.append(buildRow(id, aliases)));
+    }
+    if (statusLine.textContent) {
+      list.append(statusLine);
+    }
+  };
+
+  document.addEventListener("click", (event) => {
+    if (openMenu && !openMenu.contains(event.target as Node)) {
+      closeMenu();
+    }
+  });
+  window.addEventListener("resize", closeMenu);
+
+  refreshDeviceList = (): void => {
+    closeMenu();
+    load();
+  };
+  load();
 }
 
 /* ---------- 设置 ---------- */
@@ -560,6 +819,8 @@ function setupSettingsPage(): void {
   const exportButton = byId<HTMLButtonElement>("export-log");
   const fixedPasswordButton = byId<HTMLButtonElement>("save-fixed-password");
   const fixedPasswordInput = byId<HTMLInputElement>("set-fixed-password");
+  const fixedPasswordConfirm = byId<HTMLInputElement>("set-fixed-password-confirm");
+  const clearPasswordButton = byId<HTMLButtonElement>("clear-fixed-password");
   const trayCheckbox = byId<HTMLInputElement>("set-tray");
 
   // 关闭到托盘：默认开启，启动时把当前勾选状态交给 Rust，变更时再同步。
@@ -826,11 +1087,142 @@ function setupSettingsPage(): void {
     });
   });
 
-  fixedPasswordButton.addEventListener("click", () => {
-    const configured = fixedPasswordInput.value.length > 0;
-    flashLabel(fixedPasswordButton, configured ? "请在 RustDesk 里设置" : "请在 RustDesk 里清除");
-    fixedPasswordInput.value = "";
+  /* ----- 长期密码：两次输入一致 + ≥8 位含字母数字才允许提交 ----- */
+  // 状态行插在「设置 / 清除」按钮行下面；不改 index.html 的结构。
+  const passwordResult = document.createElement("p");
+  passwordResult.className = "row__sub";
+  passwordResult.setAttribute("role", "status");
+  passwordResult.setAttribute("aria-live", "polite");
+  (fixedPasswordButton.closest(".row__actions") ?? fixedPasswordButton).insertAdjacentElement(
+    "afterend",
+    passwordResult,
+  );
+
+  // 协助页的「长期密码」状态行：有就一起更新，没有（别的页面结构）就跳过。
+  const assistPasswordStatus = document.getElementById("password-status");
+
+  /** 与 Rust 侧保持一致：8~64 位、含字母和数字、无控制字符。 */
+  const passwordValid = (value: string): boolean => {
+    if (value.length < 8 || value.length > 64) {
+      return false;
+    }
+    if (/[\u0000-\u001f\u007f]/.test(value)) {
+      return false;
+    }
+    return /\p{L}/u.test(value) && /\d/.test(value);
+  };
+
+  const refreshSubmitState = (): void => {
+    const value = fixedPasswordInput.value;
+    const confirm = fixedPasswordConfirm.value;
+    fixedPasswordButton.disabled = !(passwordValid(value) && value === confirm);
+  };
+
+  const applyPasswordStatus = (status: PasswordStatus): void => {
+    if (assistPasswordStatus) {
+      setStatus(
+        assistPasswordStatus,
+        status.hasPermanent ? "已设置" : "未设置",
+        status.hasPermanent ? "ok" : undefined,
+      );
+    }
+  };
+
+  /** `syncVerify` 为真时才用 RustDesk 里的值覆盖分段高亮（焦点刷新不打断用户选择）。 */
+  const loadPasswordStatus = (syncVerify: boolean): void => {
+    void invoke<PasswordStatus>("get_password_status").then((status) => {
+      if (!status) {
+        if (assistPasswordStatus) {
+          setStatus(assistPasswordStatus, "预览模式：无法读取密码状态", "warn");
+        }
+        return;
+      }
+      applyPasswordStatus(status);
+      if (syncVerify) {
+        selectVerifyMethod(asVerifyMethod(status.verifyMethod));
+      }
+    });
+  };
+
+  refreshPasswordStatus = (): void => {
+    loadPasswordStatus(false);
+  };
+
+  fixedPasswordInput.addEventListener("input", () => {
+    refreshSubmitState();
+    if (!fixedPasswordInput.value) {
+      setStatus(passwordResult, "");
+    } else if (!passwordValid(fixedPasswordInput.value)) {
+      setStatus(passwordResult, "密码需 8-64 位且同时包含字母和数字", "warn");
+    } else if (fixedPasswordConfirm.value && fixedPasswordInput.value !== fixedPasswordConfirm.value) {
+      setStatus(passwordResult, "两次输入的密码不一致", "warn");
+    } else {
+      setStatus(passwordResult, "");
+    }
   });
+
+  fixedPasswordConfirm.addEventListener("input", () => {
+    refreshSubmitState();
+    if (!fixedPasswordConfirm.value) {
+      setStatus(passwordResult, "");
+      return;
+    }
+    setStatus(
+      passwordResult,
+      fixedPasswordInput.value === fixedPasswordConfirm.value ? "" : "两次输入的密码不一致",
+      fixedPasswordInput.value === fixedPasswordConfirm.value ? undefined : "warn",
+    );
+  });
+
+  fixedPasswordButton.addEventListener("click", () => {
+    const password = fixedPasswordInput.value;
+    if (!passwordValid(password)) {
+      setStatus(passwordResult, "密码需 8-64 位且同时包含字母和数字", "error");
+      return;
+    }
+    if (password !== fixedPasswordConfirm.value) {
+      setStatus(passwordResult, "两次输入的密码不一致", "error");
+      return;
+    }
+    fixedPasswordButton.disabled = true;
+    setStatus(passwordResult, "正在请求管理员确认（Windows 会弹一次 UAC）…");
+    void invoke<OpResult>("set_permanent_password", { password, verify: selectedVerify }).then((result) => {
+      // 无论成败都立刻清空两个输入框：密码不在页面上多留一秒。
+      fixedPasswordInput.value = "";
+      fixedPasswordConfirm.value = "";
+      fixedPasswordButton.disabled = true;
+      if (!result) {
+        setStatus(passwordResult, "浏览器预览：命令不可用", "warn");
+        return;
+      }
+      setStatus(passwordResult, result.message, result.ok ? "ok" : "error");
+      if (result.ok) {
+        loadPasswordStatus(true);
+      }
+    });
+  });
+
+  clearPasswordButton.addEventListener("click", () => {
+    if (!window.confirm("清除长期密码后将只能用临时密码连接，确定清除吗？")) {
+      return;
+    }
+    clearPasswordButton.disabled = true;
+    setStatus(passwordResult, "正在请求管理员确认（Windows 会弹一次 UAC）…");
+    void invoke<OpResult>("clear_permanent_password").then((result) => {
+      clearPasswordButton.disabled = false;
+      if (!result) {
+        setStatus(passwordResult, "浏览器预览：命令不可用", "warn");
+        return;
+      }
+      setStatus(passwordResult, result.message, result.ok ? "ok" : "error");
+      if (result.ok) {
+        loadPasswordStatus(true);
+      }
+    });
+  });
+
+  refreshSubmitState();
+  loadPasswordStatus(true);
 }
 
 /* ---------- 我的设备：高性能串流 ---------- */
@@ -1049,6 +1441,7 @@ function main(): void {
   setupNav();
   setupTabs();
   setupAssistPage();
+  setupDevicesPage();
   setupSettingsPage();
   setupStreamingPage();
   setupIncomingDialog();
