@@ -235,3 +235,9 @@
 - **P3 — Documentation is stale.** Correct the README’s PATH fallback and TOML write claims. Update the r7 checklist and remove the trailing spaces flagged by `git diff --check`. 
 
 - t3-r9 P2/P3（测试）：标签唯一性按 Tauri Section 合并检查；宏解析兼容 CRLF；Status getter 推进时钟的超时用例。
+
+## T5 手机扫码配置
+- 设置页「手机扫码配置」行 + 弹层：`get_mobile_config_qr` 读当前 `RustDesk2.toml`，用 `qrcode`（`EcLevel::M`，仅矩阵）生成二维码；
+  内容为官方格式 `config={"host":…,"relay":…,"key":…}`（serde_json 生成，relay 为空省略）。完整公钥只进二维码，视图只回公钥指纹；
+  canvas 白底黑块、4 模块静区、整数像素缩放居中；Esc 与关闭按钮关闭并归还焦点，浏览器预览显示不可用。
+- 单测覆盖 payload（含/不含 relay、空 server、无效 key、JSON 转义）；命令已登记 `build.rs` AppManifest 与 `capabilities/default.json`。
