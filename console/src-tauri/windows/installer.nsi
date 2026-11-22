@@ -130,6 +130,9 @@ Var vegaTargetEmpty
 Var vegaWalkPath
 Var vegaWalkFound
 Var vegaWalkError
+; t6b-fix3（架构裁定 3/5）：最近一次枚举失败的 GetLastError 码（0 = 没有错误）。
+; 预锁定后的重扫用它写中止原因，不再把「读不了」当成「不存在」。
+Var vegaWalkErrCode
 Var vegaTmp1
 Var vegaTmp2
 Var vegaTmp3
@@ -586,10 +589,11 @@ vega_install_target_ok:
     DetailPrint "安装目录已规范为 $INSTDIR"
 vega_install_target_same:
 
-  ; t6b-fix2（架构裁定 1）：先建目录并锁定 ACL，再解包任何文件。此时还没有
+  ; t6b-fix3（架构裁定 2/3）：先建目录并做预锁定，再解包任何文件。此时还没有
   ; SetOutPath / File，锁不住就直接中止，文件不会落进普通账户可改的目录。
-  ; 三条 icacls 任一失败 → 固定提示 + SetErrorLevel 2 + Abort（静默安装靠 /SD IDOK
-  ; 自动跳过提示）。POSTINSTALL 还会再锁一次（第二次失败只写完成页告警）。
+  ; 预锁定顺序是「先断继承 → setowner → 对已有子树 /reset → 重新 grant」，四条
+  ; icacls 任一失败 → 固定提示 + SetErrorLevel 2 + Abort（静默安装靠 /SD IDOK
+  ; 自动跳过提示）。POSTINSTALL 只做无 /reset 的收紧（失败只写完成页告警）。
   CreateDirectory "$INSTDIR"
   Call VegaLockInstallDir
   StrCmp $vegaAclWarning "" vega_install_lock_ok
@@ -598,6 +602,25 @@ vega_install_target_same:
     SetErrorLevel 2
     Abort
 vega_install_lock_ok:
+
+  ; t6b-fix3（架构裁定 3）：预锁定完成后**再次**完整扫描目标树。第一次扫描在
+  ; VegaValidateTarget 里，跑在目录为空之前/之时；这里重扫是因为 icacls /reset /T
+  ; 与 /T 授权都会沿着重解析点走到目录外（目标树在这一小段时间里可能被换成链接），
+  ; 发现任何重解析点或枚举错误就中止：此刻还没解包，退出码 2 干净收场。
+  StrCpy $vegaWalkPath "$INSTDIR"
+  StrCpy $vegaWalkFound "0"
+  StrCpy $vegaWalkError "0"
+  StrCpy $vegaWalkErrCode "0"
+  Call VegaScanReparseTree
+  StrCmp $vegaWalkError "1" vega_install_rescan_bad
+  StrCmp $vegaWalkFound "1" vega_install_rescan_bad
+  Goto vega_install_rescan_ok
+vega_install_rescan_bad:
+    DetailPrint "安装已中止：安装目录或子项是重解析点，或无法枚举（错误码 $vegaWalkErrCode）"
+    MessageBox MB_OK|MB_ICONSTOP "安装目录或其子项在锁定 ACL 后变成重解析点（junction 或符号链接），或无法读取。出于安全原因拒绝安装。" /SD IDOK
+    SetErrorLevel 2
+    Abort
+vega_install_rescan_ok:
 
   SetOutPath $INSTDIR
 

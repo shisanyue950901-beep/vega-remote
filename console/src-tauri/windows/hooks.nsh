@@ -450,55 +450,68 @@ vega_reparse_done_${ID}_${__LINE__}:
   Pop $0
 !macroend
 
-; t6b-fix（架构裁定）：安装完成后**总是**用 icacls 重置并锁定安装目录 ACL。
+; t6b-fix（架构裁定）：安装目录的 ACL **总是**用 icacls 收紧（解包前预锁定 + 解包后收紧）。
 ; 为什么必须收紧：长期密码助手 resources\vega-pwhelper.ps1 由控制台以 runas 提权执行，
 ; 如果普通用户能改这个文件（或把它换掉、把所在目录换成 junction），等于把提权执行权交给
 ; 普通用户。$PROGRAMFILES64\Vega 靠继承 ACL 本来是对的，但旧版自选目录（D:\Vega 之类）
 ; 和继承了盘根 Users 写权限的目录都不可信，而且同一台机器上可能残留旧的显式 ACE，
-; 所以两种位置一视同仁，顺序固定三条命令，每条都检查退出码：
-;   1. /reset /T      —— 先清掉所有显式 ACE 与继承标记，回到继承状态；旧自定义目录里
-;                        残留的个人账户 / Authenticated Users 显式写权限就是这一步清掉的
-;                        （/inheritance:r 与 /grant:r 只覆盖列出的 SID，清不掉别的 ACE）。
-;   2. /setowner      —— 所有者改成 Administrators（BUILTIN\Administrators = S-1-5-32-544），
-;                        否则原所有者仍可能改回 DACL。
-;   3. /inheritance:r /grant:r —— 只给 SYSTEM、Administrators 完全控制，Users 只读+执行
-;                        （与 Program Files 的默认 ACL 等价）。
-; 按 SID 授权，中文/本地化系统里账户名不同也不会失配。
-; 失败结果写进 $vegaAclWarning（空 = 三条都成功）：安装节开头的预锁定调用据此
-; SetErrorLevel 2 + Abort（此时还没解包任何文件）；POSTINSTALL 的第二次调用只把
-; 它追加到完成页（程序已经装好了）。$SYSDIR 绝对路径调用 icacls：提权上下文里
+; 按 SID 授权，中文/本地化系统里账户名不同也不会失配。$SYSDIR 绝对路径调用 icacls：
+; 提权上下文里按名称搜索会被 PATH 劫持。
 ;
-; t6b-fix3（架构裁定 2）：**解包之后不许再 `/reset`。** 这一条最要命：解包出来的
-; 文件/目录此刻靠继承拿到正确 ACL，`/reset` 先把它们打回继承态（目录被改成可继承
-; 之前先「无 ACE」的一瞬）再靠 `/T` 重新下发；盘根继承了 Users 写权限的机器上，
-; 普通账户就在这个窗口里能替换刚写好的 vega-console.exe / 提权助手，等于把 runas
-; 执行权交出去。所以：
-;   * VegaLockInstallDir（解包前预锁定）保留三条命令，含唯一允许的 `/reset /T`
-;     —— 那时目标目录还是空壳，清的是上一版遗留的显式 ACE；
-;   * VegaTightenInstallDir（解包后，POSTINSTALL 调用）只有 setowner 与
-;     inheritance:r / grant:r 两条，绝不动 `/reset`。
-; 按名称搜索会被 PATH 劫持。
+; t6b-fix3（架构裁定 2/3）—— 解包前的预锁定，顺序固定四条命令，每条都检查退出码：
+;   1. /inheritance:r /grant:r（**只对 $INSTDIR 本身，不带 /T**）
+;                     —— CreateDirectory 之后**先断继承**：目录一被创建就继承了盘根的
+;                        ACE（盘根给 Users 写权限时不罕见），先断开再谈其它，后面所有
+;                        步骤都跑在一个不再受盘根继承影响的目标上。
+;   2. /setowner *S-1-5-32-544 /T —— 所有者改成 Administrators，否则原所有者仍可能
+;                        改回 DACL。
+;   3. /reset /T   —— 对**已有子树**清掉所有显式 ACE 与继承标记，回到继承状态；旧自定义
+;                        目录里残留的个人账户 / Authenticated Users 显式写权限就是这一步
+;                        清掉的（1 与 4 的 /grant:r 只覆盖列出的 SID，清不掉别的 ACE）。
+;                        `/reset` 只允许出现在这里——解包之后禁止（见下）。
+;   4. /inheritance:r /grant:r ... /T —— 子树重新按 SID 下发：SYSTEM、Administrators
+;                        完全控制，Users 只读+执行（与 Program Files 的默认 ACL 等价）。
+; 失败结果写进 $vegaAclWarning（空 = 四条都成功）：安装节开头的预锁定调用据此
+; SetErrorLevel 2 + Abort（此时还没解包任何文件）。
+;
+; t6b-fix3（架构裁定 2）：**解包之后不许再 `/reset`。** 解包出来的文件/目录此刻靠继承
+; 拿到正确 ACL，`/reset` 先把它们打回继承态再靠 `/T` 重新下发；盘根继承了 Users 写权限
+; 的机器上，普通账户就在这个窗口里能替换刚写好的 vega-console.exe / 提权助手，等于把
+; runas 执行权交出去。所以 POSTINSTALL 只调 VegaTightenInstallDir（setowner +
+; inheritance:r / grant:r 两条，绝不动 `/reset`）。
+;
+; 残余风险（架构裁定 3）：CreateDirectory 到第 1 条断继承之间仍有一瞬目录继承着盘根
+; ACL，这一瞬的替换风险不在这份脚本能消除的范围内，已记在 ROADMAP「T6 加固」。
 Function VegaLockInstallDir
   Push $0
   Push $1
   Push $2
+  Push $3
   StrCpy $vegaAclWarning ""
-  DetailPrint "重置并锁定安装目录权限（仅管理员可写）：$INSTDIR"
-  nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR" /reset /T /C /Q'
+  DetailPrint "锁定安装目录权限（解包前，仅管理员可写）：$INSTDIR"
+  ; 1. 先断继承：只作用于目标目录本身，不去动已有子树（下一步 /reset 处理子树）。
+  nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /C /Q'
   Pop $0
+  ; 2. 所有者改成 Administrators。
   nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR" /setowner *S-1-5-32-544 /T /C /Q'
   Pop $1
-  nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /T /C /Q'
+  ; 3. 已有子树回到继承状态（唯一允许的 /reset：解包前）。
+  nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR" /reset /T /C /Q'
   Pop $2
-  ; 三条逐条检查（nsExec::ExecToLog 返回 "0"，失败返回退出码或 "error"）。
+  ; 4. 子树重新下发最终 ACL（顺带把目标目录本身再断一次继承）。
+  nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /T /C /Q'
+  Pop $3
+  ; 四条逐条检查（nsExec::ExecToLog 返回 "0"，失败返回退出码或 "error"）。
   StrCmp $0 "0" 0 vega_acl_fail
   StrCmp $1 "0" 0 vega_acl_fail
   StrCmp $2 "0" 0 vega_acl_fail
+  StrCmp $3 "0" 0 vega_acl_fail
   Goto vega_acl_done
 vega_acl_fail:
-  StrCpy $vegaAclWarning "安装目录权限设置失败（icacls 返回 $0/$1/$2），长期密码不可用"
+  StrCpy $vegaAclWarning "安装目录权限设置失败（icacls 返回 $0/$1/$2/$3），长期密码不可用"
   DetailPrint "$vegaAclWarning"
 vega_acl_done:
+  Pop $3
   Pop $2
   Pop $1
   Pop $0
