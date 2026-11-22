@@ -378,14 +378,17 @@ fn helper_script(app: &tauri::AppHandle) -> Option<PathBuf> {
 ///
 /// 位置对了不等于安全：`Program Files` 下被手工建出来的目录完全可以带宽松 ACL，
 /// 所以不再有「前缀命中就直接放行」的快路径，一律走完整校验：
-///   1. 安装目录形状必须是上面两条之一；
-///   2. exe、exe_dir、resources、助手文件四段原始路径都不是重解析点，
-///      且 `canonicalize` 结果与原始路径一致（校验途中不能被链接换走）；
-///   3. exe_dir 的每一级祖先（直到盘根，含 `Program Files` 根）所有者必须是
+///   1. 安装目录形状必须是上面两条之一（按未规范化的原始路径判定）；
+///   2. **先**用原始路径把所有重解析点筛掉：exe、exe_dir、resources、助手文件，
+///      以及 exe_dir 直到盘根的每一级祖先，任何一处是 junction/symlink 就拒绝；
+///   3. **再** `canonicalize`，要求规范化结果与原始路径一致（校验途中不能被链接换走）；
+///   4. exe_dir 的每一级祖先（直到盘根，含 `Program Files` 根）所有者必须是
 ///      SYSTEM / Administrators / TrustedInstaller，且不能把删除子项、改写 ACL、
 ///      改所有者、完全控制授予其他主体（建子目录/建文件允许）；
-///   4. exe_dir、resources、助手文件三层的所有者与 DACL 只允许上面三个主体写入。
-/// 任何一条不满足都返回固定文案 `INSECURE_INSTALL_DIR`，前端直接显示。
+///   5. exe_dir、resources、助手文件三层的所有者与 DACL 只允许上面三个主体写入。
+/// 2 与 3 的先后是刻意的：先规范化再判重解析点的话，链接可能在校验期间把路径换走，
+/// 规范化后的路径看着安全，实际打开的仍是链接目标。任何一条不满足都返回固定文案
+/// `INSECURE_INSTALL_DIR`，前端直接显示。
 #[cfg(all(windows, not(debug_assertions)))]
 fn ensure_helper_location(helper: &Path) -> Result<PathBuf, String> {
     validate_helper_location(helper).ok_or_else(|| INSECURE_INSTALL_DIR.to_string())
@@ -398,23 +401,37 @@ fn validate_helper_location(helper: &Path) -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let raw_exe_dir = exe.parent()?.to_path_buf();
     let raw_resources = raw_exe_dir.join("resources");
-    // 1. 位置规则：`<X>:\Vega` 或 `<ProgramFiles>\Vega`。
+    // 1. 位置规则：`<X>:\Vega` 或 `<ProgramFiles>\Vega`（原始路径判定）。
     if !allowed_install_dir(&raw_exe_dir, &crate::winpaths::program_files_dirs()) {
         return None;
     }
-    // 2. 先按未规范化的原始路径验重解析点，再要求 canonicalize 结果与原始路径一致。
-    for raw in [exe.as_path(), raw_exe_dir.as_path(), raw_resources.as_path(), helper] {
-        if !raw_matches_canonical(raw) {
+    // 2. 原始路径重解析点：整组先跑完，此时一次 `canonicalize` 都还没调用，
+    //    比较基准仍是 `current_exe` 给出的未规范化路径。祖先链也在这里一起筛
+    //    （junction 祖先可以把 exe_dir 悄悄指到别处）。
+    let ancestors = ancestor_chain(&raw_exe_dir);
+    let raw_paths: [&Path; 4] = [exe.as_path(), raw_exe_dir.as_path(), raw_resources.as_path(), helper];
+    let has_reparse = raw_paths
+        .iter()
+        .copied()
+        .chain(ancestors.iter().map(PathBuf::as_path))
+        .any(crate::winpaths::is_reparse_point);
+    if has_reparse {
+        return None;
+    }
+    // 3. 原始路径干净之后才规范化，并要求规范化结果与原始路径一致：
+    //    校验途中路径被换成链接、或短名/大小写解析出了替代路径，都在这里露出来。
+    for raw in raw_paths {
+        if !canonical_matches_raw(raw) {
             return None;
         }
     }
-    // 3. 祖先链：exe_dir 的每一级父目录直到盘根，都不能把控制权交给非管理员。
-    for ancestor in ancestor_chain(&raw_exe_dir) {
-        if !path_ancestor_admin_only_control(&ancestor) {
+    // 4. 祖先链 ACL：exe_dir 的每一级父目录直到盘根，都不能把控制权交给非管理员。
+    for ancestor in &ancestors {
+        if !path_ancestor_admin_only_control(ancestor) {
             return None;
         }
     }
-    // 4. 三层 DACL：安装目录、resources、助手文件；助手必须在 resources 里。
+    // 5. 三层 DACL：安装目录、resources、助手文件；助手必须在 resources 里。
     let canonical_exe_dir = std::fs::canonicalize(&raw_exe_dir).ok()?;
     let canonical_resources = std::fs::canonicalize(&raw_resources).ok()?;
     let canonical_helper = std::fs::canonicalize(helper).ok()?;
@@ -448,8 +465,9 @@ fn ensure_helper_location(helper: &Path) -> Result<PathBuf, String> { Ok(strip_e
 //   * 不再有「在 Program Files 前缀下就跳过检查」的快路径：`Program Files` 里被手工
 //     建出来、带宽松 ACL 的子目录一样危险，所以 `Program Files\Vega` 也必须过同一套校验；
 //   * 助手必须在 `<exe_dir>\resources` 里，exe_dir 是当前控制台 exe 的真实目录；
-//   * exe、exe_dir、exe_dir\resources、助手文件四段原始路径都不能是重解析点
-//     （junction/symlink），且 canonicalize 之后必须与原始路径一致；
+//   * 校验顺序固定：先用未规范化的原始路径判定 exe、exe_dir、exe_dir\resources、
+//     助手文件，以及 exe_dir 直到盘根的每一级祖先都不是重解析点（junction/symlink）；
+//     全部筛过之后才 canonicalize，并要求规范化结果与原始路径一致；
 //   * exe_dir 的每一级祖先直到盘根（含 `Program Files` 根）都不能把删除子项、改写 ACL、
 //     改所有者、完全控制授予非管理员主体，所有者本身也必须是受信任主体；
 //   * exe_dir、exe_dir\resources、助手文件三者的所有者必须是 SYSTEM / Administrators /
@@ -632,19 +650,14 @@ fn allowed_install_dir(exe_dir: &Path, program_files: &[PathBuf]) -> bool {
         .any(|root| same_path(&parent, &strip_extended_prefix(root)))
 }
 
-/// 原始路径不是重解析点，并且 `canonicalize` 之后与原始路径一致（去前缀、忽略大小写）。
-/// `winpaths::is_reparse_point` 在拿不到属性时也返回 true，因此这里不再单独处理
-/// `INVALID_FILE_ATTRIBUTES`。
+/// `canonicalize` 之后是否与原始路径一致（去 `\\?\` 前缀、忽略大小写）。
+/// 只负责「规范化有没有把路径带到别处」；重解析点判定已在前一步用原始路径完成，
+/// 不在这里重复（`canonicalize` 本身也会跟随链接，但那时原始路径已确认干净）。
 #[cfg(windows)]
 #[allow(dead_code)]
-fn raw_matches_canonical(raw: &Path) -> bool {
-    if crate::winpaths::is_reparse_point(raw) {
-        return false;
-    }
+fn canonical_matches_raw(raw: &Path) -> bool {
     match std::fs::canonicalize(raw) {
-        Ok(canonical) => {
-            same_path(&strip_extended_prefix(&canonical), &strip_extended_prefix(raw))
-        }
+        Ok(canonical) => same_path(&canonical, raw),
         Err(_) => false,
     }
 }
