@@ -10,6 +10,8 @@
     "core:window:allow-close",
     "core:window:allow-start-dragging",
     "updater:default",
+    "allow-check-update",
+    "allow-install-update",
     "allow-set-close-to-tray",
     "allow-get-device-id",
     "allow-get-server-config",
