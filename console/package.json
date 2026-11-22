@@ -1,7 +1,7 @@
 {
   "name": "vega-console",
   "private": true,
-  "version": "0.6.2",
+  "version": "0.6.3",
   "description": "Vega 远程协助控制台（Tauri 2 + 原生 HTML/CSS/TS）",
   "license": "MIT",
   "type": "module",

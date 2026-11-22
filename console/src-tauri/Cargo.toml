@@ -1,6 +1,6 @@
 [package]
 name = "vega-console"
-version = "0.6.2"
+version = "0.6.3"
 description = "Vega 远程协助控制台（Tauri 2 外壳）"
 authors = ["Vega Remote"]
 license = "MIT"
