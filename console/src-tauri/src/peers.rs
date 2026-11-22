@@ -56,6 +56,23 @@ pub(crate) fn read_aliases_at(path: &Path) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// 严格读别名：文件不存在算空表，读取或解析失败返回错误。
+///
+/// 删除设备前用它，避免把「别名文件读坏了」当成「没有别名」。
+pub(crate) fn read_aliases_strict_at(path: &Path) -> Result<BTreeMap<String, String>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(format!("读取别名文件失败：{e}")),
+    };
+    let raw = serde_json::from_str::<BTreeMap<String, String>>(&text)
+        .map_err(|e| format!("别名文件内容损坏：{e}"))?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|(id, alias)| Some((normalize_peer_id(&id).ok()?, normalize_alias(&alias).ok()?)))
+        .collect())
+}
+
 pub(crate) fn write_aliases_at(path: &Path, aliases: &BTreeMap<String, String>) -> Result<(), String> {
     let text = serde_json::to_string_pretty(aliases).map_err(|e| format!("序列化别名失败：{e}"))?;
     rustdesk::write_atomic(path, &text)
@@ -82,21 +99,23 @@ pub(crate) fn write_recent_at(path: &Path, list: &[String]) -> Result<(), String
         serde_json::to_string_pretty(&payload).map_err(|e| format!("序列化最近设备码失败：{e}"))?;
     rustdesk::write_atomic(path, &text)
 }
-/// 删除本地记录：先删别名，再写 recent。
+/// 删除本地记录：先把两份数据都读成功，再删别名、写 recent。
 ///
-/// 别名残留是无害的（下次改名会覆盖、列表里也不会再出现），recent 残留则会让
-/// 设备在「最近连接」里再次显示，所以把易失败的那一步放前面：别名写失败直接
-/// 返回、recent 保持原样；recent 写失败则明确告知别名已移除、需要重试。
-/// 不做跨实例锁（见 ROADMAP「T4 加固」）。
+/// 任一文件读取或解析失败就直接返回错误、**不做任何删除**：recent 读不出来时若只删了
+/// 别名，上层会凭「别名已删」报成功，而设备仍留在「最近连接」里。读取之后的写入顺序
+/// 仍是先别名后 recent（recent 写失败会明确告知别名已移除、需要重试）；
+/// 跨实例锁与两文件失败恢复见 ROADMAP「T4 加固」。
 pub(crate) fn remove_peer_at(recent: &Path, aliases: &Path, peer_id: &str) -> Result<bool, String> {
     let id = normalize_peer_id(peer_id)?;
-    let mut map = read_aliases_at(aliases);
+    let mut map = read_aliases_strict_at(aliases)
+        .map_err(|e| format!("{e}，未做任何删除"))?;
+    let mut list = rustdesk::read_recent_peers_strict_at(recent)
+        .map_err(|e| format!("{e}，未做任何删除"))?;
     let alias_removed = map.remove(&id).is_some();
     if alias_removed {
         write_aliases_at(aliases, &map)
             .map_err(|e| format!("移除本地别名失败，最近记录未改动：{e}"))?;
     }
-    let mut list = rustdesk::read_recent_peers_at(recent);
     let before = list.len();
     list.retain(|entry| entry != &id);
     let recent_removed = list.len() != before;
@@ -201,6 +220,34 @@ mod tests {
         set_alias_at(&aliases, "123456789", "只剩别名").unwrap();
         assert!(remove_peer_at(&recent, &aliases, "123456789").unwrap());
         assert!(read_aliases_at(&aliases).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn remove_peer_refuses_when_recent_corrupted() {
+        let dir = temp_dir("corrupt-recent");
+        let recent = dir.join("recent-ids.json");
+        let aliases = dir.join(ALIAS_FILE);
+        set_alias_at(&aliases, "123456789", "要保留的别名").unwrap();
+        std::fs::write(&recent, "{not json").unwrap();
+        let err = remove_peer_at(&recent, &aliases, "123456789").unwrap_err();
+        assert!(err.contains("未做任何删除"), "{err}");
+        assert_eq!(
+            read_aliases_at(&aliases).get("123456789").map(String::as_str),
+            Some("要保留的别名"),
+            "recent 读失败时不能删别名"
+        );
+        assert_eq!(std::fs::read_to_string(&recent).unwrap(), "{not json", "recent 也不能被改写");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn remove_peer_refuses_when_aliases_corrupted() {
+        let dir = temp_dir("corrupt-aliases");
+        let recent = dir.join("recent-ids.json");
+        let aliases = dir.join(ALIAS_FILE);
+        write_recent_at(&recent, &["123456789".to_string()]).unwrap();
+        std::fs::write(&aliases, "[1,2,3").unwrap();
+        assert!(remove_peer_at(&recent, &aliases, "123456789").is_err());
+        assert_eq!(rustdesk::read_recent_peers_at(&recent), vec!["123456789".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
