@@ -101,8 +101,16 @@ fn build_updater(app: &AppHandle, endpoint: &str, timeout: Duration) -> Result<U
     let url = endpoint
         .parse::<tauri::Url>()
         .map_err(|_| "更新端点配置无效".to_string())?;
-    app.updater_builder()
-        .timeout(timeout)
+    let builder = app.updater_builder().timeout(timeout);
+    // 镜像在国内，必须直连：开着 VPN/Clash 时系统代理会把对镜像的请求吞掉，
+    // 镜像日志里连一条请求都看不到。这里只对镜像端点关闭代理，检查与随后的
+    // 下载都走同一个 updater，因此下载同样直连；GitHub 端点仍走系统代理。
+    let builder = if endpoint == MIRROR_ENDPOINT {
+        builder.no_proxy()
+    } else {
+        builder
+    };
+    builder
         .endpoints(vec![url])
         .map_err(|_| "更新端点配置无效".to_string())?
         .build()
