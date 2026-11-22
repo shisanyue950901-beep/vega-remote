@@ -1085,6 +1085,25 @@ function setupSettingsPage(): void {
   const QR_QUIET_ZONE = 4;
 
   /**
+   * 上下文是否已经丢失。丢失后 `fillRect` 不报错也不写像素，画布会白屏，
+   * 所以绘制前必须问一句。老实现没有 `isContextLost()`，只能退回 null 判断。
+   */
+  const mobileContextIsLost = (): boolean => {
+    if (!mobileContext) {
+      return false;
+    }
+    const isLost = mobileContext.isContextLost;
+    if (typeof isLost !== "function") {
+      return false;
+    }
+    try {
+      return isLost.call(mobileContext) === true;
+    } catch {
+      return false;
+    }
+  };
+
+  /**
    * 清空空画布。context 不可用时返回 false，调用方不得再显示成功状态。
    */
   const clearMobileCanvas = (): boolean => {
@@ -1107,6 +1126,11 @@ function setupSettingsPage(): void {
   const drawMobileQr = (view: MobileQrView): boolean => {
     if (!mobileContext) {
       setStatus(mobileStatus, "当前环境不支持 canvas，请更新系统或显卡驱动后重试", "error");
+      return false;
+    }
+    // 已经丢了上下文就别画：白底黑块都写不进去，画完还报成功等于骗人。
+    if (mobileContextIsLost()) {
+      setStatus(mobileStatus, "绘制二维码失败，请重试", "error");
       return false;
     }
     const size = view.size;
@@ -1162,9 +1186,20 @@ function setupSettingsPage(): void {
 
   const closeMobileSheet = (): void => {
     mobileGeneration += 1;
+    mobileCanvas.removeEventListener("contextlost", handleMobileContextLost);
     if (mobileSheet.open) {
       mobileSheet.close();
     }
+  };
+
+  /**
+   * 弹层打开期间 GPU 掉了会触发 contextlost：这时画布上什么都没了，
+   * 继续显示「当前 ID 服务器」就是白屏配成功。直接翻成绘制失败，
+   * 并作废进行中的请求，免得迟到的结果又把状态写回 ok。
+   */
+  const handleMobileContextLost = (): void => {
+    mobileGeneration += 1;
+    setStatus(mobileStatus, "绘制二维码失败，请重试", "error");
   };
 
   const openMobileSheet = (): void => {
@@ -1172,6 +1207,7 @@ function setupSettingsPage(): void {
     if (!mobileSheet.open) {
       mobileSheet.showModal();
     }
+    mobileCanvas.addEventListener("contextlost", handleMobileContextLost);
     mobileClose.focus();
     clearMobileCanvas();
     if (!window.__TAURI__?.core) {
@@ -1208,6 +1244,8 @@ function setupSettingsPage(): void {
   });
   mobileSheet.addEventListener("close", () => {
     mobileGeneration += 1;
+    // Esc / cancel 走的是浏览器自己关弹层，这里统一摘掉 contextlost 监听。
+    mobileCanvas.removeEventListener("contextlost", handleMobileContextLost);
     mobileButton.focus();
   });
 
