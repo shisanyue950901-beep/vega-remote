@@ -20,6 +20,7 @@
 - [ ] 下载失败场景（断网或代理拦截）：同样只提示，不阻断 Vega 安装；`%ProgramData%\Vega\logs\setup.log` 有失败原因。
 - [ ] 卸载 Vega 后，`RustDesk2.toml` 的三个受管键恢复为安装前的值（或整行删除），用户原有 RustDesk 保留。
 - [ ] 设置页「默认中继」一行显示安装包默认值与 RustDesk 当前配置；手动改过 RustDesk 中继时会显示不一致提示。
+- [ ] 旧版装在 D 盘 → 安装新版后 D 盘旧目录被移除、配置保留（`%ProgramData%\Vega`、RustDesk 配置与用户 AppData 都还在）。
 
 ## 1. 脚本安装
 - [ ] A：管理员 PowerShell，`Set-ExecutionPolicy -Scope Process Bypass -Force`，`.\host\install-host.ps1`，无报错结束。
