@@ -31,8 +31,10 @@
 ;      t6b-fix2 接着 CreateDirectory + Call VegaLockInstallDir 预锁定 ACL，任何一条
 ;      icacls 失败都在解包之前中止；POSTINSTALL 再锁第二次（失败只写完成页告警）。
 ;      t6c 起两层都调共用的四步 VegaApplyInstallDirAcl：根 /setowner → 根 DACL 用 SDDL
-;      精确替换（受保护 DACL）→ /setowner /T → 子项 "$INSTDIR\*" /reset /T（三态枚举，
-;      确认空则跳过，枚举失败即失败）。根目录绝不再带 /T 做断继承。
+;      精确替换（受保护 DACL）→ 子项 "$INSTDIR\*" /reset /T（三态枚举，确认空则跳过，
+;      枚举失败即失败）→ /setowner /T。先 /reset 后 /setowner /T，让 0.6.1 空 DACL 的
+;      子项先继承根目录的 Administrators 完全控制、拿到 WRITE_OWNER，再改所有者才不会
+;      被拒绝。根目录绝不再带 /T 做断继承。
 ;
 ; 为什么不用宏覆盖：MUI2.nsh 在 include 时就把 MUI_PAGE_DIRECTORY 展开成页面序号，
 ; hooks.nsh 里 !undef + 空宏不起作用（页面照样出现）。只能改模板本体。
@@ -626,8 +628,8 @@ vega_install_target_same:
   ; t6b-fix3（架构裁定 2/3）+ t6c（架构裁定 3）：先建目录并做预锁定，再解包任何文件。
   ; 此时还没有 SetOutPath / File，锁不住就直接中止，文件不会落进普通账户可改的目录。
   ; 预锁定四步（共用 VegaApplyInstallDirAcl）：根 /setowner → 根 DACL 用 SDDL 精确替换
-  ; （替换全部 ACE，受保护 DACL）→ /setowner /T → 子项三态枚举并按需
-  ; `"$INSTDIR\*" /reset /T`（确认为空则跳过，枚举失败即失败）；任一失败 → 固定提示 +
+  ; （替换全部 ACE，受保护 DACL）→ 子项三态枚举并按需 `"$INSTDIR\*" /reset /T`（确认为空
+  ; 则跳过，枚举失败即失败）→ /setowner /T；任一失败 → 固定提示 +
   ; SetErrorLevel 2 + Abort（静默安装靠 /SD IDOK 自动跳过提示）。
   ; POSTINSTALL 用同样的四步再收紧一次（失败只写完成页告警）。
   CreateDirectory "$INSTDIR"
