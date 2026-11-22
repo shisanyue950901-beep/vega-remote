@@ -9,9 +9,14 @@
 
 ## 0.5 安装包（Vega-Setup.exe）
 - [ ] Actions → Console → Artifacts 下载 `vega-setup-windows`，解压得 `Vega-Setup.exe`。
-- [ ] 双击后只弹一次 UAC；安装界面是简体中文且没有语言选择框，**也没有「选择安装目录」页**（定制模板已删除该页，路径固定、不可改）。
-- [ ] 装完 `C:\Program Files\Vega\resources\vega-defaults.json` 存在，且与仓库里的默认中继一致。
-- [ ] `C:\Program Files\Vega\resources\host\install-rustdesk.ps1` 与 `...\host\lib\Vega.Common.psm1` 都存在。
+- [ ] 双击后只弹一次 UAC；安装界面是简体中文且没有语言选择框，**有「选择安装目录」页**，默认 `C:\Program Files\Vega`（T6b 恢复该页，允许自选本地目录）。
+- [ ] 选 `D:\Vega` 安装：装完后 `icacls D:\Vega` 里所有者是 `BUILTIN\Administrators`，只有 SYSTEM/Administrators 完全控制、`BUILTIN\Users` 只有 `(OI)(CI)(RX)`，且没有继承来的 Users 写权限（`(I)` 拒绝项不该出现写权限）。
+- [ ] 在 D:\Vega 安装上设置长期密码成功（控制台通过自选目录的 ACL 校验）。
+- [ ] 手动 `icacls D:\Vega /grant *S-1-5-32-545:(OI)(CI)M` 放开 Users 写权限后，再设置长期密码被拒绝，提示「Vega 安装目录权限不安全，无法设置长期密码。请重新运行安装包修复。」；恢复 ACL（重新运行安装包或按上面的 icacls 收紧）后又能设置。
+- [ ] 目录页校验：填 `D:\`（盘根）、`\\server\share\Vega`（UNC）、U 盘/光驱路径、以及一个已存在且非空的普通目录（例如先建 `D:\Test` 并放一个文件）都被拒绝并弹出提示；填 `D:\Vega2` 时实际安装到 `D:\Vega2\Vega`（自动补末段 `Vega`）。
+- [ ] 已装在 `D:\Vega` 的机器上重装 / 在线更新（`/P` 被动模式）：目录页默认值、静默安装的 `$INSTDIR` 都仍是 `D:\Vega`，不会跳回 Program Files，且不触发旧目录迁移。
+- [ ] 装完 `<安装目录>\resources\vega-defaults.json`（默认位置是 `C:\Program Files\Vega\resources\`）存在，且与仓库里的默认中继一致。
+- [ ] `<安装目录>\resources\host\install-rustdesk.ps1` 与 `...\host\lib\Vega.Common.psm1` 都存在。
 - [ ] `%ProgramData%\Vega\logs\setup.log` 有本次安装记录和 `[nsis] install-rustdesk.ps1 exit code:` 一行。
 - [ ] 全新安装（之前没有 Vega）但已装 RustDesk 的机器：日志显示「已安装 RustDesk，跳过安装」，中继配置仍被写入。覆盖重装 Vega 的情形见下方「跳过 RustDesk 脚本」一项。
 - [ ] 未装 RustDesk 的机器：安装包自动下载固定版本并 SHA256 校验通过后静默安装；RustDesk 服务出现在服务列表。

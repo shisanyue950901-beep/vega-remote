@@ -34,14 +34,29 @@
 替换自己 `%LOCALAPPDATA%` 下文件（或已拿到管理员）的本地攻击者**不在范围内**——那种对手本来就能读 RustDesk
 配置、改 `recent-ids.json`、或在 UAC 之后动助手输入，任何进程内校验都挡不住。所有验证方式回读都依赖 RustDesk
 服务处于运行状态：服务未运行时 `--option` 可能只写进 CLI 账户的本地配置，此时助手以 12 退出、不做「已生效」的结论。
-本节还假设安装目录保持 Program Files 的默认权限；管理员若人为放宽该目录权限（让普通用户可写），
-则长期密码助手可能被普通用户替换，这属于管理员误配置，不在本节防护范围内。
+本节假设安装目录的权限没有被管理员事后放宽（让普通用户可写）——见下面「安装目录权限」一条，
+控制台对自选目录会在每次提权前自己校验 ACL。
 
 - **一次性 UAC**：控制台用 `ShellExecuteExW` 的 `runas` 直接拉起系统 PowerShell，参数只有
   `-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "<安装目录>\resources\vega-pwhelper.ps1" -InputFile "<载荷>"`，
   PowerShell 与助手都用系统绝对路径。只有助手进程是管理员，它读完载荷、设好密码就退出；控制台始终以普通用户身份运行。
 - **只认打包目录内的助手**：发行版只使用 Tauri 资源目录里的 `vega-pwhelper.ps1`，没有源码目录回退；助手定位
   RustDesk 时只读 `[Environment]::GetFolderPath('ProgramFiles')` 下的固定路径，不接受 `VEGA_RUSTDESK_EXE` 等环境覆盖。
+- **安装目录权限（v0.6.1 / T6b）**：安装目录不再固定为 `C:\Program Files\Vega`，用户可以在安装包里选任意
+  本地固定磁盘的 NTFS 目录（例如 `D:\Vega`；UNC、U 盘/光驱/网络盘、盘根、已存在且非空的非 Vega 目录会被拒绝）。
+  为了让助手仍然只可能被管理员替换，做了两层约束：
+  1. **安装器收紧 ACL**：安装完成后，只要安装目录不在 `Program Files` 下，安装器就用
+     `icacls /setowner *S-1-5-32-544` 把所有者改成 Administrators，再用
+     `/inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX`
+     递归收紧成「SYSTEM、Administrators 完全控制，Users 只读执行」——等价于 Program Files 的默认权限。
+     失败时安装照常完成，但完成页明确提示「安装目录权限设置失败，长期密码不可用」。
+  2. **控制台每次提权前校验**：`ensure_helper_location` 只接受两类助手位置——`Program Files`（含 x86），
+     或「助手正好位于 `<控制台 exe 目录>\resources` 下」。走后者时，还要对控制台 exe 目录、`resources`
+     目录、助手文件三者逐一检查：都不能是重解析点（junction/symlink），所有者必须是
+     SYSTEM / Administrators / TrustedInstaller，DACL 中所有带写权限（含 DELETE / WRITE_DAC / WRITE_OWNER /
+     GENERIC_WRITE 等）的 allow ACE 只能授给这三个主体（CREATOR OWNER 仅允许出现在 `INHERIT_ONLY` 的继承 ACE 上）。
+     任一条不满足就拒绝设置长期密码，并提示「Vega 安装目录权限不安全，无法设置长期密码。请重新运行安装包修复。」
+  管理员事后手动放宽该目录权限（例如把 Users 加回写权限）会命中第 2 层，长期密码直接不可用而不是被静默劫持。
 - **载荷创建时即带 DACL**：载荷写在 `%LOCALAPPDATA%\Vega\pw\` 下的 `vega-pw-<32 位十六进制>.json`，由 Rust 侧用
   一次性 `CreateFileW` 以 SDDL `D:P(A;;FA;;;<当前用户>)(A;;FA;;;BA)(A;;FA;;;SY)` 创建——不继承父目录权限，只允许
   当前用户、Administrators、SYSTEM 完全控制，写完立即关闭句柄。控制台命令行里只有路径，没有密码；助手只接受

@@ -168,9 +168,13 @@
   「服务侧确认」落地后一并改为读实际生效值。
 - P2 集成测试缺口：真实 Windows DACL 生效验证、跨账户 UAC（标准用户 → 管理员）、助手 20 s 调用
   超时清理、PS 5.1 原生参数传递目前都靠 Mock 覆盖，需要在集成环境里跑一次真机用例。
-- P1 安装目录 ACL：安装器应对安装目录强制设置标准 ACL（或控制台发行版校验助手及其父目录不向
-  Users / Authenticated Users / Everyone 授予写权限），否则装进被放宽权限的已有目录时助手可被替换。
-  来源：Codex t4-r4 P1。
+- ~~P1 安装目录 ACL~~ **已完成（T6b）**：安装目录不再固定为 Program Files，用户可选任意本地固定
+  NTFS 目录；安装器在 POSTINSTALL 对非 Program Files 目录执行 `icacls /setowner` + `/inheritance:r`
+  + 只授予 SYSTEM/Administrators 完全控制、Users 只读执行，失败写完成页提示；控制台
+  `password.rs::ensure_helper_location` 在每次提权前校验 exe 目录 / `resources` / 助手文件三层的
+  所有者与 DACL（并要求不是重解析点），不满足即拒绝长期密码。原条目：安装器应对安装目录强制设置
+  标准 ACL（或控制台发行版校验助手及其父目录不向 Users / Authenticated Users / Everyone 授予写权限），
+  否则装进被放宽权限的已有目录时助手可被替换。来源：Codex t4-r4 P1。
 
 ## M3 进阶（v1.0）
 - 虚拟显示器自动安装（无显示器被控端）
@@ -286,6 +290,14 @@
 - 旧目录迁移在 `/UPDATE` 下也执行（只删文件）：比较前对两条路径依次调用 `GetFullPathNameW` + `GetLongPathNameW`；旧目录或 `old\resources` 带 `FILE_ATTRIBUTE_REPARSE_POINT` 时整段跳过；长路径相同则不动。
 - `tools/publish-update.sh`：镜像先传 `<file>.part` 再远端 `mv`；版本化文件已存在时，远程 SHA256 相同才允许重跑，不同则中止。GitHub Release 用 `--latest=false` 创建，已存在则 `gh api PATCH make_latest=false`；版本化 exe/.sig 不用 `--clobber`，已存在且 SHA256 不同在触碰镜像前中止，相同则跳过；两个通道都完成安装包校验/上传后才切清单（GitHub：上传 `latest.json.new` → 删除旧 `latest.json` → `gh api -X PATCH .../assets/<id> -f name=latest.json`；镜像：临时名 → 原子 `mv`）。
 - 前端 `check_update` 增加代际/状态守卫：安装开始或监听注册失败后，在途检查结果直接丢弃，不再覆盖下载状态或监听错误提示。
+
+### T6b 安装目录放开（v0.6.1）
+- 目录页回归：定制模板恢复 `MUI_PAGE_DIRECTORY`（`PRE SkipIfPassive`），新增 `VegaDirectoryLeave` 校验——只接受 `X:\...` 本地路径、`GetDriveTypeW` 必须为 3（固定盘）、`GetVolumeInformationW` 必须是 NTFS、拒绝盘根、拒绝已存在且非空但不是 Vega（无 `vega-console.exe`）的目录；末段不是 `Vega` 时自动补 `\Vega`。UNC、U 盘/光驱/网络盘/内存盘都被拒。
+- `.onInit`：默认仍是 `$PROGRAMFILES64\Vega`；命令行 `/D=` 优先；否则卸载注册表 `InstallLocation`（去引号、去尾反斜杠）指向仍含 `vega-console.exe` 的目录时沿用（更新/重装、含 `/P` 被动更新都留在原位置）。`PREINSTALL` 只在 `$INSTDIR` 为空时兜底，不再强制改写。
+- 安装后收紧 ACL：`POSTINSTALL` 在迁移前，若 `$INSTDIR` 不在 `$PROGRAMFILES64`/`$PROGRAMFILES` 下，执行 `icacls /setowner *S-1-5-32-544 /T` 与 `/inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /T`；两条都要退出码 0，失败只写完成页提示「安装目录权限设置失败，长期密码不可用」，不 Abort。
+- 迁移比较对象改为本次最终 `$INSTDIR`（不再固定 Program Files）；旧目录与 `$INSTDIR` 相同时不做迁移，其余安全检查（不运行旧卸载器、新 uninstall/vega-console 必须是文件、注册表回滚、重解析点、占用跳过）全部保留。
+- 控制台：`password.rs::ensure_helper_location` 除 Program Files 外，只接受「助手位于 `<exe_dir>\resources`」且 exe_dir / resources / 助手文件三层都不是重解析点、所有者与 DACL 都只允许 SYSTEM/Administrators/TrustedInstaller 写（`dacl_admin_only_write` 为纯函数并带单测）；否则返回「Vega 安装目录权限不安全，无法设置长期密码。请重新运行安装包修复。」
+- 版本：`0.6.0` → `0.6.1`。
 
 ### T6 加固（待做）
 - 磁盘写满时的安装/在线更新：NSIS 覆盖写入中途耗尽空间会留下截断的 `vega-console.exe` / `uninstall.exe` 与指向它的卸载入口（与 Tauri 默认模板相同）。后续：安装前检查剩余空间、先写临时名再替换，或写入失败时回滚注册表（迁移路径已回滚）。
