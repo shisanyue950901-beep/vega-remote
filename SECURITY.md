@@ -59,11 +59,15 @@
   2. **控制台每次提权前都校验，没有 `Program Files` 快路径**：`ensure_helper_location` 对任何安装位置
      （包括默认的 `Program Files\Vega`）都跑同一套完整校验，不存在「前缀命中就跳过」的分支——`Program Files`
      下被手工建出来、带宽松 ACL 的目录同样危险。校验要求助手正好位于 `<控制台 exe 目录>\resources` 下，并依次检查：
-     - **位置**：控制台 exe 目录只能是 `<X>:\Vega` 或 `<ProgramFiles>\Vega`（`Program Files` 根来自
-       `winpaths::program_files_dirs()`，不读可被启动环境改写的环境变量）。
-     - **重解析点（先用原始路径判完）**：控制台 exe、exe 目录、`resources` 目录、助手文件，以及 exe 目录直到
-       盘根的每一级祖先，都不能是 junction/symlink。这一组检查全部基于 `current_exe` 给出的未规范化路径先跑完，
-       之后才 `canonicalize` 并要求规范化结果与原始路径一致，避免链接在校验途中换走路径。
+     - **位置**：控制台 exe 目录只能是 `<X>:\Vega` 或 `<ProgramFiles>\Vega`。`Program Files` 根按已知文件夹取
+       **原始路径**（不读可被启动环境改写的环境变量，也不预先 `canonicalize`），只做三项不涉及规范化的判定：
+       不是重解析点、目录名只能是 `Program Files` 或 `Program Files (x86)`、直接父级是盘根且与系统盘同盘。
+     - **重解析点（先用原始路径判完）**：控制台 exe、exe 目录、`resources` 目录、助手文件、`Program Files` 根，
+       以及 exe 目录直到盘根的每一级祖先，都不能是 junction/symlink。这一组检查全部基于 `current_exe` 给出的
+       未规范化路径先跑完，之后才 `canonicalize`，并要求规范化结果与原始路径一致，避免链接在校验途中换走路径。
+     - **路径绑定**：exe 目录、`resources`、助手文件（以及由规范化 exe 目录推出的祖先链）每个只规范化**一次**，
+       结果保存下来复用；DACL 判定、启动前的复验、以及交给 PowerShell `-File` 的路径全部用这同一组值，不再做
+       第二次 `canonicalize`——第二次规范化会跟随当时的链接状态，可能与第一次判过的不是同一条路径。
      - **祖先规则（直到盘根，含 `Program Files` 根）**：`exe` 目录的每一级父目录，所有者必须是
        SYSTEM / Administrators / TrustedInstaller，且 DACL 中不得把 `DELETE` / `FILE_DELETE_CHILD` /
        `WRITE_DAC` / `WRITE_OWNER` / `GENERIC_WRITE` / `GENERIC_ALL` 授予其他主体；建子目录/建文件

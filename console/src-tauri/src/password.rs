@@ -371,60 +371,87 @@ fn helper_script(app: &tauri::AppHandle) -> Option<PathBuf> {
         dev.is_file().then_some(dev)
     })
 }
-/// 发行版只接受一种安装目录形状，返回规范化并去掉 `\\?\` 的助手路径交给 `-File` 使用：
+/// 发行版只接受一种安装目录形状，返回绑定好的一组路径（见 `HelperLayout`）：
 ///   * `<X>:\Vega`（任意盘根的直接子目录），或
-///   * `<ProgramFiles>\Vega`，根目录取自 `winpaths::program_files_dirs()`
-///     （已知文件夹 + 系统卷校验，不读可被启动环境改写的环境变量）。
+///   * `<ProgramFiles>\Vega`，根目录取自本模块的 `raw_program_files_dirs()`
+///     （已知文件夹的**原始路径** + 系统盘同盘校验，不读可被启动环境改写的环境变量，
+///     也不复用 `winpaths::program_files_dirs()`——那个接口在返回前就已经规范化了）。
 ///
 /// 位置对了不等于安全：`Program Files` 下被手工建出来的目录完全可以带宽松 ACL，
 /// 所以不再有「前缀命中就直接放行」的快路径，一律走完整校验：
 ///   1. 安装目录形状必须是上面两条之一（按未规范化的原始路径判定）；
-///   2. **先**用原始路径把所有重解析点筛掉：exe、exe_dir、resources、助手文件，
-///      以及 exe_dir 直到盘根的每一级祖先，任何一处是 junction/symlink 就拒绝；
-///   3. **再** `canonicalize`，要求规范化结果与原始路径一致（校验途中不能被链接换走）；
+///   2. **先**用原始路径把所有重解析点筛掉：exe、exe_dir、resources、助手文件、
+///      `Program Files` 根，以及 exe_dir 直到盘根的每一级祖先，任何一处是 junction/symlink 就拒绝；
+///   3. **再** `canonicalize`：每个路径只规范化一次，结果保存进 `HelperLayout`，
+///      并要求规范化结果与原始路径一致（校验途中不能被链接换走）；
 ///   4. exe_dir 的每一级祖先（直到盘根，含 `Program Files` 根）所有者必须是
 ///      SYSTEM / Administrators / TrustedInstaller，且不能把删除子项、改写 ACL、
 ///      改所有者、完全控制授予其他主体（建子目录/建文件允许）；
 ///   5. exe_dir、resources、助手文件三层的所有者与 DACL 只允许上面三个主体写入。
 /// 2 与 3 的先后是刻意的：先规范化再判重解析点的话，链接可能在校验期间把路径换走，
-/// 规范化后的路径看着安全，实际打开的仍是链接目标。任何一条不满足都返回固定文案
-/// `INSECURE_INSTALL_DIR`，前端直接显示。
+/// 规范化后的路径看着安全，实际打开的仍是链接目标。3 之后的所有判定（ACL、启动前复验、
+/// `ShellExecuteExW` 的 `-File` 参数）都只用 `HelperLayout` 里那组值，不再各自 canonicalize。
+/// 任何一条不满足都返回固定文案 `INSECURE_INSTALL_DIR`，前端直接显示。
 #[cfg(all(windows, not(debug_assertions)))]
-fn ensure_helper_location(helper: &Path) -> Result<PathBuf, String> {
+fn ensure_helper_location(helper: &Path) -> Result<HelperLayout, String> {
     validate_helper_location(helper).ok_or_else(|| INSECURE_INSTALL_DIR.to_string())
 }
 
-/// 完整校验一次助手位置；通过时返回去掉 `\\?\` 的助手路径。
-/// 发版路径里每次拉起提权助手前都要跑一遍（`run_helper` 在 `ShellExecuteExW` 紧前面再跑一次）。
+/// 校验通过后绑定的安装布局。
+///
+/// 每个路径只在 `validate_helper_location` 里规范化**一次**，结果存在这里；ACL 判定、
+/// 启动前复验、以及交给 PowerShell `-File` 的路径都从这同一组值派生，不再做第二次
+/// `canonicalize`——第二次规范化会跟随当时的链接状态，可能和第一次判过的不是同一条路径。
+#[cfg(windows)]
+#[allow(dead_code)]
+struct HelperLayout {
+    /// 助手文件的规范路径（ACL 判定与复验都看这个）。
+    helper: PathBuf,
+    /// `exe_dir\resources` 的规范路径。
+    resources: PathBuf,
+    /// 控制台 exe 目录的规范路径。
+    exe_dir: PathBuf,
+    /// 从规范 `exe_dir` 推出的祖先链（父目录……盘根）。
+    ancestors: Vec<PathBuf>,
+    /// 交给 `-File` 的形式：`helper` 去掉 `\\?\` 前缀。纯字符串变换，不是另一次规范化。
+    launch: PathBuf,
+}
+
+/// 完整校验一次助手位置；通过时返回绑定好的布局。
+/// 发版路径里每次拉起提权助手前都要跑一遍（`run_helper` 在 `ShellExecuteExW` 紧前面
+/// 用 `recheck_helper_layout` 复验同一组值）。
 #[cfg(all(windows, not(debug_assertions)))]
-fn validate_helper_location(helper: &Path) -> Option<PathBuf> {
+fn validate_helper_location(helper: &Path) -> Option<HelperLayout> {
     let exe = std::env::current_exe().ok()?;
     let raw_exe_dir = exe.parent()?.to_path_buf();
     let raw_resources = raw_exe_dir.join("resources");
-    // 1. 位置规则：`<X>:\Vega` 或 `<ProgramFiles>\Vega`（原始路径判定）。
-    if !allowed_install_dir(&raw_exe_dir, &crate::winpaths::program_files_dirs()) {
+    // 1. 位置规则：`<X>:\Vega` 或 `<ProgramFiles>\Vega`（原始路径判定，根也是原始路径）。
+    let raw_program_files = raw_program_files_dirs();
+    if !allowed_install_dir(&raw_exe_dir, &raw_program_files) {
         return None;
     }
     // 2. 原始路径重解析点：整组先跑完，此时一次 `canonicalize` 都还没调用，
-    //    比较基准仍是 `current_exe` 给出的未规范化路径。祖先链也在这里一起筛
-    //    （junction 祖先可以把 exe_dir 悄悄指到别处）。
-    let ancestors = ancestor_chain(&raw_exe_dir);
+    //    比较基准仍是 `current_exe` 给出的未规范化路径。祖先链与 `Program Files`
+    //    根也在这里一起筛（junction 祖先可以把 exe_dir 悄悄指到别处）。
+    let raw_ancestors = ancestor_chain(&raw_exe_dir);
     let raw_paths: [&Path; 4] = [exe.as_path(), raw_exe_dir.as_path(), raw_resources.as_path(), helper];
-    let has_reparse = raw_paths
+    let has_reparse = raw_program_files
         .iter()
-        .copied()
-        .chain(ancestors.iter().map(PathBuf::as_path))
+        .map(PathBuf::as_path)
+        .chain(raw_paths.iter().copied())
+        .chain(raw_ancestors.iter().map(PathBuf::as_path))
         .any(crate::winpaths::is_reparse_point);
     if has_reparse {
         return None;
     }
-    // 3. 原始路径干净之后才规范化，并要求规范化结果与原始路径一致：
+    // 3. 原始路径干净之后才规范化，每个路径只做一次，并把结果留下来：
     //    校验途中路径被换成链接、或短名/大小写解析出了替代路径，都在这里露出来。
-    for raw in raw_paths {
-        if !canonical_matches_raw(raw) {
-            return None;
-        }
-    }
+    let exe_dir = canonicalize_once(&raw_exe_dir)?;
+    let resources = canonicalize_once(&raw_resources)?;
+    let helper_canonical = canonicalize_once(helper)?;
+    // 祖先链从保存下来的规范 `exe_dir` 推出：规范路径的父目录已经是规范路径，
+    // 既不需要、也不允许再逐个 canonicalize。
+    let ancestors = ancestor_chain(&exe_dir);
     // 4. 祖先链 ACL：exe_dir 的每一级父目录直到盘根，都不能把控制权交给非管理员。
     for ancestor in &ancestors {
         if !path_ancestor_admin_only_control(ancestor) {
@@ -432,25 +459,135 @@ fn validate_helper_location(helper: &Path) -> Option<PathBuf> {
         }
     }
     // 5. 三层 DACL：安装目录、resources、助手文件；助手必须在 resources 里。
-    let canonical_exe_dir = std::fs::canonicalize(&raw_exe_dir).ok()?;
-    let canonical_resources = std::fs::canonicalize(&raw_resources).ok()?;
-    let canonical_helper = std::fs::canonicalize(helper).ok()?;
-    if !canonical_helper.is_file() {
+    if !helper_canonical.is_file() {
         return None;
     }
-    if !same_path(canonical_helper.parent()?, &canonical_resources) {
+    if !same_path(helper_canonical.parent()?, &resources) {
         return None;
     }
-    if !path_acl_admin_only_write(&canonical_exe_dir)
-        || !path_acl_admin_only_write(&canonical_resources)
-        || !path_acl_admin_only_write(&canonical_helper)
+    if !path_acl_admin_only_write(&exe_dir)
+        || !path_acl_admin_only_write(&resources)
+        || !path_acl_admin_only_write(&helper_canonical)
     {
         return None;
     }
-    Some(strip_extended_prefix(&canonical_helper))
+    let launch = strip_extended_prefix(&helper_canonical);
+    Some(HelperLayout { helper: helper_canonical, resources, exe_dir, ancestors, launch })
 }
+
+/// 系统 `Program Files` / `Program Files (x86)` 的**原始**路径（不规范化、不跟随重解析点）。
+///
+/// 不复用 `winpaths::program_files_dirs()`：它在返回前就 `canonicalize` 了，而本模块的
+/// 校验顺序要求「原始路径重解析点检查全部跑完之前不许规范化」。这里只做不涉及
+/// `canonicalize` 的判定：不是重解析点、名字只能是 `Program Files[(x86)]`、直接父级是
+/// 盘根、与系统盘同盘、是目录。
+#[cfg(all(windows, not(debug_assertions)))]
+fn raw_program_files_dirs() -> Vec<PathBuf> {
+    use core::ffi::c_void;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{
+        FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, SHGetKnownFolderPath, KNOWN_FOLDER_FLAG,
+    };
+
+    let Some(system_drive) = system32_dir().as_deref().and_then(drive_letter) else {
+        return Vec::new();
+    };
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for id in [&FOLDERID_ProgramFiles, &FOLDERID_ProgramFilesX86] {
+        // SAFETY: `SHGetKnownFolderPath` 分配的是以 NUL 结尾的 UTF-16 字符串，由 COM 任务
+        // 分配器释放。这里读出长度、立刻复制成 String，再用 CoTaskMemFree 释放一次；
+        // 没有跨语句保存的裸指针。
+        let raw = unsafe {
+            SHGetKnownFolderPath(id, KNOWN_FOLDER_FLAG(0), None::<&HANDLE>)
+                .ok()
+                .map(|raw| {
+                    let mut len = 0usize;
+                    while *raw.0.add(len) != 0 {
+                        len += 1;
+                    }
+                    let text = String::from_utf16_lossy(core::slice::from_raw_parts(raw.0, len));
+                    CoTaskMemFree(Some(raw.0 as *const c_void));
+                    text
+                })
+        };
+        let Some(raw) = raw.filter(|text| !text.is_empty()).map(PathBuf::from) else {
+            continue;
+        };
+        // 根自身是 junction / 挂载点：后面所有判定都会跟着跑偏，直接跳过。
+        if crate::winpaths::is_reparse_point(&raw) {
+            continue;
+        }
+        let Some(name) = raw.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !(name.eq_ignore_ascii_case("Program Files")
+            || name.eq_ignore_ascii_case("Program Files (x86)"))
+        {
+            continue;
+        }
+        let Some(parent) = raw.parent() else {
+            continue;
+        };
+        if !is_drive_root(parent) || drive_letter(&raw) != Some(system_drive) || !raw.is_dir() {
+            continue;
+        }
+        if !roots.contains(&raw) {
+            roots.push(raw);
+        }
+    }
+    roots
+}
+
+/// 路径所在的盘符（`C:\...` → `c`）；UNC、相对路径返回 `None`。纯字符串判断，不碰文件系统。
+#[cfg(windows)]
+#[allow(dead_code)]
+fn drive_letter(path: &Path) -> Option<u8> {
+    let text = strip_extended_prefix(path).to_string_lossy().into_owned();
+    let bytes = text.as_bytes();
+    (bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic())
+        .then(|| bytes[0].to_ascii_lowercase())
+}
+
+/// 启动前的复验：只对 `HelperLayout` 里绑定的那组规范值重跑判定，不再 `canonicalize`。
+///
+/// 与 `validate_helper_location` 的唯一区别就是「不重新解析路径」——复验确认的必须正是
+/// 接下来 `ShellExecuteExW` 会打开的那条路径，而不是一条重新解析出来的、可能已经变了的路径。
+#[cfg(all(windows, not(debug_assertions)))]
+fn recheck_helper_layout(layout: &HelperLayout) -> bool {
+    if !layout.helper.is_file()
+        || crate::winpaths::is_reparse_point(&layout.helper)
+        || crate::winpaths::is_reparse_point(&layout.resources)
+        || crate::winpaths::is_reparse_point(&layout.exe_dir)
+    {
+        return false;
+    }
+    if !same_path(layout.helper.parent().unwrap_or_else(|| Path::new("")), &layout.resources) {
+        return false;
+    }
+    if !path_acl_admin_only_write(&layout.helper)
+        || !path_acl_admin_only_write(&layout.resources)
+        || !path_acl_admin_only_write(&layout.exe_dir)
+    {
+        return false;
+    }
+    layout.ancestors.iter().all(|ancestor| path_ancestor_admin_only_control(ancestor))
+}
+
+/// 开发构建没有安装器收紧过的目录，不做落位校验，复验一律放行。
 #[cfg(all(windows, debug_assertions))]
-fn ensure_helper_location(helper: &Path) -> Result<PathBuf, String> { Ok(strip_extended_prefix(helper)) }
+fn recheck_helper_layout(_layout: &HelperLayout) -> bool { true }
+
+#[cfg(all(windows, debug_assertions))]
+fn ensure_helper_location(helper: &Path) -> Result<HelperLayout, String> {
+    Ok(HelperLayout {
+        launch: strip_extended_prefix(helper),
+        helper: helper.to_path_buf(),
+        resources: PathBuf::new(),
+        exe_dir: PathBuf::new(),
+        ancestors: Vec::new(),
+    })
+}
 
 // ---------------------------------------------------------------------------
 // t6b：安装目录 ACL 校验
@@ -460,14 +597,16 @@ fn ensure_helper_location(helper: &Path) -> Result<PathBuf, String> { Ok(strip_e
 // runas 执行该脚本，脚本可写就等于把「管理员执行任意 PowerShell」交给任何本地用户。
 // t6b 放开目录限制（用户可以装到 D:\Vega），改由安装器用 icacls 把目录 ACL 收紧成
 // 「只有 SYSTEM / Administrators 可写」，控制台在每次提权前自己再验一遍：
-//   * 安装目录只能是 `<X>:\Vega` 或 `<ProgramFiles>\Vega`（`Program Files` 根来自
-//     `winpaths::program_files_dirs()`），更深或改名的目录不认；
+//   * 安装目录只能是 `<X>:\Vega` 或 `<ProgramFiles>\Vega`（`Program Files` 根由本模块
+//     `raw_program_files_dirs()` 按已知文件夹取原始路径，先判重解析点再用），更深或改名的目录不认；
 //   * 不再有「在 Program Files 前缀下就跳过检查」的快路径：`Program Files` 里被手工
 //     建出来、带宽松 ACL 的子目录一样危险，所以 `Program Files\Vega` 也必须过同一套校验；
 //   * 助手必须在 `<exe_dir>\resources` 里，exe_dir 是当前控制台 exe 的真实目录；
 //   * 校验顺序固定：先用未规范化的原始路径判定 exe、exe_dir、exe_dir\resources、
-//     助手文件，以及 exe_dir 直到盘根的每一级祖先都不是重解析点（junction/symlink）；
-//     全部筛过之后才 canonicalize，并要求规范化结果与原始路径一致；
+//     助手文件、`Program Files` 根，以及 exe_dir 直到盘根的每一级祖先都不是重解析点
+//     （junction/symlink）；全部筛过之后才 canonicalize，并要求规范化结果与原始路径一致；
+//   * 每个路径只规范化一次，结果保存在 `HelperLayout` 里：ACL 判定、启动前复验、
+//     `ShellExecuteExW` 的 `-File` 参数都用这同一组值，不再各自 canonicalize；
 //   * exe_dir 的每一级祖先直到盘根（含 `Program Files` 根）都不能把删除子项、改写 ACL、
 //     改所有者、完全控制授予非管理员主体，所有者本身也必须是受信任主体；
 //   * exe_dir、exe_dir\resources、助手文件三者的所有者必须是 SYSTEM / Administrators /
@@ -628,8 +767,8 @@ fn is_drive_root(path: &Path) -> bool {
 }
 
 /// 安装目录形状（纯函数）：`exe_dir` 必须正好是 `<X>:\Vega`，或 `<ProgramFiles>\Vega`
-/// 且 `ProgramFiles` 出现在 `program_files`（来自 `winpaths::program_files_dirs()`）里。
-/// 前缀相同但更深或改了名的目录一律不认。
+/// 且 `ProgramFiles` 出现在 `program_files` 里（来自本模块 `raw_program_files_dirs()`，
+/// 全是**原始**路径，比较时不涉及规范化）。前缀相同但更深或改了名的目录一律不认。
 #[allow(dead_code)]
 fn allowed_install_dir(exe_dir: &Path, program_files: &[PathBuf]) -> bool {
     let dir = strip_extended_prefix(exe_dir);
@@ -650,16 +789,15 @@ fn allowed_install_dir(exe_dir: &Path, program_files: &[PathBuf]) -> bool {
         .any(|root| same_path(&parent, &strip_extended_prefix(root)))
 }
 
-/// `canonicalize` 之后是否与原始路径一致（去 `\\?\` 前缀、忽略大小写）。
-/// 只负责「规范化有没有把路径带到别处」；重解析点判定已在前一步用原始路径完成，
-/// 不在这里重复（`canonicalize` 本身也会跟随链接，但那时原始路径已确认干净）。
+/// `canonicalize` **一次**，并把结果交回调用方保存（`HelperLayout`）：
+/// 规范化结果与原始路径不一致（被链接换走、或短名/大小写解析出替代路径）时返回 `None`。
+/// 重解析点判定已在前一步用原始路径完成，不在这里重复（`canonicalize` 本身也会跟随链接，
+/// 但那时原始路径已确认干净）。调用方不得对同一路径再调一次 `canonicalize`。
 #[cfg(windows)]
 #[allow(dead_code)]
-fn canonical_matches_raw(raw: &Path) -> bool {
-    match std::fs::canonicalize(raw) {
-        Ok(canonical) => same_path(&canonical, raw),
-        Err(_) => false,
-    }
+fn canonicalize_once(raw: &Path) -> Option<PathBuf> {
+    let canonical = std::fs::canonicalize(raw).ok()?;
+    same_path(&canonical, raw).then_some(canonical)
 }
 
 /// `exe_dir` 的祖先链：父目录、祖父目录……直到盘根（含）。
@@ -896,8 +1034,9 @@ fn run_helper(app: &tauri::AppHandle, payload: &Path) -> Result<(), String> {
     };
 
     let helper = helper_script(app).ok_or_else(|| "找不到提权助手 vega-pwhelper.ps1".to_string())?;
-    // 第一遍：尽早失败，错误文案统一。
-    let helper = ensure_helper_location(&helper)?;
+    // 第一遍：尽早失败，错误文案统一。返回的布局在本次调用里固定下来——后续的 ACL 判定、
+    // 复验和 `-File` 参数都用这同一组已规范化的值，不再各自 canonicalize。
+    let layout = ensure_helper_location(&helper)?;
     let system32 = system32_dir().ok_or_else(|| "找不到 System32 目录".to_string())?;
     let powershell = powershell_path().ok_or_else(|| "找不到系统 PowerShell".to_string())?;
     let (file_w, dir_w, verb_w) = (
@@ -919,20 +1058,14 @@ fn run_helper(app: &tauri::AppHandle, payload: &Path) -> Result<(), String> {
     }
     let com_ready = hr >= 0;
 
-    // 紧挨着 ShellExecuteExW 再跑一遍完整校验：从第一次校验到这里之间，安装目录或助手文件
-    // 仍可能被换掉。这一遍给出的路径才是真正交给 PowerShell `-File` 的路径。
-    let revalidated = match ensure_helper_location(&helper) {
-        Ok(path) => path,
-        Err(err) => {
-            if com_ready { unsafe { CoUninitialize() } }
-            return Err(err);
-        }
-    };
-    if !same_path(&revalidated, &helper) {
+    // 紧挨着 ShellExecuteExW 再复验一遍：从第一次校验到这里之间，安装目录或助手文件
+    // 仍可能被换掉。复验只针对上面绑定的那组规范值，不重新 canonicalize——重新规范化
+    // 解析出来的可能是另一条路径，那样复验的就不是马上要启动的东西。
+    if !recheck_helper_layout(&layout) {
         if com_ready { unsafe { CoUninitialize() } }
         return Err(INSECURE_INSTALL_DIR.to_string());
     }
-    let args = match build_helper_args(&revalidated, payload) {
+    let args = match build_helper_args(&layout.launch, payload) {
         Ok(args) => args,
         Err(err) => {
             if com_ready { unsafe { CoUninitialize() } }
