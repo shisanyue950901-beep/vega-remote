@@ -30,6 +30,11 @@
 ;      / `/D=` 安装与交互安装共用同一份目标校验，失败 `SetErrorLevel 2` 并中止。
 ;      t6b-fix2 接着 CreateDirectory + Call VegaLockInstallDir 预锁定 ACL，任何一条
 ;      icacls 失败都在解包之前中止；POSTINSTALL 再锁第二次（失败只写完成页告警）。
+;      t6c 起两层都调共用的四步 VegaApplyInstallDirAcl：根 /setowner → 根 DACL 用 SDDL
+;      精确替换（受保护 DACL）→ 子项 "$INSTDIR\*" /reset /T（三态枚举，确认空则跳过，
+;      枚举失败即失败）→ /setowner /T。先 /reset 后 /setowner /T，让 0.6.1 空 DACL 的
+;      子项先继承根目录的 Administrators 完全控制、拿到 WRITE_OWNER，再改所有者才不会
+;      被拒绝。根目录绝不再带 /T 做断继承。
 ;
 ; 为什么不用宏覆盖：MUI2.nsh 在 include 时就把 MUI_PAGE_DIRECTORY 展开成页面序号，
 ; hooks.nsh 里 !undef + 空宏不起作用（页面照样出现）。只能改模板本体。
@@ -620,11 +625,13 @@ vega_install_target_ok:
     DetailPrint "安装目录已规范为 $INSTDIR"
 vega_install_target_same:
 
-  ; t6b-fix3（架构裁定 2/3）：先建目录并做预锁定，再解包任何文件。此时还没有
-  ; SetOutPath / File，锁不住就直接中止，文件不会落进普通账户可改的目录。
-  ; 预锁定顺序是「先断继承 → setowner → 对已有子树 /reset → 重新 grant」，四条
-  ; icacls 任一失败 → 固定提示 + SetErrorLevel 2 + Abort（静默安装靠 /SD IDOK
-  ; 自动跳过提示）。POSTINSTALL 只做无 /reset 的收紧（失败只写完成页告警）。
+  ; t6b-fix3（架构裁定 2/3）+ t6c（架构裁定 3）：先建目录并做预锁定，再解包任何文件。
+  ; 此时还没有 SetOutPath / File，锁不住就直接中止，文件不会落进普通账户可改的目录。
+  ; 预锁定四步（共用 VegaApplyInstallDirAcl）：根 /setowner → 根 DACL 用 SDDL 精确替换
+  ; （替换全部 ACE，受保护 DACL）→ 子项三态枚举并按需 `"$INSTDIR\*" /reset /T`（确认为空
+  ; 则跳过，枚举失败即失败）→ /setowner /T；任一失败 → 固定提示 +
+  ; SetErrorLevel 2 + Abort（静默安装靠 /SD IDOK 自动跳过提示）。
+  ; POSTINSTALL 用同样的四步再收紧一次（失败只写完成页告警）。
   CreateDirectory "$INSTDIR"
   Call VegaLockInstallDir
   StrCmp $vegaAclWarning "" vega_install_lock_ok
@@ -635,8 +642,9 @@ vega_install_target_same:
 vega_install_lock_ok:
 
   ; t6b-fix3（架构裁定 3）：预锁定完成后**再次**完整扫描目标树。第一次扫描在
-  ; VegaValidateTarget 里，跑在目录为空之前/之时；这里重扫是因为 icacls /reset /T
-  ; 与 /T 授权都会沿着重解析点走到目录外（目标树在这一小段时间里可能被换成链接），
+  ; VegaValidateTarget 里，跑在目录为空之前/之时；这里重扫是因为 icacls 的 /T
+  ; （setowner /T 与子项 /reset /T）会沿着重解析点走到目录外（目标树在这一小段时间里
+  ; 可能被换成链接），
   ; 发现任何重解析点或枚举错误就中止：此刻还没解包，退出码 2 干净收场。
   StrCpy $vegaWalkPath "$INSTDIR"
   StrCpy $vegaWalkFound "0"

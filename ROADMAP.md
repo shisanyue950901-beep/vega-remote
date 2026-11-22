@@ -294,17 +294,50 @@
 ### T6b 安装目录放开（v0.6.1）
 - 目录页回归：定制模板恢复 `MUI_PAGE_DIRECTORY`（`PRE SkipIfPassive`），新增 `VegaDirectoryLeave` 校验——只接受 `X:\...` 本地路径、`GetDriveTypeW` 必须为 3（固定盘）、`GetVolumeInformationW` 必须是 NTFS、拒绝盘根、拒绝已存在且非空但不是 Vega（无 `vega-console.exe`）的目录；末段不是 `Vega` 时自动补 `\Vega`。UNC、U 盘/光驱/网络盘/内存盘都被拒。
 - `.onInit`：默认仍是 `$PROGRAMFILES64\Vega`；命令行 `/D=` 优先；否则卸载注册表 `InstallLocation`（去引号、去尾反斜杠）指向仍含 `vega-console.exe` 的目录时沿用（更新/重装、含 `/P` 被动更新都留在原位置）。`PREINSTALL` 只在 `$INSTDIR` 为空时兜底，不再强制改写。
-- 安装后收紧 ACL：`POSTINSTALL` 在迁移前，若 `$INSTDIR` 不在 `$PROGRAMFILES64`/`$PROGRAMFILES` 下，执行 `icacls /setowner *S-1-5-32-544 /T` 与 `/inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /T`；两条都要退出码 0，失败只写完成页提示「安装目录权限设置失败，长期密码不可用」，不 Abort。
+- 安装后收紧 ACL：`POSTINSTALL` 在迁移前，若 `$INSTDIR` 不在 `$PROGRAMFILES64`/`$PROGRAMFILES` 下，执行 `icacls /setowner *S-1-5-32-544 /T` 与 `/inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /T`；两条都要退出码 0，失败只写完成页提示「安装目录权限设置失败，长期密码不可用」，不 Abort。（**t6c / t6c-fix1 起这条被共用四步方案取代，见下节**：对目录带 `/T` 的 `/inheritance:r` 会让子文件 DACL 变空。）
 - 迁移比较对象改为本次最终 `$INSTDIR`（不再固定 Program Files）；旧目录与 `$INSTDIR` 相同时不做迁移，其余安全检查（不运行旧卸载器、新 uninstall/vega-console 必须是文件、注册表回滚、重解析点、占用跳过）全部保留。
 - 控制台：`password.rs::ensure_helper_location` 除 Program Files 外，只接受「助手位于 `<exe_dir>\resources`」且 exe_dir / resources / 助手文件三层都不是重解析点、所有者与 DACL 都只允许 SYSTEM/Administrators/TrustedInstaller 写（`dacl_admin_only_write` 为纯函数并带单测）；否则返回「Vega 安装目录权限不安全，无法设置长期密码。请重新运行安装包修复。」
 - 版本：`0.6.0` → `0.6.1`。
+- t6c 第 1 轮审计修复见下节（0.6.2）。
 - t6b 第 1 轮审计修复（架构裁定，仅 NSIS 侧）：允许的安装位置收紧为 `$PROGRAMFILES64\Vega` 或 `X:\Vega`（本地固定 NTFS 盘根下的 Vega），其它输入规范成 `X:\Vega` 并在目录页提示；`VegaValidateTarget` 成为唯一校验入口，目录页回调与安装节开头（任何 `SetOutPath` 之前）都调用，静默 / 被动 / `/D=` 失败时 `SetErrorLevel 2` 并中止；非空目录用 `FindFirst`/`FindNext` 跳过 `.`/`..` 判定，只接受空目录或 `vega-console.exe` 确实是文件的已有 Vega；`System::Call` 输出寄存器统一 `.rN` 并读 `$N`；ACL 对两种位置都执行 `icacls /reset /T` → `/setowner *S-1-5-32-544 /T` → `/inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /T`，三条退出码都检查；`.onInit` 用 `$CMDLINE` 里的 `" /D="`（大小写不敏感）判定命令行是否指定目录，未指定时优先沿用校验通过的旧位置。
+
+### T6c 安装目录 ACL 修复（v0.6.2）
+- 真机事故（0.6.1）：`VegaLockInstallDir` 第 4 步与 `VegaTightenInstallDir` 第 2 步都对 `"$INSTDIR"` **带 `/T`**
+  执行 `/inheritance:r /grant:r …(OI)(CI)…`。对**文件**来说 `/inheritance:r` 删掉了全部继承 ACE，而 `(OI)(CI)`
+  授权无法落到文件上（`/C` 吞掉错误）→ `D:\Vega\vega-console.exe` 的 DACL 为空：用户无法运行、管理员身份的
+  安装器也无法覆盖写入（「无法打开要写入的文件」）、连卸载都删不掉。`icacls D:\Vega` 本身当时是对的。
+- 架构裁定（固定布局）：**目录本身带显式 ACL 且断继承（受保护 DACL），所有子项只靠继承、不带显式 ACE。** 解包前的
+  `VegaLockInstallDir` 与解包后的 `VegaTightenInstallDir` 都只打日志后 `Call` 共用 `VegaApplyInstallDirAcl`，
+  四步逐条检查退出码、每步 `Pop` 后立即判定，失败即停（不再执行后续步骤）：
+  1. `"$INSTDIR" /setowner *S-1-5-32-544 /C /Q`（只根目录）；
+  2. 根 DACL 用 PowerShell `SetSecurityDescriptorSddlForm` **精确替换**为
+     `O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)`（受保护 DACL，替换全部 ACE，
+     包括继承、显式拒绝和其他 SID）；删除旧的 `/inheritance:r /grant:r` 调用；写入前检查 `$INSTDIR` 不含单引号；
+  3. 仅当 `$INSTDIR` 下存在子项时（`VegaHasChildEntries` 三态：`1`=有子项、`0`=确认为空、`E`=枚举失败；
+     t6c-fix2 起 `FindFirst` 失败或句柄为空一律记 `E`，不再用 `IfFileExists "$INSTDIR\*.*"` 二次判定）
+     `"$INSTDIR\*" /reset /T /C /Q`；`E` 即失败，`0` 跳过并视为成功；
+  4. `"$INSTDIR" /setowner *S-1-5-32-544 /T /C /Q`。
+- t6c-fix3 调换第 3、4 步（先 `/reset` 后 `/setowner /T`）：0.6.1 留下的空 DACL 文件所有者已是
+  Administrators，但空 DACL 只给隐式 `WRITE_DAC`、没有 `WRITE_OWNER`，`icacls /setowner` 在缺
+  `WRITE_OWNER` 时不会主动启用接管特权，先 `/setowner /T` 会被拒绝访问，`/reset` 永远执行不到。
+  先 `/reset` 让子项继承根目录的 Administrators 完全控制、拿到 `WRITE_OWNER`，再 `/setowner /T` 即可。
+  每步仍 `Pop` 后立即检查、失败短路。
+- 第 3 步的子项 `/reset` 经架构批准：它只把子项改回继承**已锁定的根目录**，不会让根目录重新继承盘根 ACL；
+  同时自愈旧版留下的空 DACL 文件（所有者已是 Administrators，可改 DACL）。t6b-fix3 的「解包之后禁止 `/reset`」被本条取代。
+- t6c-fix1（第 1 轮审计）：根 DACL 改为 SDDL 精确替换——旧的 `/inheritance:r /grant:r` 只删继承 ACE、只替换指定 SID
+  的允许 ACE，旧目录上可继承的显式拒绝项和其他 SID 的可继承写权限会残留；每步 `Pop` 后立即检查（前置步骤失败
+  不再继续 `/reset`）；枚举改三态，`FindFirst` 失败不再被当成空目录（t6c-fix2 进一步去掉
+  `IfFileExists` 判定，失败即 `E`）；`"$INSTDIR\*" /reset /T` 仅在确认有子项时执行。
+  冒烟清单助手路径同步为 `resources\vega-pwhelper.ps1`（tauri.conf.json 的实际 resources 映射）。
+- 其余不变：解包前预锁定后的重扫重解析点逻辑保留在 `VegaLockInstallDir` 之后；`$COMMONPROGRAMDATA\Vega\logs`
+  那条 icacls 只作用于目录本身（不带 `/T`），不改；Rust 端逻辑不改（控制台校验的是 exe_dir 的 DACL，目录 ACL 不变）。
+- 版本：`0.6.1` → `0.6.2`。
 
 ### T6 加固（待做）
 - 磁盘写满时的安装/在线更新：NSIS 覆盖写入中途耗尽空间会留下截断的 `vega-console.exe` / `uninstall.exe` 与指向它的卸载入口（与 Tauri 默认模板相同）。后续：安装前检查剩余空间、先写临时名再替换，或写入失败时回滚注册表（迁移路径已回滚）。
 - 盘根 ACL 被改成普通账户可删除子项（非默认配置）时，`X:\Vega` 可被替换，卸载入口随之被劫持；后续安装器复用控制台的祖先 ACL 校验拒绝此类盘符。
-- 残余竞态（t6b-fix3 架构裁定 3）：预锁定是 `CreateDirectory $INSTDIR` 之后才执行
-  `/inheritance:r`，从创建目录到断继承之间有一瞬目录仍在继承盘根 ACL——盘根给 Users
+- 残余竞态（t6b-fix3 架构裁定 3 / t6c-fix1）：预锁定是 `CreateDirectory $INSTDIR` 之后才写入受保护的根 DACL
+  （SDDL 精确替换），从创建目录到 DACL 生效之间有一瞬目录仍在继承盘根 ACL——盘根给 Users
   写权限（非默认配置）时，这一瞬里 `X:\Vega` 可被换成 junction/symlink。安装器随后会再扫
   一次目标树（发现重解析点即退出码 2 中止），但扫描与替换之间依旧是 TOCTOU。彻底修法要么
   在创建前锁定父目录，要么改用 `\??\` 句柄级 API 建目录，留待后续；本轮按裁定只记录。
@@ -327,3 +360,29 @@
 - P2 响应大小（架构裁决：插件 API 无法设上限，本轮不修）：恶意大响应可使控制台 OOM，仅 DoS，签名仍保证不装恶意包。启动静默检查会整份缓冲清单，下载会整份缓冲安装包；现有 15 秒 / 10 分钟超时只限时间不限字节。
 - P2 签名/版本（架构裁决：本轮不修）：HTTP 镜像可被中间人回放更早的已签名 Vega 版本（降级）；后续用签名内绑定版本 / `requireSignedVersion` 或 HTTPS 镜像。
 - P3 Windows 重启语义：被动安装器自己用 `/R` 拉起新版本，`app.restart()` 只是非 Windows / 安装器未接管时的兜底，文档不再把它写成主路径。
+- `VegaHasChildEntries` 的「确认为空」区分不了中途 I/O 失败（t6c-fix2 审计，非阻断）：
+  宏在 `FindFirst` 成功后进入循环，开头跳过 `.` 与 `..`；空目录时 `FindNext` 正常耗尽（无更多项），
+  变量保持初始 `0`，调用方据此跳过 `/reset`——这一分支是正确的。遗留限制是 `FindNext` **中途**
+  失败（IO 错误等）也被当成正常耗尽，因此同样保留 `0` 并跳过 `/reset`，与「确认为空」无法区分；
+  但真正的枚举失败只在 `FindFirst`（失败或句柄为空）上判 `E`，不会放过应当失败的枚举。修法：换成
+  `System::Call` 的 `FindFirstFileW` / `FindNextFileW` + `?e`，用 `ERROR_NO_MORE_FILES`（18）区分
+  正常结束与中途错误。本轮按裁定只记录，不阻断 0.6.2。
+- 预锁定期间的替换窗口（t6c-fix2 架构裁定，非阻断）：`CreateDirectory $INSTDIR` → `icacls /setowner` →
+  PowerShell 启动并 `SetSecurityDescriptorSddlForm` 写入受保护 DACL 这三步之间目录一直继承盘根 ACL，
+  期间还额外起了一个 PowerShell 进程（启动开销把窗口拉长到数百毫秒级）。盘根给 Users 写权限（非默认配置）
+  时，这一瞬里 `X:\Vega` 可被换成 junction/symlink；安装器随后重扫目标树只能缩小、不能消除 TOCTOU。
+  理想方案：创建目录时就用 `SECURITY_ATTRIBUTES` 带上**受保护 DACL**（`CreateDirectoryW` 的
+  `lpSecurityAttributes`，一次原子写入，不存在「先继承后替换」的中间态）；对已存在的目录则用
+  `\\?\` 句柄 + `SetSecurityInfo` 在**同一个目录句柄**上设置安全描述符（避免按路径二次打开被替换）；
+  递归收紧时逐项打开、遇到 `FILE_ATTRIBUTE_REPARSE_POINT` 直接拒绝而不是跟随。以上都需要
+  `System::Call` 或插件，本轮只记录。
+- App Control / WDAC 脚本强制下内联 PowerShell 会中止安装（t6c-fix3 审计，非阻断）：启用脚本强制后，
+  即使策略允许安装器和 `powershell.exe` 运行，内联 `-Command` 仍进入 `ConstrainedLanguage`；
+  `Get-Acl` 返回的实际类型是 `DirectorySecurity`，PowerShell 按实际类型检查实例方法，拒绝
+  `SetSecurityDescriptorSddlForm`，`$ErrorActionPreference='Stop'` 使该步以非零退出，安装器按
+  `SetErrorLevel 2` 中止。理想方案：改用 Win32 `SetNamedSecurityInfoW` 在同一个句柄上只写
+  Owner + 受保护 DACL，保留一次提权与逐步检查，不再依赖 PowerShell 语言模式。
+- `Set-Acl` 未带 `-Audit` 可能清掉根目录已有 SACL（t6c-fix3 审计，非阻断）：`Get-Acl` 未带 `-Audit`，
+  而 `Set-Acl` 的文件系统提供程序会先尝试持久化全部段；在具备审计写权限的提权令牌下，这可能清掉根目录
+  已有的显式 SACL。理想方案同上：用 Win32 API 把写入范围限定在 Owner 和受保护 DACL（`SetSecurityInfo`
+  只传 `OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION`）。
