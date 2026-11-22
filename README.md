@@ -167,7 +167,7 @@ CI 只构建未签名的安装包：`createUpdaterArtifacts: false`，工作流�
 签名与发布由维护者在本机完成（私钥只在本地环境变量，不进仓库与 CI）：
 
 ```bash
-export TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.tauri/vega.key)"
+export TAURI_SIGNING_PRIVATE_KEY="$(cat <私钥文件>)"
 export TAURI_SIGNING_PRIVATE_KEY_PASSWORD='…'
 tools/publish-update.sh v0.6.0 <path>/Vega-Setup.exe
 ```

@@ -62,7 +62,7 @@ curl -fsSI http://60.205.95.98/vega/updates/Vega-Setup.exe
 1. 本机导出维护者私钥（只在 shell 环境变量里，不进仓库、不进 CI、不作为脚本参数）：
 
    ```bash
-   export TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.tauri/vega.key)"
+   export TAURI_SIGNING_PRIVATE_KEY="$(cat <私钥文件>)"
    export TAURI_SIGNING_PRIVATE_KEY_PASSWORD='…'
    ```
 
