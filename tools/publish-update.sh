@@ -76,17 +76,145 @@ trap 'rm -rf "$work"' EXIT
 SETUP_ABS="${work}/${ASSET}"
 cp "$SETUP" "$SETUP_ABS"
 
-# --- 1. 本地签名 -------------------------------------------------------------
-# 用 console 里锁定的 tauri CLI 版本签名，参数为空则 CLI 自己读 TAURI_SIGNING_* 环境变量。
-TAURI_BIN="${CONSOLE}/node_modules/.bin/tauri"
-[ -x "$TAURI_BIN" ] || { echo "找不到 tauri CLI: $TAURI_BIN（先在 console 里 npm ci）" >&2; exit 1; }
-
-echo "签名 ${TAG} …"
-( cd "$CONSOLE" && "$TAURI_BIN" signer sign "$SETUP_ABS" )
-SIG="${SETUP_ABS}.sig"
-[ -s "$SIG" ] || { echo "签名失败：没有生成 ${SIG}" >&2; exit 1; }
+# --- 1. 签名（同一个 exe 永不重签） -----------------------------------------
+# 签名缓存必须放在仓库之外：Tauri 会把签名时间写进 .sig，重签同一个 exe 会让
+# 签名文件哈希变化，已发布的同版本包就无法重跑发布（远端会判成不同文件）。
+SIG_CACHE="${VEGA_SIG_CACHE:-${HOME}/.cache/vega-sig}"
+mkdir -p "$SIG_CACHE"
 
 LOCAL_SHA="$(sha256sum "$SETUP_ABS" | awk '{print $1}')"
+echo "本地 SHA256：${ASSET} ${LOCAL_SHA}"
+
+# GitHub 资产辅助函数：按名字取 id / 下载后比对 SHA256。
+gh_release_id() {
+  gh api "repos/${REPO}/releases/tags/${RELEASE_TAG}" --jq .id
+}
+gh_asset_id() {
+  local release_id="$1" name="$2"
+  gh api "repos/${REPO}/releases/${release_id}/assets" --paginate \
+    --jq ".[] | select(.name == \"${name}\") | .id"
+}
+# 资产已存在时下载并比对 SHA256；相同返回 0，不同返回 1。不存在返回 2。
+gh_verify_asset() {
+  local release_id="$1" name="$2" want="$3" dest="$4"
+  local id
+  id="$(gh_asset_id "$release_id" "$name")"
+  if [ -z "$id" ]; then
+    return 2
+  fi
+  gh release download "$RELEASE_TAG" --repo "$REPO" --pattern "$name" --output "$dest" --clobber
+  local got
+  got="$(sha256sum "$dest" | awk '{print $1}')"
+  if [ "$got" = "$want" ]; then
+    return 0
+  fi
+  return 1
+}
+# 上传走 Release 的 upload_url（GitHub.com 上是 uploads.github.com）。相对路径的
+# `gh api -X POST repos/.../assets` 发到 api.github.com，上传端点不接受，会失败。
+# 资产改名仍然走 api.github.com 的 PATCH。
+gh_upload_asset() {
+  local file="$1" name="$2"
+  gh release upload "$RELEASE_TAG" "$file" --repo "$REPO"
+  echo "已上传 GitHub ${name}（经 upload_url）。"
+}
+
+# SSH 探测：0=存在，1=不存在，其他（含连接失败的 255）一律中止。
+# 绝不能再把连接失败当成“文件不存在”，否则会覆盖镜像上已发布的同版本包。
+ssh_exists() {
+  local path="$1" rc=0
+  set +e
+  ssh "$MIRROR_HOST" "test -e '${path}'"
+  rc=$?
+  set -e
+  case "$rc" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *)
+      echo "SSH 连接 ${MIRROR_HOST} 失败（退出码 ${rc}）：中止，避免误判远端文件不存在。" >&2
+      exit 1
+      ;;
+  esac
+}
+
+# GitHub 更新 Release 的准备要放在签名之前：远端已有同一个 exe 时要下载并复用
+# 它的 .sig，而不是重新签名。--latest=false：这个 Release 没有源码 ZIP /
+# SHA256SUMS.txt，不能顶掉 bootstrap.ps1 依赖的源码 Release。
+release_id=""
+if [ "${VEGA_SKIP_GITHUB:-0}" != "1" ]; then
+  command -v gh >/dev/null || { echo "需要 gh CLI（或设置 VEGA_SKIP_GITHUB=1）" >&2; exit 1; }
+  if ! gh release view "$RELEASE_TAG" --repo "$REPO" >/dev/null 2>&1; then
+    gh release create "$RELEASE_TAG" --repo "$REPO" --latest=false \
+      --title "Vega 更新通道" --notes "自动更新清单与安装包。由 tools/publish-update.sh 维护，请勿手工改动。"
+  else
+    # 老 Release 可能曾被标成 latest，显式降回去。Update release 只接受 release id。
+    release_id="$(gh_release_id)"
+    gh api -X PATCH "repos/${REPO}/releases/${release_id}" -f make_latest=false >/dev/null
+  fi
+  release_id="$(gh_release_id)"
+fi
+
+SIG="${SETUP_ABS}.sig"
+
+# 1) 本地缓存命中：同一个 exe 的签名原样复用。
+if [ -s "${SIG_CACHE}/${LOCAL_SHA}.sig" ]; then
+  cp "${SIG_CACHE}/${LOCAL_SHA}.sig" "$SIG"
+  echo "复用签名缓存 ${SIG_CACHE}/${LOCAL_SHA}.sig（exe 未变，不重签）。"
+fi
+
+# 2) 远端已经有字节相同的 exe：下载远端 .sig 复用，绝不重签已发布的 exe。
+if [ ! -s "$SIG" ] && [ "${VEGA_SKIP_GITHUB:-0}" != "1" ]; then
+  set +e
+  gh_verify_asset "$release_id" "$ASSET" "$LOCAL_SHA" "${work}/remote-${ASSET}"
+  rc=$?
+  set -e
+  case "$rc" in
+    0)
+      echo "GitHub 已有相同的 ${ASSET}，复用远端签名（不重签）。"
+      gh release download "$RELEASE_TAG" --repo "$REPO" --pattern "$ASSET_SIG" \
+        --output "$SIG" --clobber
+      cp "$SIG" "${SIG_CACHE}/${LOCAL_SHA}.sig"
+      ;;
+    1)
+      echo "GitHub 上的 ${ASSET} 与本地 SHA256 不同，拒绝覆盖（换版本号后重发）。" >&2
+      exit 1
+      ;;
+    2) ;;
+    *)
+      echo "校验 GitHub 资产 ${ASSET} 失败。" >&2
+      exit 1
+      ;;
+  esac
+fi
+if [ ! -s "$SIG" ] && [ "${VEGA_SKIP_MIRROR:-0}" != "1" ]; then
+  remote_exe="${MIRROR_DIR}/${VERSION}/${ASSET}"
+  if ssh_exists "$remote_exe"; then
+    got="$(ssh "$MIRROR_HOST" "sha256sum '${remote_exe}'" | awk '{print $1}')"
+    if [ "$got" = "$LOCAL_SHA" ]; then
+      echo "镜像已有相同的 ${ASSET}，复用远端签名（不重签）。"
+      scp -q "${MIRROR_HOST}:${remote_exe}.sig" "$SIG"
+      cp "$SIG" "${SIG_CACHE}/${LOCAL_SHA}.sig"
+    else
+      echo "镜像上的 ${remote_exe} 与本地 SHA256 不同，拒绝覆盖（换版本号后重发）。" >&2
+      exit 1
+    fi
+  fi
+fi
+
+# 3) 缓存与两个通道都没有现成签名（从未发布过的新 exe）才本地签名。
+if [ ! -s "$SIG" ]; then
+  # 用 console 里锁定的 tauri CLI 版本签名，参数为空则 CLI 自己读 TAURI_SIGNING_* 环境变量。
+  TAURI_BIN="${CONSOLE}/node_modules/.bin/tauri"
+  [ -x "$TAURI_BIN" ] || { echo "找不到 tauri CLI: $TAURI_BIN（先在 console 里 npm ci）" >&2; exit 1; }
+  echo "签名 ${TAG} …"
+  ( cd "$CONSOLE" && "$TAURI_BIN" signer sign "$SETUP_ABS" )
+  [ -s "$SIG" ] || { echo "签名失败：没有生成 ${SIG}" >&2; exit 1; }
+  cp "$SIG" "${SIG_CACHE}/${LOCAL_SHA}.sig"
+  echo "已签名并写入缓存 ${SIG_CACHE}/${LOCAL_SHA}.sig。"
+else
+  echo "使用已有签名 ${SIG}（exe 未变，不重签）。"
+fi
+
 LOCAL_SIG_SHA="$(sha256sum "$SIG" | awk '{print $1}')"
 echo "本地 SHA256：${ASSET} ${LOCAL_SHA}"
 
@@ -118,48 +246,10 @@ PY
 echo "SHA256："
 ( cd "$work" && sha256sum "$ASSET" "${ASSET}.sig" latest.json latest-mirror.json )
 
-# GitHub 资产辅助函数：按名字取 id / 下载后比对 SHA256。
-gh_release_id() {
-  gh api "repos/${REPO}/releases/tags/${RELEASE_TAG}" --jq .id
-}
-gh_asset_id() {
-  local release_id="$1" name="$2"
-  gh api "repos/${REPO}/releases/${release_id}/assets" --paginate \
-    --jq ".[] | select(.name == \"${name}\") | .id"
-}
-# 资产已存在时下载并比对 SHA256；相同返回 0，不同返回 1。不存在返回 2。
-gh_verify_asset() {
-  local release_id="$1" name="$2" want="$3" dest="$4"
-  local id
-  id="$(gh_asset_id "$release_id" "$name")"
-  if [ -z "$id" ]; then
-    return 2
-  fi
-  gh release download "$RELEASE_TAG" --repo "$REPO" --pattern "$name" --output "$dest" --clobber
-  local got
-  got="$(sha256sum "$dest" | awk '{print $1}')"
-  if [ "$got" = "$want" ]; then
-    return 0
-  fi
-  return 1
-}
-
 # --- 3. 安装包先上两个通道（版本化、不可变、可安全重跑） ---------------------
 # 顺序：GitHub 校验/上传 → 镜像校验/上传 → 再切清单。任何一步失败都不会换清单。
-release_id=""
+# Release 已在签名前准备好（release_id）。
 if [ "${VEGA_SKIP_GITHUB:-0}" != "1" ]; then
-  command -v gh >/dev/null || { echo "需要 gh CLI（或设置 VEGA_SKIP_GITHUB=1）" >&2; exit 1; }
-  if ! gh release view "$RELEASE_TAG" --repo "$REPO" >/dev/null 2>&1; then
-    # --latest=false：这个更新 Release 没有源码 ZIP / SHA256SUMS.txt，不能顶掉
-    # bootstrap.ps1 依赖的源码 Release。
-    gh release create "$RELEASE_TAG" --repo "$REPO" --latest=false \
-      --title "Vega 更新通道" --notes "自动更新清单与安装包。由 tools/publish-update.sh 维护，请勿手工改动。"
-  else
-    # 老 Release 可能曾被标成 latest，显式降回去。Update release 只接受 release id。
-    release_id="$(gh_release_id)"
-    gh api -X PATCH "repos/${REPO}/releases/${release_id}" -f make_latest=false >/dev/null
-  fi
-  release_id="$(gh_release_id)"
 
   for pair in "${ASSET}:${LOCAL_SHA}" "${ASSET_SIG}:${LOCAL_SIG_SHA}"; do
     name="${pair%%:*}"
@@ -178,8 +268,7 @@ if [ "${VEGA_SKIP_GITHUB:-0}" != "1" ]; then
         ;;
       2)
         # 不用 --clobber：上传失败不会先删掉旧资产。
-        gh release upload "$RELEASE_TAG" "${work}/${name}" --repo "$REPO"
-        echo "已上传 GitHub ${name}。"
+        gh_upload_asset "${work}/${name}" "$name"
         ;;
       *)
         echo "校验 GitHub 资产 ${name} 失败。" >&2
@@ -197,7 +286,7 @@ if [ "${VEGA_SKIP_MIRROR:-0}" != "1" ]; then
     name="${pair%%:*}"
     want="${pair#*:}"
     remote="${remote_dir}/${name}"
-    if ssh "$MIRROR_HOST" "test -e '${remote}'"; then
+    if ssh_exists "$remote"; then
       got="$(ssh "$MIRROR_HOST" "sha256sum '${remote}'" | awk '{print $1}')"
       if [ "$got" = "$want" ]; then
         echo "镜像已有相同 ${name}，跳过上传。"
