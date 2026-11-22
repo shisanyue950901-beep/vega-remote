@@ -4,7 +4,7 @@
 
 ```
 /opt/vega-relay/updates/
-├── latest.json          # 客户端检查入口（由 latest-mirror.json 原子改名而来）
+├── latest.json          # 客户端检查入口（由 latest-mirror.json 原子改名而来，内容见 publish-update.sh）
 ├── Vega-Setup.exe       # NSIS 安装包
 └── Vega-Setup.exe.sig   # minisign 签名
 ```
@@ -56,17 +56,30 @@ curl -fsSI http://60.205.95.98/vega/updates/Vega-Setup.exe
 
 ## 发布一次更新
 
-1. 在 GitHub 推送 tag `v0.6.0`，`Console` 工作流的 `release` job 上传
-   `Vega-Setup.exe`、`.sig`、`latest.json`、`latest-mirror.json`。
-2. 本机（有服务器 SSH 权限）运行：
+签名只在维护者本机做：CI 构建出来的 `Vega-Setup.exe` 是未签名的普通安装包，公钥已提交在
+`console/src-tauri/tauri.conf.json` 的 `plugins.updater.pubkey`，CI 不需要任何签名密钥。
+
+1. 本机导出维护者私钥（只在 shell 环境变量里，不进仓库、不进 CI、不作为脚本参数）：
 
    ```bash
-   tools/publish-update-mirror.sh v0.6.0
+   export TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.tauri/vega.key)"
+   export TAURI_SIGNING_PRIVATE_KEY_PASSWORD='…'
    ```
 
-   脚本下载 `latest-mirror.json` 与安装包、打印 SHA256，上传后把
-   `.latest.json.tmp` 原子改名为 `latest.json`，客户端不会读到半个文件。
+2. 用 CI 产出的安装包发布：
+
+   ```bash
+   tools/publish-update.sh v0.6.0 <path>/Vega-Setup.exe
+   ```
+
+   脚本用 `tauri signer sign` 生成 `Vega-Setup.exe.sig`，写出 `latest.json`（指向 GitHub tag 资产）
+   与 `latest-mirror.json`（指向本镜像），打印 SHA256，然后上传到 GitHub Release 和
+   `/opt/vega-relay/updates/`；镜像清单最后以 `.latest.json.tmp` 原子改名为 `latest.json`，
+   客户端不会读到半个文件。只想发一边时用 `VEGA_SKIP_GITHUB=1` / `VEGA_SKIP_MIRROR=1`。
 3. 用上面的 `curl` 复查 `latest.json` 的 `version` 与 `url`。
+
+注意：漏签或改用手工 `scp` 时，务必连 `.sig` 一起传；`latest.json` 里的 `signature`
+与安装包内容必须对应，否则客户端校验失败、不会安装。
 
 ## 回滚
 
