@@ -382,22 +382,311 @@ fn helper_script(app: &tauri::AppHandle) -> Option<PathBuf> {
         dev.is_file().then_some(dev)
     })
 }
-/// 发行版必须把助手装在受保护目录（系统 `Program Files`）内：
-/// 否则同用户进程可以改写这个 PowerShell 脚本，提权即被劫持。
-/// 根目录取自 `winpaths::program_files_dirs()`（已知文件夹 + 系统卷校验），不读可被启动环境改写的环境变量。
-/// 返回规范化并去掉 `\\?\` 的最终路径，交给 `-File` 使用。
+/// 发行版只接受两类助手位置，返回规范化并去掉 `\\?\` 的最终路径交给 `-File` 使用：
+///   1. 系统 `Program Files`（含 x86）：根目录取自 `winpaths::program_files_dirs()`
+///      （已知文件夹 + 系统卷校验），不读可被启动环境改写的环境变量。这是默认安装位置。
+///   2. t6b 新增：任意本地安装目录，但必须满足 `custom_install_dir_admin_only` ——
+///      助手在 `<exe_dir>\resources` 里，且 exe_dir / resources / 助手文件三层的所有者与
+///      DACL 都只允许 SYSTEM、Administrators、TrustedInstaller 写入（安装器用 icacls 收紧）。
+/// 两条都不满足时返回固定文案 `INSECURE_INSTALL_DIR`，前端直接显示。
 #[cfg(all(windows, not(debug_assertions)))]
 fn ensure_helper_location(helper: &Path) -> Result<PathBuf, String> {
     let canonical = std::fs::canonicalize(helper).map_err(|_| "无法定位提权助手".to_string())?;
     let roots = crate::winpaths::program_files_dirs();
-    if roots.is_empty() {
-        return Err("无法确定系统 Program Files 目录，无法设置长期密码".into());
+    if let Some(path) = trusted_helper_path(&canonical, &roots) {
+        return Ok(path);
     }
-    trusted_helper_path(&canonical, &roots)
-        .ok_or_else(|| "Vega 未安装在受保护目录，无法设置长期密码".into())
+    let custom = strip_extended_prefix(&canonical);
+    if custom_install_dir_admin_only(&canonical) {
+        return Ok(custom);
+    }
+    Err(INSECURE_INSTALL_DIR.to_string())
 }
 #[cfg(all(windows, debug_assertions))]
 fn ensure_helper_location(helper: &Path) -> Result<PathBuf, String> { Ok(strip_extended_prefix(helper)) }
+
+// ---------------------------------------------------------------------------
+// t6b：安装目录 ACL 校验
+//
+// t6 曾把安装目录固定成 Program Files，理由是长期密码助手
+// `resources\vega-pwhelper.ps1` 必须放在普通用户不可写的目录里：提权助手会以
+// runas 执行该脚本，脚本可写就等于把「管理员执行任意 PowerShell」交给任何本地用户。
+// t6b 放开目录限制（用户可以装到 D:\Vega），改由安装器用 icacls 把目录 ACL 收紧成
+// 「只有 SYSTEM / Administrators 可写」，控制台在每次提权前自己再验一遍：
+//   * 助手必须在 `<exe_dir>\resources` 里，exe_dir 是当前控制台 exe 的真实目录；
+//   * exe_dir、exe_dir\resources、助手文件三者都不能是重解析点（junction/symlink）；
+//   * 三者的所有者必须是 SYSTEM / Administrators / TrustedInstaller；
+//   * 三者的 DACL 里，凡是授予写权限的 allow ACE，被授权者只能是上面三个主体
+//     （CREATOR OWNER 只允许出现在 INHERIT_ONLY 的继承 ACE 上，它不作用于对象本身）。
+// 任何一条不满足都拒绝设置长期密码，并提示重新运行安装包修复。
+// ---------------------------------------------------------------------------
+
+/// 拒绝时给用户看的统一文案。
+#[allow(dead_code)]
+const INSECURE_INSTALL_DIR: &str =
+    "Vega 安装目录权限不安全，无法设置长期密码。请重新运行安装包修复。";
+/// 受信任的主体：本地系统、内置管理员组、TrustedInstaller。
+const SID_LOCAL_SYSTEM: &str = "S-1-5-18";
+const SID_ADMINISTRATORS: &str = "S-1-5-32-544";
+const SID_TRUSTED_INSTALLER: &str =
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+/// CREATOR OWNER：只有带 INHERIT_ONLY 的继承 ACE 才可放行。
+const SID_CREATOR_OWNER: &str = "S-1-3-0";
+
+/// `ACCESS_ALLOWED_ACE_TYPE`：只接受这种普通 allow ACE。
+const ACE_TYPE_ACCESS_ALLOWED: u8 = 0x00;
+/// `INHERIT_ONLY_ACE`：ACE 只作用于子对象，不作用于对象本身。
+const ACE_FLAG_INHERIT_ONLY: u8 = 0x08;
+/// 写类访问权限位（含泛化位）：出现在 allow ACE 里就必须是受信任主体。
+const ACE_WRITE_BITS: u32 = 0x0000_0002 // FILE_WRITE_DATA / FILE_ADD_FILE
+    | 0x0000_0004 // FILE_APPEND_DATA / FILE_ADD_SUBDIRECTORY
+    | 0x0000_0010 // FILE_WRITE_EA
+    | 0x0000_0100 // FILE_WRITE_ATTRIBUTES
+    | 0x0000_0040 // FILE_DELETE_CHILD
+    | 0x0001_0000 // DELETE
+    | 0x0004_0000 // WRITE_DAC
+    | 0x0008_0000 // WRITE_OWNER
+    | 0x1000_0000 // GENERIC_ALL
+    | 0x4000_0000; // GENERIC_WRITE
+
+/// 一条 ACE：`(ace_type, ace_flags, access_mask, SID 字符串)`。
+type AceRecord = (u8, u8, u32, String);
+
+/// SID 是否属于受信任主体（SYSTEM / Administrators / TrustedInstaller）。
+fn is_trusted_sid(sid: &str) -> bool {
+    sid.eq_ignore_ascii_case(SID_LOCAL_SYSTEM)
+        || sid.eq_ignore_ascii_case(SID_ADMINISTRATORS)
+        || sid.eq_ignore_ascii_case(SID_TRUSTED_INSTALLER)
+}
+
+/// ACE 类型分类：`Some(true)` = allow，`Some(false)` = deny/audit（不影响判定），
+/// `None` = 未知类型（一律拒绝）。
+fn ace_class(ace_type: u8) -> Option<bool> {
+    match ace_type {
+        // ACCESS_ALLOWED_ACE_TYPE
+        0x00 => Some(true),
+        // ACCESS_ALLOWED_OBJECT / CALLBACK / CALLBACK_OBJECT：也是 allow，但带对象/回调，
+        // 无法用本函数的简单模型确认授权对象，直接判为不安全。
+        0x05 | 0x09 | 0x0B => Some(true),
+        // SYSTEM_AUDIT / DENY（0x01,0x02,0x03,0x06,0x07,0x08,0x0A,0x0C）：不放行访问。
+        0x01 | 0x02 | 0x03 | 0x04 | 0x06 | 0x07 | 0x08 | 0x0A | 0x0C => Some(false),
+        _ => None,
+    }
+}
+
+/// 纯判定逻辑（可单测）：`owner` 是对象所有者 SID，`dacl` 是 DACL 里的 ACE 列表；
+/// `None` 表示 DACL 为空（NULL DACL = 所有人完全控制）。
+fn dacl_admin_only_write(owner: &str, dacl: Option<&[AceRecord]>) -> bool {
+    if !is_trusted_sid(owner) {
+        return false;
+    }
+    let Some(aces) = dacl else {
+        return false;
+    };
+    for (ace_type, flags, mask, sid) in aces {
+        match ace_class(*ace_type) {
+            // 未知 ACE 类型：不能证明安全，拒绝。
+            None => return false,
+            Some(false) => continue,
+            Some(true) => {}
+        }
+        // allow ACE 只接受普通 ACCESS_ALLOWED_ACE。
+        if *ace_type != ACE_TYPE_ACCESS_ALLOWED {
+            return false;
+        }
+        if mask & ACE_WRITE_BITS == 0 {
+            continue; // 只读/执行权限谁都可以有。
+        }
+        if is_trusted_sid(sid) {
+            continue;
+        }
+        // CREATOR OWNER 的继承 ACE 只作用于子对象，可以放行；作用于对象本身的不行。
+        if sid.eq_ignore_ascii_case(SID_CREATOR_OWNER) && flags & ACE_FLAG_INHERIT_ONLY != 0 {
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+/// 两个路径是否指向同一目录（Windows 路径按 ASCII 忽略大小写，忽略 `\\?\` 前缀与尾部斜杠）。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn same_path(a: &Path, b: &Path) -> bool {
+    let (a, b) = (strip_extended_prefix(a), strip_extended_prefix(b));
+    under_root(&a, &b) && under_root(&b, &a)
+}
+
+/// 读取一个路径的所有者 SID 与 DACL(ACE 列表)；任何一步失败都返回 `None`。
+#[cfg(windows)]
+fn path_owner_and_dacl(path: &Path) -> Option<(String, Option<Vec<AceRecord>>)> {
+    // GetNamedSecurityInfoW / ConvertSidToStringSidW / SE_FILE_OBJECT 在 Security::Authorization；
+    // GetAce / GetAclInformation / ACL_SIZE_INFORMATION 在 Security；LocalFree 在 Foundation。
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, GetNamedSecurityInfoW, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+        SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        GetAce, GetAclInformation, ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION, AclSizeInformation, ACL,
+    };
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut owner: *mut c_void = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut sd: *mut c_void = std::ptr::null_mut();
+    // SAFETY: `wide` 以 NUL 结尾；输出指针由系统写入，安全描述符用 LocalFree 释放。
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    // 从这里开始无论怎么返回都要释放安全描述符。
+    let finish = |value: Option<(String, Option<Vec<AceRecord>>)>| {
+        if !sd.is_null() {
+            unsafe { LocalFree(sd.cast()) };
+        }
+        value
+    };
+
+    let mut raw: *mut u16 = std::ptr::null_mut();
+    if unsafe { ConvertSidToStringSidW(owner, &mut raw) } == 0 {
+        return finish(None);
+    }
+    let mut len = 0usize;
+    unsafe {
+        while *raw.add(len) != 0 {
+            len += 1;
+        }
+    }
+    let owner_sid = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(raw, len) });
+    unsafe { LocalFree(raw.cast()) };
+
+    // NULL DACL：所有人都完全控制，直接按「无 DACL」上报。
+    if dacl.is_null() {
+        return finish(Some((owner_sid, None)));
+    }
+    let mut info: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        GetAclInformation(
+            dacl,
+            (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    };
+    if ok == 0 {
+        return finish(None);
+    }
+    let mut aces: Vec<AceRecord> = Vec::with_capacity(info.AceCount as usize);
+    for index in 0..info.AceCount {
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
+            return finish(None);
+        }
+        // SAFETY: GetAce 返回的指针至少含 ACE_HEADER；allow ACE 才有 Mask/SidStart。
+        let header = unsafe { (ace as *const windows_sys::Win32::Security::ACE_HEADER).read() };
+        let mut record: AceRecord = (header.AceType, header.AceFlags, 0, String::new());
+        if header.AceType == ACE_TYPE_ACCESS_ALLOWED {
+            let allowed = unsafe { (ace as *const ACCESS_ALLOWED_ACE).read() };
+            let mut sid_raw: *mut u16 = std::ptr::null_mut();
+            // SID 起点是 ACE 里的 SidStart 字段。必须指向原始 ACE 缓冲区，不能指向
+            // `allowed` 这个栈上拷贝（那里只有 SID 的前 4 个字节）。
+            let sid_ptr = unsafe {
+                (ace as *const u8).add(std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart)) as *mut c_void
+            };
+            if unsafe { ConvertSidToStringSidW(sid_ptr, &mut sid_raw) } == 0 {
+                // 转换不了 SID：记为不可信主体（保证判定为失败），不中断整份 DACL。
+                record.2 = allowed.Mask;
+                record.3 = String::from("<unknown>");
+            } else {
+                let mut n = 0usize;
+                unsafe {
+                    while *sid_raw.add(n) != 0 {
+                        n += 1;
+                    }
+                }
+                record.2 = allowed.Mask;
+                record.3 = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(sid_raw, n) });
+                unsafe { LocalFree(sid_raw.cast()) };
+            }
+        }
+        aces.push(record);
+    }
+    finish(Some((owner_sid, Some(aces))))
+}
+
+#[cfg(not(windows))]
+#[allow(dead_code)]
+fn path_owner_and_dacl(_path: &Path) -> Option<(String, Option<Vec<AceRecord>>)> {
+    None
+}
+
+/// 单个路径的 ACL 是否「只有管理员可写」。
+#[allow(dead_code)]
+fn path_acl_admin_only_write(path: &Path) -> bool {
+    // 重解析点（junction/symlink）一律不信任：GetNamedSecurityInfoW 看的是链接本身，
+    // 而实际内容可能在别处。
+    if crate::winpaths::is_reparse_point(path) {
+        return false;
+    }
+    match path_owner_and_dacl(path) {
+        Some((owner, dacl)) => dacl_admin_only_write(&owner, dacl.as_deref()),
+        None => false,
+    }
+}
+
+/// 非 Program Files 安装是否可信：助手必须直接位于 `<exe_dir>\resources` 下，
+/// 且 exe_dir、resources、助手文件三层 ACL 都只允许管理员写。
+#[cfg(windows)]
+#[allow(dead_code)]
+fn custom_install_dir_admin_only(helper: &Path) -> bool {
+    use std::path::PathBuf;
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let Some(exe_parent) = exe.parent() else {
+        return false;
+    };
+    let Ok(exe_dir) = std::fs::canonicalize(exe_parent) else {
+        return false;
+    };
+    let Ok(canonical_helper) = std::fs::canonicalize(helper) else {
+        return false;
+    };
+    // 助手文件必须真实存在且是文件（AllowSkipFile 之外的实现），并直接位于 resources 下。
+    if !canonical_helper.is_file() {
+        return false;
+    }
+    let resources: PathBuf = exe_dir.join("resources");
+    let Ok(helper_dir) = std::fs::canonicalize(canonical_helper.parent().unwrap_or(&resources)) else {
+        return false;
+    };
+    if !same_path(&helper_dir, &resources) {
+        return false;
+    }
+    // 三层逐一校验：安装目录、resources、助手文件。
+    path_acl_admin_only_write(&exe_dir)
+        && path_acl_admin_only_write(&resources)
+        && path_acl_admin_only_write(&canonical_helper)
+}
+
+#[cfg(not(windows))]
+#[allow(dead_code)]
+fn custom_install_dir_admin_only(_helper: &Path) -> bool {
+    false
+}
 /// `%SystemRoot%\System32`（`GetSystemDirectoryW`）。
 #[cfg(windows)]
 fn system32_dir() -> Option<PathBuf> {
@@ -570,6 +859,90 @@ mod tests {
         assert!(!under_root(Path::new(r"C:\Users\me\Vega\resources\h.ps1"), root));
         assert!(!under_root(Path::new(r"C:\h.ps1"), root));
         assert!(!under_root(Path::new(r"C:\Program Files\Vega\x"), Path::new("")));
+    }
+    // ---- t6b：安装目录 DACL 判定 ----
+    /// 便捷构造一条 allow ACE：`(sid, mask, flags)`。
+    fn ace(sid: &str, mask: u32, flags: u8) -> AceRecord {
+        (ACE_TYPE_ACCESS_ALLOWED, flags, mask, sid.to_string())
+    }
+    const FILE_ALL: u32 = 0x001F_01FF; // FILE_ALL_ACCESS
+    const FILE_READ_EXEC: u32 = 0x0012_00A9; // 只读 + 执行
+    #[test]
+    fn dacl_admin_only_write_accepts_installer_acl() {
+        // 安装器 icacls 之后的典型 DACL：SYSTEM/Administrators 完全控制，Users 只读执行。
+        let aces = vec![
+            ace(SID_LOCAL_SYSTEM, FILE_ALL, 0),
+            ace(SID_ADMINISTRATORS, FILE_ALL, 0),
+            ace("S-1-5-32-545", FILE_READ_EXEC, 0),
+            ace(SID_TRUSTED_INSTALLER, FILE_ALL, 0),
+        ];
+        assert!(dacl_admin_only_write(SID_ADMINISTRATORS, Some(&aces)));
+        assert!(dacl_admin_only_write(SID_LOCAL_SYSTEM, Some(&aces)));
+        assert!(dacl_admin_only_write(SID_TRUSTED_INSTALLER, Some(&aces)));
+        // 空 DACL：不授予任何写权限，算安全。
+        assert!(dacl_admin_only_write(SID_ADMINISTRATORS, Some(&[])));
+    }
+    #[test]
+    fn dacl_admin_only_write_rejects_user_writes() {
+        // Users 有 FILE_WRITE_DATA：提权助手可被替换 → 拒绝。
+        let aces = vec![
+            ace(SID_ADMINISTRATORS, FILE_ALL, 0),
+            ace("S-1-5-32-545", 0x0000_0002, 0),
+        ];
+        assert!(!dacl_admin_only_write(SID_ADMINISTRATORS, Some(&aces)));
+        // Authenticated Users 有修改（DELETE 等）：同样拒绝。
+        let aces = vec![
+            ace(SID_ADMINISTRATORS, FILE_ALL, 0),
+            ace("S-1-5-11", 0x0001_0000 | 0x0000_0002, 0),
+        ];
+        assert!(!dacl_admin_only_write(SID_ADMINISTRATORS, Some(&aces)));
+        // GENERIC_ALL 给 Everyone：拒绝。
+        let aces = vec![ace("S-1-1-0", 0x1000_0000, 0)];
+        assert!(!dacl_admin_only_write(SID_ADMINISTRATORS, Some(&aces)));
+    }
+    #[test]
+    fn dacl_admin_only_write_creator_owner_rules() {
+        // CREATOR OWNER 的继承 ACE（INHERIT_ONLY）只作用于子对象，放行。
+        let inherit_only = vec![
+            ace(SID_ADMINISTRATORS, FILE_ALL, 0),
+            ace(SID_CREATOR_OWNER, FILE_ALL, ACE_FLAG_INHERIT_ONLY),
+        ];
+        assert!(dacl_admin_only_write(SID_ADMINISTRATORS, Some(&inherit_only)));
+        // 不带 INHERIT_ONLY 时它作用于目录本身：拒绝。
+        let direct = vec![
+            ace(SID_ADMINISTRATORS, FILE_ALL, 0),
+            ace(SID_CREATOR_OWNER, FILE_ALL, 0),
+        ];
+        assert!(!dacl_admin_only_write(SID_ADMINISTRATORS, Some(&direct)));
+    }
+    #[test]
+    fn dacl_admin_only_write_rejects_null_dacl_and_untrusted_owner() {
+        // NULL DACL（None）：所有人完全控制。
+        assert!(!dacl_admin_only_write(SID_ADMINISTRATORS, None));
+        // 所有者是普通用户：他可以改回 DACL。
+        let aces = vec![ace(SID_ADMINISTRATORS, FILE_ALL, 0)];
+        assert!(!dacl_admin_only_write("S-1-5-21-1-2-3-1001", Some(&aces)));
+        // 所有者缺失 / 空字符串同样拒绝。
+        assert!(!dacl_admin_only_write("", Some(&aces)));
+    }
+    #[test]
+    fn dacl_admin_only_write_rejects_non_plain_allow_aces() {
+        // ACCESS_ALLOWED_OBJECT_ACE_TYPEX（0x05）：带对象类型的 allow，无法确认授权对象。
+        let aces = vec![(0x05u8, 0u8, FILE_ALL, SID_ADMINISTRATORS.to_string())];
+        assert!(!dacl_admin_only_write(SID_ADMINISTRATORS, Some(&aces)));
+        // 未知 ACE 类型：不能证明安全。
+        let aces = vec![(0x7Fu8, 0u8, FILE_READ_EXEC, SID_ADMINISTRATORS.to_string())];
+        assert!(!dacl_admin_only_write(SID_ADMINISTRATORS, Some(&aces)));
+        // DENY ACE 不放行访问，不影响判定。
+        let aces = vec![
+            ace(SID_ADMINISTRATORS, FILE_ALL, 0),
+            (0x01u8, 0u8, FILE_ALL, "S-1-5-11".to_string()),
+        ];
+        assert!(dacl_admin_only_write(SID_ADMINISTRATORS, Some(&aces)));
+    }
+    #[test]
+    fn dacl_error_text_is_the_documented_one() {
+        assert_eq!(INSECURE_INSTALL_DIR, "Vega 安装目录权限不安全，无法设置长期密码。请重新运行安装包修复。");
     }
     #[test]
     fn remove_missing_file_counts_as_success() {
