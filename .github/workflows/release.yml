@@ -84,6 +84,8 @@ jobs:
           $checked = Test-VegaBootstrapChecksum -Bytes $bytes -ChecksumText (Get-Content -LiteralPath $sums -Raw) -AssetName $name
           if (-not $checked) { throw 'SHA256SUMS.txt 自检失败' }
 
+      # 本工作流只发源码 zip 与校验和，不产出、也不依赖 updater 清单文件。
+      # 更新清单与已签名安装包由维护者本机 tools/publish-update.sh 发到固定 tag `vega-updates`。
       - name: 创建 GitHub Release
         shell: pwsh
         env:
