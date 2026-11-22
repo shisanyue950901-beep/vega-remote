@@ -1247,6 +1247,10 @@ function setupSettingsPage(): void {
     mobileGeneration += 1;
   });
   mobileSheet.addEventListener("close", () => {
+    // close 是异步派发的：若此时弹层已被重新打开，这是上一次的迟到事件，忽略。
+    if (mobileSheet.open) {
+      return;
+    }
     mobileGeneration += 1;
     mobileButton.focus();
   });
