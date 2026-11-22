@@ -294,7 +294,7 @@
 ### T6b 安装目录放开（v0.6.1）
 - 目录页回归：定制模板恢复 `MUI_PAGE_DIRECTORY`（`PRE SkipIfPassive`），新增 `VegaDirectoryLeave` 校验——只接受 `X:\...` 本地路径、`GetDriveTypeW` 必须为 3（固定盘）、`GetVolumeInformationW` 必须是 NTFS、拒绝盘根、拒绝已存在且非空但不是 Vega（无 `vega-console.exe`）的目录；末段不是 `Vega` 时自动补 `\Vega`。UNC、U 盘/光驱/网络盘/内存盘都被拒。
 - `.onInit`：默认仍是 `$PROGRAMFILES64\Vega`；命令行 `/D=` 优先；否则卸载注册表 `InstallLocation`（去引号、去尾反斜杠）指向仍含 `vega-console.exe` 的目录时沿用（更新/重装、含 `/P` 被动更新都留在原位置）。`PREINSTALL` 只在 `$INSTDIR` 为空时兜底，不再强制改写。
-- 安装后收紧 ACL：`POSTINSTALL` 在迁移前，若 `$INSTDIR` 不在 `$PROGRAMFILES64`/`$PROGRAMFILES` 下，执行 `icacls /setowner *S-1-5-32-544 /T` 与 `/inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /T`；两条都要退出码 0，失败只写完成页提示「安装目录权限设置失败，长期密码不可用」，不 Abort。（**t6c 起这条被三步方案取代，见下节**：对目录带 `/T` 的 `/inheritance:r` 会让子文件 DACL 变空。）
+- 安装后收紧 ACL：`POSTINSTALL` 在迁移前，若 `$INSTDIR` 不在 `$PROGRAMFILES64`/`$PROGRAMFILES` 下，执行 `icacls /setowner *S-1-5-32-544 /T` 与 `/inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /T`；两条都要退出码 0，失败只写完成页提示「安装目录权限设置失败，长期密码不可用」，不 Abort。（**t6c / t6c-fix1 起这条被共用四步方案取代，见下节**：对目录带 `/T` 的 `/inheritance:r` 会让子文件 DACL 变空。）
 - 迁移比较对象改为本次最终 `$INSTDIR`（不再固定 Program Files）；旧目录与 `$INSTDIR` 相同时不做迁移，其余安全检查（不运行旧卸载器、新 uninstall/vega-console 必须是文件、注册表回滚、重解析点、占用跳过）全部保留。
 - 控制台：`password.rs::ensure_helper_location` 除 Program Files 外，只接受「助手位于 `<exe_dir>\resources`」且 exe_dir / resources / 助手文件三层都不是重解析点、所有者与 DACL 都只允许 SYSTEM/Administrators/TrustedInstaller 写（`dacl_admin_only_write` 为纯函数并带单测）；否则返回「Vega 安装目录权限不安全，无法设置长期密码。请重新运行安装包修复。」
 - 版本：`0.6.0` → `0.6.1`。
@@ -306,14 +306,23 @@
   执行 `/inheritance:r /grant:r …(OI)(CI)…`。对**文件**来说 `/inheritance:r` 删掉了全部继承 ACE，而 `(OI)(CI)`
   授权无法落到文件上（`/C` 吞掉错误）→ `D:\Vega\vega-console.exe` 的 DACL 为空：用户无法运行、管理员身份的
   安装器也无法覆盖写入（「无法打开要写入的文件」）、连卸载都删不掉。`icacls D:\Vega` 本身当时是对的。
-- 架构裁定（固定布局）：**目录本身带显式 ACL 且断继承，所有子项只靠继承、不带显式 ACE。** 解包前的
-  `VegaLockInstallDir` 与解包后的 `VegaTightenInstallDir` 都是同样三步，逐条检查退出码：
-  1. 根目录 `"$INSTDIR" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /C /Q`（**不带 `/T`**）；
-  2. `"$INSTDIR" /setowner *S-1-5-32-544 /T /C /Q`；
-  3. 仅当 `$INSTDIR` 下存在子项时（`VegaHasChildEntries`：`FindFirst`/`FindNext` 跳过 `.` 与 `..`）
-     `"$INSTDIR\*" /reset /T /C /Q`；目录为空则跳过并视为成功。
-- 第 3 步的子项 `/reset` 经架构批准：它只把子项改回继承**已锁定的根目录**，不会让根目录重新继承盘根 ACL；
+- 架构裁定（固定布局）：**目录本身带显式 ACL 且断继承（受保护 DACL），所有子项只靠继承、不带显式 ACE。** 解包前的
+  `VegaLockInstallDir` 与解包后的 `VegaTightenInstallDir` 都只打日志后 `Call` 共用 `VegaApplyInstallDirAcl`，
+  四步逐条检查退出码、每步 `Pop` 后立即判定，失败即停（不再执行后续步骤）：
+  1. `"$INSTDIR" /setowner *S-1-5-32-544 /C /Q`（只根目录）；
+  2. 根 DACL 用 PowerShell `SetSecurityDescriptorSddlForm` **精确替换**为
+     `O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)`（受保护 DACL，替换全部 ACE，
+     包括继承、显式拒绝和其他 SID）；删除旧的 `/inheritance:r /grant:r` 调用；写入前检查 `$INSTDIR` 不含单引号；
+  3. `"$INSTDIR" /setowner *S-1-5-32-544 /T /C /Q`；
+  4. 仅当 `$INSTDIR` 下存在子项时（`VegaHasChildEntries` 三态：`1`=有子项、`0`=确认为空、`E`=枚举失败；
+     `FindFirst` 失败但 `IfFileExists "$INSTDIR\*.*"` 为真时记 `E`）
+     `"$INSTDIR\*" /reset /T /C /Q`；`E` 即失败，`0` 跳过并视为成功。
+- 第 4 步的子项 `/reset` 经架构批准：它只把子项改回继承**已锁定的根目录**，不会让根目录重新继承盘根 ACL；
   同时自愈旧版留下的空 DACL 文件（所有者已是 Administrators，可改 DACL）。t6b-fix3 的「解包之后禁止 `/reset`」被本条取代。
+- t6c-fix1（第 1 轮审计）：根 DACL 改为 SDDL 精确替换——旧的 `/inheritance:r /grant:r` 只删继承 ACE、只替换指定 SID
+  的允许 ACE，旧目录上可继承的显式拒绝项和其他 SID 的可继承写权限会残留；每步 `Pop` 后立即检查（前置步骤失败
+  不再继续 `/reset`）；枚举改三态，`FindFirst` 失败不再被当成空目录；`"$INSTDIR\*" /reset /T` 仅在确认有子项时执行。
+  冒烟清单助手路径同步为 `resources\vega-pwhelper.ps1`（tauri.conf.json 的实际 resources 映射）。
 - 其余不变：解包前预锁定后的重扫重解析点逻辑保留在 `VegaLockInstallDir` 之后；`$COMMONPROGRAMDATA\Vega\logs`
   那条 icacls 只作用于目录本身（不带 `/T`），不改；Rust 端逻辑不改（控制台校验的是 exe_dir 的 DACL，目录 ACL 不变）。
 - 版本：`0.6.1` → `0.6.2`。
@@ -321,8 +330,8 @@
 ### T6 加固（待做）
 - 磁盘写满时的安装/在线更新：NSIS 覆盖写入中途耗尽空间会留下截断的 `vega-console.exe` / `uninstall.exe` 与指向它的卸载入口（与 Tauri 默认模板相同）。后续：安装前检查剩余空间、先写临时名再替换，或写入失败时回滚注册表（迁移路径已回滚）。
 - 盘根 ACL 被改成普通账户可删除子项（非默认配置）时，`X:\Vega` 可被替换，卸载入口随之被劫持；后续安装器复用控制台的祖先 ACL 校验拒绝此类盘符。
-- 残余竞态（t6b-fix3 架构裁定 3）：预锁定是 `CreateDirectory $INSTDIR` 之后才执行
-  `/inheritance:r`，从创建目录到断继承之间有一瞬目录仍在继承盘根 ACL——盘根给 Users
+- 残余竞态（t6b-fix3 架构裁定 3 / t6c-fix1）：预锁定是 `CreateDirectory $INSTDIR` 之后才写入受保护的根 DACL
+  （SDDL 精确替换），从创建目录到 DACL 生效之间有一瞬目录仍在继承盘根 ACL——盘根给 Users
   写权限（非默认配置）时，这一瞬里 `X:\Vega` 可被换成 junction/symlink。安装器随后会再扫
   一次目标树（发现重解析点即退出码 2 中止），但扫描与替换之间依旧是 TOCTOU。彻底修法要么
   在创建前锁定父目录，要么改用 `\??\` 句柄级 API 建目录，留待后续；本轮按裁定只记录。

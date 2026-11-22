@@ -49,16 +49,21 @@
   为了让助手仍然只可能被管理员替换，做了两层约束：
   1. **安装器在解包前就锁死 ACL**：安装节校验目标通过后，先 `CreateDirectory $INSTDIR` 并调用
      `VegaLockInstallDir`，然后才 `SetOutPath` / `File` 解包——文件绝不会落进未锁定的目录。
-     锁定按固定顺序执行三步 `icacls`，每条都检查退出码，任一失败立即 `SetErrorLevel 2` + `Abort`
-     （静默安装靠 `/SD IDOK` 直接中止）。ACL 布局是「根目录显式 ACL 且断继承，子项只靠继承」：
-     1. 根目录（**不带 `/T`**）`/inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX`
-        —— SYSTEM、Administrators 完全控制，Users 只读执行；
-     2. `/setowner *S-1-5-32-544 /T` 把所有者（含子树）改成 Administrators；
-     3. 仅当目录下已有子项时 `"$INSTDIR\*" /reset /T`，让子树回到「只继承」——旧自定义目录残留的个人账户 /
-        `Authenticated Users` 显式 ACE 在这一步清掉，旧版留下的空 DACL 文件也在这里自愈。
+     锁定按固定顺序执行四步（`VegaLockInstallDir` 与 `VegaTightenInstallDir` 共用同一个
+     `VegaApplyInstallDirAcl`），每步立即检查退出码，任一失败立即 `SetErrorLevel 2` + `Abort`
+     （静默安装靠 `/SD IDOK` 直接中止）。ACL 布局是「根目录显式 ACL 且断继承（受保护 DACL），子项只靠继承」：
+     1. 根目录 `/setowner *S-1-5-32-544 /C /Q`（只根目录）；
+     2. 用 PowerShell `SetSecurityDescriptorSddlForm` 把根 DACL **精确替换**为
+        `O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)`——受保护 DACL（`P`），
+        只有 SYSTEM、Administrators 完全控制与 Users 只读执行三条 ACE；旧的继承项、显式拒绝项和其他 SID
+        的可继承写权限全部被替换，不会被子项 `/reset` 带到程序文件上。删除旧的 `/inheritance:r /grant:r`
+        调用；写入前检查 `$INSTDIR` 不含单引号；
+     3. `/setowner *S-1-5-32-544 /T` 把所有者（含子树）改成 Administrators；
+     4. 子项三态枚举（`1`=有子项 / `0`=确认为空 / `E`=枚举失败）：`E` 即失败；`1` 时
+        `"$INSTDIR\*" /reset /T`，让子树回到「只继承」并自愈旧版留下的空 DACL 文件；`0` 跳过视为成功。
      绝不能写成对 `"$INSTDIR"` 带 `/T` 的 `/inheritance:r`（0.6.1 的真实 bug）：对文件 `/inheritance:r` 会删掉
      全部继承 ACE，而 `(OI)(CI)` 授权落不到文件上（`/C` 吞错），结果 `vega-console.exe` 的 DACL 为空——用户跑不起来、
-     管理员安装器也覆盖不了。安装完成后（POSTINSTALL）用同样的三步再收紧一次；这一次失败只写进完成页告警，
+     管理员安装器也覆盖不了。安装完成后（POSTINSTALL）用同样的四步再收紧一次；这一次失败只写进完成页告警，
      不再中止（程序已经装好）。
   2. **控制台每次提权前都校验，没有 `Program Files` 快路径**：`ensure_helper_location` 对任何安装位置
      （包括默认的 `Program Files\Vega`）都跑同一套完整校验，不存在「前缀命中就跳过」的分支——`Program Files`
