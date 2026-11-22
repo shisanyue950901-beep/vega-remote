@@ -51,6 +51,15 @@ interface RelayDefaultsView {
   error: string;
 }
 
+/** 设置页「手机扫码配置」：只给矩阵与指纹，完整公钥只在二维码内容里。 */
+interface MobileQrView {
+  size: number;
+  modules: boolean[];
+  server: string;
+  keyFingerprint: string;
+  error: string;
+}
+
 interface OpResult {
   ok: boolean;
   message: string;
@@ -1057,6 +1066,193 @@ function setupSettingsPage(): void {
         : `连接失败：${result.message}`;
       setStatus(testResult, text, result.ok ? "ok" : "error");
     });
+  });
+
+  // 手机扫码配置：把当前 RustDesk 配置画成官方 App 能扫的二维码。
+  // 弹层是原生 <dialog>：showModal() 负责焦点限制在弹层内、Esc 关闭，
+  // 关闭后焦点回到「显示二维码」，键盘不会退到遮罩下的设置控件。
+  const mobileButton = byId<HTMLButtonElement>("show-mobile-qr");
+  const mobileSheet = byId<HTMLDialogElement>("mobile-qr-sheet");
+  const mobileCanvas = byId<HTMLCanvasElement>("mobile-qr-canvas");
+  const mobileStatus = byId<HTMLParagraphElement>("mobile-qr-status");
+  const mobileClose = byId<HTMLButtonElement>("mobile-qr-close");
+  const mobileContext = mobileCanvas.getContext("2d");
+  let mobileGeneration = 0;
+
+  // 二维码边长：版本 1（21）到版本 40（177），且必须是 4n+1 的整数。
+  const QR_MIN_SIZE = 21;
+  const QR_MAX_SIZE = 177;
+  const QR_QUIET_ZONE = 4;
+
+  /**
+   * 上下文是否已经丢失。丢失后 `fillRect` 不报错也不写像素，画布会白屏，
+   * 所以绘制前必须问一句。老实现没有 `isContextLost()`，只能退回 null 判断。
+   */
+  const mobileContextIsLost = (): boolean => {
+    if (!mobileContext) {
+      return false;
+    }
+    // TS 5.4 的 DOM 声明里没有 isContextLost，按可选方法读取。
+    const isLost = (mobileContext as unknown as { isContextLost?: () => boolean }).isContextLost;
+    if (typeof isLost !== "function") {
+      return false;
+    }
+    try {
+      return isLost.call(mobileContext) === true;
+    } catch {
+      return false;
+    }
+  };
+
+  /**
+   * 清空空画布。context 不可用时返回 false，调用方不得再显示成功状态。
+   */
+  const clearMobileCanvas = (): boolean => {
+    if (!mobileContext) {
+      return false;
+    }
+    try {
+      mobileContext.fillStyle = "#fff";
+      mobileContext.fillRect(0, 0, mobileCanvas.width, mobileCanvas.height);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  /**
+   * 画码并返回是否真的画成功。失败时自己写好错误状态，调用方只负责在
+   * 返回 true 之后显示成功文案——否则错误会被紧接着的 ok 覆盖（审计 P2）。
+   */
+  const drawMobileQr = (view: MobileQrView): boolean => {
+    if (!mobileContext) {
+      setStatus(mobileStatus, "当前环境不支持 canvas，请更新系统或显卡驱动后重试", "error");
+      return false;
+    }
+    // 已经丢了上下文就别画：白底黑块都写不进去，画完还报成功等于骗人。
+    if (mobileContextIsLost()) {
+      setStatus(mobileStatus, "绘制二维码失败，请重试", "error");
+      return false;
+    }
+    const size = view.size;
+    if (
+      !Number.isInteger(size) ||
+      size < QR_MIN_SIZE ||
+      size > QR_MAX_SIZE ||
+      (size - 1) % 4 !== 0
+    ) {
+      setStatus(mobileStatus, "二维码尺寸无效，请重试", "error");
+      return false;
+    }
+    if (!Array.isArray(view.modules) || view.modules.length !== size * size) {
+      setStatus(mobileStatus, "二维码数据不完整，请重试", "error");
+      return false;
+    }
+    const canvasSize = mobileCanvas.width;
+    // 四周各 4 模块静区；整数像素缩放后居中，避免半像素糊边。
+    const total = size + QR_QUIET_ZONE * 2;
+    const scale = Math.floor(canvasSize / total);
+    if (!Number.isFinite(canvasSize) || canvasSize <= 0 || scale < 1) {
+      setStatus(mobileStatus, "画布太小，无法容纳二维码和静区，请调整窗口大小后重试", "error");
+      return false;
+    }
+    if (!clearMobileCanvas()) {
+      setStatus(mobileStatus, "画布不可用，请重试", "error");
+      return false;
+    }
+    const offset = Math.floor((canvasSize - scale * total) / 2);
+    try {
+      mobileContext.fillStyle = "#000";
+      for (let row = 0; row < size; row += 1) {
+        for (let col = 0; col < size; col += 1) {
+          if (!view.modules[row * size + col]) {
+            continue;
+          }
+          mobileContext.fillRect(
+            offset + (col + QR_QUIET_ZONE) * scale,
+            offset + (row + QR_QUIET_ZONE) * scale,
+            scale,
+            scale,
+          );
+        }
+      }
+    } catch {
+      // 画到一半失败就把残码擦掉，别让用户扫到半个二维码。
+      clearMobileCanvas();
+      setStatus(mobileStatus, "绘制二维码失败，请重试", "error");
+      return false;
+    }
+    return true;
+  };
+
+  const closeMobileSheet = (): void => {
+    mobileGeneration += 1;
+    if (mobileSheet.open) {
+      mobileSheet.close();
+    }
+  };
+
+  /**
+   * 弹层打开期间 GPU 掉了会触发 contextlost：这时画布上什么都没了，
+   * 继续显示「当前 ID 服务器」就是白屏配成功。直接翻成绘制失败，
+   * 并作废进行中的请求，免得迟到的结果又把状态写回 ok。
+   */
+  const handleMobileContextLost = (): void => {
+    // 监听常驻；弹层没开时不处理，避免异步 close 与重开之间的竞态。
+    if (!mobileSheet.open) {
+      return;
+    }
+    mobileGeneration += 1;
+    setStatus(mobileStatus, "绘制二维码失败，请重试", "error");
+  };
+
+  const openMobileSheet = (): void => {
+    const generation = ++mobileGeneration;
+    if (!mobileSheet.open) {
+      mobileSheet.showModal();
+    }
+    mobileClose.focus();
+    clearMobileCanvas();
+    if (!window.__TAURI__?.core) {
+      setStatus(mobileStatus, "浏览器预览下不可用", "warn");
+      return;
+    }
+    setStatus(mobileStatus, "生成中…");
+    void invoke<MobileQrView>("get_mobile_config_qr").then((view) => {
+      if (generation !== mobileGeneration || !mobileSheet.open) {
+        return;
+      }
+      if (!view) {
+        setStatus(mobileStatus, "读取 RustDesk 配置失败，请重试", "error");
+        return;
+      }
+      if (view.error) {
+        setStatus(mobileStatus, view.error, "warn");
+        return;
+      }
+      // 只有真的画成功了才写成功状态。
+      if (!drawMobileQr(view)) {
+        return;
+      }
+      setStatus(mobileStatus, `当前 ID 服务器：${view.server}`, "ok");
+    });
+  };
+
+  mobileCanvas.addEventListener("contextlost", handleMobileContextLost);
+  mobileButton.addEventListener("click", openMobileSheet);
+  mobileClose.addEventListener("click", closeMobileSheet);
+  // 浏览器对 showModal() 的弹层自己处理 Esc（cancel → close），
+  // 这里只做收尾：作废进行中的请求并把焦点还给入口按钮。
+  mobileSheet.addEventListener("cancel", () => {
+    mobileGeneration += 1;
+  });
+  mobileSheet.addEventListener("close", () => {
+    // close 是异步派发的：若此时弹层已被重新打开，这是上一次的迟到事件，忽略。
+    if (mobileSheet.open) {
+      return;
+    }
+    mobileGeneration += 1;
+    mobileButton.focus();
   });
 
   const doctorResults = byId<HTMLUListElement>("doctor-results");

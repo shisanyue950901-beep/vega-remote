@@ -8,6 +8,7 @@ fn main() {
             "get_device_id",
             "get_server_config",
             "get_relay_defaults",
+            "get_mobile_config_qr",
             "connect_peer",
             "get_recent_peers",
             "open_rustdesk_window",

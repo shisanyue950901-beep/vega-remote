@@ -1010,6 +1010,165 @@ pub fn get_relay_defaults(app: tauri::AppHandle) -> RelayDefaultsView {
     }
 }
 
+/* ---- 手机扫码配置（T5）：官方 App 扫码即填服务器 / 中继 / 公钥 ---- */
+
+/// 读 `RustDesk2.toml` 的字节上限。正常配置只有几 KB，64 KiB 足够，
+/// 且不会因为一个超大文件把后台任务和内存拖住（审计 P2）。
+const MOBILE_CONFIG_MAX_BYTES: u64 = 64 * 1024;
+/// 单个字段（服务器 / 中继）写进 payload 前的字节上限。
+const MOBILE_FIELD_MAX_BYTES: usize = 255;
+/// `config={...}` 整串的字节上限；超过这个长度 qrcode 也编不出来，提前拒绝。
+const MOBILE_PAYLOAD_MAX_BYTES: usize = 1024;
+
+fn check_mobile_field(name: &str, value: &str) -> Result<(), String> {
+    if value.len() > MOBILE_FIELD_MAX_BYTES {
+        return Err(format!(
+            "{name}过长（{} 字节，上限 {MOBILE_FIELD_MAX_BYTES} 字节），请先在 RustDesk 的设置 → 网络里改短",
+            value.len()
+        ));
+    }
+    Ok(())
+}
+
+/// 只读前 `MOBILE_CONFIG_MAX_BYTES` 字节：多读 1 字节用于判定是否超限。
+/// 超限按 `InvalidData` 报错，不进 TOML 解析器。
+fn read_mobile_config_text(path: &Path) -> std::io::Result<String> {
+    let file = std::fs::File::open(path)?;
+    let mut buffer = Vec::new();
+    file.take(MOBILE_CONFIG_MAX_BYTES + 1)
+        .read_to_end(&mut buffer)?;
+    if buffer.len() as u64 > MOBILE_CONFIG_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "RustDesk 配置文件过大（上限 {} KiB）",
+                MOBILE_CONFIG_MAX_BYTES / 1024
+            ),
+        ));
+    }
+    String::from_utf8(buffer)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "配置文件不是有效的 UTF-8"))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MobileQrView {
+    pub size: usize,
+    pub modules: Vec<bool>,
+    pub server: String,
+    pub key_fingerprint: String,
+    pub error: String,
+}
+
+impl MobileQrView {
+    /// 失败视图：矩阵为空、`server` 与指纹置空，前端只能看到错误。
+    fn failed(error: String) -> Self {
+        Self {
+            size: 0,
+            modules: Vec::new(),
+            server: String::new(),
+            key_fingerprint: String::new(),
+            error,
+        }
+    }
+}
+
+/// 官方格式 `config={"host":…,"relay":…,"key":…}`，紧凑 JSON；relay 为空时省略。
+/// Err 文案不含公钥，完整公钥只出现在返回串里。
+///
+/// 公钥走 `validate_key` 并把**规范化后**的值写进 payload：`validate_key` 会剔除
+/// 内部空白，若这里用 trim 后的原值，带折行的公钥能过校验，但手机端会保留空白，
+/// 启用密钥校验的服务器就会拒绝（审计 P2）。
+pub fn mobile_config_payload(server: &str, relay: &str, key: &str) -> Result<String, String> {
+    let (server, relay) = (server.trim(), relay.trim());
+    if server.is_empty() {
+        return Err("还没有配置 ID 服务器，请先在 RustDesk 的设置 → 网络里填好".into());
+    }
+    if key.trim().is_empty() {
+        return Err("还没有配置服务器公钥，请先在 RustDesk 的设置 → 网络里填好".into());
+    }
+    check_mobile_field("ID 服务器", server)?;
+    check_mobile_field("中继服务器", relay)?;
+    let key = validate_key(key)
+        .map_err(|_| "服务器公钥格式无效，请检查 RustDesk 设置 → 网络".to_string())?;
+    #[derive(Serialize)]
+    struct Payload<'a> {
+        host: &'a str,
+        #[serde(skip_serializing_if = "str::is_empty")]
+        relay: &'a str,
+        key: &'a str,
+    }
+    let json = serde_json::to_string(&Payload { host: server, relay, key: key.as_str() })
+        .map_err(|_| "生成二维码内容失败".to_string())?;
+    let payload = format!("config={json}");
+    // qrcode 只在分段完成后才判定容量；这里先按上限拒绝，省掉一次无效编码。
+    if payload.len() > MOBILE_PAYLOAD_MAX_BYTES {
+        return Err(format!(
+            "二维码内容过长（{} 字节，上限 {MOBILE_PAYLOAD_MAX_BYTES} 字节），请先在 RustDesk 的设置 → 网络里缩短服务器地址",
+            payload.len()
+        ));
+    }
+    Ok(payload)
+}
+
+/// 只生成矩阵：按行优先，`Dark => true`。
+fn qr_matrix(payload: &str) -> Result<(usize, Vec<bool>), String> {
+    use qrcode::{Color, EcLevel, QrCode};
+    let code = QrCode::with_error_correction_level(payload.as_bytes(), EcLevel::M)
+        .map_err(|_| "二维码生成失败：内容无法编码".to_string())?;
+    let size = code.width();
+    let modules = code.to_colors().into_iter().map(|c| c == Color::Dark).collect();
+    Ok((size, modules))
+}
+
+/// 读当前 RustDesk2.toml 出码。视图只给矩阵与公钥指纹，
+/// 完整公钥只进入二维码内容，不进 `server` / `error`。
+///
+/// async 命令：Tauri 在异步命令里不占主线程，读文件 / 解析 TOML /
+/// 序列化 / QR 分段全走阻塞线程池（审计 P2）。
+#[tauri::command]
+pub async fn get_mobile_config_qr() -> MobileQrView {
+    match tauri::async_runtime::spawn_blocking(get_mobile_config_qr_blocking).await {
+        Ok(view) => view,
+        Err(_) => MobileQrView::failed("生成二维码失败，请重试".into()),
+    }
+}
+
+fn get_mobile_config_qr_blocking() -> MobileQrView {
+    if !cfg!(windows) {
+        return MobileQrView::failed(NOT_INSTALLED.into());
+    }
+    let Some(path) = user_config_path() else {
+        return MobileQrView::failed("找不到 %APPDATA%\\RustDesk\\config\\RustDesk2.toml".into());
+    };
+    let text = match read_mobile_config_text(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return MobileQrView::failed(format!("{NOT_INSTALLED} 或还没登录过（配置尚未生成）"))
+        }
+        Err(e) => return MobileQrView::failed(format!("读取配置失败：{e}")),
+    };
+    let snapshot = match read_server_config(&text) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return MobileQrView::failed(error),
+    };
+    let payload = match mobile_config_payload(&snapshot.server, &snapshot.relay, &snapshot.key) {
+        Ok(payload) => payload,
+        Err(error) => return MobileQrView::failed(error),
+    };
+    // 任何失败分支都只回错误状态、`server` 置空：前端不会拿旧地址当成功显示。
+    match qr_matrix(&payload) {
+        Ok((size, modules)) => MobileQrView {
+            size,
+            modules,
+            server: snapshot.server.trim().to_string(),
+            key_fingerprint: snapshot.key_fingerprint(),
+            error: String::new(),
+        },
+        Err(error) => MobileQrView::failed(error),
+    }
+}
+
 #[tauri::command]
 pub fn connect_peer(peer_id: String, mode: String, app: tauri::AppHandle) -> OpResult {
     if !cfg!(windows) {
@@ -1721,4 +1880,164 @@ other = "keep"
         assert!(first.starts_with(std::env::temp_dir()));
     }
 
+    const MOBILE_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+    #[test]
+    fn mobile_payload_matches_official_format() {
+        let payload = mobile_config_payload("id.example.com", "relay.example.com", MOBILE_KEY).unwrap();
+        assert_eq!(
+            payload,
+            format!(r#"config={{"host":"id.example.com","relay":"relay.example.com","key":"{MOBILE_KEY}"}}"#)
+        );
+    }
+
+    #[test]
+    fn mobile_payload_omits_empty_relay() {
+        let payload = mobile_config_payload("id.example.com", "  ", MOBILE_KEY).unwrap();
+        assert_eq!(payload, format!(r#"config={{"host":"id.example.com","key":"{MOBILE_KEY}"}}"#));
+        assert!(!payload.contains("relay"));
+    }
+
+    #[test]
+    fn mobile_payload_rejects_empty_server_and_bad_key() {
+        assert!(mobile_config_payload("", "", MOBILE_KEY).is_err());
+        assert!(mobile_config_payload("id.example.com", "", "").is_err());
+        let err = mobile_config_payload("id.example.com", "", "SHORT").unwrap_err();
+        assert!(!err.contains("SHORT"), "{err}");
+    }
+
+    #[test]
+    fn mobile_payload_escapes_json() {
+        // 服务器名里的引号必须由 serde_json 转义，不能拼坏 JSON。
+        let payload = mobile_config_payload(r#"id"x.com"#, "", MOBILE_KEY).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&payload["config=".len()..]).unwrap();
+        assert_eq!(json["host"], r#"id"x.com"#);
+        assert_eq!(json["key"], MOBILE_KEY);
+    }
+    #[test]
+    fn mobile_payload_uses_normalized_key() {
+        // 带折行 / 空格的公钥能过校验，但写进 payload 的必须是 validate_key
+        // 规范化（剔除内部空白）后的值，否则手机端保留空白会被服务器拒绝。
+        let folded = format!("{}\n  {}", &MOBILE_KEY[..20], &MOBILE_KEY[20..]);
+        assert!(!key_invalid(&folded));
+        let normalized = validate_key(&folded).unwrap();
+        assert_eq!(normalized.len(), 44);
+        assert!(!normalized.contains(char::is_whitespace));
+        let payload = mobile_config_payload("id.example.com", "", &folded).unwrap();
+        assert!(payload.contains(&normalized), "{payload}");
+        let json: serde_json::Value = serde_json::from_str(&payload["config=".len()..]).unwrap();
+        assert_eq!(json["key"], normalized);
+    }
+
+    /// 21x21（版本 1）到 177x177（版本 40）之外都不是合法二维码边长。
+    fn assert_valid_matrix(view_size: usize, modules: &[bool]) {
+        assert!(
+            (21..=177).contains(&view_size),
+            "尺寸 {view_size} 不在 21..=177 内"
+        );
+        assert_eq!(view_size % 4, 1, "二维码边长必须是 4n+1");
+        assert_eq!(modules.len(), view_size * view_size, "矩阵长度与尺寸不符");
+        // 不改用外部解码器（会引入新依赖），只做定位图案结构校验：
+        // 三个角各有 7x7 定位框 = 1 圈深色外框 + 1 圈白环 + 3x3 深色实心中心。
+        let at = |x: usize, y: usize| modules[y * view_size + x];
+        for (ox, oy) in [(0usize, 0usize), (view_size - 7, 0), (0, view_size - 7)] {
+            assert!(at(ox, oy), "定位框外框应为深色");
+            assert!(at(ox + 6, oy), "定位框外框应为深色");
+            assert!(!at(ox + 1, oy + 1), "定位框白环应为浅色");
+            assert!(at(ox + 3, oy + 3), "定位框中心 3x3 应为深色");
+        }
+    }
+
+    const TOML_WITH_RELAY: &str = r#"[options]
+custom-rendezvous-server = 'id.example.com'
+relay-server = 'relay.example.com'
+key = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='
+"#;
+
+    const TOML_WITHOUT_RELAY: &str = r#"[options]
+custom-rendezvous-server = 'id.example.com'
+key = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='
+"#;
+
+    #[test]
+    fn mobile_qr_builds_matrix_from_toml_with_relay() {
+        let snapshot = read_server_config(TOML_WITH_RELAY).unwrap();
+        let payload =
+            mobile_config_payload(&snapshot.server, &snapshot.relay, &snapshot.key).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&payload["config=".len()..]).unwrap();
+        assert_eq!(json["host"], "id.example.com");
+        assert_eq!(json["relay"], "relay.example.com");
+        assert_eq!(json["key"], MOBILE_KEY);
+        let (size, modules) = qr_matrix(&payload).unwrap();
+        assert_valid_matrix(size, &modules);
+    }
+
+    #[test]
+    fn mobile_qr_builds_matrix_from_toml_without_relay() {
+        let snapshot = read_server_config(TOML_WITHOUT_RELAY).unwrap();
+        let payload =
+            mobile_config_payload(&snapshot.server, &snapshot.relay, &snapshot.key).unwrap();
+        assert!(!payload.contains("relay"), "{payload}");
+        let (size, modules) = qr_matrix(&payload).unwrap();
+        assert_valid_matrix(size, &modules);
+    }
+
+    #[test]
+    fn mobile_config_rejects_oversize_fields() {
+        // 字段上限 255 字节；255 能过且 payload 仍在 1024 字节内，256 直接拒绝。
+        let host_ok = "a".repeat(MOBILE_FIELD_MAX_BYTES);
+        let payload = mobile_config_payload(&host_ok, "", MOBILE_KEY).unwrap();
+        assert!(payload.len() <= MOBILE_PAYLOAD_MAX_BYTES, "{}", payload.len());
+        let (size, modules) = qr_matrix(&payload).unwrap();
+        assert_valid_matrix(size, &modules);
+
+        let host_bad = "a".repeat(MOBILE_FIELD_MAX_BYTES + 1);
+        let err = mobile_config_payload(&host_bad, "", MOBILE_KEY).unwrap_err();
+        assert!(err.contains("过长"), "{err}");
+
+        let relay_bad = "r".repeat(MOBILE_FIELD_MAX_BYTES + 1);
+        let err = mobile_config_payload("id.example.com", &relay_bad, MOBILE_KEY).unwrap_err();
+        assert!(err.contains("中继服务器过长"), "{err}");
+    }
+
+    #[test]
+    fn mobile_config_read_is_capped_at_64_kib() {
+        let dir = temp_dir("mobile-capped");
+        let small = dir.join("small.toml");
+        std::fs::write(&small, TOML_WITH_RELAY).unwrap();
+        assert_eq!(read_mobile_config_text(&small).unwrap(), TOML_WITH_RELAY);
+
+        // 正好 64 KiB 通过，多 1 字节就报过大，且不进 TOML 解析器。
+        let exact = dir.join("exact.toml");
+        let mut text = String::from("[options]\nnote = '");
+        text.push_str(&"x".repeat((MOBILE_CONFIG_MAX_BYTES as usize) - text.len() - 2));
+        text.push_str("'\n");
+        assert_eq!(text.len() as u64, MOBILE_CONFIG_MAX_BYTES);
+        std::fs::write(&exact, &text).unwrap();
+        assert!(read_mobile_config_text(&exact).is_ok());
+
+        let big = dir.join("big.toml");
+        std::fs::write(&big, format!("{text}x")).unwrap();
+        let err = read_mobile_config_text(&big).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("配置文件过大"), "{err}");
+
+        // 非 UTF-8 也不进解析器。
+        let binary = dir.join("binary.toml");
+        std::fs::write(&binary, [0xffu8, 0xfe, 0x00, 0x41]).unwrap();
+        assert!(read_mobile_config_text(&binary).is_err());
+
+        assert!(read_mobile_config_text(&dir.join("missing.toml")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mobile_failure_view_clears_server_and_matrix() {
+        let view = MobileQrView::failed("出错了".into());
+        assert_eq!(view.size, 0);
+        assert!(view.modules.is_empty());
+        assert!(view.server.is_empty());
+        assert!(view.key_fingerprint.is_empty());
+        assert_eq!(view.error, "出错了");
+    }
 }

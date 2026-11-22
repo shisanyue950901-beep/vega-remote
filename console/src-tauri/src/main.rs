@@ -38,6 +38,7 @@ fn main() {
             rustdesk::get_device_id,
             rustdesk::get_server_config,
             rustdesk::get_relay_defaults,
+            rustdesk::get_mobile_config_qr,
             rustdesk::connect_peer,
             rustdesk::get_recent_peers,
             peers::get_peer_aliases,

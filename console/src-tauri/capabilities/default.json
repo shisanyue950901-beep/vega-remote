@@ -13,6 +13,7 @@
     "allow-get-device-id",
     "allow-get-server-config",
     "allow-get-relay-defaults",
+    "allow-get-mobile-config-qr",
     "allow-connect-peer",
     "allow-get-recent-peers",
     "allow-open-rustdesk-window",
