@@ -378,34 +378,51 @@ vega_trim_done_${ID}:
 ;   * FileFunc.nsh v3.4 没有 GetFullPathName 宏，这里直接调 Win32。
 ;   * GetLongPathNameW 对不存在的路径返回 0（缓冲区内容不可靠），失败时保留
 ;     GetFullPathNameW 的结果；真正要比较的旧目录通常存在，不存在时后续也删不到东西。
+; 注意：System::Call 的 r0–r5 对应 $0–$5（不是 $R0–$R5）。这里全程只用 $0–$5，
+; 并在进出宏时 Push/Pop，避免污染调用方使用的 $R0–$R9 与 nsExec/file 用的 $0–$5。
 !macro VegaCanonicalDir ID VAR
-  StrCpy $R0 "${VAR}"
+  Push $0
+  Push $1
+  Push $2
+  Push $3
+  Push $4
+  StrCpy $0 "${VAR}"
   System::Call 'kernel32::GetFullPathNameW(w r0, i 1024, w .r1, i 0) i .r2'
-  StrCmp $R2 "0" vega_canon_done_${ID}
-    StrCpy ${VAR} "$R1"
+  StrCmp $2 "0" vega_canon_done_${ID}
+    StrCpy ${VAR} "$1"
     ; 8.3 短名（PROGRA~1）与长名是两个不同字符串，先解析成长名再比较。
     System::Call 'kernel32::GetLongPathNameW(w r1, w .r3, i 1024) i .r4'
-    StrCmp $R4 "0" vega_canon_trim_${ID}
-      StrCpy ${VAR} "$R3"
+    StrCmp $4 "0" vega_canon_trim_${ID}
+      StrCpy ${VAR} "$3"
 vega_canon_trim_${ID}:
     !insertmacro VegaTrimDirPath canon_${ID} ${VAR}
 vega_canon_done_${ID}:
+  Pop $4
+  Pop $3
+  Pop $2
+  Pop $1
+  Pop $0
 !macroend
 
 !define FILE_ATTRIBUTE_REPARSE_POINT 0x400
 
 ; 检查路径是否带 FILE_ATTRIBUTE_REPARSE_POINT（junction / symlink / mount point）。
 ; 不存在（GetFileAttributesW 返回 INVALID_FILE_ATTRIBUTES = -1）不算重解析点。
+; 同样只用 $0/$1（System::Call 的 r0/r1），进出宏 Push/Pop。
 !macro VegaIsReparsePoint ID PATH VAR
+  Push $0
+  Push $1
   StrCpy ${VAR} "0"
-  System::Call 'kernel32::GetFileAttributesW(w "${PATH}") i .r5'
+  System::Call 'kernel32::GetFileAttributesW(w "${PATH}") i .r0'
   ; INVALID_FILE_ATTRIBUTES（0xFFFFFFFF）表示路径不存在，不算重解析点。
-  IntCmpU $R5 0xFFFFFFFF vega_reparse_done_${ID} vega_reparse_check_${ID} vega_reparse_done_${ID}
+  IntCmpU $0 0xFFFFFFFF vega_reparse_done_${ID} vega_reparse_check_${ID} vega_reparse_done_${ID}
 vega_reparse_check_${ID}:
-  IntOp $R6 ${FILE_ATTRIBUTE_REPARSE_POINT} & $R5
-  StrCmp $R6 "0" vega_reparse_done_${ID}
+  IntOp $1 ${FILE_ATTRIBUTE_REPARSE_POINT} & $0
+  StrCmp $1 "0" vega_reparse_done_${ID}
     StrCpy ${VAR} "1"
 vega_reparse_done_${ID}:
+  Pop $1
+  Pop $0
 !macroend
 
 !macro VegaRemovePreviousInstall
