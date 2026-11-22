@@ -336,6 +336,13 @@
                 <button id="test-connection" class="btn btn--tinted btn--sm" type="button">测试连接</button>
                 <button id="open-rustdesk-network" class="btn btn--primary btn--sm" type="button">在 RustDesk 中修改</button>
               </div>
+              <div class="row row--test">
+                <span class="row__body">
+                  <span class="row__label">手机扫码配置</span>
+                  <span class="row__sub">iPhone / 安卓装官方 RustDesk，首页右上角扫码即可连到本机同一服务器</span>
+                </span>
+                <button id="show-mobile-qr" class="btn btn--tinted btn--sm" type="button">显示二维码</button>
+              </div>
               <div class="row row--stack">
                 <span class="row__sub">服务器地址请在 RustDesk 的 设置 → 网络 中修改。控制台只读取 <code>RustDesk2.toml</code> 显示当前值；安装包默认值来自 <code>vega-defaults.json</code>，这里只做比对。</span>
               </div>
@@ -369,6 +376,23 @@
             </div>
           </section>
         </main>
+      </div>
+    </div>
+
+    <!-- 手机扫码配置弹层 -->
+    <div id="mobile-qr-sheet" class="modal is-hidden" role="dialog" aria-modal="true" aria-labelledby="mobile-qr-title">
+      <div class="modal__box">
+        <h2 id="mobile-qr-title" class="modal__title">手机扫码配置</h2>
+        <div class="qr-canvas-wrap"><canvas id="mobile-qr-canvas" width="240" height="240"></canvas></div>
+        <p id="mobile-qr-status" class="row__sub" role="status" aria-live="polite">生成中…</p>
+        <ol class="qr-steps">
+          <li>App Store 搜「RustDesk远程桌面」安装</li>
+          <li>打开后点首页右上角菜单里的扫码</li>
+          <li>扫这个码，ID 服务器和公钥会自动填好</li>
+        </ol>
+        <div class="modal__actions">
+          <button id="mobile-qr-close" class="btn btn--primary btn--sm" type="button">关闭</button>
+        </div>
       </div>
     </div>
 
