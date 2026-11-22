@@ -130,7 +130,8 @@ Var vegaTargetEmpty
 Var vegaWalkPath
 Var vegaWalkFound
 Var vegaWalkError
-; t6b-fix3（架构裁定 3/5）：最近一次枚举失败的 GetLastError 码（0 = 没有错误）。
+; t6b-fix3（架构裁定 3/5）：最近一次枚举失败的 GetLastError 码（0 = 没有错误，或
+; 内置 FindFirst/FindNext 失败、拿不到错误码）。
 ; 预锁定后的重扫用它写中止原因，不再把「读不了」当成「不存在」。
 Var vegaWalkErrCode
 Var vegaTmp1
@@ -934,13 +935,23 @@ FunctionEnd
 ;   * 无法枚举 → $vegaWalkError=1，绝不当作空目录继续（裁定 3）。
 ;
 ; t6b-fix3（架构裁定 5）：**「读不到」和「不存在」必须分开。**
-;   * 每次 GetFileAttributesW 都用 `?e` 把 GetLastError 取到 $vegaWalkErrCode；
+;   * 每次 GetFileAttributesW 都用 `?e` 取调用后的 GetLastError；
 ;     只有 2 (ERROR_FILE_NOT_FOUND) / 3 (ERROR_PATH_NOT_FOUND) 才算「真不存在」
 ;     （新装目标、枚举途中被删的子项），其它错误码（5 拒绝访问、32 占用、206 太长、
 ;     IO 错误……）一律中止：读不了属性就说明这棵树不可信，跳过等于放行。
-;   * FindNext 失败时取 GetLastError，只有 18 (ERROR_NO_MORE_FILES) 是正常结束；
-;     其它错误码中止。FindFirst 失败同理（先取码，2/3 视为目录已消失，其余中止）。
 ;   * 子项属性读取失败也按上面的规则处理，绝不静默跳过。
+;
+; t6b-fix3d（终检第 5 项）：**`?e` 把错误码压到 NSIS 栈顶，必须立刻 `Pop` 取走。**
+;   * 本函数本来就用 NSIS 栈存放待扫描路径，`?e` 的返回值如果不 Pop，下一轮
+;     `Pop $vegaWalkPath` 会把错误码（2 / 3 / 5 …）当成目录名去扫描；不落在循环里的
+;     那处调用则会让后面的判断读到上一次残留的错误码。所以两处都写成
+;     `System::Call '… ?e'` + 紧跟一行 `Pop $N`，用 `?e` 而不是 `?e .rN`：
+;     语义只有一种（压栈），栈平衡也一眼可数。
+;   * FindNext / FindFirst 是 NSIS 内置命令，**拿不到 GetLastError**：调用完再单独
+;     `kernel32::GetLastError` 读到的是别的 API 留下的码，不能用来判断。因此：
+;     FindNext 之后只认「$2 为空名」与内置错误标志为结束，不再区分中途失败
+;     （与正常结束无法区分，已记入 ROADMAP「T6 加固」）；FindFirst 失败（错误标志或
+;     空句柄）一律按「读不了、中止」处理（fail closed），错误码记为 0（无法取得）。
 ; 用 NSIS 栈做迭代式深度优先：底部压哨兵，顶层压根；每弹出一个目录就枚举，
 ; 子目录压回栈顶。退出前（无论命中/出错/正常结束）都把栈清到哨兵，保持平衡。
 ; 函数进出 Push/Pop $0-$5，不污染调用方。
@@ -962,8 +973,9 @@ vega_walk_pop:
   Pop $vegaWalkPath
   StrCmp $vegaWalkPath "__VEGA_WALK_END__" vega_walk_done
 
-  ; 属性 + GetLastError 一起取（?e 捕获调用后的错误码）。
-  System::Call 'kernel32::GetFileAttributesW(w "$vegaWalkPath") i .r0 ?e .r1'
+  ; 属性 + GetLastError 一起取：`?e` 把错误码压栈，下一行立即 Pop 取走（不留栈）。
+  System::Call 'kernel32::GetFileAttributesW(w "$vegaWalkPath") i .r0 ?e'
+  Pop $1
   IntCmpU $0 0xFFFFFFFF vega_walk_attrs_missing vega_walk_attrs_ok vega_walk_attrs_ok
 vega_walk_attrs_missing:
   ; 只有 2 / 3 是「真不存在」；其它错误码一律中止，不跳过。
@@ -990,8 +1002,9 @@ vega_walk_entry:
   StrCmp $2 "." vega_walk_next
   StrCmp $2 ".." vega_walk_next
   StrCpy $3 "$vegaWalkPath\$2"
-  ; 子项属性同样带 ?e：读不到就中止，不静默跳过（裁定 5）。
-  System::Call 'kernel32::GetFileAttributesW(w "$3") i .r4 ?e .r5'
+  ; 子项属性同样带 `?e` + 立刻 `Pop $5`：读不到就中止，不静默跳过（裁定 5）。
+  System::Call 'kernel32::GetFileAttributesW(w "$3") i .r4 ?e'
+  Pop $5
   IntCmpU $4 0xFFFFFFFF vega_walk_child_missing vega_walk_child_ok vega_walk_child_ok
 vega_walk_child_missing:
   ; 2 / 3：枚举期间被删，跳过这一项；其它错误码中止整次扫描。
@@ -1012,25 +1025,19 @@ vega_walk_child:
 vega_walk_next:
   ClearErrors
   FindNext $1 $2
-  IfErrors vega_walk_next_error
+  ; t6b-fix3d：内置 FindNext 拿不到错误码。错误标志或空名都只按「枚举结束」处理，
+  ; 不再试图区分「正常结束」与「中途失败」（见 ROADMAP「T6 加固」）。
+  IfErrors vega_walk_scan_done
   StrCmp $2 "" vega_walk_scan_done
   Goto vega_walk_entry
-vega_walk_next_error:
-  ; 只有 18 (ERROR_NO_MORE_FILES) 是正常结束；其余错误码中止。
-  System::Call 'kernel32::GetLastError() i .r5'
-  StrCmp $5 "18" vega_walk_scan_done
-  StrCpy $vegaWalkErrCode "$5"
-  StrCpy $vegaWalkError "1"
-  Goto vega_walk_scan_done
 vega_walk_scan_done:
   FindClose $1
   Goto vega_walk_pop
 vega_walk_find_error:
-  ; FindFirst 失败：取错误码；2 / 3 说明目录在扫描中途消失（等同于不存在），其它中止。
-  System::Call 'kernel32::GetLastError() i .r5'
-  StrCmp $5 "2" vega_walk_pop
-  StrCmp $5 "3" vega_walk_pop
-  StrCpy $vegaWalkErrCode "$5"
+  ; t6b-fix3d：FindFirst 失败只用内置错误标志与空句柄判断。拿不到错误码，无法区分
+  ; 「目录在扫描途中消失」和「拒绝访问 / IO 错误」，安全方向是 fail closed：一律按
+  ; 「读不了」中止，错误码记 0（表示无法取得），不当作空目录继续。
+  StrCpy $vegaWalkErrCode "0"
   StrCpy $vegaWalkError "1"
   Goto vega_walk_pop
 
@@ -1075,7 +1082,8 @@ FunctionEnd
 ;
 ; 结果：$vegaTargetError 为空表示通过（$INSTDIR 已规范化），否则是整句中文错误，
 ; 由调用方决定 MessageBox / SetErrorLevel + Abort。函数进出 Push/Pop $0-$5 与 $R0-$R5，
-; 不污染调用方。System::Call 的输出寄存器一律写成 `.rN`，随后读对应的 `$N`（不是 `$RN`）。
+; 不污染调用方。System::Call 的返回值/输出参数写成 `.rN`，随后读对应的 `$N`（不是 `$RN`）；
+; `?e` 是唯一的例外，它把错误码**压栈**，调用后必须紧跟一行 `Pop $N`（t6b-fix3d）。
 Function VegaValidateTarget
   Push $0
   Push $1
@@ -1093,6 +1101,8 @@ Function VegaValidateTarget
   StrCpy $vegaTargetError ""
   StrCpy $vegaTargetChanged "0"
   StrCpy $vegaTargetEmpty "1"
+  ; t6b-fix3d：错误码从这里开始只由本函数写，0 表示「拿不到错误码」（内置枚举失败）。
+  StrCpy $vegaWalkErrCode "0"
 
   StrCmp $INSTDIR "" vega_validate_empty_path
   !insertmacro VegaTrimDirPath target $INSTDIR
@@ -1164,7 +1174,10 @@ vega_validate_nonempty:
   ; 不能当作空目录放行；只有确认路径不存在才走「空目录」语义。
   ; t6b-fix3（架构裁定 5）：这个「不存在」也只认 GetLastError 2 / 3——其它错误码
   ; （拒绝访问、IO 错误……）是读不了，按错误中止，不能当成空目录往下走。
-  System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR") i .r0 ?e .r2'
+  ; t6b-fix3d（终检第 5 项）：`?e` 把错误码压栈，紧接一行 `Pop $2` 取走，不留残留；
+  ; 首次安装到尚不存在的 $PROGRAMFILES64\Vega / X:\Vega 时这里才会读到真错误码。
+  System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR") i .r0 ?e'
+  Pop $2
   IntCmpU $0 0xFFFFFFFF vega_validate_attrs_missing vega_validate_scan_open vega_validate_scan_open
 vega_validate_attrs_missing:
   StrCmp $2 "2" vega_validate_tree
@@ -1172,6 +1185,7 @@ vega_validate_attrs_missing:
   StrCpy $vegaWalkErrCode "$2"
   Goto vega_validate_scan_error
 vega_validate_scan_open:
+  ; 拿不到错误码的失败（内置 FindFirst 的错误标志 / 空句柄）一律按「读不了」处理。
   ClearErrors
   FindFirst $0 $1 "$INSTDIR\*.*"
   IfErrors vega_validate_scan_error
@@ -1184,16 +1198,11 @@ vega_validate_scan:
 vega_validate_scan_next:
   ClearErrors
   FindNext $0 $1
-  IfErrors vega_validate_scan_next_error
+  ; t6b-fix3d：内置 FindNext 拿不到 GetLastError。错误标志或空名只按「枚举结束」处理
+  ; （无法与中途失败区分，已记入 ROADMAP「T6 加固」）。
+  IfErrors vega_validate_scan_done
   StrCmp $1 "" vega_validate_scan_done
   Goto vega_validate_scan
-vega_validate_scan_next_error:
-  ; 只有 18 (ERROR_NO_MORE_FILES) 是正常结束；其它错误码按读不了处理。
-  System::Call 'kernel32::GetLastError() i .r2'
-  StrCmp $2 "18" vega_validate_scan_done
-  StrCpy $vegaWalkErrCode "$2"
-  FindClose $0
-  Goto vega_validate_scan_error
 vega_validate_scan_done:
   FindClose $0
   StrCmp $vegaTargetEmpty "1" vega_validate_tree
@@ -1211,7 +1220,8 @@ vega_validate_not_vega:
 
 vega_validate_scan_error:
   ; t6b-fix3（架构裁定 5）：错误码写进提示，便于区分「拒绝访问」和「IO 错误」。
-  StrCpy $vegaTargetError "无法读取安装目录内容（错误码 $vegaWalkErrCode），请确认该目录存在且当前账户有读取权限。"
+  ; t6b-fix3d：内置 FindFirst 失败拿不到错误码，此时为 0。
+  StrCpy $vegaTargetError "无法读取安装目录内容（错误码 $vegaWalkErrCode，0 表示无法取得），请确认该目录存在且当前账户有读取权限。"
   Goto vega_validate_done
 
 vega_validate_tree:
@@ -1243,7 +1253,9 @@ vega_validate_walk:
   StrCmp $vegaWalkFound "1" vega_validate_reparse
   Goto vega_validate_ok
 vega_validate_walk_error:
-  StrCpy $vegaTargetError "无法读取安装目录内容（错误码 $vegaWalkErrCode），请确认该目录存在且当前账户有读取权限。"
+  ; t6b-fix3d：错误码来自两处 `?e` 后的 Pop；0 表示内置 FindFirst/FindNext 失败、
+  ; 拿不到错误码（无法区分中途失败与正常结束，见 ROADMAP「T6 加固」）。
+  StrCpy $vegaTargetError "无法读取安装目录内容（错误码 $vegaWalkErrCode，0 表示无法取得），请确认该目录存在且当前账户有读取权限。"
   Goto vega_validate_done
 vega_validate_reparse:
   StrCpy $vegaTargetError "安装目录或其子项是重解析点（junction 或符号链接），解包和 ACL 会跟着链接跑到目录外，出于安全原因拒绝安装。请移除链接后重试。"
