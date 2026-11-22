@@ -39,6 +39,7 @@
 
 Var vegaSetupExitCode
 Var vegaFinishText
+Var vegaMigratePending
 Var vegaPowerShell
 Var vegaLogUsable
 Var vegaSetupLogLine
@@ -447,6 +448,7 @@ vega_sc_done_${ID}:
 !macro VegaRemovePreviousInstall
   StrCpy $vegaOldInstallDir ""
   StrCpy $vegaOldInstallWarning ""
+  StrCpy $vegaMigratePending "0"
 
   ; t6-fix4：/UPDATE 也走这里。迁移只做文件删除，不会回滚 RustDesk 配置；
   ; 若旧版就在固定目录，下面的长路径比较会直接跳过。
@@ -525,7 +527,21 @@ vega_old_refused:
 vega_old_check_binary:
   ; 护栏三：只处理确实含 vega-console.exe 的目录。
   IfFileExists "$vegaOldInstallDir\vega-console.exe" 0 vega_old_no_binary
+  ; t6-fix5（r4 P2）：PREINSTALL 只判定，不删除。新文件写入成功、到 POSTINSTALL 时
+  ; 才删旧文件并改快捷方式；新程序解包失败或用户取消时旧版仍然完整可用。
+  StrCpy $vegaMigratePending "1"
+  Goto vega_old_done
 
+vega_old_no_binary:
+  DetailPrint "旧版记录指向 $vegaOldInstallDir，但没有 vega-console.exe，跳过旧目录清理。"
+
+vega_old_done:
+!macroend
+
+; POSTINSTALL 调用：新文件已写入固定目录后再清理旧目录。
+!macro VegaFinishPreviousInstall
+  StrCmp $vegaMigratePending "1" 0 vega_mig_done
+  StrCpy $vegaMigratePending "0"
   DetailPrint "发现旧版 Vega 装在 $vegaOldInstallDir，删除旧程序文件（不运行旧卸载器，RustDesk 与配置保持原样）…"
 
   ; 先保证当前解包目录是固定目录，避免后续 File 落回旧目录。
@@ -564,19 +580,15 @@ vega_old_shortcut_sub_done:
   !insertmacro VegaMigrateShortcut old_sc_desk "$DESKTOP\${PRODUCTNAME}.lnk" "$DESKTOP"
 
   ; 主程序没删掉（仍在运行）时不再检查目录内容，上面的告警已经说明原因。
-  IfFileExists "$vegaOldInstallDir\vega-console.exe" vega_old_done
+  IfFileExists "$vegaOldInstallDir\vega-console.exe" vega_mig_done
   IfFileExists "$vegaOldInstallDir\*.*" 0 vega_old_cleaned
     StrCpy $vegaOldInstallWarning "旧版目录 $vegaOldInstallDir 的程序文件已删除，但目录里仍有其他文件（可能不是 Vega 的），已保留，可手动删除。"
     DetailPrint "$vegaOldInstallWarning"
-    Goto vega_old_done
+    Goto vega_mig_done
 vega_old_cleaned:
   DetailPrint "旧版目录 $vegaOldInstallDir 已清理。"
-  Goto vega_old_done
 
-vega_old_no_binary:
-  DetailPrint "旧版记录指向 $vegaOldInstallDir，但没有 vega-console.exe，跳过旧目录清理。"
-
-vega_old_done:
+vega_mig_done:
 !macroend
 
 ; t6-fix：安装路径固定。Tauri 在 PREINSTALL 之后才复制文件、写注册表与快捷方式，
@@ -613,6 +625,8 @@ vega_preinstall_dir_done:
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
+  ; 新文件已就位：此时才清理旧目录、改快捷方式（见 VegaFinishPreviousInstall）。
+  !insertmacro VegaFinishPreviousInstall
   ; t6-fix4（架构裁定）：
   ;   * 全新安装（PREINSTALL 没读到旧卸载键）→ 照旧运行 RustDesk 安装/配置脚本。
   ;   * 重装或 /UPDATE → 默认完全跳过脚本，不下载、不改中继配置；只有 Program Files

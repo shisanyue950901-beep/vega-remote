@@ -124,8 +124,12 @@ gh_verify_asset() {
   if [ -z "$id" ]; then
     return 2
   fi
-  size="$(gh_asset_size "$release_id" "$name")"
-  if [ "${size:-0}" = "0" ]; then
+  # 查询失败或返回空值不能当成 0 字节残留：直接报错（返回 3），绝不删除已发布资产。
+  if ! size="$(gh_asset_size "$release_id" "$name")" || [ -z "$size" ]; then
+    echo "查询 GitHub 资产 ${name} 的大小失败，中止（不删除任何资产）。" >&2
+    return 3
+  fi
+  if [ "$size" = "0" ]; then
     echo "GitHub 上的 ${name} 是 0 字节残留资产（上次上传中断），删除后重传。" >&2
     gh_delete_asset "$id"
     return 2
@@ -144,15 +148,19 @@ gh_verify_asset() {
 # 用文件基名）。资产改名仍走 api.github.com 的 PATCH。
 gh_upload_asset() {
   local file="$1" name="$2"
-  local token upload_url
-  token="$(gh auth token)"
+  local upload_url hdr
   upload_url="$(gh api "repos/${REPO}/releases/${release_id}" --jq .upload_url)"
   upload_url="${upload_url%\{*}"  # 去掉 {?name,label} 模板
+  # 令牌不进进程参数：写进 0600 头文件，curl 用 -H @file 读取，用完即删。
+  hdr="$(mktemp "${work}/gh-hdr.XXXXXX")"
+  chmod 600 "$hdr"
+  printf 'Authorization: token %s\n' "$(gh auth token)" > "$hdr"
   curl -sS -f -X POST "${upload_url}?name=${name}" \
-    -H "Authorization: token ${token}" \
+    -H "@${hdr}" \
     -H "Accept: application/vnd.github+json" \
     -H "Content-Type: application/octet-stream" \
-    --data-binary "@${file}" >/dev/null
+    --data-binary "@${file}" >/dev/null || { rm -f "$hdr"; return 1; }
+  rm -f "$hdr"
   echo "已上传 GitHub ${name}（经 upload_url ${upload_url}）。"
 }
 
@@ -207,10 +215,15 @@ if [ ! -s "$SIG" ] && [ "${VEGA_SKIP_GITHUB:-0}" != "1" ]; then
   set -e
   case "$rc" in
     0)
-      echo "GitHub 已有相同的 ${ASSET}，复用远端签名（不重签）。"
-      gh release download "$RELEASE_TAG" --repo "$REPO" --pattern "$ASSET_SIG" \
-        --output "$SIG" --clobber
-      cp "$SIG" "${SIG_CACHE}/${LOCAL_SHA}.sig"
+      if [ -n "$(gh_asset_id "$release_id" "$ASSET_SIG")" ]; then
+        echo "GitHub 已有相同的 ${ASSET}，复用远端签名（不重签）。"
+        gh release download "$RELEASE_TAG" --repo "$REPO" --pattern "$ASSET_SIG" \
+          --output "$SIG" --clobber
+        cp "$SIG" "${SIG_CACHE}/${LOCAL_SHA}.sig"
+      else
+        # 上次在传完 exe、传 .sig 前中断：签名从未发布，后面可以安全地本地签名。
+        echo "GitHub 有相同的 ${ASSET} 但没有 ${ASSET_SIG}（上次中断），稍后本地签名。"
+      fi
       ;;
     1)
       echo "GitHub 上的 ${ASSET} 与本地 SHA256 不同，拒绝覆盖（换版本号后重发）。" >&2
@@ -228,9 +241,13 @@ if [ ! -s "$SIG" ] && [ "${VEGA_SKIP_MIRROR:-0}" != "1" ]; then
   if ssh_exists "$remote_exe"; then
     got="$(ssh "$MIRROR_HOST" "sha256sum '${remote_exe}'" | awk '{print $1}')"
     if [ "$got" = "$LOCAL_SHA" ]; then
-      echo "镜像已有相同的 ${ASSET}，复用远端签名（不重签）。"
-      scp -q "${MIRROR_HOST}:${remote_exe}.sig" "$SIG"
-      cp "$SIG" "${SIG_CACHE}/${LOCAL_SHA}.sig"
+      if ssh_exists "${remote_exe}.sig"; then
+        echo "镜像已有相同的 ${ASSET}，复用远端签名（不重签）。"
+        scp -q "${MIRROR_HOST}:${remote_exe}.sig" "$SIG"
+        cp "$SIG" "${SIG_CACHE}/${LOCAL_SHA}.sig"
+      else
+        echo "镜像有相同的 ${ASSET} 但没有 .sig（上次中断），稍后本地签名。"
+      fi
     else
       echo "镜像上的 ${remote_exe} 与本地 SHA256 不同，拒绝覆盖（换版本号后重发）。" >&2
       exit 1

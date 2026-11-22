@@ -1773,8 +1773,9 @@ function setupUpdater(): void {
   /** 空闲态文案（版本号）。静默检查失败时原样恢复，不把界面留在「正在检查」。 */
   let idleStatusText = status.textContent ?? "";
 
+  /** 只在界面仍停在「正在检查更新…」时恢复；已显示的手动结果或错误不被静默检查抹掉。 */
   const restoreIdleStatus = (): void => {
-    setStatus(status, idleStatusText);
+    if (status.textContent === "正在检查更新…") setStatus(status, idleStatusText);
   };
 
   const refreshInstallButton = (): void => {
