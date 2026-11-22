@@ -116,6 +116,13 @@ Var OldMainBinaryName
 Var vegaTargetError
 Var vegaTargetChanged
 Var vegaTargetEmpty
+; t6b-fix2（架构裁定 2/3）：VegaScanReparseTree 的输入/输出。
+;   * $vegaWalkPath  当前待检查的目录（栈式遍历的工作变量，入口放 $INSTDIR）。
+;   * $vegaWalkFound 1 表示目标树里（含目标本身）出现重解析点。
+;   * $vegaWalkError 1 表示某个已存在目录无法枚举（FindFirst 失败）。
+Var vegaWalkPath
+Var vegaWalkFound
+Var vegaWalkError
 Var vegaTmp1
 Var vegaTmp2
 Var vegaTmp3
@@ -850,6 +857,85 @@ Function un.SkipIfPassive
   ${IfThen} $PassiveMode = 1  ${|} Abort ${|}
 FunctionEnd
 
+; t6b-fix2（架构裁定 2/3）：从 $vegaWalkPath 开始遍历整棵目标树，检查
+; FILE_ATTRIBUTE_REPARSE_POINT（0x400，junction / symlink / mount point）。
+;   * 目标本身、其下任意目录或文件命中 → $vegaWalkFound=1，立即停止；
+;   * 命中重解析目录不再向下展开（不跟随链接）；
+;   * 已存在的目录 FindFirst 失败（错误标志或空句柄）→ $vegaWalkError=1，
+;     绝不当作空目录继续（裁定 3）；路径不存在（INVALID_FILE_ATTRIBUTES）不算错误。
+; 用 NSIS 栈做迭代式深度优先：底部压哨兵，顶层压根；每弹出一个目录就枚举，
+; 子目录压回栈顶。退出前（无论命中/出错/正常结束）都把栈清到哨兵，保持平衡。
+; 函数进出 Push/Pop $0-$4，不污染调用方。
+Function VegaScanReparseTree
+  Push $0
+  Push $1
+  Push $2
+  Push $3
+  Push $4
+
+  Push "__VEGA_WALK_END__"
+  Push "$vegaWalkPath"
+
+vega_walk_pop:
+  StrCmp $vegaWalkFound "1" vega_walk_cleanup
+  StrCmp $vegaWalkError "1" vega_walk_cleanup
+  Pop $vegaWalkPath
+  StrCmp $vegaWalkPath "__VEGA_WALK_END__" vega_walk_done
+
+  ; 不存在的路径（新装目标 / 枚举途中被删的子项）直接跳过。
+  System::Call 'kernel32::GetFileAttributesW(w "$vegaWalkPath") i .r0'
+  IntCmpU $0 0xFFFFFFFF vega_walk_pop
+  IntOp $1 ${FILE_ATTRIBUTE_REPARSE_POINT} & $0
+  StrCmp $1 "0" vega_walk_not_reparse
+    StrCpy $vegaWalkFound "1"
+    Goto vega_walk_pop
+vega_walk_not_reparse:
+  ; 普通文件不枚举；只有目录才展开。
+  IntOp $1 $0 & 0x10
+  StrCmp $1 "0" vega_walk_pop
+
+  ClearErrors
+  FindFirst $1 $2 "$vegaWalkPath\*.*"
+  IfErrors vega_walk_find_error
+  StrCmp $1 "" vega_walk_find_error
+vega_walk_entry:
+  StrCmp $2 "." vega_walk_next
+  StrCmp $2 ".." vega_walk_next
+  StrCpy $3 "$vegaWalkPath\$2"
+  System::Call 'kernel32::GetFileAttributesW(w "$3") i .r4'
+  IntCmpU $4 0xFFFFFFFF vega_walk_next
+  IntOp $0 ${FILE_ATTRIBUTE_REPARSE_POINT} & $4
+  StrCmp $0 "0" vega_walk_child
+    StrCpy $vegaWalkFound "1"
+    Goto vega_walk_scan_done
+vega_walk_child:
+  IntOp $0 $4 & 0x10
+  StrCmp $0 "0" vega_walk_next
+  Push "$3"
+vega_walk_next:
+  FindNext $1 $2
+  StrCmp $2 "" vega_walk_scan_done
+  Goto vega_walk_entry
+vega_walk_scan_done:
+  FindClose $1
+  Goto vega_walk_pop
+vega_walk_find_error:
+  StrCpy $vegaWalkError "1"
+  Goto vega_walk_pop
+
+vega_walk_cleanup:
+  Pop $vegaWalkPath
+  StrCmp $vegaWalkPath "__VEGA_WALK_END__" vega_walk_done
+  Goto vega_walk_cleanup
+
+vega_walk_done:
+  Pop $4
+  Pop $3
+  Pop $2
+  Pop $1
+  Pop $0
+FunctionEnd
+
 ; t6b-fix（架构裁定）：唯一的目标校验入口。
 ;
 ; 允许的安装位置只有两种：
@@ -866,6 +952,14 @@ FunctionEnd
 ; 文件（FILE_ATTRIBUTE_DIRECTORY 未置位）。空目录用 FindFirst/FindNext 判定并跳过
 ; "." 与 ".."；`IfFileExists "$DIR\*.*"` 会把空目录里的点目录项当命中，不能用。
 ; 任何别的非空目录都拒绝：否则等于把用户已有数据锁成管理员独占。
+;
+; t6b-fix2（架构裁定 2/3）：规范化之后再拒绝两类目标——
+;   * 重解析点：$INSTDIR 非空时，$INSTDIR 本身、其下任意目录/文件（VegaScanReparseTree
+;     递归检查，不进入重解析目录）命中 0x400 即拒绝；父目录（$PROGRAMFILES64 或盘根
+;     `X:\`）也是重解析点时同样拒绝。否则解包会沿链接覆盖树外文件、icacls 会改到链接
+;     目标，卸载入口可被普通账户替换。
+;   * 枚举失败：目标已存在但 FindFirst 失败（错误标志或空句柄）→ 「无法读取安装目录
+;     内容」，绝不当作空目录放行；VegaScanReparseTree 内部同样处理。
 ;
 ; 结果：$vegaTargetError 为空表示通过（$INSTDIR 已规范化），否则是整句中文错误，
 ; 由调用方决定 MessageBox / SetErrorLevel + Abort。函数进出 Push/Pop $0-$5 与 $R0-$R5，
@@ -954,8 +1048,14 @@ vega_validate_programfiles:
   Goto vega_validate_nonempty
 
 vega_validate_nonempty:
+  ; 裁定 3：目标已存在时，FindFirst 失败（错误标志或空句柄）说明读不了目录，
+  ; 不能当作空目录放行；只有确认路径不存在才走「空目录」语义。
+  System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR") i .r0'
+  IntCmpU $0 0xFFFFFFFF vega_validate_tree
+  ClearErrors
   FindFirst $0 $1 "$INSTDIR\*.*"
-  StrCmp $0 "" vega_validate_scan_closed
+  IfErrors vega_validate_scan_error
+  StrCmp $0 "" vega_validate_scan_error
 vega_validate_scan:
   StrCmp $1 "." vega_validate_scan_next
   StrCmp $1 ".." vega_validate_scan_next
@@ -967,8 +1067,7 @@ vega_validate_scan_next:
   Goto vega_validate_scan
 vega_validate_scan_done:
   FindClose $0
-vega_validate_scan_closed:
-  StrCmp $vegaTargetEmpty "1" vega_validate_ok
+  StrCmp $vegaTargetEmpty "1" vega_validate_tree
 
   ; 非空：只接受已有的 Vega 安装。vega-console.exe 必须是文件——GetFileAttributesW
   ; 返回 0xFFFFFFFF 表示不存在，FILE_ATTRIBUTE_DIRECTORY (0x10) 置位表示同名目录。
@@ -976,9 +1075,46 @@ vega_validate_scan_closed:
   IntCmpU $0 0xFFFFFFFF vega_validate_not_vega vega_validate_exe_attr vega_validate_exe_attr
 vega_validate_exe_attr:
   IntOp $1 $0 & 0x10
-  StrCmp $1 "0" vega_validate_ok
+  StrCmp $1 "0" vega_validate_tree
 vega_validate_not_vega:
   StrCpy $vegaTargetError "目录 $INSTDIR 已存在且不为空，但不是 Vega 安装目录。请选择空目录（或新建一个），或选择已有的 Vega 目录。"
+  Goto vega_validate_done
+
+vega_validate_scan_error:
+  StrCpy $vegaTargetError "无法读取安装目录内容，请确认该目录存在且当前账户有读取权限。"
+  Goto vega_validate_done
+
+vega_validate_tree:
+  ; 裁定 2：父目录（$PROGRAMFILES64 或盘根 `X:\`）本身是重解析点时也拒绝——
+  ; 否则目标这个子项仍可被链接替换。
+  ${StrCase} $vegaTmp1 "$INSTDIR" "L"
+  StrCpy $vegaTmp2 "$PROGRAMFILES64\Vega"
+  ${StrCase} $vegaTmp2 "$vegaTmp2" "L"
+  StrCmp $vegaTmp1 $vegaTmp2 vega_validate_parent_pf
+  StrCpy $vegaTmp3 "$INSTDIR" 3
+  !insertmacro VegaIsReparsePoint parent "$vegaTmp3" $vegaTmp1
+  Goto vega_validate_parent_checked
+vega_validate_parent_pf:
+  !insertmacro VegaIsReparsePoint parent "$PROGRAMFILES64" $vegaTmp1
+vega_validate_parent_checked:
+  StrCmp $vegaTmp1 "0" vega_validate_walk
+  StrCpy $vegaTargetError "安装目录的上一级（盘根或 Program Files）是重解析点（junction 或符号链接），出于安全原因拒绝安装。"
+  Goto vega_validate_done
+
+vega_validate_walk:
+  ; 裁定 2/3：目标本身及其整棵树不能有重解析点，且必须能枚举。
+  StrCpy $vegaWalkPath "$INSTDIR"
+  StrCpy $vegaWalkFound "0"
+  StrCpy $vegaWalkError "0"
+  Call VegaScanReparseTree
+  StrCmp $vegaWalkError "1" vega_validate_walk_error
+  StrCmp $vegaWalkFound "1" vega_validate_reparse
+  Goto vega_validate_ok
+vega_validate_walk_error:
+  StrCpy $vegaTargetError "无法读取安装目录内容，请确认该目录存在且当前账户有读取权限。"
+  Goto vega_validate_done
+vega_validate_reparse:
+  StrCpy $vegaTargetError "安装目录或其子项是重解析点（junction 或符号链接），解包和 ACL 会跟着链接跑到目录外，出于安全原因拒绝安装。请移除链接后重试。"
   Goto vega_validate_done
 
 vega_validate_ok:
