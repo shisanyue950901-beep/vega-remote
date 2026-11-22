@@ -34,6 +34,8 @@
 替换自己 `%LOCALAPPDATA%` 下文件（或已拿到管理员）的本地攻击者**不在范围内**——那种对手本来就能读 RustDesk
 配置、改 `recent-ids.json`、或在 UAC 之后动助手输入，任何进程内校验都挡不住。所有验证方式回读都依赖 RustDesk
 服务处于运行状态：服务未运行时 `--option` 可能只写进 CLI 账户的本地配置，此时助手以 12 退出、不做「已生效」的结论。
+本节还假设安装目录保持 Program Files 的默认权限；管理员若人为放宽该目录权限（让普通用户可写），
+则长期密码助手可能被普通用户替换，这属于管理员误配置，不在本节防护范围内。
 
 - **一次性 UAC**：控制台用 `ShellExecuteExW` 的 `runas` 直接拉起系统 PowerShell，参数只有
   `-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "<安装目录>\resources\vega-pwhelper.ps1" -InputFile "<载荷>"`，
