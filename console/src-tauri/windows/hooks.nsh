@@ -40,6 +40,9 @@
 Var vegaSetupExitCode
 Var vegaFinishText
 Var vegaMigratePending
+Var vegaOldRegUninst
+Var vegaOldRegLoc
+Var vegaOldRegIcon
 Var vegaPowerShell
 Var vegaLogUsable
 Var vegaSetupLogLine
@@ -453,6 +456,10 @@ vega_sc_done_${ID}:
   ; t6-fix4：/UPDATE 也走这里。迁移只做文件删除，不会回滚 RustDesk 配置；
   ; 若旧版就在固定目录，下面的长路径比较会直接跳过。
   StrCpy $R7 "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCTNAME}"
+  ; 原样保存旧卸载入口：迁移中止（新卸载器没写成）时在 POSTINSTALL 恢复，系统卸载入口不失效。
+  ReadRegStr $vegaOldRegUninst SHCTX "$R7" "UninstallString"
+  ReadRegStr $vegaOldRegLoc SHCTX "$R7" "InstallLocation"
+  ReadRegStr $vegaOldRegIcon SHCTX "$R7" "DisplayIcon"
   ReadRegStr $R8 SHCTX "$R7" "InstallLocation"
   StrCmp $R8 "" 0 vega_old_have_path
 
@@ -549,6 +556,14 @@ vega_old_done:
   IfFileExists "${VEGA_INSTALL_DIR}\uninstall.exe" 0 vega_mig_new_missing
   IfFileExists "${VEGA_INSTALL_DIR}\vega-console.exe" vega_mig_new_same_check
 vega_mig_new_missing:
+  ; 新卸载器/主程序无效（磁盘满、同名目录等）：模板已把卸载入口改到固定目录，
+  ; 这里改回旧版的原值，旧版仍可从「应用和功能」卸载。
+  StrCmp $vegaOldRegUninst "" vega_mig_reg_restored
+    WriteRegStr SHCTX "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCTNAME}" "UninstallString" "$vegaOldRegUninst"
+    WriteRegStr SHCTX "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCTNAME}" "InstallLocation" "$vegaOldRegLoc"
+    WriteRegStr SHCTX "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCTNAME}" "DisplayIcon" "$vegaOldRegIcon"
+    DetailPrint "已把系统卸载入口恢复为旧版：$vegaOldRegUninst"
+vega_mig_reg_restored:
     StrCpy $vegaOldInstallWarning "新版主程序或卸载器没有写入 ${VEGA_INSTALL_DIR}，旧版 $vegaOldInstallDir 保持原样，请重新运行安装包。"
     DetailPrint "$vegaOldInstallWarning"
     Goto vega_mig_done

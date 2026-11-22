@@ -57,10 +57,10 @@ SETUP="${2:-}"
 if [ -z "$TAG" ] || [ -z "$SETUP" ]; then
   usage
 fi
-case "$TAG" in
-  v*) ;;
-  *) echo "tag 必须形如 v0.6.0" >&2; exit 2 ;;
-esac
+# 必须是完整的 vX.Y.Z（客户端按 SemVer 解析清单，v0.6 这类会让清单无法解析）。
+if ! [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+  echo "tag 必须形如 v0.6.0（完整三段、正式版）" >&2; exit 2
+fi
 [ -f "$SETUP" ] || { echo "找不到安装包: $SETUP" >&2; exit 1; }
 
 VERSION="${TAG#v}"
