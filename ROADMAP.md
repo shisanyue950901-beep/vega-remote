@@ -315,13 +315,14 @@
      包括继承、显式拒绝和其他 SID）；删除旧的 `/inheritance:r /grant:r` 调用；写入前检查 `$INSTDIR` 不含单引号；
   3. `"$INSTDIR" /setowner *S-1-5-32-544 /T /C /Q`；
   4. 仅当 `$INSTDIR` 下存在子项时（`VegaHasChildEntries` 三态：`1`=有子项、`0`=确认为空、`E`=枚举失败；
-     `FindFirst` 失败但 `IfFileExists "$INSTDIR\*.*"` 为真时记 `E`）
+     t6c-fix2 起 `FindFirst` 失败或句柄为空一律记 `E`，不再用 `IfFileExists "$INSTDIR\*.*"` 二次判定）
      `"$INSTDIR\*" /reset /T /C /Q`；`E` 即失败，`0` 跳过并视为成功。
 - 第 4 步的子项 `/reset` 经架构批准：它只把子项改回继承**已锁定的根目录**，不会让根目录重新继承盘根 ACL；
   同时自愈旧版留下的空 DACL 文件（所有者已是 Administrators，可改 DACL）。t6b-fix3 的「解包之后禁止 `/reset`」被本条取代。
 - t6c-fix1（第 1 轮审计）：根 DACL 改为 SDDL 精确替换——旧的 `/inheritance:r /grant:r` 只删继承 ACE、只替换指定 SID
   的允许 ACE，旧目录上可继承的显式拒绝项和其他 SID 的可继承写权限会残留；每步 `Pop` 后立即检查（前置步骤失败
-  不再继续 `/reset`）；枚举改三态，`FindFirst` 失败不再被当成空目录；`"$INSTDIR\*" /reset /T` 仅在确认有子项时执行。
+  不再继续 `/reset`）；枚举改三态，`FindFirst` 失败不再被当成空目录（t6c-fix2 进一步去掉
+  `IfFileExists` 判定，失败即 `E`）；`"$INSTDIR\*" /reset /T` 仅在确认有子项时执行。
   冒烟清单助手路径同步为 `resources\vega-pwhelper.ps1`（tauri.conf.json 的实际 resources 映射）。
 - 其余不变：解包前预锁定后的重扫重解析点逻辑保留在 `VegaLockInstallDir` 之后；`$COMMONPROGRAMDATA\Vega\logs`
   那条 icacls 只作用于目录本身（不带 `/T`），不改；Rust 端逻辑不改（控制台校验的是 exe_dir 的 DACL，目录 ACL 不变）。
@@ -354,3 +355,18 @@
 - P2 响应大小（架构裁决：插件 API 无法设上限，本轮不修）：恶意大响应可使控制台 OOM，仅 DoS，签名仍保证不装恶意包。启动静默检查会整份缓冲清单，下载会整份缓冲安装包；现有 15 秒 / 10 分钟超时只限时间不限字节。
 - P2 签名/版本（架构裁决：本轮不修）：HTTP 镜像可被中间人回放更早的已签名 Vega 版本（降级）；后续用签名内绑定版本 / `requireSignedVersion` 或 HTTPS 镜像。
 - P3 Windows 重启语义：被动安装器自己用 `/R` 拉起新版本，`app.restart()` 只是非 Windows / 安装器未接管时的兜底，文档不再把它写成主路径。
+- `VegaHasChildEntries` 的「确认为空」判不准（t6c-fix2 审计，非阻断）：宏在 `FindFirst` 成功后直接进循环，
+  而循环开头只比较 `.` / `..` 就把名字当成子项，因此**空目录**与**首个实际子项之前 `FindNext` 就失败**
+  这两种情况都会返回 `1`（有子项），`0` 在这种写法下实际不可达。后果只是对空目录多跑一次
+  `"$INSTDIR\*" /reset /T`（无子项可重置，无害），不会放过应当失败的枚举。修法：`FindFirst` 之后先判
+  `StrCmp $1 ""` 再进循环，并把 `FindNext` 的失败原因区分出来（同下条，需换成 `System::Call` 的
+  `FindFirstFileW` / `FindNextFileW` + `?e`）。本轮按裁定只记录，不阻断 0.6.2。
+- 预锁定期间的替换窗口（t6c-fix2 架构裁定，非阻断）：`CreateDirectory $INSTDIR` → `icacls /setowner` →
+  PowerShell 启动并 `SetSecurityDescriptorSddlForm` 写入受保护 DACL 这三步之间目录一直继承盘根 ACL，
+  期间还额外起了一个 PowerShell 进程（启动开销把窗口拉长到数百毫秒级）。盘根给 Users 写权限（非默认配置）
+  时，这一瞬里 `X:\Vega` 可被换成 junction/symlink；安装器随后重扫目标树只能缩小、不能消除 TOCTOU。
+  理想方案：创建目录时就用 `SECURITY_ATTRIBUTES` 带上**受保护 DACL**（`CreateDirectoryW` 的
+  `lpSecurityAttributes`，一次原子写入，不存在「先继承后替换」的中间态）；对已存在的目录则用
+  `\\?\` 句柄 + `SetSecurityInfo` 在**同一个目录句柄**上设置安全描述符（避免按路径二次打开被替换）；
+  递归收紧时逐项打开、遇到 `FILE_ATTRIBUTE_REPARSE_POINT` 直接拒绝而不是跟随。以上都需要
+  `System::Call` 或插件，本轮只记录。
