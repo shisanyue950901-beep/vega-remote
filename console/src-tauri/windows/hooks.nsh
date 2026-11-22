@@ -462,7 +462,12 @@ vega_reparse_done_${ID}:
   Pop $1
   nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /T /C /Q'
   Pop $2
-  StrCmp "$0$1$2" "000" vega_acl_done
+  ; 三条逐条检查（nsExec::ExecToLog 返回 "0"，失败返回退出码或 "error"）。
+  StrCmp $0 "0" 0 vega_acl_fail
+  StrCmp $1 "0" 0 vega_acl_fail
+  StrCmp $2 "0" 0 vega_acl_fail
+  Goto vega_acl_done
+vega_acl_fail:
   StrCpy $vegaAclWarning "安装目录权限设置失败（icacls 返回 $0/$1/$2），长期密码不可用"
   DetailPrint "$vegaAclWarning"
 vega_acl_done:
