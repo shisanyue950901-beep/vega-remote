@@ -25,16 +25,26 @@
 ;     安装器把目录 ACL 收紧成只有管理员可写」。
 ;     目标校验集中在模板 installer.nsi 的 VegaValidateTarget（目录页回调与安装节开头
 ;     都调用）；安装目录由下面的 VegaLockInstallDir 用 icacls 收紧 ACL——**总是**执行，
-;     Program Files 下也一样（先 /reset 清掉旧自定义目录留下的显式 ACE）；
+;     Program Files 下也一样（t6c 起先断根目录继承并按 SID 授权；已有子项再用
+;     子项 /reset 清掉旧自定义目录留下的显式 ACE）；
 ;     控制台 password.rs 在每次提权前校验助手父目录的 ACL。
 ;   * t6b-fix2（架构裁定）：ACL 锁定改到解包之前——安装节在校验通过后先
 ;     CreateDirectory $INSTDIR 并 Call VegaLockInstallDir，任一 icacls 失败立即
 ;     SetErrorLevel 2 + Abort，不会把文件解到未锁定的目录；POSTINSTALL 再收紧一次
 ;     （第二次失败只写完成页告警）。VegaValidateTarget 同时拒绝目标树里的重解析点
 ;     和无法枚举的目录；/D= 判定改为 .onInit 开头备份 $INSTDIR（$CMDLINE 里已无 /D=）。
-;   * t6b-fix3（架构裁定 2）：解包之后禁止再 `/reset`——解包后只用
-;     VegaTightenInstallDir（setowner + inheritance:r/grant:r 两条，每条检查退出码），
-;     `/reset` 只允许出现在解包前的预锁定 VegaLockInstallDir 里。
+;   * t6c（架构裁定 3，0.6.2，修复真机空 DACL 事故）：ACL 布局固定为「根目录显式 ACL 且
+;     断继承，所有子项只靠继承、不带显式 ACE」。解包前的 VegaLockInstallDir 与解包后的
+;     VegaTightenInstallDir 都是同样的三步，逐条检查退出码：
+;       1) 根目录 `"$INSTDIR" /inheritance:r /grant:r <三条 SID，(OI)(CI)>`（**不带 /T**）；
+;       2) `"$INSTDIR" /setowner *S-1-5-32-544 /T`；
+;       3) 仅当 $INSTDIR 下存在子项时 `"$INSTDIR\*" /reset /T`，让子树回到「只继承」。
+;     绝不允许对 `"$INSTDIR"` 同时带 `/T` 与 `/inheritance:r`：对文件来说
+;     `/inheritance:r` 会删光继承 ACE，而 `(OI)(CI)` 授权落不到文件上（`/C` 又吞掉错误），
+;     结果 D:\Vega\vega-console.exe 的 DACL 为空——用户无法运行、管理员身份的安装器也
+;     覆盖不了（"无法打开要写入的文件"）、连卸载都删不掉。
+;     t6b-fix3 的「解包之后禁止 /reset」被本条裁定取代：子项 `"$INSTDIR\*" /reset /T`
+;     只把子项改回继承**已锁定**的根目录，不会让根目录重新继承盘根 ACL。
 ;   * t6-fix2（用户 2026-11-22）：旧安装器有目录选择页，旧版可能装在 D:\Vega 这类固定目录
 ;     之外。PREINSTALL 从 Tauri 的卸载注册表项读出旧安装目录，清理旧目录，避免机器上
 ;     两份 Vega 并存。旧目录清理失败只提示，不阻断安装；RustDesk 配置、%ProgramData%\Vega
@@ -461,27 +471,60 @@ vega_reparse_done_${ID}:
 ; 按 SID 授权，中文/本地化系统里账户名不同也不会失配。$SYSDIR 绝对路径调用 icacls：
 ; 提权上下文里按名称搜索会被 PATH 劫持。
 ;
-; t6b-fix3（架构裁定 2/3）—— 解包前的预锁定，顺序固定四条命令，每条都检查退出码：
-;   1. /inheritance:r /grant:r（**只对 $INSTDIR 本身，不带 /T**）
+; t6c：判断目录 $INSTDIR 下是否还有子项（跳过 `.` 与 `..`）。
+; 输出 "1" = 有子项，"0" = 空目录 / 枚举失败（FindFirst 错误标志或空句柄）。
+; 内置 FindFirst/FindNext 拿不到 GetLastError，这里只做「有没有」的判断，不区分失败原因：
+; 判不出来就按空目录处理（跳过子项 /reset），这一步是自愈性的，跳过不会让 ACL 变坏。
+; 只用 $0/$1（句柄 / 文件名），进宏 Push，出宏 Pop；标签按调用方 ID 区分。
+!macro VegaHasChildEntries ID PATH VAR
+  Push $0
+  Push $1
+  StrCpy ${VAR} "0"
+  ClearErrors
+  FindFirst $0 $1 "${PATH}\*.*"
+  IfErrors vega_has_child_done_${ID}
+  StrCmp $0 "" vega_has_child_done_${ID}
+vega_has_child_loop_${ID}:
+  StrCmp $1 "." vega_has_child_next_${ID}
+  StrCmp $1 ".." vega_has_child_next_${ID}
+  StrCpy ${VAR} "1"
+  Goto vega_has_child_done_${ID}
+vega_has_child_next_${ID}:
+  ClearErrors
+  FindNext $0 $1
+  IfErrors vega_has_child_done_${ID}
+  StrCmp $1 "" vega_has_child_done_${ID}
+  Goto vega_has_child_loop_${ID}
+vega_has_child_done_${ID}:
+  StrCmp $0 "" vega_has_child_closed_${ID}
+    FindClose $0
+vega_has_child_closed_${ID}:
+  Pop $1
+  Pop $0
+!macroend
+
+; t6c（架构裁定 3）—— 解包前的预锁定，三步，每条都检查退出码：
+;   1. `"$INSTDIR" /inheritance:r /grant:r ...`（**只对目录本身，不带 /T**）
 ;                     —— CreateDirectory 之后**先断继承**：目录一被创建就继承了盘根的
 ;                        ACE（盘根给 Users 写权限时不罕见），先断开再谈其它，后面所有
 ;                        步骤都跑在一个不再受盘根继承影响的目标上。
-;   2. /setowner *S-1-5-32-544 /T —— 所有者改成 Administrators，否则原所有者仍可能
-;                        改回 DACL。
-;   3. /reset /T   —— 对**已有子树**清掉所有显式 ACE 与继承标记，回到继承状态；旧自定义
-;                        目录里残留的个人账户 / Authenticated Users 显式写权限就是这一步
-;                        清掉的（1 与 4 的 /grant:r 只覆盖列出的 SID，清不掉别的 ACE）。
-;                        `/reset` 只允许出现在这里——解包之后禁止（见下）。
-;   4. /inheritance:r /grant:r ... /T —— 子树重新按 SID 下发：SYSTEM、Administrators
-;                        完全控制，Users 只读+执行（与 Program Files 的默认 ACL 等价）。
-; 失败结果写进 $vegaAclWarning（空 = 四条都成功）：安装节开头的预锁定调用据此
-; SetErrorLevel 2 + Abort（此时还没解包任何文件）。
+;                        根目录拿到显式 ACE：SYSTEM / Administrators 完全控制，
+;                        Users 只读+执行（与 Program Files 的默认 ACL 等价）。
+;   2. `"$INSTDIR" /setowner *S-1-5-32-544 /T` —— 所有者（含子树）改成 Administrators，
+;                        否则原所有者仍可能改回 DACL；第 3 步能自愈旧版留下的空 DACL
+;                        文件，前提也正是所有者已是 Administrators。
+;   3. 仅当 $INSTDIR 下存在子项时：`"$INSTDIR\*" /reset /T`
+;                     —— 让**子树**回到「只继承」状态，清掉旧自定义目录里残留的个人账户 /
+;                        Authenticated Users 显式 ACE，并自愈旧版留下的空 DACL 文件
+;                        （它们此后只靠继承根目录的 ACE）。目录为空时跳过，视为成功。
 ;
-; t6b-fix3（架构裁定 2）：**解包之后不许再 `/reset`。** 解包出来的文件/目录此刻靠继承
-; 拿到正确 ACL，`/reset` 先把它们打回继承态再靠 `/T` 重新下发；盘根继承了 Users 写权限
-; 的机器上，普通账户就在这个窗口里能替换刚写好的 vega-console.exe / 提权助手，等于把
-; runas 执行权交出去。所以 POSTINSTALL 只调 VegaTightenInstallDir（setowner +
-; inheritance:r / grant:r 两条，绝不动 `/reset`）。
+;   为什么不能写成 `"$INSTDIR" /inheritance:r ... /T`（0.6.1 的 bug）：对**文件**来说
+;   `/inheritance:r` 会删掉全部继承 ACE，而 `(OI)(CI)` 授权无法落到文件上，`/C` 又吞掉
+;   这类错误 → D:\Vega\vega-console.exe 的 DACL 变成空：用户跑不起来、管理员安装器也
+;   覆盖不了（"无法打开要写入的文件"）、连删除都失败。
+;
+; 失败结果写进 $vegaAclWarning（空 = 三步都成功）：安装节开头的预锁定调用据此
+; SetErrorLevel 2 + Abort（此时还没解包任何文件）。
 ;
 ; 残余风险（架构裁定 3）：CreateDirectory 到第 1 条断继承之间仍有一瞬目录继承着盘根
 ; ACL，这一瞬的替换风险不在这份脚本能消除的范围内，已记在 ROADMAP「T6 加固」。
@@ -492,26 +535,30 @@ Function VegaLockInstallDir
   Push $3
   StrCpy $vegaAclWarning ""
   DetailPrint "锁定安装目录权限（解包前，仅管理员可写）：$INSTDIR"
-  ; 1. 先断继承：只作用于目标目录本身，不去动已有子树（下一步 /reset 处理子树）。
+  ; 1. 先断继承：只作用于目标目录本身（**不带 /T**），不去动已有子项。
   nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /C /Q'
   Pop $0
-  ; 2. 所有者改成 Administrators。
+  ; 2. 所有者（含子树）改成 Administrators。
   nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR" /setowner *S-1-5-32-544 /T /C /Q'
   Pop $1
-  ; 3. 已有子树回到继承状态（唯一允许的 /reset：解包前）。
-  nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR" /reset /T /C /Q'
+  ; 3. 有子项时让子树回到「只继承」：清掉旧目录残留的显式 ACE，并自愈旧版留下的空 DACL
+  ;    文件（它们此后只靠继承根目录的 ACE）。目录为空就跳过，视为成功。
+  !insertmacro VegaHasChildEntries lock "$INSTDIR" $3
+  StrCmp $3 "1" 0 vega_acl_reset_skip
+  nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR\*" /reset /T /C /Q'
   Pop $2
-  ; 4. 子树重新下发最终 ACL（顺带把目标目录本身再断一次继承）。
-  nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /T /C /Q'
-  Pop $3
-  ; 四条逐条检查（nsExec::ExecToLog 返回 "0"，失败返回退出码或 "error"）。
+  Goto vega_acl_check
+vega_acl_reset_skip:
+  DetailPrint "安装目录为空，跳过子项 /reset（无子项可重置）"
+  StrCpy $2 "0"
+vega_acl_check:
+  ; 三条逐条检查（nsExec::ExecToLog 返回 "0"，失败返回退出码或 "error"）。
   StrCmp $0 "0" 0 vega_acl_fail
   StrCmp $1 "0" 0 vega_acl_fail
   StrCmp $2 "0" 0 vega_acl_fail
-  StrCmp $3 "0" 0 vega_acl_fail
   Goto vega_acl_done
 vega_acl_fail:
-  StrCpy $vegaAclWarning "安装目录权限设置失败（icacls 返回 $0/$1/$2/$3），长期密码不可用"
+  StrCpy $vegaAclWarning "安装目录权限设置失败（icacls 返回 $0/$1/$2），长期密码不可用"
   DetailPrint "$vegaAclWarning"
 vega_acl_done:
   Pop $3
@@ -520,28 +567,45 @@ vega_acl_done:
   Pop $0
 FunctionEnd
 
-; t6b-fix3（架构裁定 2）：解包后的第二次收紧。只有两条命令，没有 `/reset`：
-;   * /setowner *S-1-5-32-544 /T —— 所有者仍是 Administrators；
-;   * /inheritance:r /grant:r ... /T —— 重新断开继承并按 SID 下发最终 ACL。
-; 解包出来的文件本来就继承了目录 ACL，这一步只覆盖解包期间新增/改写的子项，
-; 顺带把中途出现的继承标记再断一次。每条都检查退出码，失败只写 $vegaAclWarning
-; （POSTINSTALL 期间程序已经装好，Abort 只会留下半装状态），完成页会显示它。
+; t6c（架构裁定 3）：解包后的第二次收紧，与预锁定同样的三步，逐条检查退出码：
+;   * /setowner *S-1-5-32-544 /T —— 所有者仍是 Administrators（含解包出来的子项）；
+;   * `"$INSTDIR" /inheritance:r /grant:r ...`（**不带 /T**）—— 根目录显式 ACL 保持锁定；
+;   * 有子项时 `"$INSTDIR\*" /reset /T` —— 子项回到「只继承」，把解包期间新增/改写的
+;     子项统一成继承根目录的 ACE，也顺手自愈任何被旧版留下空 DACL 的文件。
+; 这一步的 `/reset` 只作用于**子项**：子项改回继承已锁定的根目录，不会让根目录重新继承
+; 盘根 ACL，因此不会重新出现「普通用户能替换 vega-console.exe」的窗口。
+; 每条都检查退出码，失败只写 $vegaAclWarning（POSTINSTALL 期间程序已经装好，
+; Abort 只会留下半装状态），完成页会显示它。
 Function VegaTightenInstallDir
   Push $0
   Push $1
+  Push $2
+  Push $3
   StrCpy $vegaAclWarning ""
   DetailPrint "收紧安装目录权限（解包后，仅管理员可写）：$INSTDIR"
   nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR" /setowner *S-1-5-32-544 /T /C /Q'
   Pop $0
-  nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /T /C /Q'
+  nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX /C /Q'
   Pop $1
+  !insertmacro VegaHasChildEntries tighten "$INSTDIR" $3
+  StrCmp $3 "1" 0 vega_acl_post_reset_skip
+  nsExec::ExecToLog '"$SYSDIR\icacls.exe" "$INSTDIR\*" /reset /T /C /Q'
+  Pop $2
+  Goto vega_acl_post_check
+vega_acl_post_reset_skip:
+  DetailPrint "安装目录为空，跳过子项 /reset（无子项可重置）"
+  StrCpy $2 "0"
+vega_acl_post_check:
   StrCmp $0 "0" 0 vega_acl_post_fail
   StrCmp $1 "0" 0 vega_acl_post_fail
+  StrCmp $2 "0" 0 vega_acl_post_fail
   Goto vega_acl_post_done
 vega_acl_post_fail:
-  StrCpy $vegaAclWarning "安装目录权限设置失败（icacls 返回 $0/$1），长期密码不可用"
+  StrCpy $vegaAclWarning "安装目录权限设置失败（icacls 返回 $0/$1/$2），长期密码不可用"
   DetailPrint "$vegaAclWarning"
 vega_acl_post_done:
+  Pop $3
+  Pop $2
   Pop $1
   Pop $0
 FunctionEnd
@@ -782,9 +846,10 @@ vega_preinstall_dir_done:
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
-  ; t6b-fix3（架构裁定 2）：这里只调 VegaTightenInstallDir——setowner +
-  ; inheritance:r / grant:r 两条，**没有 `/reset`**。解包后 `/reset` 会把刚写好的
-  ; 文件打回继承态再重新下发，中间那一瞬在盘根继承 Users 写权限的机器上可被替换。
+  ; t6c（架构裁定 3）：这里只调 VegaTightenInstallDir——setowner /T + 根目录
+  ; inheritance:r / grant:r（不带 /T）+ 子项 `"$INSTDIR\*" /reset /T` 三步。
+  ; 子项 /reset 只把子项改回继承已锁定的根目录，不会让根目录重新继承盘根 ACL；
+  ; 根目录本身**绝不再**带 /T 做 /inheritance:r（0.6.1 的空 DACL bug）。
   ; 失败只写完成页告警，不 Abort（程序已经装好了）。
   Call VegaTightenInstallDir
   ; 新文件已就位：此时才清理旧目录、改快捷方式（见 VegaFinishPreviousInstall）。
