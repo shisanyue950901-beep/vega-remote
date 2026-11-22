@@ -562,6 +562,19 @@ vega_install_target_ok:
     DetailPrint "安装目录已规范为 $INSTDIR"
 vega_install_target_same:
 
+  ; t6b-fix2（架构裁定 1）：先建目录并锁定 ACL，再解包任何文件。此时还没有
+  ; SetOutPath / File，锁不住就直接中止，文件不会落进普通账户可改的目录。
+  ; 三条 icacls 任一失败 → 固定提示 + SetErrorLevel 2 + Abort（静默安装靠 /SD IDOK
+  ; 自动跳过提示）。POSTINSTALL 还会再锁一次（第二次失败只写完成页告警）。
+  CreateDirectory "$INSTDIR"
+  Call VegaLockInstallDir
+  StrCmp $vegaAclWarning "" vega_install_lock_ok
+    DetailPrint "安装已中止：$vegaAclWarning"
+    MessageBox MB_OK|MB_ICONSTOP "无法锁定安装目录权限，安装已中止" /SD IDOK
+    SetErrorLevel 2
+    Abort
+vega_install_lock_ok:
+
   SetOutPath $INSTDIR
 
   !ifmacrodef NSIS_HOOK_PREINSTALL
