@@ -1,0 +1,11 @@
+{
+  "version": "0.6.2",
+  "notes": "Vega 控制台 0.6.2：修复 0.6.1 安装目录权限问题（文件无法运行）",
+  "pub_date": "2026-11-22T15:29:57Z",
+  "platforms": {
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTcHRmNEZnalZMRWt3YUY3cG1YaGtGUy9RR1JYYXdCNklINEN4Z0VkTERwYm5wYjNPa21LR3RTR0txYnZUT0hzQm9COUNvOVJDTXVBM1RDU2NPS2JSblE3UmpTd2hvbWdrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzk1MzYxMzkxCWZpbGU6VmVnYS1TZXR1cC0wLjYuMi5leGUKaTlvbkIrWXo3Sk1uSnpLdXJYWlVkRnJ5YVJGaGM4alYrVkhaS25xdVF4cnBwSWRiYnB0VWhKcFhkYUYxKzRzcSs0dS81RFh3U21ZZFBXQXFYMy8vQmc9PQo=",
+      "url": "http://60.205.95.98/vega/updates/0.6.2/Vega-Setup-0.6.2.exe"
+    }
+  }
+}
