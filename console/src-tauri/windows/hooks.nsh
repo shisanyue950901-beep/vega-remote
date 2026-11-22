@@ -22,9 +22,12 @@
 ;     系统 Program Files 下（默认 ACL 只允许管理员写），用户自选目录可能落在普通用户
 ;     可写的位置，UAC 之后拉起该目录里的脚本就等于把提权执行权交给普通用户。
 ;   * t6-fix2（用户 2026-11-22）：旧安装器有目录选择页，旧版可能装在 D:\Vega 这类固定目录
-;     之外。PREINSTALL 从 Tauri 的卸载注册表项读出旧安装目录，静默卸载并删掉旧目录，
-;     避免机器上两份 Vega 并存。旧目录清理失败只提示，不阻断安装；RustDesk 配置、
-;     %ProgramData%\Vega 与用户 AppData 都不在删除范围（RMDir 不加 /r，只删旧安装目录本身）。
+;     之外。PREINSTALL 从 Tauri 的卸载注册表项读出旧安装目录，清理旧目录，避免机器上
+;     两份 Vega 并存。旧目录清理失败只提示，不阻断安装；RustDesk 配置、%ProgramData%\Vega
+;     与用户 AppData 都不在删除范围（RMDir 不加 /r，只删旧安装目录本身）。
+;   * t6-fix3b（架构裁定）：目录页必须改模板，!undef 宏不生效，已删除该死代码；
+;     旧版迁移绝不运行旧卸载器（旧卸载器会回滚 RustDesk），只在 PREINSTALL 里删除
+;     已知程序文件；/UPDATE 模式完全跳过 RustDesk 安装脚本。
 ;
 ; 注意：本文件在 tauri 的 installer.nsi 顶部（MUI 页面插入之前）被 include，
 ; 所以这里的 !define 能影响完成页文案；MUI_FINISHPAGE_TEXT 里放的是运行时变量。
@@ -41,6 +44,7 @@ Var vegaResultFile
 Var vegaResultReason
 Var vegaOldInstallDir
 Var vegaOldInstallWarning
+Var vegaFixedDir
 
 ; t6-fix：安装路径固定。$PROGRAMFILES64 保留原生 Program Files（Tauri 的 NSIS stub 是
 ; 32 位进程，$PROGRAMFILES 会被重定向到 Program Files (x86)，所以这里不用它）。
@@ -48,14 +52,9 @@ Var vegaOldInstallWarning
   !define VEGA_INSTALL_DIR "$PROGRAMFILES64\Vega"
 !endif
 
-; t6-fix：去掉“选择安装目录”页。本文件在 installer.nsi 顶部、MUI 页面插入之前被 include，
-; MUI2 这时已经定义好 MUI_PAGE_DIRECTORY 宏，把宏换成空实现后安装器就不再插入目录页。
-; 即使将来模板顺序变化、目录页仍然出现，$INSTDIR 也会在 PREINSTALL 里被改写回固定路径。
-!ifdef MUI_PAGE_DIRECTORY
-  !undef MUI_PAGE_DIRECTORY
-  !macro MUI_PAGE_DIRECTORY
-  !macroend
-!endif
+; t6-fix：去掉“选择安装目录”页。页面本体已从定制模板 windows/installer.nsi 中删除
+; （宏覆盖在 MUI2 include 时无效，见文件头 t6-fix3b）。$INSTDIR 在模板 .onInit 末尾与
+; 下面 PREINSTALL 里两处强制为固定目录。
 
 ; 安装失败时改写完成页文案（$vegaFinishText 在页面显示时按当时的值展开）。
 ; MUI2 在 include 时已给出默认 MUI_FINISHPAGE_TEXT，这里先 undef 再定义，避免重定义告警。
@@ -345,8 +344,10 @@ vega_trim_done_${ID}:
   StrCpy ${VAR} $R0
 !macroend
 
-; t6-fix2：旧版装在 ${VEGA_INSTALL_DIR} 之外（旧安装器有目录页，例如 D:\Vega）时，
-; 先静默卸载旧目录再装新版，机器上不留两份 Vega。
+; t6-fix3b（架构裁定）：旧版装在 ${VEGA_INSTALL_DIR} 之外（旧安装器有目录页，
+; 例如 D:\Vega）时，只删除旧目录里的 Vega 程序文件，绝不运行旧卸载器。
+; 原因：旧卸载器会执行 install-rustdesk.ps1 -Uninstall，把 RustDesk 中继配置回滚掉，
+; 等于用一次目录迁移毁掉现有远程协助。
 ;
 ; 注册表位置与 Tauri 的 installer.nsi 完全一致：
 ;   SHCTX\Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCTNAME}
@@ -354,20 +355,31 @@ vega_trim_done_${ID}:
 ; Tauri 自己也是用这个键的 InstallLocation / UninstallString 判断旧安装，读同一个值不会跑偏。
 ;
 ; 行为约定：
-;   * 路径按大小写不敏感、去掉尾反斜杠后比较；与 ${VEGA_INSTALL_DIR} 相同就什么都不做
-;     （同路径重装/升级由 Tauri 的 RestorePreviousInstallLocation + PageReinstall 处理）。
-;   * /UPDATE 模式不动：更新器已经把旧安装交给旧卸载器跑过一遍，重复卸载会把新版打残。
-;   * 旧目录里没有 uninstall.exe 就不动它，只在日志里记一行。
-;   * 卸载失败（旧版正在运行等）只写完成页提示，安装继续，绝不 Abort。
-;   * 只删旧安装目录本身：Delete 残留 uninstall.exe + 非递归 RMDir。不加 /r，
-;     所以 RustDesk 配置、%ProgramData%\Vega、用户 AppData 都不可能被顺带删掉。
-;   * 盘根、Windows、ProgramData、用户配置目录一律拒绝处理（护栏）。
+;   * 只在非 /UPDATE 模式处理；/UPDATE 时旧版就在固定目录，无需迁移。
+;   * InstallLocation / UninstallString 先归一化（去引号、去尾反斜杠），再用 Win32
+;     GetFullPathNameW 规范化，与 ${VEGA_INSTALL_DIR} 大小写不敏感比较；相同则不做。
+;   * 盘根、UNC、Windows/ProgramData/用户配置目录一律拒绝（护栏）。
+;   * 旧目录里必须有 vega-console.exe，否则一概不碰。
+;   * 先把 $OUTDIR 指到固定目录，再 Delete 已知文件、非递归 RMDir 子目录与旧目录。
+;     不加 /r，所以 RustDesk 配置、%ProgramData%\Vega、用户 AppData 都不会被删。
+;   * 旧快捷方式只有指向旧目录时才删除（Tauri 随后按新目录重建）。
+;   * 任何失败都只追加完成页提示，绝不 Abort；卸载注册表键由新安装重写。
+;   * FileFunc.nsh v3.4 没有 GetFullPathName 宏，这里直接调 Win32。
+!macro VegaCanonicalDir ID VAR
+  StrCpy $R0 "${VAR}"
+  System::Call 'kernel32::GetFullPathNameW(w r0, i 1024, w .r1, i 0) i .r2'
+  StrCmp $R2 "0" vega_canon_done_${ID}
+    StrCpy ${VAR} "$R1"
+    !insertmacro VegaTrimDirPath canon_${ID} ${VAR}
+vega_canon_done_${ID}:
+!macroend
+
 !macro VegaRemovePreviousInstall
   StrCpy $vegaOldInstallDir ""
   StrCpy $vegaOldInstallWarning ""
 
   StrCmp $UpdateMode "1" 0 vega_old_read_reg
-    DetailPrint "更新模式：旧版由更新流程处理，跳过旧目录清理。"
+    DetailPrint "更新模式：跳过旧目录迁移（旧版就在 ${VEGA_INSTALL_DIR}）。"
     Goto vega_old_done
 
 vega_old_read_reg:
@@ -388,16 +400,26 @@ vega_old_have_path:
   StrCpy $vegaOldInstallDir $R8
   !insertmacro VegaTrimDirPath old_inst $vegaOldInstallDir
   StrCmp $vegaOldInstallDir "" vega_old_done
+  ; 规范化（相对路径按当前目录解析，去掉 . / .. 与重复分隔符）。
+  !insertmacro VegaCanonicalDir old_inst $vegaOldInstallDir
+  StrCmp $vegaOldInstallDir "" vega_old_done
+
+  StrCpy $vegaFixedDir "${VEGA_INSTALL_DIR}"
+  !insertmacro VegaCanonicalDir fixed $vegaFixedDir
 
   ; 大小写不敏感比较，尾部反斜杠已在上一步去掉。
   ${StrCase} $R8 "$vegaOldInstallDir" "L"
-  ${StrCase} $R9 "${VEGA_INSTALL_DIR}" "L"
+  ${StrCase} $R9 "$vegaFixedDir" "L"
   StrCmp $R8 $R9 0 vega_old_differs
     DetailPrint "旧版安装目录就是 ${VEGA_INSTALL_DIR}，按就地升级处理。"
     Goto vega_old_done
 
 vega_old_differs:
-  ; 护栏一：长度 <= 3 的路径（C:\）或等于系统/配置目录时不处理。
+  ; 护栏一：UNC（\\server\share）不处理。
+  StrCpy $R1 "$vegaOldInstallDir" 2
+  StrCmp $R1 "\\" vega_old_refused
+
+  ; 护栏二：长度 <= 3 的路径（C:\）、系统/配置目录不处理。
   StrLen $R6 "$vegaOldInstallDir"
   IntCmp $R6 3 vega_old_refused vega_old_refused vega_old_guard_config
 
@@ -412,42 +434,63 @@ vega_old_guard_config:
   StrCmp $R8 $R6 vega_old_refused
   ${StrCase} $R6 "$PROFILE" "L"
   StrCmp $R8 $R6 vega_old_refused
-  Goto vega_old_check_uninstaller
+  Goto vega_old_check_binary
 
 vega_old_refused:
   DetailPrint "旧版记录指向 $vegaOldInstallDir，看起来不是安装目录，跳过清理。"
   Goto vega_old_done
 
-vega_old_check_uninstaller:
-  ; 护栏二：只处理带 uninstall.exe 的目录，别的目录一概不碰。
-  StrCpy $R7 "$vegaOldInstallDir\uninstall.exe"
-  IfFileExists "$R7" 0 vega_old_no_uninstaller
+vega_old_check_binary:
+  ; 护栏三：只处理确实含 vega-console.exe 的目录。
+  IfFileExists "$vegaOldInstallDir\vega-console.exe" 0 vega_old_no_binary
 
-  DetailPrint "发现旧版 Vega 装在 $vegaOldInstallDir，先静默卸载旧目录再安装到 ${VEGA_INSTALL_DIR}…"
-  ClearErrors
-  ExecWait '"$R7" /S _?=$vegaOldInstallDir' $R6
-  IfErrors vega_old_uninstall_failed
-  StrCmp $R6 "0" 0 vega_old_uninstall_failed
+  DetailPrint "发现旧版 Vega 装在 $vegaOldInstallDir，删除旧程序文件（不运行旧卸载器，RustDesk 与配置保持原样）…"
 
-  ; 卸载成功：清残留卸载器，再删旧目录。RMDir 非递归——目录里若还有用户自己的东西就留着。
-  Delete "$R7"
+  ; 先保证当前解包目录是固定目录，避免后续 File 落回旧目录。
+  StrCpy $INSTDIR "${VEGA_INSTALL_DIR}"
+  SetOutPath "$INSTDIR"
+
+  ; 只删 Tauri 安装的已知文件（主程序 + tauri.conf.json resources + 卸载器）。
+  Delete "$vegaOldInstallDir\vega-console.exe"
+  Delete "$vegaOldInstallDir\uninstall.exe"
+  Delete "$vegaOldInstallDir\resources\vega-pwhelper.ps1"
+  Delete "$vegaOldInstallDir\resources\vega-defaults.json"
+  Delete "$vegaOldInstallDir\resources\host\install-rustdesk.ps1"
+  Delete "$vegaOldInstallDir\resources\host\resolve-interactive-user.ps1"
+  Delete "$vegaOldInstallDir\resources\host\lib\Vega.Common.psm1"
+  RMDir "$vegaOldInstallDir\resources\host\lib"
+  RMDir "$vegaOldInstallDir\resources\host"
+  RMDir "$vegaOldInstallDir\resources"
   RMDir "$vegaOldInstallDir"
-  IfFileExists "$vegaOldInstallDir" 0 vega_old_done
-    StrCpy $vegaOldInstallWarning "旧版目录 $vegaOldInstallDir 卸载后仍有残留文件，已保留，可手动删除。"
+
+  ; 旧快捷方式只在指向旧目录时删除；Tauri 安装完会按固定目录重建。
+  !insertmacro IsShortcutTarget "$SMPROGRAMS\${PRODUCTNAME}.lnk" "$vegaOldInstallDir\vega-console.exe"
+  Pop $R5
+  StrCmp $R5 "1" 0 vega_old_shortcut_sm_done
+    Delete "$SMPROGRAMS\${PRODUCTNAME}.lnk"
+vega_old_shortcut_sm_done:
+  StrCmp $AppStartMenuFolder "" vega_old_shortcut_sub_done
+  !insertmacro IsShortcutTarget "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk" "$vegaOldInstallDir\vega-console.exe"
+  Pop $R5
+  StrCmp $R5 "1" 0 vega_old_shortcut_sub_done
+    Delete "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk"
+vega_old_shortcut_sub_done:
+  !insertmacro IsShortcutTarget "$DESKTOP\${PRODUCTNAME}.lnk" "$vegaOldInstallDir\vega-console.exe"
+  Pop $R5
+  StrCmp $R5 "1" 0 vega_old_shortcut_desk_done
+    Delete "$DESKTOP\${PRODUCTNAME}.lnk"
+vega_old_shortcut_desk_done:
+
+  IfFileExists "$vegaOldInstallDir\*.*" 0 vega_old_cleaned
+    StrCpy $vegaOldInstallWarning "旧版目录 $vegaOldInstallDir 的程序文件已删除，但目录里仍有其他文件（可能不是 Vega 的），已保留，可手动删除。"
     DetailPrint "$vegaOldInstallWarning"
     Goto vega_old_done
-
-vega_old_no_uninstaller:
-  DetailPrint "旧版记录指向 $vegaOldInstallDir，但没有 uninstall.exe，跳过旧目录清理。"
+vega_old_cleaned:
+  DetailPrint "旧版目录 $vegaOldInstallDir 已清理。"
   Goto vega_old_done
 
-vega_old_uninstall_failed:
-  StrCmp $R6 "" 0 vega_old_uninstall_failed_msg
-    StrCpy $R6 "unknown"
-vega_old_uninstall_failed_msg:
-  ; 不 Abort：旧版正在运行、卸载器被占用都只影响清理，不该拦住新装的 Vega。
-  StrCpy $vegaOldInstallWarning "旧版 Vega（$vegaOldInstallDir）卸载未完成（退出码 $R6），安装继续；请稍后手动卸载并删除该目录。"
-  DetailPrint "$vegaOldInstallWarning"
+vega_old_no_binary:
+  DetailPrint "旧版记录指向 $vegaOldInstallDir，但没有 vega-console.exe，跳过旧目录清理。"
 
 vega_old_done:
 !macroend
@@ -457,22 +500,24 @@ vega_old_done:
 ; 落到 $PROGRAMFILES64\Vega；/D 参数、旧版注册表里的 InstallLocation、目录页的选择
 ; 都不会改变结果。
 !macro NSIS_HOOK_PREINSTALL
-  ; 先处理旧安装目录：.onInit 的 RestorePreviousInstallLocation 可能已把 $INSTDIR 设成
-  ; 旧版的 D:\Vega，这里读完注册表再改写。
+  ; 先处理旧安装目录。$INSTDIR 已在模板 .onInit 末尾强制为固定目录；这里从注册表
+  ; 读旧安装记录做迁移，但不运行旧卸载器。
   !insertmacro VegaRemovePreviousInstall
 
   StrCmp $INSTDIR "${VEGA_INSTALL_DIR}" vega_preinstall_dir_done
     DetailPrint "安装目录固定为 ${VEGA_INSTALL_DIR}（忽略请求的 $INSTDIR）"
 vega_preinstall_dir_done:
   StrCpy $INSTDIR "${VEGA_INSTALL_DIR}"
-  ; Tauri 的 Section Install 在本钩子之前已经 SetOutPath $INSTDIR，$OUTDIR 还指着旧目录
-  ; （例如 D:\Vega）。不重新 SetOutPath 的话后面的 File 仍会解到旧目录，等于新装的文件
-  ; 又落回刚被清理掉的位置。
+  ; 双保险：让 $OUTDIR 指向固定目录，后续 File 一定解到新目录。
   SetOutPath "$INSTDIR"
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
-  !insertmacro VegaRunInstallRustDesk
+  ; t6-fix3b：/UPDATE 只替换 Vega 程序文件，RustDesk 的安装与中继配置原样保留，
+  ; 因此完全跳过安装脚本（不下载、不改配置），避免在线更新把中继配置改写。
+  StrCmp $UpdateMode "1" vega_postinstall_done
+    !insertmacro VegaRunInstallRustDesk
+vega_postinstall_done:
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
