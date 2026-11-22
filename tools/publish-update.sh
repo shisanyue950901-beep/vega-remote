@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 维护者本地发布一次控制台更新：签名 → 写清单 → 传阿里云镜像 + GitHub 固定 tag。
+# 维护者本地发布一次控制台更新：签名 → 写清单 → 两个通道都上安装包 → 最后切清单。
 #
 # 用法：
 #   export TAURI_SIGNING_PRIVATE_KEY="$(cat <私钥文件>)"        # 或私钥文件路径
@@ -12,7 +12,16 @@
 #   镜像    <MIRROR_DIR>/<ver>/Vega-Setup-<ver>.exe（版本目录只写一次，不覆盖），
 #           再原子替换 <MIRROR_DIR>/latest.json；清单 url 指向 <MIRROR_URL>/<ver>/Vega-Setup-<ver>.exe
 #
-# 旧版本的版本目录一直保留，不清理；同一版本重复发布会被拒绝（换版本号再发）。
+# 重跑规则（t6-fix4 架构裁定）：
+#   * 版本化安装包若已存在，远程 SHA256 与本地相同 → 跳过；不同 → 中止，绝不覆盖。
+#   * GitHub 资产不用 --clobber 上传；上传中断留下的同名资产会被 SHA256 校验拦下。
+#   * 镜像先传 <file>.part，传完再远端 mv 成最终名；中断只会留下 .part。
+#   * Release 用 --latest=false 创建；已存在则 PATCH make_latest=false，避免顶掉
+#     一键安装用的源码 Release。
+#   * 清单最后换：先上传 latest.json.new → 删除旧 latest.json → PATCH 改名为 latest.json。
+#     两个通道都先完成安装包校验/上传，再切各自的清单。
+#
+# 旧版本的版本目录一直保留，不清理；同一版本重复发布只允许字节完全相同的包。
 #
 # 可选环境变量：
 #   VEGA_NOTES          latest.json 里的更新说明，默认 "Vega 控制台 <version>"
@@ -52,6 +61,7 @@ MIRROR_DIR="${VEGA_MIRROR_DIR:-/opt/vega-relay/updates}"
 MIRROR_URL="${VEGA_MIRROR_URL:-http://${MIRROR_HOST}/vega/updates}"
 NOTES="${VEGA_NOTES:-Vega 控制台 ${VERSION}}"
 ASSET="Vega-Setup-${VERSION}.exe"
+ASSET_SIG="${ASSET}.sig"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONSOLE="${ROOT}/console"
@@ -75,6 +85,10 @@ echo "签名 ${TAG} …"
 ( cd "$CONSOLE" && "$TAURI_BIN" signer sign "$SETUP_ABS" )
 SIG="${SETUP_ABS}.sig"
 [ -s "$SIG" ] || { echo "签名失败：没有生成 ${SIG}" >&2; exit 1; }
+
+LOCAL_SHA="$(sha256sum "$SETUP_ABS" | awk '{print $1}')"
+LOCAL_SIG_SHA="$(sha256sum "$SIG" | awk '{print $1}')"
+echo "本地 SHA256：${ASSET} ${LOCAL_SHA}"
 
 # --- 2. 写清单 --------------------------------------------------------------
 # GitHub 清单指向固定 tag 下的版本化资产；镜像清单指向镜像的版本目录。
@@ -104,34 +118,126 @@ PY
 echo "SHA256："
 ( cd "$work" && sha256sum "$ASSET" "${ASSET}.sig" latest.json latest-mirror.json )
 
-# --- 3. GitHub Release（固定 tag，资产覆盖，保持唯一入口） ---------------------
+# GitHub 资产辅助函数：按名字取 id / 下载后比对 SHA256。
+gh_release_id() {
+  gh api "repos/${REPO}/releases/tags/${RELEASE_TAG}" --jq .id
+}
+gh_asset_id() {
+  local release_id="$1" name="$2"
+  gh api "repos/${REPO}/releases/${release_id}/assets" --paginate \
+    --jq ".[] | select(.name == \"${name}\") | .id"
+}
+# 资产已存在时下载并比对 SHA256；相同返回 0，不同返回 1。不存在返回 2。
+gh_verify_asset() {
+  local release_id="$1" name="$2" want="$3" dest="$4"
+  local id
+  id="$(gh_asset_id "$release_id" "$name")"
+  if [ -z "$id" ]; then
+    return 2
+  fi
+  gh release download "$RELEASE_TAG" --repo "$REPO" --pattern "$name" --output "$dest" --clobber
+  local got
+  got="$(sha256sum "$dest" | awk '{print $1}')"
+  if [ "$got" = "$want" ]; then
+    return 0
+  fi
+  return 1
+}
+
+# --- 3. 安装包先上两个通道（版本化、不可变、可安全重跑） ---------------------
+# 顺序：GitHub 校验/上传 → 镜像校验/上传 → 再切清单。任何一步失败都不会换清单。
+release_id=""
 if [ "${VEGA_SKIP_GITHUB:-0}" != "1" ]; then
   command -v gh >/dev/null || { echo "需要 gh CLI（或设置 VEGA_SKIP_GITHUB=1）" >&2; exit 1; }
   if ! gh release view "$RELEASE_TAG" --repo "$REPO" >/dev/null 2>&1; then
-    gh release create "$RELEASE_TAG" --repo "$REPO" \
+    # --latest=false：这个更新 Release 没有源码 ZIP / SHA256SUMS.txt，不能顶掉
+    # bootstrap.ps1 依赖的源码 Release。
+    gh release create "$RELEASE_TAG" --repo "$REPO" --latest=false \
       --title "Vega 更新通道" --notes "自动更新清单与安装包。由 tools/publish-update.sh 维护，请勿手工改动。"
+  else
+    # 老 Release 可能曾被标成 latest，显式降回去。
+    gh api -X PATCH "repos/${REPO}/releases/tags/${RELEASE_TAG}" -f make_latest=false >/dev/null
   fi
-  # 只有 latest.json 会变；安装包按版本命名，旧版本资产保留。
-  gh release upload "$RELEASE_TAG" "${work}/${ASSET}" "${work}/${ASSET}.sig" "${work}/latest.json" \
-    --repo "$REPO" --clobber
-  echo "已发布 GitHub Release ${REPO} ${RELEASE_TAG}（资产 ${ASSET}）"
+  release_id="$(gh_release_id)"
+
+  for pair in "${ASSET}:${LOCAL_SHA}" "${ASSET_SIG}:${LOCAL_SIG_SHA}"; do
+    name="${pair%%:*}"
+    want="${pair#*:}"
+    set +e
+    gh_verify_asset "$release_id" "$name" "$want" "${work}/remote-${name}"
+    rc=$?
+    set -e
+    case "$rc" in
+      0)
+        echo "GitHub 已有相同 ${name}，跳过上传。"
+        ;;
+      1)
+        echo "GitHub 上的 ${name} 与本地 SHA256 不同，拒绝覆盖（换版本号后重发）。" >&2
+        exit 1
+        ;;
+      2)
+        # 不用 --clobber：上传失败不会先删掉旧资产。
+        gh release upload "$RELEASE_TAG" "${work}/${name}" --repo "$REPO"
+        echo "已上传 GitHub ${name}。"
+        ;;
+      *)
+        echo "校验 GitHub 资产 ${name} 失败。" >&2
+        exit 1
+        ;;
+    esac
+  done
 fi
 
-# --- 4. 阿里云镜像（版本目录不可变 + 清单原子替换） ---------------------------
-# 顺序很重要：先落安装包，再换清单。清单是客户端判断更新的入口，必须最后一步。
 if [ "${VEGA_SKIP_MIRROR:-0}" != "1" ]; then
   remote_dir="${MIRROR_DIR}/${VERSION}"
   ssh "$MIRROR_HOST" "mkdir -p '${remote_dir}'"
-  if ssh "$MIRROR_HOST" "test -e '${remote_dir}/${ASSET}'"; then
-    echo "镜像已有 ${VERSION} 的安装包：${remote_dir}/${ASSET}" >&2
-    echo "版本目录不可覆盖，请改版本号后重发。" >&2
-    exit 1
+  # 先传 .part 再 mv：中断不会留下半个最终文件。
+  for pair in "${ASSET}:${LOCAL_SHA}" "${ASSET_SIG}:${LOCAL_SIG_SHA}"; do
+    name="${pair%%:*}"
+    want="${pair#*:}"
+    remote="${remote_dir}/${name}"
+    if ssh "$MIRROR_HOST" "test -e '${remote}'"; then
+      got="$(ssh "$MIRROR_HOST" "sha256sum '${remote}'" | awk '{print $1}')"
+      if [ "$got" = "$want" ]; then
+        echo "镜像已有相同 ${name}，跳过上传。"
+        continue
+      fi
+      echo "镜像上的 ${remote} 与本地 SHA256 不同，拒绝覆盖（换版本号后重发）。" >&2
+      exit 1
+    fi
+    scp -q "${work}/${name}" "${MIRROR_HOST}:${remote}.part"
+    ssh "$MIRROR_HOST" "mv -f '${remote}.part' '${remote}'"
+    echo "已上传镜像 ${remote}。"
+  done
+fi
+
+# --- 4. 两个通道都换清单（最后一步） ----------------------------------------
+if [ "${VEGA_SKIP_GITHUB:-0}" != "1" ]; then
+  new_name="latest.json.new"
+  # 上次中断可能留下 latest.json.new：先删掉同名临时资产。
+  stale_id="$(gh_asset_id "$release_id" "$new_name")"
+  if [ -n "$stale_id" ]; then
+    gh api -X DELETE "repos/${REPO}/releases/assets/${stale_id}" >/dev/null
   fi
-  scp -q "${work}/${ASSET}" "${work}/${ASSET}.sig" "${MIRROR_HOST}:${remote_dir}/"
+  # 上传为临时名（API 不能直接覆盖已存在同名资产）。
+  gh api -X POST "repos/${REPO}/releases/${release_id}/assets?name=${new_name}" \
+    -H "Content-Type: application/octet-stream" --input "${work}/latest.json" >/dev/null
+  old_id="$(gh_asset_id "$release_id" "latest.json")"
+  if [ -n "$old_id" ]; then
+    gh api -X DELETE "repos/${REPO}/releases/assets/${old_id}" >/dev/null
+  fi
+  new_id="$(gh_asset_id "$release_id" "$new_name")"
+  [ -n "$new_id" ] || { echo "上传 latest.json.new 失败。" >&2; exit 1; }
+  # 改名为最终资产名：客户端只会看到完整的新清单。
+  gh api -X PATCH "repos/${REPO}/releases/assets/${new_id}" -f name=latest.json >/dev/null
+  echo "已切换 GitHub 清单 ${REPO} ${RELEASE_TAG}/latest.json。"
+fi
+
+if [ "${VEGA_SKIP_MIRROR:-0}" != "1" ]; then
   tmp_name=".latest.json.tmp.$$"
   scp -q "${work}/latest-mirror.json" "${MIRROR_HOST}:${MIRROR_DIR}/${tmp_name}"
   ssh "$MIRROR_HOST" "mv -f '${MIRROR_DIR}/${tmp_name}' '${MIRROR_DIR}/latest.json'"
-  echo "已发布 ${TAG} 到 ${MIRROR_HOST}:${remote_dir}/，清单 ${MIRROR_URL}/${VERSION}/${ASSET}"
+  echo "已切换镜像清单 ${MIRROR_URL}/latest.json（版本 ${VERSION}）。"
 fi
 
 echo "完成：${VERSION}（签名产物仅本地生成，旧版本目录保留）"
