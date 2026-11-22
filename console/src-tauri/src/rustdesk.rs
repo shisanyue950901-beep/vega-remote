@@ -1010,6 +1010,92 @@ pub fn get_relay_defaults(app: tauri::AppHandle) -> RelayDefaultsView {
     }
 }
 
+/* ---- 手机扫码配置（T5）：官方 App 扫码即填服务器 / 中继 / 公钥 ---- */
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MobileQrView {
+    pub size: usize,
+    pub modules: Vec<bool>,
+    pub server: String,
+    pub key_fingerprint: String,
+    pub error: String,
+}
+
+/// 官方格式 `config={"host":…,"relay":…,"key":…}`，紧凑 JSON；relay 为空时省略。
+/// Err 文案不含公钥，完整公钥只出现在返回串里。
+pub fn mobile_config_payload(server: &str, relay: &str, key: &str) -> Result<String, String> {
+    let (server, relay, key) = (server.trim(), relay.trim(), key.trim());
+    if server.is_empty() {
+        return Err("还没有配置 ID 服务器，请先在 RustDesk 的设置 → 网络里填好".into());
+    }
+    if key.is_empty() {
+        return Err("还没有配置服务器公钥，请先在 RustDesk 的设置 → 网络里填好".into());
+    }
+    if key_invalid(key) {
+        return Err("服务器公钥格式无效，请检查 RustDesk 设置 → 网络".into());
+    }
+    #[derive(Serialize)]
+    struct Payload<'a> {
+        host: &'a str,
+        #[serde(skip_serializing_if = "str::is_empty")]
+        relay: &'a str,
+        key: &'a str,
+    }
+    let json = serde_json::to_string(&Payload { host: server, relay, key })
+        .map_err(|_| "生成二维码内容失败".to_string())?;
+    Ok(format!("config={json}"))
+}
+
+/// 只生成矩阵：按行优先，`Dark => true`。
+fn qr_matrix(payload: &str) -> Result<(usize, Vec<bool>), String> {
+    use qrcode::{Color, EcLevel, QrCode};
+    let code = QrCode::with_error_correction_level(payload.as_bytes(), EcLevel::M)
+        .map_err(|_| "二维码生成失败：内容无法编码".to_string())?;
+    let size = code.width();
+    let modules = code.to_colors().into_iter().map(|c| c == Color::Dark).collect();
+    Ok((size, modules))
+}
+
+/// 读当前 RustDesk2.toml 出码。视图只给矩阵与公钥指纹，
+/// 完整公钥只进入二维码内容，不进 `server` / `error`。
+#[tauri::command]
+pub fn get_mobile_config_qr() -> MobileQrView {
+    let fail = |error: String| MobileQrView {
+        size: 0, modules: Vec::new(), server: String::new(),
+        key_fingerprint: String::new(), error,
+    };
+    if !cfg!(windows) {
+        return fail(NOT_INSTALLED.into());
+    }
+    let Some(path) = user_config_path() else {
+        return fail("找不到 %APPDATA%\\RustDesk\\config\\RustDesk2.toml".into());
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return fail(format!("{NOT_INSTALLED} 或还没登录过（配置尚未生成）"))
+        }
+        Err(e) => return fail(format!("读取配置失败：{e}")),
+    };
+    let snapshot = match read_server_config(&text) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return fail(error),
+    };
+    let (server, fingerprint) = (snapshot.server.clone(), snapshot.key_fingerprint());
+    let view = |size, modules, error| MobileQrView {
+        size, modules, server: server.clone(),
+        key_fingerprint: fingerprint.clone(), error,
+    };
+    match mobile_config_payload(&snapshot.server, &snapshot.relay, &snapshot.key) {
+        Ok(payload) => match qr_matrix(&payload) {
+            Ok((size, modules)) => view(size, modules, String::new()),
+            Err(error) => view(0, Vec::new(), error),
+        },
+        Err(error) => view(0, Vec::new(), error),
+    }
+}
+
 #[tauri::command]
 pub fn connect_peer(peer_id: String, mode: String, app: tauri::AppHandle) -> OpResult {
     if !cfg!(windows) {
@@ -1721,4 +1807,38 @@ other = "keep"
         assert!(first.starts_with(std::env::temp_dir()));
     }
 
+    const MOBILE_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+    #[test]
+    fn mobile_payload_matches_official_format() {
+        let payload = mobile_config_payload("id.example.com", "relay.example.com", MOBILE_KEY).unwrap();
+        assert_eq!(
+            payload,
+            format!(r#"config={{"host":"id.example.com","relay":"relay.example.com","key":"{MOBILE_KEY}"}}"#)
+        );
+    }
+
+    #[test]
+    fn mobile_payload_omits_empty_relay() {
+        let payload = mobile_config_payload("id.example.com", "  ", MOBILE_KEY).unwrap();
+        assert_eq!(payload, format!(r#"config={{"host":"id.example.com","key":"{MOBILE_KEY}"}}"#));
+        assert!(!payload.contains("relay"));
+    }
+
+    #[test]
+    fn mobile_payload_rejects_empty_server_and_bad_key() {
+        assert!(mobile_config_payload("", "", MOBILE_KEY).is_err());
+        assert!(mobile_config_payload("id.example.com", "", "").is_err());
+        let err = mobile_config_payload("id.example.com", "", "SHORT").unwrap_err();
+        assert!(!err.contains("SHORT"), "{err}");
+    }
+
+    #[test]
+    fn mobile_payload_escapes_json() {
+        // 服务器名里的引号必须由 serde_json 转义，不能拼坏 JSON。
+        let payload = mobile_config_payload(r#"id"x.com"#, "", MOBILE_KEY).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&payload["config=".len()..]).unwrap();
+        assert_eq!(json["host"], r#"id"x.com"#);
+        assert_eq!(json["key"], MOBILE_KEY);
+    }
 }
