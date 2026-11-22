@@ -1766,6 +1766,14 @@ function setupUpdater(): void {
    * 不会把「下载中」或监听错误界面刷回「发现新版本」。
    */
   let checkGeneration = 0;
+  /** 手动检查在途标记：静默检查不得插队，否则手动请求的结果会被作废。 */
+  let manualCheckInFlight = false;
+  /** 空闲态文案（版本号）。静默检查失败时原样恢复，不把界面留在「正在检查」。 */
+  let idleStatusText = status.textContent ?? "";
+
+  const restoreIdleStatus = (): void => {
+    setStatus(status, idleStatusText);
+  };
 
   const refreshInstallButton = (): void => {
     installButton.disabled = installing || !latest || !eventsReady;
@@ -1813,9 +1821,11 @@ function setupUpdater(): void {
     }
     if (view.current) {
       byId<HTMLSpanElement>("about-version").textContent = `v${view.current}`;
+      idleStatusText = `当前版本 v${view.current}`;
     }
     if (view.error) {
       if (!silent) setStatus(status, view.error, "error");
+      else restoreIdleStatus();
       return;
     }
     latest = view.available ? view.latest : "";
@@ -1833,19 +1843,28 @@ function setupUpdater(): void {
 
   const check = async (silent: boolean): Promise<void> => {
     if (installing || listenerError) return;
+    // 手动检查在途时不插静默检查：否则手动回包会被新一轮代号作废。
+    if (silent && manualCheckInFlight) return;
     const generation = ++checkGeneration;
+    if (!silent) manualCheckInFlight = true;
     checkButton.disabled = true;
     if (!silent) setStatus(status, "正在检查更新…");
-    let view: UpdateView;
+    let view: UpdateView | null;
     try {
       view = await invoke<UpdateView>("check_update");
     } catch {
+      if (!silent) manualCheckInFlight = false;
       if (generation === checkGeneration) {
         checkButton.disabled = installing || listenerError;
-        if (!installing && !listenerError) setStatus(status, "检查更新失败，请稍后重试", "error");
+        if (!installing && !listenerError) {
+          // 静默检查失败不弹错，但也不能把状态留在「正在检查更新…」。
+          if (silent) restoreIdleStatus();
+          else setStatus(status, "检查更新失败，请稍后重试", "error");
+        }
       }
       return;
     }
+    if (!silent) manualCheckInFlight = false;
     // 只有最新一次检查能改界面；安装中或监听错误时也不能覆盖已有状态。
     if (generation !== checkGeneration) return;
     checkButton.disabled = installing || listenerError;
