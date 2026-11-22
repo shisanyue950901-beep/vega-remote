@@ -502,6 +502,10 @@ Section WebView2
   ${EndIf}
 SectionEnd
 
+; t6-fix7：不允许「忽略」写入失败的文件（全局安装器属性）。否则跳过新 vega-console.exe 后，
+; POSTINSTALL 仍会清理旧版，留下两边都无法启动的控制台。
+AllowSkipFiles off
+
 Section Install
   SetOutPath $INSTDIR
 

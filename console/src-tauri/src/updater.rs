@@ -130,10 +130,10 @@ fn acceptable(update: &Update, current_is_pre: bool) -> bool {
     }
 }
 
-/// 两个候选里取 semver 更高者；同号取镜像。
+/// 两个候选里取 semver 优先级更高者（忽略 +build 元数据）；同优先级取镜像。
 fn github_wins(github: &Update, mirror: &Update) -> bool {
     match (parse_version(&github.version), parse_version(&mirror.version)) {
-        (Some(g), Some(m)) => g > m,
+        (Some(g), Some(m)) => g.cmp_precedence(&m) == std::cmp::Ordering::Greater,
         _ => false,
     }
 }

@@ -215,7 +215,23 @@ if [ ! -s "$SIG" ] && [ "${VEGA_SKIP_GITHUB:-0}" != "1" ]; then
   set -e
   case "$rc" in
     0)
-      if [ -n "$(gh_asset_id "$release_id" "$ASSET_SIG")" ]; then
+      # 签名资产的状态：查询失败中止；0 字节 starter 删除后按缺失处理；有效则复用。
+      if ! sig_id="$(gh_asset_id "$release_id" "$ASSET_SIG")"; then
+        echo "查询 GitHub 资产 ${ASSET_SIG} 失败，中止。" >&2
+        exit 1
+      fi
+      if [ -n "$sig_id" ]; then
+        if ! sig_size="$(gh_asset_size "$release_id" "$ASSET_SIG")" || [ -z "$sig_size" ]; then
+          echo "查询 GitHub 资产 ${ASSET_SIG} 的大小失败，中止。" >&2
+          exit 1
+        fi
+        if [ "$sig_size" = "0" ]; then
+          echo "GitHub 上的 ${ASSET_SIG} 是 0 字节残留，删除后稍后本地签名。"
+          gh_delete_asset "$sig_id"
+          sig_id=""
+        fi
+      fi
+      if [ -n "$sig_id" ]; then
         echo "GitHub 已有相同的 ${ASSET}，复用远端签名（不重签）。"
         gh release download "$RELEASE_TAG" --repo "$REPO" --pattern "$ASSET_SIG" \
           --output "$SIG" --clobber
@@ -364,10 +380,11 @@ if [ "${VEGA_SKIP_GITHUB:-0}" != "1" ]; then
   # 上传为临时名：gh_upload_asset 走 upload_url，文件基名即资产名。
   cp "${work}/latest.json" "${work}/${new_name}"
   gh_upload_asset "${work}/${new_name}" "$new_name"
-  old_id="$(gh_asset_id "$release_id" "latest.json")"
+  # 先确认新清单资产就位，再删旧清单：查询失败时旧 latest.json 仍在，更新入口不会消失。
+  new_id="$(gh_asset_id "$release_id" "$new_name")" || new_id=""
+  [ -n "$new_id" ] || { echo "查不到 latest.json.new（上传或查询失败），旧清单保持不变。" >&2; exit 1; }
+  old_id="$(gh_asset_id "$release_id" "latest.json")" || { echo "查询旧 latest.json 失败，旧清单保持不变。" >&2; exit 1; }
   gh_delete_asset "$old_id"
-  new_id="$(gh_asset_id "$release_id" "$new_name")"
-  [ -n "$new_id" ] || { echo "上传 latest.json.new 失败。" >&2; exit 1; }
   # 改名为最终资产名：客户端只会看到完整的新清单。
   gh api -X PATCH "repos/${REPO}/releases/assets/${new_id}" -f name=latest.json >/dev/null
   echo "已切换 GitHub 清单 ${REPO} ${RELEASE_TAG}/latest.json。"

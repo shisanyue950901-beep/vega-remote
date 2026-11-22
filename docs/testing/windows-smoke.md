@@ -13,7 +13,7 @@
 - [ ] 装完 `C:\Program Files\Vega\resources\vega-defaults.json` 存在，且与仓库里的默认中继一致。
 - [ ] `C:\Program Files\Vega\resources\host\install-rustdesk.ps1` 与 `...\host\lib\Vega.Common.psm1` 都存在。
 - [ ] `%ProgramData%\Vega\logs\setup.log` 有本次安装记录和 `[nsis] install-rustdesk.ps1 exit code:` 一行。
-- [ ] 已装 RustDesk 的机器上重跑安装包：日志显示「已安装 RustDesk，跳过安装」，配置仍被写入。
+- [ ] 全新安装（之前没有 Vega）但已装 RustDesk 的机器：日志显示「已安装 RustDesk，跳过安装」，中继配置仍被写入。覆盖重装 Vega 的情形见下方「跳过 RustDesk 脚本」一项。
 - [ ] 未装 RustDesk 的机器：安装包自动下载固定版本并 SHA256 校验通过后静默安装；RustDesk 服务出现在服务列表。
 - [ ] 校验失败场景：把下载到的安装包副本改一个字节（或临时把 `Get-VegaRustDeskRelease` 的摘要改错）后重跑，
       Vega 安装照常完成，完成页提示「RustDesk 未装好，请打开 Vega 按提示手动安装」，安装没有整体失败。
