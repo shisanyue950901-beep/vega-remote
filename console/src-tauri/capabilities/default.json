@@ -24,6 +24,12 @@
     "allow-open-sunshine-settings",
     "allow-start-moonlight-stream",
     "allow-run-doctor",
-    "allow-export-doctor-log"
+    "allow-export-doctor-log",
+    "allow-get-peer-aliases",
+    "allow-set-peer-alias",
+    "allow-remove-peer",
+    "allow-get-password-status",
+    "allow-set-permanent-password",
+    "allow-clear-permanent-password"
   ]
 }

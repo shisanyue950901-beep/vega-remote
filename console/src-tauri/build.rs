@@ -20,6 +20,12 @@ fn main() {
             "start_moonlight_stream",
             "run_doctor",
             "export_doctor_log",
+            "get_peer_aliases",
+            "set_peer_alias",
+            "remove_peer",
+            "get_password_status",
+            "set_permanent_password",
+            "clear_permanent_password",
         ])),
     )
     .expect("tauri-build 失败");

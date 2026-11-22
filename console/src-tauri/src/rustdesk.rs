@@ -551,31 +551,41 @@ pub(crate) fn spawn_detached(exe: &Path, args: &[&str]) -> Result<(), String> {
 /* 最近设备码存储（JSON，不含任何密钥）                                  */
 /* ------------------------------------------------------------------ */
 
-fn recent_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn recent_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_config_dir()
         .map(|dir| dir.join(RECENT_FILE))
         .map_err(|e| format!("取配置目录失败：{e}"))
 }
 
-pub fn read_recent_peers_at(path: &Path) -> Vec<String> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
+/// 严格读最近设备码：文件不存在算「空列表」，读取或解析失败返回错误。
+///
+/// 删除设备这类破坏性操作必须先用它——把读取失败折成空列表会让「recent 没删掉」
+/// 被当成已删除，从而在上层报成功。
+pub fn read_recent_peers_strict_at(path: &Path) -> Result<Vec<String>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("读取最近设备记录失败：{e}")),
     };
     #[derive(serde::Deserialize)]
     struct Store {
         #[serde(default)]
         ids: Vec<String>,
     }
-    match serde_json::from_str::<Store>(&text) {
-        Ok(store) => store
-            .ids
-            .into_iter()
-            .filter(|id| normalize_device_id(id).is_some())
-            .take(RECENT_LIMIT)
-            .collect(),
-        Err(_) => Vec::new(),
-    }
+    let store = serde_json::from_str::<Store>(&text)
+        .map_err(|e| format!("最近设备记录内容损坏：{e}"))?;
+    Ok(store
+        .ids
+        .into_iter()
+        .filter(|id| normalize_device_id(id).is_some())
+        .take(RECENT_LIMIT)
+        .collect())
+}
+
+/// 宽松读：展示用，任何失败都当作空列表（写路径请用 `read_recent_peers_strict_at`）。
+pub fn read_recent_peers_at(path: &Path) -> Vec<String> {
+    read_recent_peers_strict_at(path).unwrap_or_default()
 }
 
 pub fn push_recent_peer(list: &mut Vec<String>, id: &str) {
@@ -600,7 +610,7 @@ fn save_recent_peers(app: &tauri::AppHandle, list: &[String]) -> Result<(), Stri
 
 /// 原子写：同目录临时文件 + rename。临时文件用 `create_new` 独占创建，
 /// 文件名带进程号与序号，两个 Vega 实例不会互相踩到对方的临时文件。
-fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
+pub(crate) fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "目标路径没有父目录".to_string())?;
@@ -710,13 +720,13 @@ pub struct OpResult {
 }
 
 impl OpResult {
-    fn ok(message: impl Into<String>) -> Self {
+    pub(crate) fn ok(message: impl Into<String>) -> Self {
         Self {
             ok: true,
             message: message.into(),
         }
     }
-    fn err(message: impl Into<String>) -> Self {
+    pub(crate) fn err(message: impl Into<String>) -> Self {
         Self {
             ok: false,
             message: message.into(),

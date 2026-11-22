@@ -56,6 +56,14 @@
   - 前端：串流页去掉假主机列表与内置 PIN 输入，改为真实状态/显卡/固定入口；设置页 doctor 与「诊断网络」跳转；
     Assist/Settings 共用一份配置快照并在 focus 时重查设备码与安装状态；设置页探测复位结果并恢复按钮
   - 旧清单 `RustDesk.RustDesk` 包按已下线处理：提示手动卸载、销账后继续回滚；host/client 各有 Pester 覆盖
+- T4d 长期密码（设置页）：
+  - Rust 后端 `password.rs`：密码只经 DACL 收紧的临时文件交给一次性提权的助手；校验 8~64 位且含字母和数字，
+    验证方式映射 temporary/permanent/both；状态只回答「是否已设置」与 `verification-method`，不读密码内容
+  - 助手 `console/src-tauri/resources/vega-pwhelper.ps1`（随包 resources，`-Mode set|clear`）：点源可测，
+    读后立即用同长度空白覆盖并删除载荷，用官方 `rustdesk.exe --password` 设密码、`--option verification-method`
+    写验证方式；清除时设 32 位随机密码并把验证方式改回临时密码；退出码 0/非 0，stderr 只写脱敏原因
+  - 测试：`password.rs` 单测覆盖密码规则/验证方式映射/icacls 参数；`tests/vega-pwhelper.Tests.ps1` 覆盖参数校验、
+    读后删除、密码规则与「失败摘要不含密码」；风险与取舍见 `SECURITY.md`「长期密码」
 - 安装包冒烟测试仍延后：M2c 阶段 CI 只跑 `tauri build --no-bundle`；T3 起改为产出 `Vega-Setup.exe`，真机检查项见 `docs/testing/windows-smoke.md`
 
 ## T3 一键安装包（v0.6，Vega-Setup.exe）
@@ -143,6 +151,26 @@
   应统一解析 IP+端口，并用完整公钥摘要参与比较，同时对无效公钥显示配置错误。
 - P2 CI 安装包实测：仍未在 Windows CI 对产出的 `Vega-Setup.exe` 验证钩子位数、静默退出码、两处配置写入
   与卸载回滚；`server/lib/ip-detect.sh` 也尚未纳入 shellcheck 步骤。
+
+## Backlog「T4 加固」（t4-fix1 / t4-fix2 记录）
+- P2 设备记录的跨实例一致性：`peers.rs` 的连接/改名/删除仍是「读-改-写」两步文件操作，
+  单文件原子替换保护不了两个 Vega 实例同时更新的场景。本轮已让删除与改名/清除别名都先严格读取
+  （任一读取/解析失败即报错、不写盘、不做任何删除），但「别名 + recent」两文件仍缺失败恢复与跨实例锁：
+  应让三条路径共用一把跨进程文件锁，并让 recent 写失败时能回滚已提交的别名。
+- P2 载荷文件的身份校验：助手打开前只校验文件名与末级路径属性，约束不了父目录重解析点、硬链接
+  和「检查后替换」。应在同一受限句柄上核验最终目录、文件标识（FileId）、链接数与所有者，
+  不符即退 10 且不写 RustDesk。
+- P2 验证方式的服务侧确认：CLI 回读读到的可能是 CLI 账户本地配置而非服务实际值。应补一次服务侧
+  确认（IPC/受管配置），无法确认时返回「部分成功 / 结果未知」而不是 0；本轮只加了「服务必须
+  Running」的前置检查（未运行退 12），仍不能证明服务端已生效。
+- P2 长期密码状态：已改为读助手成功后写的 `pw-state.json`（`has_permanent`）并区分清除时写入的
+  随机替代值；验证方式仍读当前用户侧 `RustDesk2.toml`，因此可能与服务实际生效值不一致——等
+  「服务侧确认」落地后一并改为读实际生效值。
+- P2 集成测试缺口：真实 Windows DACL 生效验证、跨账户 UAC（标准用户 → 管理员）、助手 20 s 调用
+  超时清理、PS 5.1 原生参数传递目前都靠 Mock 覆盖，需要在集成环境里跑一次真机用例。
+- P1 安装目录 ACL：安装器应对安装目录强制设置标准 ACL（或控制台发行版校验助手及其父目录不向
+  Users / Authenticated Users / Everyone 授予写权限），否则装进被放宽权限的已有目录时助手可被替换。
+  来源：Codex t4-r4 P1。
 
 ## M3 进阶（v1.0）
 - 虚拟显示器自动安装（无显示器被控端）
