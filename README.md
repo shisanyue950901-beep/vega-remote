@@ -189,7 +189,12 @@ tools/publish-update.sh v0.6.0 <path>/Vega-Setup.exe
 ```
 
 脚本用 `tauri signer sign` 签安装包、写 `latest.json` 与 `latest-mirror.json`、打印 SHA256，再上传到
-GitHub Release 和阿里云 `/opt/vega-relay/updates/`（清单最后原子改名）。镜像部署见
+GitHub Release 和阿里云 `/opt/vega-relay/updates/`（清单最后原子改名）。本机直传不了
+`uploads.github.com` 时，可在 Actions 手动运行 **Publish GitHub fallback** 工作流并填版本号、安装包
+SHA256 与签名 `.sig` 的 SHA256（均 64 位小写 hex）：它从镜像下载安装包、`.sig` 与清单，校验安装包
+sha256 与 `.sig` sha256 都等于输入、`version`/`signature`/`pub_date` 一致后把清单 `url` 改指向固定 tag，
+先传 exe/`.sig`、后传清单，再用 `GITHUB_TOKEN` 上传补齐 GitHub 回退端点并从 Release 下载 exe/`.sig`/清单
+复核。若只有 `latest.json` 上传失败，重跑本工作流即可恢复。镜像部署见
 [relay/updates-nginx.md](relay/updates-nginx.md)，安全边界见 [SECURITY.md](SECURITY.md)。
 
 ## 文档

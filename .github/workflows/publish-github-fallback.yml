@@ -1,0 +1,347 @@
+name: Publish GitHub fallback
+
+# 旧客户端的第二个更新端点固定为
+#   https://github.com/shisanyue950901-beep/vega-remote/releases/download/vega-updates/latest.json
+# 维护者本机无法直传 uploads.github.com，改由 Actions 用 GITHUB_TOKEN 发布。
+#
+# 只镜像「镜像站上已经发布」的版本：先把安装包、.sig 与镜像 latest.json 下载到 runner，
+# 再校验 安装包 sha256 等于 sha256 输入、.sig 文件 sha256 等于 sig_sha256 输入、
+# 清单 version 等于输入、signature 与 .sig 内容完全一致、pub_date 是严格 RFC3339，
+# 然后把清单里 platforms.windows-x86_64.url 改指向 GitHub 固定 tag。
+# EXE 与签名都由维护者提供的两个可信哈希锚定，任何校验失败都不发布。
+# 上传顺序固定为 exe/.sig 先、latest.json 后，保证客户端看到新清单时安装包已就位；
+# 发布后再从 GitHub 下载 exe/.sig/清单回来复核一遍。
+#
+# 并发控制：同一时间只允许一个发布任务，后到的排队而不取消正在进行的任务，避免资产交错覆盖。
+# 日志安全：涉及镜像数据的步骤用 ::stop-commands:: 包裹，镜像内容不会被当作 workflow command。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "要发布到 GitHub 回退端点的版本号（形如 0.6.4）"
+        required: true
+        type: string
+      sha256:
+        description: "安装包 Vega-Setup-<version>.exe 的 SHA256（64 位小写 hex）"
+        required: true
+        type: string
+      sig_sha256:
+        description: "签名文件 Vega-Setup-<version>.exe.sig 的 SHA256（64 位小写 hex）"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: 发布 GitHub 回退端点
+    runs-on: ubuntu-latest
+    # 同一组串行执行、不取消正在运行的任务，防止并发运行交错覆盖 Release 资产。
+    concurrency:
+      group: publish-github-fallback
+      cancel-in-progress: false
+    env:
+      # 输入值只经 env 落进 shell，绝不在 run 里内插 ${{ inputs.* }}（防注入）。
+      VERSION: ${{ inputs.version }}
+      SHA256: ${{ inputs.sha256 }}
+      SIG_SHA256: ${{ inputs.sig_sha256 }}
+      REPOSITORY: ${{ github.repository }}
+      MIRROR_BASE: http://60.205.95.98/vega/updates
+      RELEASE_TAG: vega-updates
+    steps:
+      - name: 校验版本号与两个 sha256 格式
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 先拒掉换行/回车：grep -E 是逐行匹配，"0.6.4\n1.0.0" 会因首行命中而被放过。
+          for name in VERSION SHA256 SIG_SHA256; do
+            value="${!name}"
+            case "$value" in
+              *$'\n'* | *$'\r'*)
+                echo "${name} 不能包含换行" >&2
+                exit 1
+                ;;
+            esac
+          done
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "version 必须是形如 0.6.4 的三段数字" >&2
+            exit 1
+          fi
+          # 只接受 64 位小写 hex：大写、0x 前缀、含空格一律拒绝。
+          for name in SHA256 SIG_SHA256; do
+            value="${!name}"
+            if ! [[ "$value" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "${name} 必须是 64 位小写十六进制" >&2
+              exit 1
+            fi
+          done
+          # 生成一次性 stop-commands 令牌，只写入 env 供后续步骤使用，不打印到日志。
+          {
+            echo "STOP_TOKEN<<__VEGA_EOF__"
+            python3 -c 'import secrets; print(secrets.token_hex(16))'
+            echo "__VEGA_EOF__"
+          } >> "$GITHUB_ENV"
+          echo "输入格式校验通过"
+
+      - name: 下载镜像上的安装包、签名与清单
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${STOP_TOKEN:-}" || { echo "STOP_TOKEN 未生成，终止" >&2; exit 1; }
+          echo "::stop-commands::${STOP_TOKEN}"
+          trap 'echo "::${STOP_TOKEN}::"' EXIT
+          mkdir -p dist
+          asset="Vega-Setup-${VERSION}.exe"
+          curl -fsSL --retry 3 -o "dist/${asset}" \
+            "${MIRROR_BASE}/${VERSION}/${asset}"
+          curl -fsSL --retry 3 -o "dist/${asset}.sig" \
+            "${MIRROR_BASE}/${VERSION}/${asset}.sig"
+          curl -fsSL --retry 3 -o "dist/latest.json" \
+            "${MIRROR_BASE}/latest.json"
+          for f in "dist/${asset}" "dist/${asset}.sig" "dist/latest.json"; do
+            test -s "$f" || { echo "镜像下载为空：$f" >&2; exit 1; }
+          done
+          echo "镜像素材下载完成"
+
+      - name: 校验安装包 sha256 等于输入
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${STOP_TOKEN:-}" || { echo "STOP_TOKEN 未生成，终止" >&2; exit 1; }
+          echo "::stop-commands::${STOP_TOKEN}"
+          trap 'echo "::${STOP_TOKEN}::"' EXIT
+          asset="dist/Vega-Setup-${VERSION}.exe"
+          actual="$(sha256sum "$asset" | awk '{print $1}')"
+          # 不打印实际值：它由镜像内容决定，属于镜像可控字段。
+          if [ "$actual" != "$SHA256" ]; then
+            echo "安装包 sha256 与输入 sha256 不符，不发布" >&2
+            exit 1
+          fi
+          echo "安装包 sha256 校验通过"
+
+      - name: 校验签名 sha256 等于输入
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${STOP_TOKEN:-}" || { echo "STOP_TOKEN 未生成，终止" >&2; exit 1; }
+          echo "::stop-commands::${STOP_TOKEN}"
+          trap 'echo "::${STOP_TOKEN}::"' EXIT
+          sig="dist/Vega-Setup-${VERSION}.exe.sig"
+          actual="$(sha256sum "$sig" | awk '{print $1}')"
+          # 不打印实际值：它由镜像内容决定，属于镜像可控字段。
+          if [ "$actual" != "$SIG_SHA256" ]; then
+            echo "签名 sha256 与输入 sig_sha256 不符，不发布" >&2
+            exit 1
+          fi
+          echo "签名 sha256 校验通过"
+
+      - name: 校验镜像清单并生成 GitHub latest.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${STOP_TOKEN:-}" || { echo "STOP_TOKEN 未生成，终止" >&2; exit 1; }
+          echo "::stop-commands::${STOP_TOKEN}"
+          trap 'echo "::${STOP_TOKEN}::"' EXIT
+          python3 - <<'PY'
+          import datetime
+          import json
+          import os
+          import pathlib
+          import re
+          import sys
+
+          version = os.environ["VERSION"]
+          repo = os.environ["REPOSITORY"]
+          dist = pathlib.Path("dist")
+          asset = f"Vega-Setup-{version}.exe"
+
+          def fail(msg: str) -> "NoReturn":
+              # 只输出固定文案与字段名，绝不拼接镜像内容（异常文本也可能带镜像片段）。
+              print(f"校验失败：{msg}", file=sys.stderr)
+              sys.exit(1)
+
+          manifest_path = dist / "latest.json"
+          try:
+              manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          except OSError:
+              fail("读取镜像 latest.json 失败")
+          except ValueError:
+              fail("镜像 latest.json 不是合法 JSON")
+
+          if not isinstance(manifest, dict):
+              fail("镜像 latest.json 顶层不是对象")
+
+          if manifest.get("version") != version:
+              fail("镜像清单 version 字段与输入不一致，不发布")
+
+          platforms = manifest.get("platforms")
+          if not isinstance(platforms, dict):
+              fail("镜像清单缺少 platforms 对象")
+          platform = platforms.get("windows-x86_64")
+          if not isinstance(platform, dict):
+              fail("镜像清单缺少 platforms.windows-x86_64")
+
+          # .sig 只允许去掉文件末尾的「单个」换行，其余字节必须与清单 signature 完全相等。
+          sig_path = dist / f"{asset}.sig"
+          try:
+              sig_text = sig_path.read_text(encoding="utf-8")
+          except OSError:
+              fail("读取下载的 .sig 失败")
+          except UnicodeDecodeError:
+              fail("下载的 .sig 不是 UTF-8 文本")
+          if sig_text.endswith("\n"):
+              sig_text = sig_text[:-1]
+          if "\n" in sig_text or "\r" in sig_text:
+              fail(".sig 含多余换行或多行内容，与清单 signature 无法逐字比对")
+
+          manifest_sig = platform.get("signature")
+          if not isinstance(manifest_sig, str):
+              fail("镜像清单 signature 字段不是字符串")
+          if manifest_sig != sig_text:
+              fail("镜像清单 signature 与下载的 .sig 内容不一致（逐字比较），不发布")
+          # 生成的清单里写入与 .sig 完全相同（去掉末尾单个换行）的字符串。
+          platform["signature"] = sig_text
+
+          pub_date = manifest.get("pub_date")
+          if (
+              not isinstance(pub_date, str)
+              or len(pub_date) != 20
+              or not pub_date.endswith("Z")
+              or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", pub_date)
+          ):
+              fail("pub_date 不是严格 RFC3339（YYYY-MM-DDTHH:MM:SSZ）")
+          try:
+              datetime.datetime.strptime(pub_date, "%Y-%m-%dT%H:%M:%SZ")
+          except ValueError:
+              fail("pub_date 不是有效时间")
+
+          # 只改 url，其余字段（version/notes/pub_date/signature）原样保留。
+          platform["url"] = (
+              f"https://github.com/{repo}/releases/download/{os.environ['RELEASE_TAG']}/{asset}"
+          )
+          manifest_path.write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          # 不把清单内容写进日志：只打印固定文案。
+          print("已生成 GitHub latest.json：version、url、signature 校验完成")
+          PY
+
+      - name: 确保固定 tag 的 Release 存在
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$RELEASE_TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --repo "$REPOSITORY" --latest=false \
+              --title "Vega 更新通道" \
+              --notes "自动更新清单与安装包。GitHub 回退端点，请勿手工改动。"
+          fi
+
+      - name: 上传安装包与签名（先于清单）
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd dist
+          gh release upload "$RELEASE_TAG" \
+            "Vega-Setup-${VERSION}.exe" \
+            "Vega-Setup-${VERSION}.exe.sig" \
+            --clobber --repo "$REPOSITORY"
+
+      - name: 上传 latest.json（安装包就位后）
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd dist
+          gh release upload "$RELEASE_TAG" latest.json \
+            --clobber --repo "$REPOSITORY"
+
+      - name: 发布后从 GitHub 下载并复核
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${STOP_TOKEN:-}" || { echo "STOP_TOKEN 未生成，终止" >&2; exit 1; }
+          echo "::stop-commands::${STOP_TOKEN}"
+          trap 'echo "::${STOP_TOKEN}::"' EXIT
+          mkdir -p verify
+          base="https://github.com/${REPOSITORY}/releases/download/${RELEASE_TAG}"
+          asset="Vega-Setup-${VERSION}.exe"
+          curl -fsSL --retry 3 -o verify/gh-latest.json "${base}/latest.json"
+          curl -fsSL --retry 3 -o verify/gh-exe "${base}/${asset}"
+          curl -fsSL --retry 3 -o verify/gh-exe.sig "${base}/${asset}.sig"
+          for f in verify/gh-latest.json verify/gh-exe verify/gh-exe.sig; do
+            test -s "$f" || { echo "GitHub 下载为空：$f" >&2; exit 1; }
+          done
+          # 安装包 sha256 必须等于输入；不打印由镜像内容决定的实际值。
+          actual="$(sha256sum verify/gh-exe | awk '{print $1}')"
+          if [ "$actual" != "$SHA256" ]; then
+            echo "GitHub 上的安装包 sha256 与输入 sha256 不符" >&2
+            exit 1
+          fi
+          # 签名 sha256 必须等于输入 sig_sha256；不打印实际值。
+          actual_sig="$(sha256sum verify/gh-exe.sig | awk '{print $1}')"
+          if [ "$actual_sig" != "$SIG_SHA256" ]; then
+            echo "GitHub 上的签名 sha256 与输入 sig_sha256 不符" >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          def fail(msg: str) -> "NoReturn":
+              # 只输出固定文案与字段名，绝不拼接镜像/远端内容。
+              print(f"发布后复核失败：{msg}", file=sys.stderr)
+              sys.exit(1)
+
+          try:
+              local = json.loads(pathlib.Path("dist/latest.json").read_text(encoding="utf-8"))
+              remote = json.loads(pathlib.Path("verify/gh-latest.json").read_text(encoding="utf-8"))
+          except (OSError, ValueError):
+              fail("清单读取或解析失败")
+
+          if not isinstance(remote, dict):
+              fail("远端 latest.json 顶层不是对象")
+
+          def field(doc, name):
+              platforms = doc.get("platforms")
+              if not isinstance(platforms, dict):
+                  return None
+              platform = platforms.get("windows-x86_64")
+              if not isinstance(platform, dict):
+                  return None
+              return platform.get(name)
+
+          checks = {
+              "version": (local.get("version"), remote.get("version")),
+              "url": (field(local, "url"), field(remote, "url")),
+              "signature": (field(local, "signature"), field(remote, "signature")),
+          }
+          for name, (want, got) in checks.items():
+              if want != got:
+                  fail(f"远端 latest.json 的 {name} 字段与本地生成不一致")
+
+          # 远端清单的 signature 必须等于从 GitHub 下载回来的 .sig 内容（去掉末尾单个换行）。
+          try:
+              remote_sig_text = pathlib.Path("verify/gh-exe.sig").read_text(encoding="utf-8")
+          except OSError:
+              fail("读取远端 .sig 失败")
+          except UnicodeDecodeError:
+              fail("远端 .sig 不是 UTF-8 文本")
+          if remote_sig_text.endswith("\n"):
+              remote_sig_text = remote_sig_text[:-1]
+          remote_manifest_sig = field(remote, "signature")
+          if not isinstance(remote_manifest_sig, str):
+              fail("远端 latest.json 的 signature 字段不是字符串")
+          if remote_manifest_sig != remote_sig_text:
+              fail("远端 latest.json 的 signature 与远端 .sig 内容不一致")
+          print("发布后复核通过：version、url、signature 与本地生成一致，signature 与远端 .sig 逐字一致")
+          PY
+          echo "GitHub 安装包与签名的 sha256 复核通过"
