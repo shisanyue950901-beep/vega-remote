@@ -33,8 +33,9 @@
     "allow-get-peer-aliases",
     "allow-set-peer-alias",
     "allow-remove-peer",
-    "allow-get-password-status",
-    "allow-set-permanent-password",
-    "allow-clear-permanent-password"
+    "allow-get-access-code",
+    "allow-refresh-access-code",
+    "allow-set-fixed-access-code",
+    "allow-set-rotate-access-code"
   ]
 }
