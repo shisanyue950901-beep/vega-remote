@@ -76,7 +76,8 @@
   `NSIS_HOOK_PREUNINSTALL` 调 `-Uninstall` 按 state.json 回滚 ✅
 - `host/install-rustdesk.ps1`：AGPL 约束下不打包 RustDesk 二进制，固定版本下载并校验 SHA256
   （1.5.3 的官方摘要已固定为 `523ba0ef…ed249`）；先试 Vega 镜像 `http://60.205.95.98/vega/updates/rustdesk/<版本>/`
-  （官方未修改原版，直连不走系统代理，只允许同一主机），失败再走官方 GitHub Release；两个源共用 120 秒截止时间、
+  （官方未修改原版，直连不走系统代理，只允许同一主机），失败再走官方 GitHub Release；镜像源独立 45 秒预算
+  （单次阻塞读最长 15 秒，最坏约 60 秒回退），GitHub 回退重新获得完整 120 秒、
   每个源最多 2 次尝试，镜像允许明文 http 但拒绝跨主机重定向，两源都按同一份固定摘要校验；
   已装跳过、`--silent-install`、有界 60 秒等服务达到 Running；复用 T2 的 `RustDesk2.toml` ACL/原子写入逻辑，
   由 NSIS 钩子解析当前登录交互用户（explorer.exe 所有者 / 活动会话用户）的 SID 与 Roaming AppData，
@@ -121,6 +122,8 @@
   只采用成功且通过 IPv4 正则的公网地址，RFC1918 结果打印警告 ✅ 已修（T3）
 - `Get-VegaRustDeskRelease` 的 SHA256 已固定为 RustDesk 1.5.3 官方资产摘要；升级版本时必须同步更新
   版本号、文件名与摘要，否则安装包会走「RustDesk 未装好」提示分支（这是有意的安全默认值）。
+- t6e-fix4 待补测试：镜像下载的真实读流停滞（不是 Mock 直接抛超时）时，应在 45 秒预算 + 最长 15 秒阻塞读
+  之后先清理已写入的部分文件、再回退 GitHub；现有用例只覆盖 Mock 抛超时，没有验证部分文件清理与真实阻塞读的时序。
 
 ## Backlog「T3 加固」（t3-fix3 架构师裁剪、t3-fix4 审计后仍未做项，按原审计编号保留）
 - RustDesk 升级版本时同步上传镜像：`Get-VegaRustDeskRelease` 的版本号/文件名/SHA256 一改，必须把官方原版
