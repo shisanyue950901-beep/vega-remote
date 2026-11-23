@@ -183,38 +183,38 @@ fn run_service() {
 }
 
 #[cfg(windows)]
+fn report_service_status(
+    handle: windows_sys::Win32::System::Services::SERVICE_STATUS_HANDLE,
+    state: u32,
+    accepted: u32,
+    exit_code: u32,
+    wait_hint: u32,
+) {
+    use windows_sys::Win32::System::Services::{SetServiceStatus, SERVICE_STATUS};
+
+    const SERVICE_WIN32_OWN_PROCESS: u32 = 0x0000_0010;
+    // SAFETY: 全零结构体随后逐字段填好，传给 SetServiceStatus。
+    let mut status: SERVICE_STATUS = unsafe { std::mem::zeroed() };
+    status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+    status.dwCurrentState = state;
+    status.dwControlsAccepted = accepted;
+    status.dwWin32ExitCode = exit_code;
+    status.dwCheckPoint = 0;
+    status.dwWaitHint = wait_hint;
+    // SAFETY: handle 来自 RegisterServiceCtrlHandlerW，status 在调用期间有效。
+    unsafe {
+        SetServiceStatus(handle, &status);
+    }
+}
+
+#[cfg(windows)]
 unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
-    use windows_sys::Win32::System::Services::{
-        RegisterServiceCtrlHandlerW, SERVICE_STATUS_HANDLE,
-    };
+    use windows_sys::Win32::System::Services::RegisterServiceCtrlHandlerW;
 
     const SERVICE_START_PENDING: u32 = 0x0000_0002;
     const SERVICE_RUNNING: u32 = 0x0000_0004;
     const SERVICE_STOPPED: u32 = 0x0000_0001;
     const SERVICE_ACCEPT_STOP: u32 = 0x0000_0001;
-
-    fn report(
-        handle: SERVICE_STATUS_HANDLE,
-        state: u32,
-        accepted: u32,
-        exit_code: u32,
-        wait_hint: u32,
-    ) {
-        use windows_sys::Win32::System::Services::{SetServiceStatus, SERVICE_STATUS};
-        const SERVICE_WIN32_OWN_PROCESS: u32 = 0x0000_0010;
-        // SAFETY: 全零结构体随后逐字段填好，传给 SetServiceStatus。
-        let mut status: SERVICE_STATUS = unsafe { std::mem::zeroed() };
-        status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
-        status.dwCurrentState = state;
-        status.dwControlsAccepted = accepted;
-        status.dwWin32ExitCode = exit_code;
-        status.dwCheckPoint = 0;
-        status.dwWaitHint = wait_hint;
-        // SAFETY: handle 来自 RegisterServiceCtrlHandlerW，status 在调用期间有效。
-        unsafe {
-            SetServiceStatus(handle, &status);
-        }
-    }
 
     let name = winutil::wide(SERVICE_NAME);
     // SAFETY: 名称以 NUL 结尾；处理函数签名匹配 LPHANDLER_FUNCTIONW。
@@ -222,23 +222,23 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
     if handle == 0 {
         return;
     }
-    report(handle, SERVICE_START_PENDING, 0, 0, 120_000);
+    report_service_status(handle, SERVICE_START_PENDING, 0, 0, 120_000);
 
     let agent = match bootstrap() {
         Ok(agent) => agent,
         Err(err) => {
             log::event(&format!("服务启动失败：{err}"));
-            report(handle, SERVICE_STOPPED, 0, 1, 0);
+            report_service_status(handle, SERVICE_STOPPED, 0, 1, 0);
             return;
         }
     };
     start_workers(&agent);
-    report(handle, SERVICE_RUNNING, SERVICE_ACCEPT_STOP, 0, 0);
+    report_service_status(handle, SERVICE_RUNNING, SERVICE_ACCEPT_STOP, 0, 0);
 
     while !STOP.load(Ordering::Relaxed) {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
-    report(handle, SERVICE_STOPPED, 0, 0, 0);
+    report_service_status(handle, SERVICE_STOPPED, 0, 0, 0);
 }
 
 #[cfg(windows)]
