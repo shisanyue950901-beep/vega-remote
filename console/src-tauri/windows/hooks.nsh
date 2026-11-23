@@ -353,6 +353,147 @@ vega_unsetup_failed:
 vega_unsetup_skip:
 !macroend
 
+; ---------------------------------------------------------------------------
+; t8b：VegaAgent 访问码服务（vega-agent.exe）。
+;   * 服务在 RustDesk 安装/回填之后注册并启动：agent 启动后需要 rustdesk.exe 才能应用
+;     访问码；RustDesk 缺失时也照装服务，agent 自己每 30 s 重试（服务不因为缺 RustDesk
+;     而拒绝启动）。
+;   * 升级/覆盖安装前先 stop，避免旧的 vega-agent.exe 占用 resources 目录导致复制失败。
+;   * sc 返回值只写 setup.log，不中断安装；缺失服务（1060）与未启动（1062）不算错误。
+; ---------------------------------------------------------------------------
+!define VEGA_AGENT_SERVICE "VegaAgent"
+!define VEGA_AGENT_DISPLAY "Vega 访问码服务"
+
+; 停止旧服务。ID 由调用方给出，保证同一钩子内展开多次时标签不重名。
+!macro VegaStopAgentService ID
+  nsExec::ExecToStack '"$SYSDIR\sc.exe" stop ${VEGA_AGENT_SERVICE}'
+  Pop $0
+  Pop $1
+  StrCmp $0 "0" vega_agent_stop_done_${ID}
+  StrCmp $0 "1060" vega_agent_stop_done_${ID}
+  StrCmp $0 "1062" vega_agent_stop_done_${ID}
+  StrCpy $vegaSetupLogLine "sc stop ${VEGA_AGENT_SERVICE} exit code: $0"
+  !insertmacro VegaAppendSetupLog agent_stop_${ID}
+vega_agent_stop_done_${ID}:
+!macroend
+
+; 注册/修复并启动服务。已存在时用 sc config 覆盖 binPath/start/obj/DisplayName，
+; 这样旧版本留下的参数也会被纠正。
+!macro VegaInstallAgentService ID
+  !insertmacro VegaPrepareLogDirectory agent_install_${ID}
+
+  ; PREINSTALL 已停过一次；这里再兜底一次，处理 /UPDATE 或异常退出后的残留进程。
+  nsExec::ExecToStack '"$SYSDIR\sc.exe" stop ${VEGA_AGENT_SERVICE}'
+  Pop $0
+  Pop $1
+  Sleep 500
+
+  nsExec::ExecToStack '"$SYSDIR\sc.exe" query ${VEGA_AGENT_SERVICE}'
+  Pop $0
+  Pop $1
+  StrCmp $0 "0" vega_agent_config_${ID} vega_agent_create_${ID}
+
+vega_agent_create_${ID}:
+  nsExec::ExecToStack '"$SYSDIR\sc.exe" create ${VEGA_AGENT_SERVICE} binPath= "\"$INSTDIR\resources\vega-agent.exe\"" start= auto obj= LocalSystem DisplayName= "${VEGA_AGENT_DISPLAY}"'
+  Pop $0
+  Pop $1
+  StrCmp $0 "0" vega_agent_created_${ID}
+  StrCpy $vegaSetupLogLine "sc create ${VEGA_AGENT_SERVICE} exit code: $0"
+  !insertmacro VegaAppendSetupLog agent_create_fail_${ID}
+  Goto vega_agent_install_done_${ID}
+vega_agent_created_${ID}:
+  Goto vega_agent_failure_${ID}
+
+vega_agent_config_${ID}:
+  nsExec::ExecToStack '"$SYSDIR\sc.exe" config ${VEGA_AGENT_SERVICE} binPath= "\"$INSTDIR\resources\vega-agent.exe\"" start= auto obj= LocalSystem DisplayName= "${VEGA_AGENT_DISPLAY}"'
+  Pop $0
+  Pop $1
+  StrCmp $0 "0" vega_agent_failure_${ID}
+  StrCpy $vegaSetupLogLine "sc config ${VEGA_AGENT_SERVICE} exit code: $0"
+  !insertmacro VegaAppendSetupLog agent_config_fail_${ID}
+
+vega_agent_failure_${ID}:
+  ; 崩溃后 5 秒重启；86400 秒（一天）重置失败计数；末尾空动作表示不再继续重启。
+  nsExec::ExecToStack '"$SYSDIR\sc.exe" failure ${VEGA_AGENT_SERVICE} reset= 86400 actions= restart/5000/restart/5000//'
+  Pop $0
+  Pop $1
+  StrCmp $0 "0" vega_agent_desc_${ID}
+  StrCpy $vegaSetupLogLine "sc failure ${VEGA_AGENT_SERVICE} exit code: $0"
+  !insertmacro VegaAppendSetupLog agent_failure_fail_${ID}
+
+vega_agent_desc_${ID}:
+  nsExec::ExecToStack '"$SYSDIR\sc.exe" description ${VEGA_AGENT_SERVICE} "${VEGA_AGENT_DISPLAY}"'
+  Pop $0
+  Pop $1
+  StrCmp $0 "0" vega_agent_start_${ID}
+  StrCpy $vegaSetupLogLine "sc description ${VEGA_AGENT_SERVICE} exit code: $0"
+  !insertmacro VegaAppendSetupLog agent_desc_fail_${ID}
+
+vega_agent_start_${ID}:
+  nsExec::ExecToStack '"$SYSDIR\sc.exe" start ${VEGA_AGENT_SERVICE}'
+  Pop $0
+  Pop $1
+  StrCmp $0 "0" vega_agent_install_done_${ID}
+  ; 1056 = 服务已在运行；升级场景下正常。
+  StrCmp $0 "1056" vega_agent_install_done_${ID}
+  StrCpy $vegaSetupLogLine "sc start ${VEGA_AGENT_SERVICE} exit code: $0"
+  !insertmacro VegaAppendSetupLog agent_start_fail_${ID}
+
+vega_agent_install_done_${ID}:
+!macroend
+
+; 卸载：停服务 → 删服务 → 删 ProgramData\Vega\agent → 把 RustDesk 验证方式恢复默认。
+; 恢复默认失败只记日志（RustDesk 可能已被用户卸载）；/UPDATE 完全跳过。
+!macro VegaRemoveAgentService ID
+  StrCmp $UpdateMode "1" vega_agent_remove_done_${ID}
+
+  !insertmacro VegaPrepareLogDirectory agent_uninstall_${ID}
+
+  nsExec::ExecToStack '"$SYSDIR\sc.exe" stop ${VEGA_AGENT_SERVICE}'
+  Pop $0
+  Pop $1
+  StrCmp $0 "0" vega_agent_un_stopped_${ID}
+  StrCmp $0 "1060" vega_agent_un_delete_${ID}
+  StrCmp $0 "1062" vega_agent_un_delete_${ID}
+  StrCpy $vegaSetupLogLine "sc stop ${VEGA_AGENT_SERVICE} exit code: $0"
+  !insertmacro VegaAppendSetupLog agent_un_stop_fail_${ID}
+  Goto vega_agent_un_delete_${ID}
+
+vega_agent_un_stopped_${ID}:
+  Sleep 1000
+
+vega_agent_un_delete_${ID}:
+  nsExec::ExecToStack '"$SYSDIR\sc.exe" delete ${VEGA_AGENT_SERVICE}'
+  Pop $0
+  Pop $1
+  StrCmp $0 "0" vega_agent_un_state_${ID}
+  StrCmp $0 "1060" vega_agent_un_state_${ID}
+  StrCpy $vegaSetupLogLine "sc delete ${VEGA_AGENT_SERVICE} exit code: $0"
+  !insertmacro VegaAppendSetupLog agent_un_delete_fail_${ID}
+
+vega_agent_un_state_${ID}:
+  RMDir /r "$COMMONPROGRAMDATA\Vega\agent"
+
+vega_agent_un_restore_${ID}:
+  ; RustDesk 安装路径探测：先看 64 位 Program Files，再看 32 位视图。
+  StrCpy $R0 "$PROGRAMFILES64\RustDesk\rustdesk.exe"
+  IfFileExists "$R0" vega_agent_un_restore_run_${ID}
+  StrCpy $R0 "$PROGRAMFILES\RustDesk\rustdesk.exe"
+  IfFileExists "$R0" vega_agent_un_restore_run_${ID}
+  Goto vega_agent_remove_done_${ID}
+
+vega_agent_un_restore_run_${ID}:
+  nsExec::ExecToStack '"$R0" --option verification-method use-both-passwords'
+  Pop $0
+  Pop $1
+  StrCmp $0 "0" vega_agent_remove_done_${ID}
+  ; 卸载阶段失败只记录，不阻断卸载。
+  StrCpy $vegaSetupLogLine "rustdesk restore verification-method exit code: $0"
+  !insertmacro VegaAppendSetupLog agent_un_restore_fail_${ID}
+
+vega_agent_remove_done_${ID}:
+!macroend
+
 ; t6-fix2：去掉首尾成对引号、去掉尾部反斜杠（"C:\" 这种盘根保持原样），结果写回传入变量。
 ; Tauri 的 installer.nsi 写注册表时 InstallLocation 是 "$\"$INSTDIR$\""（带引号），
 ; 旧版 / 手改过的值可能是裸路径或带尾反斜杠，两种都要能对得上本次的 $INSTDIR。
@@ -815,6 +956,7 @@ vega_old_delete_rest:
   ; 只删 Tauri 安装的已知文件（主程序 + tauri.conf.json resources + 卸载器）。
   Delete "$vegaOldInstallDir\uninstall.exe"
   Delete "$vegaOldInstallDir\resources\vega-pwhelper.ps1"
+  Delete "$vegaOldInstallDir\resources\vega-agent.exe"
   Delete "$vegaOldInstallDir\resources\vega-defaults.json"
   Delete "$vegaOldInstallDir\resources\host\install-rustdesk.ps1"
   Delete "$vegaOldInstallDir\resources\host\resolve-interactive-user.ps1"
@@ -853,6 +995,11 @@ vega_mig_done:
   ; 跳过，如果只在脚本宏里初始化，/UPDATE 的完成页就是空白（MUI_FINISHPAGE_TEXT 引用
   ; 的是 $vegaFinishText 运行时值）。各语言默认文案在 .onInit 之后仍可用。
   StrCpy $vegaFinishText "$(MUI_TEXT_FINISH_INFO_TEXT)"
+
+  ; t8b：升级/覆盖安装（含 /UPDATE）先停旧访问码服务，再让 Tauri 复制文件；
+  ; 否则旧的 vega-agent.exe 正在运行会让复制失败。日志目录先准备好，stop 失败可记录。
+  !insertmacro VegaPrepareLogDirectory agent_preinstall
+  !insertmacro VegaStopAgentService agent_preinstall
 
   ; t6-fix4：Tauri 在 PREINSTALL 之后才复制文件并重写卸载注册表项。先在这里
   ; 记录「安装前是否已有 Vega 卸载键」，POSTINSTALL 据此区分全新安装与重装/更新。
@@ -905,6 +1052,10 @@ vega_postinstall_run:
   !insertmacro VegaRunInstallRustDesk
 
 vega_postinstall_notes:
+  ; t8b：RustDesk 安装/回填之后再注册访问码服务，两类路径（跑脚本 / 跳过脚本）都装。
+  ; sc 失败只写 setup.log，不中断安装；RustDesk 缺失时 agent 自己每 30 s 重试。
+  !insertmacro VegaInstallAgentService agent
+
   ; t6-fix5 P3：迁移告警在「跑脚本」和「跳过脚本」两条路径下都要出现。
   StrCmp $vegaOldInstallWarning "" vega_postinstall_acl
     StrCpy $vegaFinishText "$vegaFinishText$\r$\n$\r$\n$vegaOldInstallWarning"
@@ -916,5 +1067,8 @@ vega_postinstall_done:
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
+  ; t8b：先停/删访问码服务并把 RustDesk 验证方式恢复默认，再回滚 RustDesk 配置。
+  ; /UPDATE 在宏内部跳过（只换程序文件，保留服务与访问码）。
+  !insertmacro VegaRemoveAgentService agent
   !insertmacro VegaRunUninstallRustDesk
 !macroend
