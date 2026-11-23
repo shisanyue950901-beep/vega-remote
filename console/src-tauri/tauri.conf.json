@@ -42,7 +42,7 @@
     "longDescription": "零登录、零广告的远程协助与串流控制台。",
     "resources": {
       "resources/vega-defaults.json": "resources/vega-defaults.json",
-      "resources/vega-pwhelper.ps1": "resources/vega-pwhelper.ps1",
+      "resources/vega-agent.exe": "resources/vega-agent.exe",
       "../../host/install-rustdesk.ps1": "resources/host/install-rustdesk.ps1",
       "../../host/resolve-interactive-user.ps1": "resources/host/resolve-interactive-user.ps1",
       "../../host/lib/Vega.Common.psm1": "resources/host/lib/Vega.Common.psm1"
