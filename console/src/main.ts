@@ -1143,13 +1143,14 @@ function setupSettingsPage(): void {
       return;
     }
     if (hasPermanentPassword) {
-      if (window.confirm("关闭后将清除长期密码，只能用临时密码连接，继续吗？")) {
-        setUnattendedOpen(false);
-        clearPasswordButton.click();
-      } else {
-        unattendedToggle.checked = true;
-        return;
-      }
+      // 清除本身带一次确认；用户取消时把开关拨回去。
+      clearPasswordButton.click();
+      window.setTimeout(() => {
+        if (hasPermanentPassword) {
+          unattendedToggle.checked = true;
+        }
+      }, 0);
+      return;
     }
     unattendedOn = false;
     setUnattendedOpen(false);
