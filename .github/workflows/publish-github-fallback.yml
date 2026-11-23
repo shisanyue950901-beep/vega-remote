@@ -169,7 +169,7 @@ jobs:
               encoding="utf-8",
           )
           # 不把清单内容写进日志：只打印 version 与已校验过的 url/sha256 摘要。
-          print(f"已生成 GitHub latest.json：version={version} url={platform['url']}")
+          print(f"已生成 GitHub latest.json：version={version}，signature 与 .sig 逐字一致")
           PY
 
       - name: 确保固定 tag 的 Release 存在
