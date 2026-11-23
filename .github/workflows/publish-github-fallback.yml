@@ -5,14 +5,20 @@ name: Publish GitHub fallback
 # 维护者本机无法直传 uploads.github.com，改由 Actions 用 GITHUB_TOKEN 发布。
 #
 # 只镜像「镜像站上已经发布」的版本：先把安装包、.sig 与镜像 latest.json 下载到 runner，
-# 校验清单 version 等于输入、signature 与 .sig 内容一致、pub_date 是严格 RFC3339，
-# 再把清单里 platforms.windows-x86_64.url 改指向 GitHub 固定 tag 后上传。任何校验失败都不发布。
+# 再校验 安装包 sha256 等于输入、清单 version 等于输入、signature 与 .sig 内容完全一致、
+# pub_date 是严格 RFC3339，然后把清单里 platforms.windows-x86_64.url 改指向 GitHub 固定 tag。
+# 任何校验失败都不发布。上传顺序固定为 exe/.sig 先、latest.json 后，保证客户端看到新清单时
+# 安装包已就位；发布后再从 GitHub 下载回来复核一遍。
 
 on:
   workflow_dispatch:
     inputs:
       version:
         description: "要发布到 GitHub 回退端点的版本号（形如 0.6.4）"
+        required: true
+        type: string
+      sha256:
+        description: "安装包 Vega-Setup-<version>.exe 的 SHA256（64 位小写 hex）"
         required: true
         type: string
 
@@ -24,28 +30,37 @@ jobs:
     name: 发布 GitHub 回退端点
     runs-on: ubuntu-latest
     env:
-      # 输入值只经 env 落进 shell，绝不在 run 里内插 ${{ inputs.version }}（防注入）。
+      # 输入值只经 env 落进 shell，绝不在 run 里内插 ${{ inputs.* }}（防注入）。
       VERSION: ${{ inputs.version }}
+      SHA256: ${{ inputs.sha256 }}
       REPOSITORY: ${{ github.repository }}
       MIRROR_BASE: http://60.205.95.98/vega/updates
       RELEASE_TAG: vega-updates
     steps:
-      - name: 校验版本号格式
+      - name: 校验版本号与 sha256 格式
         shell: bash
         run: |
           set -euo pipefail
           # 先拒掉换行/回车：grep -E 是逐行匹配，"0.6.4\n1.0.0" 会因首行命中而被放过。
-          case "$VERSION" in
-            *$'\n'* | *$'\r'*)
-              echo "version 不能包含换行：${VERSION@Q}" >&2
-              exit 1
-              ;;
-          esac
+          for name in VERSION SHA256; do
+            value="${!name}"
+            case "$value" in
+              *$'\n'* | *$'\r'*)
+                echo "${name} 不能包含换行" >&2
+                exit 1
+                ;;
+            esac
+          done
           if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "version 必须是形如 0.6.4 的三段数字，实际为：${VERSION@Q}" >&2
             exit 1
           fi
-          echo "版本号 ${VERSION} 格式正确"
+          # 只接受 64 位小写 hex：大写、0x 前缀、含空格一律拒绝。
+          if ! [[ "$SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "sha256 必须是 64 位小写十六进制，实际长度 ${#SHA256}" >&2
+            exit 1
+          fi
+          echo "版本号 ${VERSION}，sha256 ${SHA256} 格式正确"
 
       - name: 下载镜像上的安装包、签名与清单
         shell: bash
@@ -63,6 +78,18 @@ jobs:
             test -s "$f" || { echo "下载为空：$f" >&2; exit 1; }
           done
           ls -l dist
+
+      - name: 校验安装包 sha256 等于输入
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="dist/Vega-Setup-${VERSION}.exe"
+          actual="$(sha256sum "$asset" | awk '{print $1}')"
+          if [ "$actual" != "$SHA256" ]; then
+            echo "安装包 sha256 不符，不发布：期望 ${SHA256}，实际 ${actual}" >&2
+            exit 1
+          fi
+          echo "安装包 sha256 校验通过：${actual}"
 
       - name: 校验镜像清单并生成 GitHub latest.json
         shell: bash
@@ -101,14 +128,24 @@ jobs:
           if not isinstance(platform, dict):
               fail("镜像清单缺少 platforms.windows-x86_64")
 
+          # .sig 只允许去掉文件末尾的「单个」换行，其余字节必须与清单 signature 完全相等。
           sig_path = dist / f"{asset}.sig"
           try:
-              sig_file = sig_path.read_text(encoding="utf-8")
-          except OSError as exc:
+              sig_text = sig_path.read_text(encoding="utf-8")
+          except (OSError, UnicodeDecodeError) as exc:
               fail(f"读取下载的 .sig 失败：{exc}")
+          if sig_text.endswith("\n"):
+              sig_text = sig_text[:-1]
+          if "\n" in sig_text or "\r" in sig_text:
+              fail(".sig 含多余换行或多行内容，与清单 signature 无法逐字比对")
+
           manifest_sig = platform.get("signature")
-          if not isinstance(manifest_sig, str) or manifest_sig.strip() != sig_file.strip():
-              fail("镜像清单 signature 与下载的 .sig 内容不一致，不发布")
+          if not isinstance(manifest_sig, str):
+              fail("镜像清单 signature 不是字符串")
+          if manifest_sig != sig_text:
+              fail("镜像清单 signature 与下载的 .sig 内容不一致（逐字比较），不发布")
+          # 生成的清单里写入与 .sig 完全相同（去掉末尾单个换行）的字符串。
+          platform["signature"] = sig_text
 
           pub_date = manifest.get("pub_date")
           if (
@@ -131,9 +168,9 @@ jobs:
               json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
               encoding="utf-8",
           )
-          print(f"已生成 GitHub latest.json，url={platform['url']}")
+          # 不把清单内容写进日志：只打印 version 与已校验过的 url/sha256 摘要。
+          print(f"已生成 GitHub latest.json：version={version} url={platform['url']}")
           PY
-          cat dist/latest.json
 
       - name: 确保固定 tag 的 Release 存在
         shell: bash
@@ -147,7 +184,7 @@ jobs:
               --notes "自动更新清单与安装包。GitHub 回退端点，请勿手工改动。"
           fi
 
-      - name: 上传 exe / sig / latest.json
+      - name: 上传安装包与签名（先于清单）
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -157,12 +194,55 @@ jobs:
           gh release upload "$RELEASE_TAG" \
             "Vega-Setup-${VERSION}.exe" \
             "Vega-Setup-${VERSION}.exe.sig" \
-            latest.json \
             --clobber --repo "$REPOSITORY"
 
-      - name: 验证 GitHub latest.json 可下载
+      - name: 上传 latest.json（安装包就位后）
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd dist
+          gh release upload "$RELEASE_TAG" latest.json \
+            --clobber --repo "$REPOSITORY"
+
+      - name: 发布后从 GitHub 下载并复核
         shell: bash
         run: |
           set -euo pipefail
-          url="https://github.com/${REPOSITORY}/releases/download/${RELEASE_TAG}/latest.json"
-          curl -fsSIL "$url" -o /dev/null -w '%{http_code} %{url_effective}\n'
+          mkdir -p verify
+          base="https://github.com/${REPOSITORY}/releases/download/${RELEASE_TAG}"
+          asset="Vega-Setup-${VERSION}.exe"
+          curl -fsSL --retry 3 -o verify/gh-latest.json "${base}/latest.json"
+          curl -fsSL --retry 3 -o verify/gh-exe "${base}/${asset}"
+          for f in verify/gh-latest.json verify/gh-exe; do
+            test -s "$f" || { echo "GitHub 下载为空：$f" >&2; exit 1; }
+          done
+          actual="$(sha256sum verify/gh-exe | awk '{print $1}')"
+          if [ "$actual" != "$SHA256" ]; then
+            echo "GitHub 上的安装包 sha256 不符：期望 ${SHA256}，实际 ${actual}" >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          local = json.loads(pathlib.Path("dist/latest.json").read_text(encoding="utf-8"))
+          remote = json.loads(pathlib.Path("verify/gh-latest.json").read_text(encoding="utf-8"))
+
+          def field(doc, name):
+              return doc.get("platforms", {}).get("windows-x86_64", {}).get(name)
+
+          checks = {
+              "version": (local.get("version"), remote.get("version")),
+              "url": (field(local, "url"), field(remote, "url")),
+              "signature": (field(local, "signature"), field(remote, "signature")),
+          }
+          for name, (want, got) in checks.items():
+              if want != got:
+                  print(f"发布后复核失败：{name} 不一致（本地 {want!r}，远端 {got!r}）", file=sys.stderr)
+                  sys.exit(1)
+          print(f"发布后复核通过：version={remote['version']} url 与 signature 与本地生成一致")
+          PY
+          echo "GitHub 安装包 sha256 复核通过：${actual}"
