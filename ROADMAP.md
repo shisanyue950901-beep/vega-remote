@@ -74,8 +74,10 @@
 - NSIS 钩子：`console/src-tauri/windows/hooks.nsh` 的 `NSIS_HOOK_POSTINSTALL` 隐藏窗口跑 `install-rustdesk.ps1`，
   退出码写 `%ProgramData%\Vega\logs\setup.log`；脚本失败不阻断安装，只在完成时提示到 Vega 手动安装；
   `NSIS_HOOK_PREUNINSTALL` 调 `-Uninstall` 按 state.json 回滚 ✅
-- `host/install-rustdesk.ps1`：AGPL 约束下不打包 RustDesk 二进制，固定官方 GitHub Release 版本下载并校验 SHA256
-  （1.5.3 的官方摘要已固定为 `523ba0ef…ed249`），整个下载共用一个 120 秒截止时间、最多 2 次尝试，只接受 HTTPS；
+- `host/install-rustdesk.ps1`：AGPL 约束下不打包 RustDesk 二进制，固定版本下载并校验 SHA256
+  （1.5.3 的官方摘要已固定为 `523ba0ef…ed249`）；先试 Vega 镜像 `http://60.205.95.98/vega/updates/rustdesk/<版本>/`
+  （官方未修改原版，直连不走系统代理，只允许同一主机），失败再走官方 GitHub Release；两个源共用 120 秒截止时间、
+  每个源最多 2 次尝试，镜像允许明文 http 但拒绝跨主机重定向，两源都按同一份固定摘要校验；
   已装跳过、`--silent-install`、有界 60 秒等服务达到 Running；复用 T2 的 `RustDesk2.toml` ACL/原子写入逻辑，
   由 NSIS 钩子解析当前登录交互用户（explorer.exe 所有者 / 活动会话用户）的 SID 与 Roaming AppData，
   以 ASCII Base64(UTF-8) 传入脚本（t3-fix4，避免中文路径经 nsExec ANSI 解码损坏），解码后校验目录存在，
@@ -121,6 +123,9 @@
   版本号、文件名与摘要，否则安装包会走「RustDesk 未装好」提示分支（这是有意的安全默认值）。
 
 ## Backlog「T3 加固」（t3-fix3 架构师裁剪、t3-fix4 审计后仍未做项，按原审计编号保留）
+- RustDesk 升级版本时同步上传镜像：`Get-VegaRustDeskRelease` 的版本号/文件名/SHA256 一改，必须把官方原版
+  安装包同时放到 `60.205.95.98:/opt/vega-relay/updates/rustdesk/<版本>/`，否则国内客户机会先撞镜像 404
+  再回落到 GitHub（仍能装，但镜像优先的意义就没了）。
 - P2（t3-r3）服务就绪尾段缺口：新装/已装分支都等待 Running，但写配置期间服务若停止或消失，重启函数会跳过，
   安装仍返回成功。应让重启与最终状态检查共享同一个有界等待，返回成功前再次确认 Running。
 - P2（t3-r3）用户回滚基线仍按路径存储：`state.json` 只有一个可覆盖的 SID/路径对象，真正的键基线没有 SID；
