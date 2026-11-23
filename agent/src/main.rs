@@ -27,6 +27,8 @@ static STOP: AtomicBool = AtomicBool::new(false);
 /// 访问码状态在进程内只有一份；所有修改都在锁内完成落盘与内存更新。
 pub struct Agent {
     state: Mutex<state::State>,
+    /// 串行化「改状态 + 应用到 RustDesk」，避免两个请求的 CLI 调用乱序收尾。
+    apply: Mutex<()>,
 }
 
 impl Agent {
@@ -52,6 +54,7 @@ impl Agent {
 
     /// 会话结束后轮换；fixed 模式不动。
     pub fn rotate_after_session(&self) -> Result<Option<(String, String)>, String> {
+        let _apply = self.apply.lock().map_err(|_| "状态锁不可用".to_string())?;
         let mut guard = self.state.lock().map_err(|_| "状态锁不可用".to_string())?;
         if guard.mode != state::Mode::Rotate {
             return Ok(None);
@@ -66,6 +69,7 @@ impl Agent {
     }
 
     fn install(&self, next: state::State) -> Result<(String, String), String> {
+        let _apply = self.apply.lock().map_err(|_| "状态锁不可用".to_string())?;
         let mut guard = self.state.lock().map_err(|_| "状态锁不可用".to_string())?;
         state::save(&next)?;
         *guard = next.clone();
@@ -113,6 +117,7 @@ fn bootstrap() -> Result<Arc<Agent>, String> {
     log::event(&format!("访问码服务已启动（模式：{}）", current.mode_name()));
     Ok(Arc::new(Agent {
         state: Mutex::new(current),
+        apply: Mutex::new(()),
     }))
 }
 
