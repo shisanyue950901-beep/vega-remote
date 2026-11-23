@@ -6,11 +6,13 @@ on:
     branches: [main]
     tags: ["v*"]
     paths:
+      - "agent/**"
       - "console/**"
       - "host/**"
       - ".github/workflows/console.yml"
   pull_request:
     paths:
+      - "agent/**"
       - "console/**"
       - "host/**"
       - ".github/workflows/console.yml"
@@ -76,6 +78,19 @@ jobs:
             npm install --no-audit --no-fund
           fi
 
+      # t8b：先编译访问码服务并放进 Tauri resources，安装器才有东西可打包。
+      # agent 暂未提交 Cargo.lock：存在时才加 --locked，避免 CI 因缺 lock 直接失败。
+      - name: 构建 vega-agent 并放入 resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          lock=''
+          if [ -f ../agent/Cargo.lock ]; then
+            lock='--locked'
+          fi
+          cargo build --release $lock --manifest-path ../agent/Cargo.toml
+          cp ../agent/target/release/vega-agent.exe src-tauri/resources/vega-agent.exe
+
       # TODO(m2b): Cargo.lock 提交后追加 --locked，保证依赖可复现。
       # tauri.conf.json 里 bundle.targets = ["nsis"]，perMachine 只提权一次；
       # 安装包会带上 host/install-rustdesk.ps1 与 resources/vega-defaults.json。
@@ -87,6 +102,10 @@ jobs:
       # cargo test 的 build.rs（generate_context!）需要 ../dist，上面构建已生成。
       - name: Rust 单元测试
         run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      # t8b：访问码服务自己的单元测试（不依赖 Tauri / dist）。
+      - name: vega-agent 单元测试
+        run: cargo test --manifest-path ../agent/Cargo.toml
 
       - name: 重命名安装包为 Vega-Setup.exe
         shell: bash
