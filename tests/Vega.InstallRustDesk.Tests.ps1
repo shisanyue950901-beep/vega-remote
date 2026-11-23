@@ -6,8 +6,11 @@
   所有下载/安装/服务/配置写入的外部动作都 Mock，文件只落在 $TestDrive。
 #>
 
-# Mock 体在模块作用域执行，计数器/注入数据用 $global: 才能在测试作用域回读；
-# 改成 $script: 会落到模块作用域，断言读不到。这里只豁免这一条规则。
+# Mock 体按“创建它的脚本作用域”执行（Pester 5 只把 mock 包装器切到模块作用域，
+# behavior 自身的 SessionState 仍是本测试文件），所以 Mock 里的 $script: 是测试文件作用域；
+# 但用 `& (Get-Module ...) { $script:X = ... }` 重置只会写进模块作用域，mock 看不到
+# （t6e-fix3 的计数器串值就是这条踩出来的）。计数器/注入数据统一用 $global:，
+# 在任一作用域都能读写。这里只豁免这一条规则。
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', '',
     Justification = 'Pester Mock 在模块作用域执行，用 $global: 在测试与 Mock 之间共享注入数据和调用计数。')]
 param()
@@ -554,10 +557,16 @@ Describe 'Invoke-VegaRustDeskBootstrap' {
     }
 
     It '未安装时下载、静默安装、写用户级与服务级配置并记录到 state.json' {
-        & (Get-Module $script:ModuleName) { $script:VegaProbeCount = 0 }
+        # t6e-fix3：mock 体按**创建它的脚本作用域**执行（Pester 5 的 ExecuteBehavior 只把包装器
+        # 切到模块作用域，behavior 自身的 SessionState 仍是本测试文件），所以 Mock 里的
+        # `$script:` 是测试文件作用域，不是模块作用域。原来用
+        # `& (Get-Module ...) { $script:VegaProbeCount = 0 }` 重置的是模块作用域里的同名变量，
+        # mock 根本看不到，计数器会从上个用例的值接着往上加。统一改用 $global:（两处作用域都
+        # 能读写），每个用例开头显式归零。
+        $global:VegaProbeCount = 0
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall {
-            $script:VegaProbeCount += 1
-            if ($script:VegaProbeCount -le 1) { '' } else { 'C:\Program Files\RustDesk\rustdesk.exe' }
+            $global:VegaProbeCount += 1
+            if ($global:VegaProbeCount -le 1) { '' } else { 'C:\Program Files\RustDesk\rustdesk.exe' }
         }
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstaller {
             [pscustomobject]@{ Success = $true; Path = 'C:\temp\rustdesk.exe'; Sha256 = ('a' * 64); Lock = $null; Error = '' }
@@ -597,10 +606,12 @@ Describe 'Invoke-VegaRustDeskBootstrap' {
     }
 
     It 't6e-fix2 镜像失败但 GitHub 成功时，安装日志写入镜像失败原因' {
-        & (Get-Module $script:ModuleName) { $script:VegaProbeCount = 0 }
+        # t6e-fix3：同上，计数器必须归零在本测试文件作用域（$global:），否则首次探测就直接
+        # 返回“已安装”，Bootstrap 走跳过安装的分支，日志里只剩最后一行 OK 中继。
+        $global:VegaProbeCount = 0
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall {
-            $script:VegaProbeCount += 1
-            if ($script:VegaProbeCount -le 1) { '' } else { 'C:\Program Files\RustDesk\rustdesk.exe' }
+            $global:VegaProbeCount += 1
+            if ($global:VegaProbeCount -le 1) { '' } else { 'C:\Program Files\RustDesk\rustdesk.exe' }
         }
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstaller {
             [pscustomobject]@{
