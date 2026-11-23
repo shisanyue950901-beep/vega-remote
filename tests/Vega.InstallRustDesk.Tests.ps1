@@ -87,6 +87,9 @@ Describe 'Get-VegaRustDeskRelease' {
         $release.FileName | Should -Match 'x86_64\.exe$'
         $release.Sha256 | Should -Match '^[0-9a-f]{64}$'
         $release.Page | Should -Be 'https://rustdesk.com/download'
+        # t6e：镜像优先、GitHub 兜底；镜像地址用 http，靠固定 SHA256 保证内容不被替换。
+        $release.MirrorUrl | Should -Be ("http://60.205.95.98/vega/updates/rustdesk/{0}/rustdesk-{0}-x86_64.exe" -f $release.Version)
+        $release.MirrorUrl | Should -Match [regex]::Escape($release.Version)
     }
 }
 
@@ -105,7 +108,7 @@ Describe 'Get-VegaRustDeskInstaller' {
 
     It 'SHA256 不匹配立即中止并删除文件' {
         Mock -ModuleName $script:ModuleName Invoke-VegaHttpsDownload {
-            param($Uri, $OutFile, $TimeoutSeconds, $Deadline)
+            param($Uri, $OutFile, $TimeoutSeconds, $Deadline, [switch]$AllowHttp, [switch]$NoProxy)
             $null = $Uri, $OutFile, $TimeoutSeconds, $Deadline
             Set-Content -LiteralPath $OutFile -Value 'not-the-real-installer' -Encoding UTF8
         }
@@ -147,9 +150,68 @@ Describe 'Get-VegaRustDeskInstaller' {
         Should -Invoke -CommandName Invoke-VegaHttpsDownload -ModuleName $script:ModuleName -Times 2 -Exactly
     }
 
+    It 't6e 镜像失败时回退到官方 GitHub，镜像请求直连且允许 http' {
+        $mirrored = [pscustomobject]@{
+            Version   = $script:release.Version
+            FileName  = $script:release.FileName
+            Url       = 'https://example.invalid/rustdesk.exe'
+            MirrorUrl = 'http://mirror.invalid/rustdesk/rustdesk.exe'
+            Sha256    = ('a' * 64)
+            Page      = $script:release.Page
+        }
+
+        Mock -ModuleName $script:ModuleName Invoke-VegaHttpsDownload {
+            param($Uri, $OutFile, $TimeoutSeconds, $Deadline, [switch]$AllowHttp, [switch]$NoProxy)
+            $null = $TimeoutSeconds, $Deadline, $AllowHttp, $NoProxy
+            if ($Uri -like 'http://*') { throw '镜像不可用' }
+            Set-Content -LiteralPath $OutFile -Value 'installer' -Encoding UTF8
+        }
+        Mock -ModuleName $script:ModuleName Get-FileHash {
+            [pscustomobject]@{ Hash = ('a' * 64) }
+        }
+
+        $result = Get-VegaRustDeskInstaller -DestinationDirectory $script:downloadDir -Release $mirrored
+        $result.Success | Should -BeTrue
+        $result.Source | Should -Be '官方 GitHub'
+        $result.Url | Should -Be $mirrored.Url
+        Should -Invoke -CommandName Invoke-VegaHttpsDownload -ModuleName $script:ModuleName -Times 2 -Exactly
+        Should -Invoke -CommandName Invoke-VegaHttpsDownload -ModuleName $script:ModuleName -Times 1 -Exactly -ParameterFilter {
+            $Uri -eq 'http://mirror.invalid/rustdesk/rustdesk.exe' -and $AllowHttp -and $NoProxy
+        }
+        $result.Lock.Dispose()
+        Remove-Item -LiteralPath $result.Path -Force -ErrorAction SilentlyContinue
+    }
+
+    It 't6e 镜像与 GitHub 都失败时返回失败，Error 含每个源的原因' {
+        $mirrored = [pscustomobject]@{
+            Version   = $script:release.Version
+            FileName  = $script:release.FileName
+            Url       = 'https://example.invalid/rustdesk.exe'
+            MirrorUrl = 'http://mirror.invalid/rustdesk/rustdesk.exe'
+            Sha256    = ('a' * 64)
+            Page      = $script:release.Page
+        }
+
+        Mock -ModuleName $script:ModuleName Invoke-VegaHttpsDownload {
+            param($Uri, $OutFile, $TimeoutSeconds, $Deadline, [switch]$AllowHttp, [switch]$NoProxy)
+            $null = $OutFile, $TimeoutSeconds, $Deadline, $AllowHttp, $NoProxy
+            if ($Uri -like 'http://*') { throw '镜像不可用' }
+            throw 'GitHub 不可用'
+        }
+
+        $result = Get-VegaRustDeskInstaller -DestinationDirectory $script:downloadDir -Release $mirrored
+        $result.Success | Should -BeFalse
+        $result.Error | Should -Match '已尝试 4 次'
+        $result.Error | Should -Match 'Vega 镜像'
+        $result.Error | Should -Match '镜像不可用'
+        $result.Error | Should -Match '官方 GitHub'
+        $result.Error | Should -Match 'GitHub 不可用'
+        Test-Path -LiteralPath (Join-Path $script:downloadDir $mirrored.FileName) | Should -BeFalse
+    }
+
     It '校验通过返回安装包路径，并保持独占读句柄到启动' {
         Mock -ModuleName $script:ModuleName Invoke-VegaHttpsDownload {
-            param($Uri, $OutFile, $TimeoutSeconds, $Deadline)
+            param($Uri, $OutFile, $TimeoutSeconds, $Deadline, [switch]$AllowHttp, [switch]$NoProxy)
             $null = $Uri, $OutFile, $TimeoutSeconds, $Deadline
             Set-Content -LiteralPath $OutFile -Value 'installer' -Encoding UTF8
         }
@@ -179,7 +241,7 @@ Describe 'Get-VegaRustDeskInstaller' {
         $global:VegaTestPayload = $payload
 
         Mock -ModuleName $script:ModuleName Invoke-VegaHttpsDownload {
-            param($Uri, $OutFile, $TimeoutSeconds, $Deadline)
+            param($Uri, $OutFile, $TimeoutSeconds, $Deadline, [switch]$AllowHttp, [switch]$NoProxy)
             $null = $Uri, $OutFile, $TimeoutSeconds, $Deadline
             Copy-Item -LiteralPath $global:VegaTestPayload -Destination $OutFile -Force
         }
