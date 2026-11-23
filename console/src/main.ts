@@ -489,11 +489,11 @@ function setupAssistPage(): void {
     accessCodeHint.textContent = "正在刷新访问码…";
     void invoke<OpResult>("refresh_access_code").then((result) => {
       accessCodeRefresh.disabled = false;
-      if (!result) {
+      if (result === null) {
         showAccessCodeFallback();
         return;
       }
-      if (!result.ok) {
+      if (result && !result.ok) {
         accessCodeHint.textContent = result.message;
         return;
       }

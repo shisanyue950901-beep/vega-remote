@@ -1011,7 +1011,6 @@ code {
 .connect-row .input {
   flex: 1;
   min-width: 0;
-  height: 36px;
 }
 
 .connect-row .seg {
@@ -1039,6 +1038,7 @@ code {
 .chip {
   position: relative;
   display: inline-flex;
+  cursor: pointer;
   align-items: center;
   gap: 4px;
   height: 28px;
@@ -1288,6 +1288,10 @@ code {
   backdrop-filter: blur(6px);
   -webkit-backdrop-filter: blur(6px);
   z-index: 60;
+}
+
+dialog.modal:not([open]) {
+  display: none;
 }
 
 .modal[open] {
