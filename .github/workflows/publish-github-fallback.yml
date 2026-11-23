@@ -1,0 +1,168 @@
+name: Publish GitHub fallback
+
+# 旧客户端的第二个更新端点固定为
+#   https://github.com/shisanyue950901-beep/vega-remote/releases/download/vega-updates/latest.json
+# 维护者本机无法直传 uploads.github.com，改由 Actions 用 GITHUB_TOKEN 发布。
+#
+# 只镜像「镜像站上已经发布」的版本：先把安装包、.sig 与镜像 latest.json 下载到 runner，
+# 校验清单 version 等于输入、signature 与 .sig 内容一致、pub_date 是严格 RFC3339，
+# 再把清单里 platforms.windows-x86_64.url 改指向 GitHub 固定 tag 后上传。任何校验失败都不发布。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "要发布到 GitHub 回退端点的版本号（形如 0.6.4）"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: 发布 GitHub 回退端点
+    runs-on: ubuntu-latest
+    env:
+      # 输入值只经 env 落进 shell，绝不在 run 里内插 ${{ inputs.version }}（防注入）。
+      VERSION: ${{ inputs.version }}
+      REPOSITORY: ${{ github.repository }}
+      MIRROR_BASE: http://60.205.95.98/vega/updates
+      RELEASE_TAG: vega-updates
+    steps:
+      - name: 校验版本号格式
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 先拒掉换行/回车：grep -E 是逐行匹配，"0.6.4\n1.0.0" 会因首行命中而被放过。
+          case "$VERSION" in
+            *$'\n'* | *$'\r'*)
+              echo "version 不能包含换行：${VERSION@Q}" >&2
+              exit 1
+              ;;
+          esac
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "version 必须是形如 0.6.4 的三段数字，实际为：${VERSION@Q}" >&2
+            exit 1
+          fi
+          echo "版本号 ${VERSION} 格式正确"
+
+      - name: 下载镜像上的安装包、签名与清单
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          asset="Vega-Setup-${VERSION}.exe"
+          curl -fsSL --retry 3 -o "dist/${asset}" \
+            "${MIRROR_BASE}/${VERSION}/${asset}"
+          curl -fsSL --retry 3 -o "dist/${asset}.sig" \
+            "${MIRROR_BASE}/${VERSION}/${asset}.sig"
+          curl -fsSL --retry 3 -o "dist/latest.json" \
+            "${MIRROR_BASE}/latest.json"
+          for f in "dist/${asset}" "dist/${asset}.sig" "dist/latest.json"; do
+            test -s "$f" || { echo "下载为空：$f" >&2; exit 1; }
+          done
+          ls -l dist
+
+      - name: 校验镜像清单并生成 GitHub latest.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import datetime
+          import json
+          import os
+          import pathlib
+          import re
+          import sys
+
+          version = os.environ["VERSION"]
+          repo = os.environ["REPOSITORY"]
+          dist = pathlib.Path("dist")
+          asset = f"Vega-Setup-{version}.exe"
+
+          def fail(msg: str) -> "NoReturn":
+              print(f"校验失败：{msg}", file=sys.stderr)
+              sys.exit(1)
+
+          manifest_path = dist / "latest.json"
+          try:
+              manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          except (OSError, ValueError) as exc:
+              fail(f"镜像 latest.json 无法解析：{exc}")
+
+          if manifest.get("version") != version:
+              fail(f"镜像清单 version={manifest.get('version')!r} 与输入 {version!r} 不一致，不发布")
+
+          platforms = manifest.get("platforms")
+          if not isinstance(platforms, dict):
+              fail("镜像清单缺少 platforms 对象")
+          platform = platforms.get("windows-x86_64")
+          if not isinstance(platform, dict):
+              fail("镜像清单缺少 platforms.windows-x86_64")
+
+          sig_path = dist / f"{asset}.sig"
+          try:
+              sig_file = sig_path.read_text(encoding="utf-8")
+          except OSError as exc:
+              fail(f"读取下载的 .sig 失败：{exc}")
+          manifest_sig = platform.get("signature")
+          if not isinstance(manifest_sig, str) or manifest_sig.strip() != sig_file.strip():
+              fail("镜像清单 signature 与下载的 .sig 内容不一致，不发布")
+
+          pub_date = manifest.get("pub_date")
+          if (
+              not isinstance(pub_date, str)
+              or len(pub_date) != 20
+              or not pub_date.endswith("Z")
+              or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", pub_date)
+          ):
+              fail(f"pub_date 不是严格 RFC3339（YYYY-MM-DDTHH:MM:SSZ）：{pub_date!r}")
+          try:
+              datetime.datetime.strptime(pub_date, "%Y-%m-%dT%H:%M:%SZ")
+          except ValueError as exc:
+              fail(f"pub_date 不是有效时间：{pub_date!r}（{exc}）")
+
+          # 只改 url，其余字段（version/notes/pub_date/signature）原样保留。
+          platform["url"] = (
+              f"https://github.com/{repo}/releases/download/{os.environ['RELEASE_TAG']}/{asset}"
+          )
+          manifest_path.write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          print(f"已生成 GitHub latest.json，url={platform['url']}")
+          PY
+          cat dist/latest.json
+
+      - name: 确保固定 tag 的 Release 存在
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$RELEASE_TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --repo "$REPOSITORY" --latest=false \
+              --title "Vega 更新通道" \
+              --notes "自动更新清单与安装包。GitHub 回退端点，请勿手工改动。"
+          fi
+
+      - name: 上传 exe / sig / latest.json
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd dist
+          gh release upload "$RELEASE_TAG" \
+            "Vega-Setup-${VERSION}.exe" \
+            "Vega-Setup-${VERSION}.exe.sig" \
+            latest.json \
+            --clobber --repo "$REPOSITORY"
+
+      - name: 验证 GitHub latest.json 可下载
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="https://github.com/${REPOSITORY}/releases/download/${RELEASE_TAG}/latest.json"
+          curl -fsSIL "$url" -o /dev/null -w '%{http_code} %{url_effective}\n'
