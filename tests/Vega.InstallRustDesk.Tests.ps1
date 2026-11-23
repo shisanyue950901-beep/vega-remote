@@ -114,7 +114,8 @@ Describe 'Get-VegaRustDeskInstaller' {
     It 'SHA256 不匹配立即中止并删除文件' {
         Mock -ModuleName $script:ModuleName Invoke-VegaHttpsDownload {
             param($Uri, $OutFile, $TimeoutSeconds, $Deadline, [switch]$AllowHttp, [switch]$NoProxy)
-            $null = $Uri, $OutFile, $TimeoutSeconds, $Deadline
+            # t6e-fix4：Mock 里声明了 -AllowHttp/-NoProxy 就必须引用，否则 PSReviewUnusedParameter 失败。
+            $null = $Uri, $OutFile, $TimeoutSeconds, $Deadline, $AllowHttp, $NoProxy
             Set-Content -LiteralPath $OutFile -Value 'not-the-real-installer' -Encoding UTF8
         }
         Mock -ModuleName $script:ModuleName Get-FileHash {
@@ -273,7 +274,8 @@ Describe 'Get-VegaRustDeskInstaller' {
     It '校验通过返回安装包路径，并保持独占读句柄到启动' {
         Mock -ModuleName $script:ModuleName Invoke-VegaHttpsDownload {
             param($Uri, $OutFile, $TimeoutSeconds, $Deadline, [switch]$AllowHttp, [switch]$NoProxy)
-            $null = $Uri, $OutFile, $TimeoutSeconds, $Deadline
+            # t6e-fix4：Mock 里声明了 -AllowHttp/-NoProxy 就必须引用，否则 PSReviewUnusedParameter 失败。
+            $null = $Uri, $OutFile, $TimeoutSeconds, $Deadline, $AllowHttp, $NoProxy
             Set-Content -LiteralPath $OutFile -Value 'installer' -Encoding UTF8
         }
         Mock -ModuleName $script:ModuleName Get-FileHash {
@@ -303,7 +305,8 @@ Describe 'Get-VegaRustDeskInstaller' {
 
         Mock -ModuleName $script:ModuleName Invoke-VegaHttpsDownload {
             param($Uri, $OutFile, $TimeoutSeconds, $Deadline, [switch]$AllowHttp, [switch]$NoProxy)
-            $null = $Uri, $OutFile, $TimeoutSeconds, $Deadline
+            # t6e-fix4：Mock 里声明了 -AllowHttp/-NoProxy 就必须引用，否则 PSReviewUnusedParameter 失败。
+            $null = $Uri, $OutFile, $TimeoutSeconds, $Deadline, $AllowHttp, $NoProxy
             Copy-Item -LiteralPath $global:VegaTestPayload -Destination $OutFile -Force
         }
 
