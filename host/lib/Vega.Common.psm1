@@ -6347,6 +6347,8 @@ function Invoke-VegaHttpsDownload {
            避免开放重定向把明文请求或校验过的下载带到别的主机；
         - t6e：-NoProxy 让本次请求直连（Proxy=$null），国内镜像不经系统代理；
         - 每次请求与读流的超时都按剩余时间现算，不会“每个分块重新计时”；
+        - t6e-fix4：镜像请求（-AllowHttp）的 Timeout 与 ReadWriteTimeout 都取 min(剩余预算, 15000 ms)，
+          单次阻塞等待不再能吃满 45 秒，最坏回退延迟约 60 秒；GitHub 源保持原行为；
         - 失败抛异常，由调用方决定重试与报错文案。
     #>
     [CmdletBinding()]
@@ -6397,8 +6399,13 @@ function Invoke-VegaHttpsDownload {
         $request = [System.Net.HttpWebRequest]::Create($current)
         $request.Method = 'GET'
         $request.AllowAutoRedirect = $false
-        $request.Timeout = $remainingMs
-        $request.ReadWriteTimeout = $remainingMs
+        # t6e-fix4：镜像请求的连接与每次读都最多等 15 秒，不能只把 ReadWriteTimeout 设成剩余预算
+        # （45 秒预算下，一次阻塞读就能再等近 45 秒，回退 GitHub 被拖到 90 秒）。
+        # 45 秒预算 + 最长 15 秒读流停滞 => 最坏约 60 秒回退。GitHub 源保持 main 原行为。
+        $requestTimeoutMs = $remainingMs
+        if ($AllowHttp) { $requestTimeoutMs = [Math]::Min($remainingMs, 15000) }
+        $request.Timeout = $requestTimeoutMs
+        $request.ReadWriteTimeout = $requestTimeoutMs
         $request.UserAgent = 'Vega-Setup'
         # t6e：镜像直连，避免客户机上不可用的系统代理把国内请求也带坏。
         if ($NoProxy) { $request.Proxy = $null }
