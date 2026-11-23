@@ -173,7 +173,7 @@ fn call_pipe(request: &Request) -> Result<AccessCode, String> {
             std::ptr::null(),
             OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL,
-            std::ptr::null_mut(),
+            Default::default(),
         )
     };
     if handle == INVALID_HANDLE_VALUE {
@@ -193,7 +193,7 @@ fn call_pipe(request: &Request) -> Result<AccessCode, String> {
                     std::ptr::null(),
                     OPEN_EXISTING,
                     FILE_ATTRIBUTE_NORMAL,
-                    std::ptr::null_mut(),
+                    Default::default(),
                 )
             };
             if handle == INVALID_HANDLE_VALUE {
