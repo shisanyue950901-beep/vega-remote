@@ -82,14 +82,16 @@ Describe 'Get-VegaRustDeskDefaultConfig' {
 Describe 'Get-VegaRustDeskRelease' {
     It '固定官方 GitHub Release，SHA256 是待填的 64 位常量' {
         $release = Get-VegaRustDeskRelease
-        $release.Url | Should -Match '^https://github\.com/rustdesk/rustdesk/releases/download/'
-        $release.Url | Should -Match ([regex]::Escape($release.Version))
-        $release.FileName | Should -Match 'x86_64\.exe$'
+        # 版本固定，直接用字面量断言：原来 `Should -Match [regex]::Escape($release.Version)`
+        # 没加括号，参数模式下 PowerShell 把 `[regex]::Escape` 当裸字符串传给 -Match，
+        # 断言退化成匹配字面量 "[regex]::Escape"，必然失败。
+        $release.Version | Should -Be '1.5.3'
+        $release.Url | Should -Be 'https://github.com/rustdesk/rustdesk/releases/download/1.5.3/rustdesk-1.5.3-x86_64.exe'
+        $release.FileName | Should -Be 'rustdesk-1.5.3-x86_64.exe'
         $release.Sha256 | Should -Match '^[0-9a-f]{64}$'
         $release.Page | Should -Be 'https://rustdesk.com/download'
         # t6e：镜像优先、GitHub 兜底；镜像地址用 http，靠固定 SHA256 保证内容不被替换。
-        $release.MirrorUrl | Should -Be ("http://60.205.95.98/vega/updates/rustdesk/{0}/rustdesk-{0}-x86_64.exe" -f $release.Version)
-        $release.MirrorUrl | Should -Match [regex]::Escape($release.Version)
+        $release.MirrorUrl | Should -Be 'http://60.205.95.98/vega/updates/rustdesk/1.5.3/rustdesk-1.5.3-x86_64.exe'
     }
 }
 
@@ -174,8 +176,12 @@ Describe 'Get-VegaRustDeskInstaller' {
         $result.Success | Should -BeTrue
         $result.Source | Should -Be '官方 GitHub'
         $result.Url | Should -Be $mirrored.Url
-        Should -Invoke -CommandName Invoke-VegaHttpsDownload -ModuleName $script:ModuleName -Times 2 -Exactly
-        Should -Invoke -CommandName Invoke-VegaHttpsDownload -ModuleName $script:ModuleName -Times 1 -Exactly -ParameterFilter {
+        # 实现里“每个源最多 MaxAttempts=2 次”是 P2b 就有的重试策略（见函数注释与
+        # '下载失败最多尝试 2 次' 用例），t6e 只是把源从 1 个变成 2 个：
+        # 镜像两次都被 Mock 抛错 -> 2 次，GitHub 第一次就成功 -> 1 次，合计 3 次。
+        # 所以这里按实现的真实次数断言 3，不是实现多下载了一次。
+        Should -Invoke -CommandName Invoke-VegaHttpsDownload -ModuleName $script:ModuleName -Times 3 -Exactly
+        Should -Invoke -CommandName Invoke-VegaHttpsDownload -ModuleName $script:ModuleName -Times 2 -Exactly -ParameterFilter {
             $Uri -eq 'http://mirror.invalid/rustdesk/rustdesk.exe' -and $AllowHttp -and $NoProxy
         }
         $result.Lock.Dispose()
