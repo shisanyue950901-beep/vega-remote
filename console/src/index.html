@@ -8,12 +8,6 @@
     <script type="module" src="main.js"></script>
   </head>
   <body>
-    <!-- 背景极光（固定不动，纯 CSS） -->
-    <div class="aurora" aria-hidden="true">
-      <span class="aurora__blob aurora__blob--violet"></span>
-      <span class="aurora__blob aurora__blob--cyan"></span>
-    </div>
-
     <div class="app">
       <!-- 自绘标题栏：透明融入背景，仅右上三个控制点 -->
       <header class="titlebar" data-tauri-drag-region>
@@ -32,22 +26,14 @@
       </header>
 
       <div class="shell">
-        <!-- 左栏：玻璃侧栏 -->
+        <!-- 左栏：半透明侧栏 -->
         <aside class="sidebar">
           <div class="brand">
             <svg class="brand__mark" viewBox="0 0 24 24" aria-hidden="true">
-              <defs>
-                <linearGradient id="vega-star-grad" x1="0" y1="0" x2="1" y2="1">
-                  <stop offset="0%" stop-color="#8E7CFF" />
-                  <stop offset="50%" stop-color="#6C5CE7" />
-                  <stop offset="100%" stop-color="#4FC3F7" />
-                </linearGradient>
-              </defs>
               <path
                 d="M12 2c.5 4.6 2.4 6.9 7 7.5v1c-4.6.6-6.5 2.9-7 7.5-.5-4.6-2.4-6.9-7-7.5v-1c4.6-.6 6.5-2.9 7-7.5z"
-                fill="url(#vega-star-grad)"
               />
-              <path d="M18.6 16.4c.2 1.9 1 2.8 2.9 3.1v.4c-1.9.3-2.7 1.2-2.9 3.1H18c-.2-1.9-1-2.8-2.9-3.1v-.4c1.9-.3 2.7-1.2 2.9-3.1h.6z" fill="url(#vega-star-grad)" opacity=".72" />
+              <path d="M18.6 16.4c.2 1.9 1 2.8 2.9 3.1v.4c-1.9.3-2.7 1.2-2.9 3.1H18c-.2-1.9-1-2.8-2.9-3.1v-.4c1.9-.3 2.7-1.2 2.9-3.1h.6z" opacity=".6" />
             </svg>
             <span class="brand__text">Vega</span>
           </div>
@@ -68,83 +54,91 @@
           </nav>
 
           <div class="sidebar__footer">
-            <span class="version">v0.6.0</span>
+            <span class="sidebar__status">
+              <span class="dot dot--off" id="sidebar-dot" aria-hidden="true"></span>
+              <span id="sidebar-status-text">正在读取…</span>
+            </span>
+            <span class="version" id="sidebar-version">v0.6.4</span>
             <button id="update-badge" class="update-badge is-hidden" type="button" title="发现新版本">有新版本</button>
           </div>
         </aside>
 
         <main class="content">
           <!-- 1 远程协助 -->
-          <section id="page-assist" class="page is-active" aria-labelledby="assist-title">
+          <section id="page-assist" class="page page--assist is-active" aria-labelledby="assist-title">
             <h1 id="assist-title" class="page__title">远程协助</h1>
 
-            <!-- 签名元素：设备码卡 -->
-            <div class="hero">
-              <div class="hero__stars" aria-hidden="true"></div>
-              <div class="hero__top">
-                <span class="hero__label">本机设备码</span>
-              </div>
+            <!-- 仅在异常时出现的警告横幅（默认隐藏） -->
+            <div class="banner is-hidden" id="service-status" role="status" aria-live="polite">
+              <span class="dot dot--off" id="service-dot" aria-hidden="true"></span>
+              <span class="banner__icon" aria-hidden="true">
+                <svg viewBox="0 0 20 20"><path d="M10 3.2 17.2 16H2.8L10 3.2z" /><path d="M10 8.2v3.4M10 13.6v.1" /></svg>
+              </span>
+              <span class="banner__body">
+                <span class="banner__text" id="service-status-text">未检测到 RustDesk</span>
+                <span class="banner__sub" id="install-hint">从官方发行页下载安装包手动安装</span>
+              </span>
+              <span class="banner__actions">
+                <button id="open-install-page" class="btn btn--tinted btn--sm is-hidden" type="button">安装</button>
+                <button id="service-diagnose" class="btn btn--tinted btn--sm" type="button">诊断</button>
+              </span>
+            </div>
 
-              <div class="hero__code-line">
-                <span id="device-code" class="hero__code">读取中…</span>
-                <button id="copy-code" class="hero__copy" type="button" aria-label="复制设备码" title="复制设备码">
-                  <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="6.5" y="6.5" width="9" height="9" rx="2" /><path d="M4.5 13.2A1.7 1.7 0 0 1 3.4 11.6V5.1c0-.9.7-1.7 1.7-1.7h6.5" /></svg>
+            <!-- 本机 -->
+            <div class="group">
+              <div class="card-head">
+                <span class="card-head__title">
+                  本机
+                  <span class="pill" id="local-state">在线</span>
+                </span>
+                <span class="card-head__spacer"></span>
+                <button
+                  id="mobile-qr-quick"
+                  class="btn btn--icon"
+                  type="button"
+                  aria-label="手机扫码连接本机"
+                  title="手机扫码连接本机"
+                >
+                  <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="3" y="3" width="5" height="5" rx="1" /><rect x="12" y="3" width="5" height="5" rx="1" /><rect x="3" y="12" width="5" height="5" rx="1" /><path d="M12 12h2v2h-2zM15.5 12H17v2M12 15.5V17h2M15.5 15.5H17V17" /></svg>
                 </button>
               </div>
 
-              <p id="device-code-status" class="hero__status-line" role="status" aria-live="polite"></p>
-
-              <div class="hero__pill">
-                <span class="dot dot--off" id="id-dot" aria-hidden="true"></span>
-                <span id="id-status-text">正在读取 RustDesk 状态…</span>
-                <button id="id-test" class="hero__pill-btn is-hidden" type="button">诊断</button>
-              </div>
-            </div>
-
-            <!-- RustDesk 未检测到时的警告行（默认隐藏） -->
-            <div class="row row--warn is-hidden" id="service-status">
-              <span class="dot dot--off" id="service-dot" aria-hidden="true"></span>
-              <span class="row__body">
-                <span id="service-status-text">未检测到 RustDesk</span>
-                <span id="install-hint" class="row__sub">从官方发行页下载安装包手动安装</span>
-              </span>
-              <button id="open-install-page" class="link is-hidden" type="button">重新运行安装程序</button>
-            </div>
-
-            <h2 class="group__title">访问密码</h2>
-            <div class="group">
-              <div class="row">
-                <span class="row__body">
-                  <span class="row__label">临时密码</span>
-                  <span class="row__sub">由 RustDesk 自己管理，控制台不读取、不记录。</span>
-                  <span id="temporary-password-status" class="row__sub" role="status" aria-live="polite"></span>
-                </span>
-                <button id="show-password" class="link" type="button">查看</button>
-              </div>
-              <div id="fixed-password-row" class="row">
-                <span class="row__body">
-                  <span class="row__label">长期密码</span>
-                  <span id="password-status" class="row__sub" role="status" aria-live="polite">未设置</span>
-                </span>
-                <button id="open-fixed-password" class="link" type="button" aria-label="到设置页设置长期密码">设置</button>
-              </div>
-              <div class="row row--stack">
-                <span class="row__label">验证方式</span>
-                <div id="verify-method" class="seg seg--full" role="group" aria-label="验证方式">
-                  <button class="seg__btn is-active" type="button" data-verify="temporary">临时</button>
-                  <button class="seg__btn" type="button" data-verify="permanent">长期</button>
-                  <button class="seg__btn" type="button" data-verify="both">两者</button>
+              <div class="code-grid">
+                <div class="code-field">
+                  <span class="code-field__label">设备码</span>
+                  <span class="code-line">
+                    <span id="device-code" class="code-value code-value--device">读取中…</span>
+                    <button id="copy-code" class="btn btn--icon" type="button" aria-label="复制设备码" title="复制设备码">
+                      <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="6.5" y="6.5" width="9" height="9" rx="2" /><path d="M4.5 13.2A1.7 1.7 0 0 1 3.4 11.6V5.1c0-.9.7-1.7 1.7-1.7h6.5" /></svg>
+                    </button>
+                  </span>
+                  <p id="device-code-status" class="code-hint" role="status" aria-live="polite"></p>
                 </div>
-                <span id="verify-hint" class="row__sub is-hidden" role="status" aria-live="polite">先设置长期密码</span>
+
+                <div class="code-field">
+                  <span class="code-field__label">访问码</span>
+                  <span class="code-line">
+                    <span id="access-code" class="code-value code-value--access" aria-live="polite">••••••</span>
+                    <button id="access-code-toggle" class="btn btn--icon" type="button" aria-label="显示访问码" title="显示访问码">
+                      <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M1.8 10S4.7 4.8 10 4.8 18.2 10 18.2 10 15.3 15.2 10 15.2 1.8 10 1.8 10z" /><circle cx="10" cy="10" r="2.4" /></svg>
+                    </button>
+                    <button id="access-code-refresh" class="btn btn--icon" type="button" aria-label="刷新访问码" title="刷新访问码">
+                      <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M16.4 10a6.4 6.4 0 1 1-1.9-4.5" /><path d="M16.6 3.4v3.4h-3.4" /></svg>
+                    </button>
+                    <button id="access-code-fallback" class="link is-hidden" type="button">在 RustDesk 中查看</button>
+                  </span>
+                  <span id="access-code-hint" class="code-hint">每次连接后自动更换</span>
+                </div>
+              </div>
+
+              <div class="card-foot">
+                <button id="copy-share" class="btn btn--primary" type="button">复制并分享</button>
               </div>
             </div>
 
-            <button id="copy-share" class="btn btn--primary btn--block" type="button">复制邀请</button>
-            <p class="footnote">复制「设备码 + 让对方在 RustDesk 窗口查看临时密码」一段文字，不含任何密码。</p>
-
-            <h2 class="group__title">连接其他设备</h2>
-            <div class="group">
-              <div class="row row--field">
+            <!-- 连接其他设备 -->
+            <div class="group" style="margin-top: 12px">
+              <div class="connect-row">
                 <input
                   id="peer-code"
                   class="input input--peer"
@@ -156,12 +150,7 @@
                   aria-label="对方设备码"
                 />
                 <datalist id="recent-devices"></datalist>
-                <button id="connect-peer" class="btn btn--round" type="button" aria-label="连接" title="连接">
-                  <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4.5 10h10M10.5 5.5 15 10l-4.5 4.5" /></svg>
-                </button>
-              </div>
-              <div class="row row--stack">
-                <div class="seg seg--full" role="group" aria-label="连接方式">
+                <div class="seg" role="group" aria-label="连接方式">
                   <label class="seg__btn">
                     <input type="radio" name="connect-mode" value="control" checked />
                     <span>远程控制</span>
@@ -171,10 +160,13 @@
                     <span>文件传输</span>
                   </label>
                 </div>
+                <button id="connect-peer" class="btn btn--primary" type="button">连接</button>
               </div>
-              <div class="row">
-                <span id="connect-status" class="row__sub" role="status" aria-live="polite">连接后弹出 RustDesk 会话窗口，输入对方临时密码。</span>
-              </div>
+
+              <div class="recent-head">最近连接</div>
+              <div id="recent-chips" class="chips" aria-label="最近连接"></div>
+
+              <p id="connect-status" class="card-status" role="status" aria-live="polite"></p>
             </div>
           </section>
 
@@ -190,15 +182,9 @@
             <div id="tab-rd" class="tabpanel is-active" role="tabpanel">
               <div class="group group--plain" id="device-list">
                 <div class="empty">
-                  <svg class="empty__art" viewBox="0 0 64 64" aria-hidden="true">
-                    <path
-                      d="M32 8c1.4 12.6 6.6 18.9 19.2 20.5v1.6C38.6 31.7 33.4 38 32 50.6c-1.4-12.6-6.6-18.9-19.2-20.5v-1.6C25.4 26.9 30.6 20.6 32 8z"
-                      fill="url(#vega-star-grad)"
-                      opacity=".85"
-                    />
-                    <circle cx="48" cy="46" r="2" fill="currentColor" opacity=".28" />
-                    <circle cx="15.5" cy="43" r="1.4" fill="currentColor" opacity=".22" />
-                    <circle cx="26" cy="55" r="1.2" fill="currentColor" opacity=".18" />
+                  <svg class="empty__art" viewBox="0 0 24 24" aria-hidden="true">
+                    <rect x="3" y="4.5" width="18" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.4" />
+                    <path d="M2 19.5h20" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
                   </svg>
                   <p class="empty__text">连接过的设备会出现在这里</p>
                 </div>
@@ -283,76 +269,120 @@
               </div>
             </div>
 
-            <h2 class="group__title">安全</h2>
+            <h2 class="group__title">无人值守访问</h2>
             <div class="group">
-              <div class="row row--stack">
-                <span class="row__label">长期密码</span>
-                <p class="row__sub">用于无人值守访问自己的电脑。设置时 Windows 会请求一次管理员确认。</p>
-                <div class="row__actions">
-                  <button
-                    id="toggle-fixed-password"
-                    class="link"
-                    type="button"
-                    aria-expanded="false"
-                    aria-controls="fixed-password-form"
-                  >设置长期密码</button>
+              <div class="row">
+                <span class="row__body">
+                  <span class="row__label">允许用长期密码直接连接</span>
+                  <span class="row__sub">开启后可以设置长期密码；关闭则只保留临时密码</span>
+                </span>
+                <label class="switch">
+                  <input id="allow-unattended" type="checkbox" />
+                </label>
+              </div>
+
+              <div id="unattended-detail" class="is-hidden">
+                <div class="row" id="fixed-password-row">
+                  <span class="row__body">
+                    <span class="row__label">设置长期密码</span>
+                    <span id="password-status" class="row__sub" role="status" aria-live="polite">未设置</span>
+                  </span>
+                  <button id="open-fixed-password" class="link link--chevron" type="button" aria-label="设置长期密码">设置</button>
                 </div>
-                <div id="fixed-password-form" class="field-stack is-hidden">
-                  <input
-                    id="set-fixed-password"
-                    class="input"
-                    type="password"
-                    placeholder="新密码（8-64 位，字母+数字）"
-                    autocomplete="new-password"
-                    aria-label="新长期密码"
-                  />
-                  <input
-                    id="set-fixed-password-confirm"
-                    class="input"
-                    type="password"
-                    placeholder="再次输入以确认"
-                    autocomplete="new-password"
-                    aria-label="确认长期密码"
-                  />
-                  <span class="row__sub">设置后的验证方式</span>
-                  <div id="pw-form-verify" class="seg seg--full" role="group" aria-label="设置后的验证方式">
-                    <button class="seg__btn" type="button" data-pw-verify="temporary">临时</button>
-                    <button class="seg__btn" type="button" data-pw-verify="permanent">长期</button>
-                    <button class="seg__btn is-active" type="button" data-pw-verify="both">两者</button>
+
+                <div class="row row--stack">
+                  <span class="row__label">验证方式</span>
+                  <div id="verify-method" class="seg seg--full" role="group" aria-label="验证方式">
+                    <button class="seg__btn is-active" type="button" data-verify="temporary">临时</button>
+                    <button class="seg__btn" type="button" data-verify="permanent">长期</button>
+                    <button class="seg__btn" type="button" data-verify="both">两者</button>
                   </div>
+                  <span id="verify-hint" class="row__sub is-hidden" role="status" aria-live="polite">先设置长期密码</span>
+                </div>
+
+                <div class="row row--stack">
+                  <p class="row__sub">用于无人值守访问自己的电脑。设置时 Windows 会请求一次管理员确认。</p>
                   <div class="row__actions">
-                    <button id="save-fixed-password" class="btn btn--primary btn--sm" type="button">设置</button>
-                    <button id="clear-fixed-password" class="link link--danger" type="button">清除长期密码</button>
+                    <button
+                      id="toggle-fixed-password"
+                      class="link"
+                      type="button"
+                      aria-expanded="false"
+                      aria-controls="fixed-password-form"
+                    >设置长期密码</button>
+                  </div>
+                  <div id="fixed-password-form" class="field-stack is-hidden">
+                    <input
+                      id="set-fixed-password"
+                      class="input"
+                      type="password"
+                      placeholder="新密码（8-64 位，字母+数字）"
+                      autocomplete="new-password"
+                      aria-label="新长期密码"
+                    />
+                    <input
+                      id="set-fixed-password-confirm"
+                      class="input"
+                      type="password"
+                      placeholder="再次输入以确认"
+                      autocomplete="new-password"
+                      aria-label="确认长期密码"
+                    />
+                    <span class="row__sub">设置后的验证方式</span>
+                    <div id="pw-form-verify" class="seg seg--full" role="group" aria-label="设置后的验证方式">
+                      <button class="seg__btn" type="button" data-pw-verify="temporary">临时</button>
+                      <button class="seg__btn" type="button" data-pw-verify="permanent">长期</button>
+                      <button class="seg__btn is-active" type="button" data-pw-verify="both">两者</button>
+                    </div>
+                    <div class="row__actions">
+                      <button id="save-fixed-password" class="btn btn--primary btn--sm" type="button">设置</button>
+                      <button id="clear-fixed-password" class="link link--danger" type="button">清除长期密码</button>
+                    </div>
                   </div>
                 </div>
+              </div>
+
+              <div class="row">
+                <span class="row__body">
+                  <button id="show-password" class="link" type="button">在 RustDesk 中查看临时密码</button>
+                  <span id="temporary-password-status" class="row__sub" role="status" aria-live="polite"></span>
+                </span>
               </div>
             </div>
 
             <h2 class="group__title">网络</h2>
             <div class="group">
               <div class="row">
+                <span class="dot dot--off" id="id-dot" aria-hidden="true"></span>
+                <span class="row__body">
+                  <span class="row__label">中继服务器</span>
+                  <span id="id-status-text" class="row__sub">正在读取 RustDesk 状态…</span>
+                </span>
+                <button id="id-test" class="btn btn--tinted btn--sm is-hidden" type="button">诊断</button>
+              </div>
+              <div class="row">
                 <span class="row__label">ID 服务器</span>
                 <input id="set-id-server" class="input input--inline" type="text" readonly placeholder="RustDesk2.toml 里未配置" />
               </div>
               <div class="row">
-                <span class="row__label">中继服务器</span>
+                <span class="row__label">中继地址</span>
                 <input id="set-relay-server" class="input input--inline" type="text" readonly placeholder="未指定，由 RustDesk 自动推导" />
               </div>
               <div class="row">
                 <span class="row__label">当前公钥指纹</span>
-                <span id="server-key-fingerprint" class="row__value">未读取</span>
+                <span id="server-key-fingerprint" class="row__value row__value--mono">未读取</span>
               </div>
-              <div class="row row--test">
+              <div class="row">
                 <span class="row__body">
                   <span class="row__label">连接测试</span>
                   <span id="test-connection-result" class="row__sub">未测试</span>
-                  <span id="network-status" class="row__sub row__sub--path" role="status" aria-live="polite"></span>
+                  <span id="network-status" class="row__sub" role="status" aria-live="polite"></span>
                   <span id="relay-defaults" class="row__sub" role="status" aria-live="polite">默认中继：读取中…</span>
                 </span>
                 <button id="test-connection" class="btn btn--tinted btn--sm" type="button">测试连接</button>
                 <button id="open-rustdesk-network" class="btn btn--primary btn--sm" type="button">在 RustDesk 中修改</button>
               </div>
-              <div class="row row--test">
+              <div class="row">
                 <span class="row__body">
                   <span class="row__label">手机扫码配置</span>
                   <span class="row__sub">iPhone / 安卓装官方 RustDesk，底部「设置」右上角扫码图标扫这个码，就能连到本机同一服务器</span>
