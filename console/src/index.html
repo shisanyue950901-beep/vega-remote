@@ -92,14 +92,9 @@
                   <span class="pill" id="local-state">在线</span>
                 </span>
                 <span class="card-head__spacer"></span>
-                <button
-                  id="mobile-qr-quick"
-                  class="btn btn--icon"
-                  type="button"
-                  aria-label="手机扫码连接本机"
-                  title="手机扫码连接本机"
-                >
-                  <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="3" y="3" width="5" height="5" rx="1" /><rect x="12" y="3" width="5" height="5" rx="1" /><rect x="3" y="12" width="5" height="5" rx="1" /><path d="M12 12h2v2h-2zM15.5 12H17v2M12 15.5V17h2M15.5 15.5H17V17" /></svg>
+                <button id="mobile-qr-quick" class="btn btn--tinted btn--sm" type="button">
+                  <svg class="btn__icon" viewBox="0 0 20 20" aria-hidden="true"><rect x="3" y="3" width="5" height="5" rx="1" /><rect x="12" y="3" width="5" height="5" rx="1" /><rect x="3" y="12" width="5" height="5" rx="1" /><path d="M12 12h2v2h-2zM15.5 12H17v2M12 15.5V17h2M15.5 15.5H17V17" /></svg>
+                  <span>手机扫码</span>
                 </button>
               </div>
 
@@ -125,7 +120,7 @@
                     <button id="access-code-refresh" class="btn btn--icon" type="button" aria-label="刷新访问码" title="刷新访问码">
                       <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M16.4 10a6.4 6.4 0 1 1-1.9-4.5" /><path d="M16.6 3.4v3.4h-3.4" /></svg>
                     </button>
-                    <button id="access-code-fallback" class="link is-hidden" type="button">在 RustDesk 中查看</button>
+                    <button id="access-code-fallback" class="link is-hidden" type="button">修复</button>
                   </span>
                   <span id="access-code-hint" class="code-hint">每次连接后自动更换</span>
                 </div>
@@ -138,6 +133,9 @@
 
             <!-- 连接其他设备 -->
             <div class="group" style="margin-top: 12px">
+              <div class="card-head">
+                <span class="card-head__title">连接其他设备</span>
+              </div>
               <div class="connect-row">
                 <input
                   id="peer-code"
@@ -273,80 +271,22 @@
             <div class="group">
               <div class="row">
                 <span class="row__body">
-                  <span class="row__label">允许用长期密码直接连接</span>
-                  <span class="row__sub">开启后可以设置长期密码；关闭则只保留临时密码</span>
+                  <span class="row__label">访问码每次连接后自动更换</span>
+                  <span class="row__sub">关闭后使用固定访问码，适合无人值守连接</span>
                 </span>
                 <label class="switch">
-                  <input id="allow-unattended" type="checkbox" />
+                  <input id="allow-unattended" type="checkbox" checked />
                 </label>
               </div>
 
               <div id="unattended-detail" class="is-hidden">
-                <div class="row" id="fixed-password-row">
+                <div class="row is-hidden" id="fixed-access-row">
                   <span class="row__body">
-                    <span class="row__label">设置长期密码</span>
-                    <span id="password-status" class="row__sub" role="status" aria-live="polite">未设置</span>
+                    <span class="row__label">设置固定访问码</span>
+                    <span id="access-mode-status" class="row__sub" role="status" aria-live="polite">固定访问码</span>
                   </span>
-                  <button id="open-fixed-password" class="link link--chevron" type="button" aria-label="设置长期密码">设置</button>
+                  <button id="open-fixed-access" class="link link--chevron" type="button" aria-label="设置固定访问码">设置</button>
                 </div>
-
-                <div class="row row--stack">
-                  <span class="row__label">验证方式</span>
-                  <div id="verify-method" class="seg seg--full" role="group" aria-label="验证方式">
-                    <button class="seg__btn is-active" type="button" data-verify="temporary">临时</button>
-                    <button class="seg__btn" type="button" data-verify="permanent">长期</button>
-                    <button class="seg__btn" type="button" data-verify="both">两者</button>
-                  </div>
-                  <span id="verify-hint" class="row__sub is-hidden" role="status" aria-live="polite">先设置长期密码</span>
-                </div>
-
-                <div class="row row--stack">
-                  <p class="row__sub">用于无人值守访问自己的电脑。设置时 Windows 会请求一次管理员确认。</p>
-                  <div class="row__actions">
-                    <button
-                      id="toggle-fixed-password"
-                      class="link"
-                      type="button"
-                      aria-expanded="false"
-                      aria-controls="fixed-password-form"
-                    >设置长期密码</button>
-                  </div>
-                  <div id="fixed-password-form" class="field-stack is-hidden">
-                    <input
-                      id="set-fixed-password"
-                      class="input"
-                      type="password"
-                      placeholder="新密码（8-64 位，字母+数字）"
-                      autocomplete="new-password"
-                      aria-label="新长期密码"
-                    />
-                    <input
-                      id="set-fixed-password-confirm"
-                      class="input"
-                      type="password"
-                      placeholder="再次输入以确认"
-                      autocomplete="new-password"
-                      aria-label="确认长期密码"
-                    />
-                    <span class="row__sub">设置后的验证方式</span>
-                    <div id="pw-form-verify" class="seg seg--full" role="group" aria-label="设置后的验证方式">
-                      <button class="seg__btn" type="button" data-pw-verify="temporary">临时</button>
-                      <button class="seg__btn" type="button" data-pw-verify="permanent">长期</button>
-                      <button class="seg__btn is-active" type="button" data-pw-verify="both">两者</button>
-                    </div>
-                    <div class="row__actions">
-                      <button id="save-fixed-password" class="btn btn--primary btn--sm" type="button">设置</button>
-                      <button id="clear-fixed-password" class="link link--danger" type="button">清除长期密码</button>
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              <div class="row">
-                <span class="row__body">
-                  <button id="show-password" class="link" type="button">在 RustDesk 中查看临时密码</button>
-                  <span id="temporary-password-status" class="row__sub" role="status" aria-live="polite"></span>
-                </span>
               </div>
             </div>
 
@@ -381,13 +321,6 @@
                 </span>
                 <button id="test-connection" class="btn btn--tinted btn--sm" type="button">测试连接</button>
                 <button id="open-rustdesk-network" class="btn btn--primary btn--sm" type="button">在 RustDesk 中修改</button>
-              </div>
-              <div class="row">
-                <span class="row__body">
-                  <span class="row__label">手机扫码配置</span>
-                  <span class="row__sub">iPhone / 安卓装官方 RustDesk，底部「设置」右上角扫码图标扫这个码，就能连到本机同一服务器</span>
-                </span>
-                <button id="show-mobile-qr" class="btn btn--tinted btn--sm" type="button">显示二维码</button>
               </div>
               <div class="row row--stack">
                 <span class="row__sub">服务器地址请在 RustDesk 的 设置 → 网络 中修改。控制台只读取 <code>RustDesk2.toml</code> 显示当前值；安装包默认值来自 <code>vega-defaults.json</code>，这里只做比对。</span>
@@ -424,6 +357,31 @@
         </main>
       </div>
     </div>
+
+    <!-- 固定访问码弹层 -->
+    <dialog id="fixed-access-sheet" class="modal" aria-labelledby="fixed-access-title">
+      <div class="modal__box">
+        <h2 id="fixed-access-title" class="modal__title">设置固定访问码</h2>
+        <p class="modal__text">6–32 位字母或数字。设置后关闭「自动更换」，无人值守连接就一直使用这个访问码。</p>
+        <div class="field-stack">
+          <input
+            id="set-fixed-access-code"
+            class="input"
+            type="text"
+            inputmode="text"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="输入固定访问码"
+            aria-label="固定访问码"
+          />
+        </div>
+        <p id="fixed-access-status" class="row__sub" role="status" aria-live="polite"></p>
+        <div class="modal__actions">
+          <button id="cancel-fixed-access" class="btn btn--tinted btn--sm" type="button">取消</button>
+          <button id="save-fixed-access" class="btn btn--primary btn--sm" type="button">保存</button>
+        </div>
+      </div>
+    </dialog>
 
     <!-- 手机扫码配置弹层：原生 dialog + showModal()，
          焦点被限制在弹层内，Esc 由浏览器归还焦点 -->

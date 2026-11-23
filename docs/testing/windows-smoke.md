@@ -16,13 +16,13 @@
       - 根目录 `icacls D:\Vega`：**恰好三条** ACE，全部是 `(OI)(CI)` 且**不带 `(I)`**（即非继承的显式 ACE）——
         `NT AUTHORITY\SYSTEM:(OI)(CI)(F)`、`BUILTIN\Administrators:(OI)(CI)(F)`、`BUILTIN\Users:(OI)(CI)(RX)`；
         因为根 DACL 是受保护 DACL，不该出现任何 `(I)` 继承项（也不该出现 Users 的写/修改权限或额外拒绝项）。
-      - `icacls D:\Vega\vega-console.exe` 与 `icacls D:\Vega\resources\vega-pwhelper.ps1`：**三条 ACE 全部带 `(I)`**
+      - `icacls D:\Vega\vega-console.exe` 与 `icacls D:\Vega\resources\vega-agent.exe`：**三条 ACE 全部带 `(I)`**
         （`(I)(F)` / `(I)(F)` / `(I)(RX)`，文件上不会带 `(OI)(CI)`），且**没有任何非继承 ACE**——
         即 DACL 含三条继承 (I) ACE，显式 ACE 数为 0。若是空 DACL（`icacls` 只打出文件名、没有 ACE）就是 0.6.1 的 bug 复现。
       - 子目录（如 `icacls D:\Vega\resources`）：继承 ACE 可以带 `(OI)(CI)(I)`，同样不该有非继承 ACE。
       - 行为：双击能直接启动，普通用户（Users）可运行，管理员可覆盖重装，`del` 能删除。
-- [ ] 在 D:\Vega 安装上设置长期密码成功（控制台通过自选目录的 ACL 校验）。
-- [ ] 手动 `icacls D:\Vega /grant *S-1-5-32-545:(OI)(CI)M` 放开 Users 写权限后，再设置长期密码被拒绝，提示「Vega 安装目录权限不安全，无法设置长期密码。请重新运行安装包修复。」；恢复 ACL（重新运行安装包或按上面的 icacls 收紧）后又能设置。
+- [ ] 在 D:\Vega 安装上能从主页读到访问码，设置固定访问码成功（`Get-Service VegaAgent` 为 Running）。
+- [ ] 停止 `VegaAgent` 后主页显示「访问码服务未运行」和「修复」；启动服务并点「修复」能恢复访问码。
 - [ ] 目录页校验：填 `D:\tools\Vega` 或 `D:\任意目录` 会被自动改成 `D:\Vega` 并弹出「Vega 只能安装在 …已改为 D:\Vega」；填 `\\server\share\Vega`（UNC）、U 盘/光驱路径被拒绝；`D:\Vega` 本身已存在、非空、且没有 `vega-console.exe`（例如先建 `D:\Vega` 并放一个文件）时被拒绝并提示「已存在且不为空，但不是 Vega 安装目录」；`vega-console.exe` 是同名**目录**时同样按「不是 Vega 安装目录」拒绝。
 - [ ] 已装在 `D:\Vega` 的机器上重装 / 在线更新（`/P` 被动模式）：目录页默认值、静默安装的 `$INSTDIR` 都仍是 `D:\Vega`，不会跳回 Program Files，且不触发旧目录迁移。
 - [ ] 静默/被动安装的 `/D=` 必须是允许的位置（t6b-fix3 起 `D:\Test` 不再被静默改到 `D:\Vega`，而是按无效目标中止）：

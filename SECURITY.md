@@ -25,106 +25,28 @@
 - 已经公开且上游已修复、但用户没有升级的版本
 - 需要先拿到管理员权限才能利用的本地提权（除非脚本本身扩大了影响）
 
-## 长期密码
+## 访问码
 
-控制台运行时不提权。只有在「设置 / 清除长期密码」时，才通过 UAC 拉起一次提权助手
-（安装目录里的 `resources\vega-pwhelper.ps1`）；用户在 UAC 点「否」即视为取消，不重试。
+控制台不再提权，也不再读取 RustDesk 的临时密码。访问码由 LocalSystem 的 `VegaAgent` 服务生成，经由命名管道
+`\\.\pipe\VegaAgent` 提供给当前控制台会话；服务把同一个码写成 RustDesk 的永久密码，并把
+`verification-method` 设为 `use-permanent-password`。全产品只剩「访问码」一个密码概念。
 
-**威胁模型**：本节防护的是「同一台机器上、只有普通用户权限、没有管理员批准」的对手。已经能以同一用户会话
-替换自己 `%LOCALAPPDATA%` 下文件（或已拿到管理员）的本地攻击者**不在范围内**——那种对手本来就能读 RustDesk
-配置、改 `recent-ids.json`、或在 UAC 之后动助手输入，任何进程内校验都挡不住。所有验证方式回读都依赖 RustDesk
-服务处于运行状态：服务未运行时 `--option` 可能只写进 CLI 账户的本地配置，此时助手以 12 退出、不做「已生效」的结论。
-本节假设安装目录的权限没有被管理员事后放宽（让普通用户可写）——见下面「安装目录权限」一条，
-控制台对**任何**安装目录（包括默认的 `Program Files\Vega`）都会在每次提权前自己校验 ACL。
-
-- **一次性 UAC**：控制台用 `ShellExecuteExW` 的 `runas` 直接拉起系统 PowerShell，参数只有
-  `-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "<安装目录>\resources\vega-pwhelper.ps1" -InputFile "<载荷>"`，
-  PowerShell 与助手都用系统绝对路径。只有助手进程是管理员，它读完载荷、设好密码就退出；控制台始终以普通用户身份运行。
-- **只认打包目录内的助手**：发行版只使用 Tauri 资源目录里的 `vega-pwhelper.ps1`，没有源码目录回退；助手定位
-  RustDesk 时只读 `[Environment]::GetFolderPath('ProgramFiles')` 下的固定路径，不接受 `VEGA_RUSTDESK_EXE` 等环境覆盖。
-- **安装目录权限（v0.6.1 / T6b，ACL 细节 v0.6.2 / T6c 修正）**：安装目录只允许两个位置——`C:\Program Files\Vega`（`$PROGRAMFILES64\Vega`，默认），
-  或某个本地固定 NTFS 磁盘根目录下的 `Vega`（`X:\Vega`）。目录页/静默安装/`/D=` 的其它输入都会被规范化并提示：
-  落在系统盘 `Program Files` 里的收成 `$PROGRAMFILES64\Vega`，其余按所选路径的盘符收成 `X:\Vega`；UNC、U 盘/光驱/网络盘/
-  内存盘、非 NTFS、以及已存在且非空又不是 Vega 的目录会被拒绝（静默/被动安装直接中止，退出码 2）。
-  为了让助手仍然只可能被管理员替换，做了两层约束：
-  1. **安装器在解包前就锁死 ACL**：安装节校验目标通过后，先 `CreateDirectory $INSTDIR` 并调用
-     `VegaLockInstallDir`，然后才 `SetOutPath` / `File` 解包——文件绝不会落进未锁定的目录。
-     锁定按固定顺序执行四步（`VegaLockInstallDir` 与 `VegaTightenInstallDir` 共用同一个
-     `VegaApplyInstallDirAcl`），每步立即检查退出码，任一失败立即 `SetErrorLevel 2` + `Abort`
-     （静默安装靠 `/SD IDOK` 直接中止）。ACL 布局是「根目录显式 ACL 且断继承（受保护 DACL），子项只靠继承」：
-     1. 根目录 `/setowner *S-1-5-32-544 /C /Q`（只根目录）；
-     2. 用 PowerShell `SetSecurityDescriptorSddlForm` 把根 DACL **精确替换**为
-        `O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)`——受保护 DACL（`P`），
-        只有 SYSTEM、Administrators 完全控制与 Users 只读执行三条 ACE；旧的继承项、显式拒绝项和其他 SID
-        的可继承写权限全部被替换，不会被子项 `/reset` 带到程序文件上。删除旧的 `/inheritance:r /grant:r`
-        调用；写入前检查 `$INSTDIR` 不含单引号；
-     3. 子项三态枚举（`1`=有子项 / `0`=确认为空 / `E`=枚举失败）：`E` 即失败；`1` 时
-        `"$INSTDIR\*" /reset /T`，让子树回到「只继承」并自愈旧版留下的空 DACL 文件；`0` 跳过视为成功；
-     4. `/setowner *S-1-5-32-544 /T` 把所有者（含子树）改成 Administrators。
-     先 `/reset` 后 `/setowner /T`：0.6.1 留下的空 DACL 文件所有者已是 Administrators，但空 DACL 只给
-     隐式 `WRITE_DAC`、没有 `WRITE_OWNER`，`icacls /setowner` 在缺 `WRITE_OWNER` 时不会主动启用接管
-     特权；先 `/reset` 让子项继承根目录的 Administrators 完全控制（拿到 `WRITE_OWNER`），再改所有者
-     就不会被拒绝。每步仍然 `Pop` 后立即检查、失败短路。
-     绝不能写成对 `"$INSTDIR"` 带 `/T` 的 `/inheritance:r`（0.6.1 的真实 bug）：对文件 `/inheritance:r` 会删掉
-     全部继承 ACE，而 `(OI)(CI)` 授权落不到文件上（`/C` 吞错），结果 `vega-console.exe` 的 DACL 为空——用户跑不起来、
-     管理员安装器也覆盖不了。安装完成后（POSTINSTALL）用同样的四步再收紧一次；这一次失败只写进完成页告警，
-     不再中止（程序已经装好）。
-  2. **控制台每次提权前都校验，没有 `Program Files` 快路径**：`ensure_helper_location` 对任何安装位置
-     （包括默认的 `Program Files\Vega`）都跑同一套完整校验，不存在「前缀命中就跳过」的分支——`Program Files`
-     下被手工建出来、带宽松 ACL 的目录同样危险。校验要求助手正好位于 `<控制台 exe 目录>\resources` 下，并依次检查：
-     - **位置**：控制台 exe 目录只能是 `<X>:\Vega` 或 `<ProgramFiles>\Vega`。`Program Files` 根按已知文件夹取
-       **原始路径**（不读可被启动环境改写的环境变量，也不预先 `canonicalize`），只做三项不涉及规范化的判定：
-       不是重解析点、目录名只能是 `Program Files` 或 `Program Files (x86)`、直接父级是盘根且与系统盘同盘。
-     - **重解析点（先用原始路径判完）**：控制台 exe、exe 目录、`resources` 目录、助手文件、`Program Files` 根，
-       以及 exe 目录直到盘根的每一级祖先，都不能是 junction/symlink。这一组检查全部基于 `current_exe` 给出的
-       未规范化路径先跑完，之后才 `canonicalize`，并要求规范化结果与原始路径一致，避免链接在校验途中换走路径。
-     - **路径绑定**：exe 目录、`resources`、助手文件（以及由规范化 exe 目录推出的祖先链）每个只规范化**一次**，
-       结果保存下来复用；DACL 判定、启动前的复验、以及交给 PowerShell `-File` 的路径全部用这同一组值，不再做
-       第二次 `canonicalize`——第二次规范化会跟随当时的链接状态，可能与第一次判过的不是同一条路径。
-     - **祖先规则（直到盘根，含 `Program Files` 根）**：`exe` 目录的每一级父目录，所有者必须是
-       SYSTEM / Administrators / TrustedInstaller，且 DACL 中不得把 `DELETE` / `FILE_DELETE_CHILD` /
-       `WRITE_DAC` / `WRITE_OWNER` / `GENERIC_WRITE` / `GENERIC_ALL` 授予其他主体；建子目录/建文件
-       （`FILE_ADD_SUBDIRECTORY` / `FILE_ADD_FILE`）允许，盘根上给 `Authenticated Users` 建目录是 Windows 默认 ACL。
-     - **三层 DACL**：控制台 exe 目录、`resources` 目录、助手文件三者的所有者必须是
-       SYSTEM / Administrators / TrustedInstaller，DACL 中所有带写权限（含 DELETE / WRITE_DAC / WRITE_OWNER /
-       GENERIC_WRITE 等）的 allow ACE 只能授给这三个主体（CREATOR OWNER 仅允许出现在 `INHERIT_ONLY` 的继承 ACE 上）；
-       只接受普通 `ACCESS_ALLOWED_ACE_TYPE`，复合/对象/回调类 allow ACE 与未知 ACE 类型一律判为不安全。
-     任一条不满足就拒绝设置长期密码，并提示「Vega 安装目录权限不安全，无法设置长期密码。请重新运行安装包修复。」
-  管理员事后手动放宽该目录权限（例如把 Users 加回写权限，或把某一级祖先的所有者改成普通用户）会命中第 2 层，
-  长期密码直接不可用而不是被静默劫持。
-- **载荷创建时即带 DACL**：载荷写在 `%LOCALAPPDATA%\Vega\pw\` 下的 `vega-pw-<32 位十六进制>.json`，由 Rust 侧用
-  一次性 `CreateFileW` 以 SDDL `D:P(A;;FA;;;<当前用户>)(A;;FA;;;BA)(A;;FA;;;SY)` 创建——不继承父目录权限，只允许
-  当前用户、Administrators、SYSTEM 完全控制，写完立即关闭句柄。控制台命令行里只有路径，没有密码；助手只接受
-  文件名匹配该正则且不是重解析点的普通文件。
-- **30 s 过期由助手校验，且每次修改前复核**：载荷带 `expires = 创建时间 + 30 s`；助手在拿到载荷时比对一次，
-  在每一次 CLI 修改（`--password`、`--option verification-method`）之前用当前 unix 秒再各比对一次，过期即退出
-  10、不再写 RustDesk。控制台同时启动 30 秒看门狗删除残留载荷，并最多等助手 60 秒。
-- **RustDesk 服务必须正在运行**：修改前先 `Get-Service -Name RustDesk`，不存在或状态不是 `Running` 即退出 12。
-  没有服务 IPC 时 `--option` 只写 CLI 账户的本地配置，回读也会读到那份本地值，看起来「成功」而服务端没变。
-- **调用有 20 s 时限**：每次 `rustdesk.exe` 调用都用 `[Diagnostics.Process]` 等待至多 20 秒；超时杀掉子进程并退出
-  14（结果未知，界面提示人工确认）。卡住的 RustDesk 不会把提权助手一起挂死。
-- **读后即毁，不按路径重删**：助手用单个 `DeleteOnClose` 句柄（`FileShare.None`）读出全部内容，同一句柄 `Seek(0)`
-  回写等长空格并 Flush，关闭句柄即删除；关闭后若该路径仍存在（说明删除没生效）直接退出 10，**不再按路径
-  `Remove-Item` 兜底**——路径在两次访问之间可能已被替换，按路径删除会删掉别人的文件。JSON 非法、字段不合格、
-  `mode` 不是 `set|clear`、`clear` 带 `password` 或验证方式不在白名单时同样退 10，且不会调用 RustDesk。密码字符串
-  在进程内存里无法清零，属于 .NET/PowerShell 的固有限制。
-- **密码字符集限制**：只允许 8~64 位 ASCII 字母、数字与 `!#$%&*+,-./:;<=>?@^_~`，且必须同时含字母和数字。排除空格、
-  引号、反斜杠和非 ASCII 是为了让 JSON、PowerShell 原生参数传递与 RustDesk CLI 三方都不发生转义或截断，避免
-  「校验通过但实际写入另一个密码」。
-- **结果回读**：设密码后要求 `rustdesk.exe --password` 输出包含 `Done!`，否则退 12；写验证方式后再执行
-  `--option verification-method` 回读，Trim 后与期望值不一致退 13。`clear` 用 32 位随机密码替代原密码
-  （拒绝采样阈值按字母表长度计算），验证方式固定改回 `use-temporary-password`。
-- **已知风险：`--password` 参数在提权进程中短暂可见**。RustDesk 只提供 `rustdesk.exe --password <pwd>` 这一官方
-  接口，因此密码会出现在该提权进程的命令行里，`Get-CimInstance Win32_Process`、ETW 进程审计或其他管理员级工具
-  在那一瞬间可以读到它。本机管理员本来就能读取 RustDesk 配置与内存，接受该风险，换取不自行实现 RustDesk 的
-  密码派生与配置格式。
-- **输出**：助手退出码 0 成功 / 10 载荷无效、过期或无法清理 / 11 找不到 RustDesk / 12 RustDesk 拒绝修改或服务
-  未运行 / 13 验证方式回读不一致 / 14 调用 RustDesk 超时（结果未知）；stderr 只写固定短句，不含异常原文和密码；
-  密码不进 stdout、日志、`state.json` 或 doctor 导出。
+- **状态文件**：`%ProgramData%\Vega\agent\state.json` 只保存 `{code, mode, updated}`，目录 ACL 是受保护 DACL，
+  只给 SYSTEM 与 Administrators；普通用户不能改访问码。
+- **管道权限**：命名管道 DACL 只给 SYSTEM 全部、Interactive Users 读写，并带 `PIPE_REJECT_REMOTE_CLIENTS`；
+  连接后比对客户端会话号与当前活动控制台会话号，同机其他登录用户不能借管道改码。单条消息上限 4 KiB，
+  控制台侧整次调用 3 秒超时。
+- **不回显密码**：管道错误信息只给固定中文原因，不回显请求里的访问码；控制台日志、服务日志都不记录访问码。
+- **应用方式**：服务以 SYSTEM 执行 `rustdesk.exe --password <code>` 与
+  `rustdesk.exe --option verification-method use-permanent-password`（无窗口、15 秒超时）。访问码会出现在该子进程的
+  命令行里，本机管理员本来就能读取 RustDesk 配置与进程信息，接受这一已知风险。
+- **轮换**：自动模式生成 6 位纯数字；发现被控会话（命令行含 `--cm` 的 rustdesk.exe）从有变无时换新码。
+  固定模式由用户在控制台设置 6–32 位字母或数字，服务不再自动轮换。
+- **控制台不可达时**：主页只显示「访问码服务未运行」和修复入口，不回退到 RustDesk 临时密码。
 
 ## 已知设计取舍
 
-- 安装/卸载脚本（`host/`、`client/`、`bootstrap.ps1`）不接收、不保存任何密码；Sunshine 管理密码由用户在本机界面设置；RustDesk 长期密码只经上面的提权助手一次性写入，控制台不读回内容
+- 安装/卸载脚本（`host/`、`client/`、`bootstrap.ps1`）不接收、不保存任何密码；Sunshine 管理密码由用户在本机界面设置；RustDesk 永久密码由 `VegaAgent` 服务写入，访问码只经上述命名管道在服务与控制台之间传递
 - Sunshine 管理页只允许本机访问，防火墙不放行管理端口
 - 状态清单只按白名单回滚，读取前校验所有者与重解析点
 
