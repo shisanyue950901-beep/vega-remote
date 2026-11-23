@@ -4,3 +4,7 @@ server/data/
 
 # 审计日志软链接（指向仓库外 work/logs，不入库）
 .logs-link
+
+# 本地运维目录（报告另存仓库外，不入库）
+.rel0*/
+.rdmirror/
