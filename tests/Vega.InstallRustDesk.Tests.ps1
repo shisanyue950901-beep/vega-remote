@@ -6,8 +6,11 @@
   所有下载/安装/服务/配置写入的外部动作都 Mock，文件只落在 $TestDrive。
 #>
 
-# Mock 体在模块作用域执行，计数器/注入数据用 $global: 才能在测试作用域回读；
-# 改成 $script: 会落到模块作用域，断言读不到。这里只豁免这一条规则。
+# Mock 体按“创建它的脚本作用域”执行（Pester 5 只把 mock 包装器切到模块作用域，
+# behavior 自身的 SessionState 仍是本测试文件），所以 Mock 里的 $script: 是测试文件作用域；
+# 但用 `& (Get-Module ...) { $script:X = ... }` 重置只会写进模块作用域，mock 看不到
+# （t6e-fix3 的计数器串值就是这条踩出来的）。计数器/注入数据统一用 $global:，
+# 在任一作用域都能读写。这里只豁免这一条规则。
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidGlobalVars', '',
     Justification = 'Pester Mock 在模块作用域执行，用 $global: 在测试与 Mock 之间共享注入数据和调用计数。')]
 param()
@@ -82,11 +85,16 @@ Describe 'Get-VegaRustDeskDefaultConfig' {
 Describe 'Get-VegaRustDeskRelease' {
     It '固定官方 GitHub Release，SHA256 是待填的 64 位常量' {
         $release = Get-VegaRustDeskRelease
-        $release.Url | Should -Match '^https://github\.com/rustdesk/rustdesk/releases/download/'
-        $release.Url | Should -Match ([regex]::Escape($release.Version))
-        $release.FileName | Should -Match 'x86_64\.exe$'
+        # 版本固定，直接用字面量断言：原来 `Should -Match [regex]::Escape($release.Version)`
+        # 没加括号，参数模式下 PowerShell 把 `[regex]::Escape` 当裸字符串传给 -Match，
+        # 断言退化成匹配字面量 "[regex]::Escape"，必然失败。
+        $release.Version | Should -Be '1.5.3'
+        $release.Url | Should -Be 'https://github.com/rustdesk/rustdesk/releases/download/1.5.3/rustdesk-1.5.3-x86_64.exe'
+        $release.FileName | Should -Be 'rustdesk-1.5.3-x86_64.exe'
         $release.Sha256 | Should -Match '^[0-9a-f]{64}$'
         $release.Page | Should -Be 'https://rustdesk.com/download'
+        # t6e：镜像优先、GitHub 兜底；镜像地址用 http，靠固定 SHA256 保证内容不被替换。
+        $release.MirrorUrl | Should -Be 'http://60.205.95.98/vega/updates/rustdesk/1.5.3/rustdesk-1.5.3-x86_64.exe'
     }
 }
 
@@ -105,8 +113,9 @@ Describe 'Get-VegaRustDeskInstaller' {
 
     It 'SHA256 不匹配立即中止并删除文件' {
         Mock -ModuleName $script:ModuleName Invoke-VegaHttpsDownload {
-            param($Uri, $OutFile, $TimeoutSeconds, $Deadline)
-            $null = $Uri, $OutFile, $TimeoutSeconds, $Deadline
+            param($Uri, $OutFile, $TimeoutSeconds, $Deadline, [switch]$AllowHttp, [switch]$NoProxy)
+            # t6e-fix4：Mock 里声明了 -AllowHttp/-NoProxy 就必须引用，否则 PSReviewUnusedParameter 失败。
+            $null = $Uri, $OutFile, $TimeoutSeconds, $Deadline, $AllowHttp, $NoProxy
             Set-Content -LiteralPath $OutFile -Value 'not-the-real-installer' -Encoding UTF8
         }
         Mock -ModuleName $script:ModuleName Get-FileHash {
@@ -147,10 +156,126 @@ Describe 'Get-VegaRustDeskInstaller' {
         Should -Invoke -CommandName Invoke-VegaHttpsDownload -ModuleName $script:ModuleName -Times 2 -Exactly
     }
 
+    It 't6e 镜像失败时回退到官方 GitHub，镜像请求直连且允许 http' {
+        $mirrored = [pscustomobject]@{
+            Version   = $script:release.Version
+            FileName  = $script:release.FileName
+            Url       = 'https://example.invalid/rustdesk.exe'
+            MirrorUrl = 'http://mirror.invalid/rustdesk/rustdesk.exe'
+            Sha256    = ('a' * 64)
+            Page      = $script:release.Page
+        }
+
+        Mock -ModuleName $script:ModuleName Invoke-VegaHttpsDownload {
+            param($Uri, $OutFile, $TimeoutSeconds, $Deadline, [switch]$AllowHttp, [switch]$NoProxy)
+            $null = $TimeoutSeconds, $Deadline, $AllowHttp, $NoProxy
+            if ($Uri -like 'http://*') { throw '镜像不可用' }
+            Set-Content -LiteralPath $OutFile -Value 'installer' -Encoding UTF8
+        }
+        Mock -ModuleName $script:ModuleName Get-FileHash {
+            [pscustomobject]@{ Hash = ('a' * 64) }
+        }
+
+        $result = Get-VegaRustDeskInstaller -DestinationDirectory $script:downloadDir -Release $mirrored
+        $result.Success | Should -BeTrue
+        $result.Source | Should -Be '官方 GitHub'
+        $result.Url | Should -Be $mirrored.Url
+        # 实现里“每个源最多 MaxAttempts=2 次”是 P2b 就有的重试策略（见函数注释与
+        # '下载失败最多尝试 2 次' 用例），t6e 只是把源从 1 个变成 2 个：
+        # 镜像两次都被 Mock 抛错 -> 2 次，GitHub 第一次就成功 -> 1 次，合计 3 次。
+        # 所以这里按实现的真实次数断言 3，不是实现多下载了一次。
+        Should -Invoke -CommandName Invoke-VegaHttpsDownload -ModuleName $script:ModuleName -Times 3 -Exactly
+        Should -Invoke -CommandName Invoke-VegaHttpsDownload -ModuleName $script:ModuleName -Times 2 -Exactly -ParameterFilter {
+            $Uri -eq 'http://mirror.invalid/rustdesk/rustdesk.exe' -and $AllowHttp -and $NoProxy
+        }
+        # t6e-fix2：回退成功时调用方要能拿到镜像失败原因写日志。
+        $result.MirrorError | Should -Be '镜像不可用'
+        $result.Lock.Dispose()
+        Remove-Item -LiteralPath $result.Path -Force -ErrorAction SilentlyContinue
+    }
+
+    It 't6e-fix2 镜像超时后仍回退 GitHub，且 GitHub 拿到独立的完整截止时间' {
+        $mirrored = [pscustomobject]@{
+            Version   = $script:release.Version
+            FileName  = $script:release.FileName
+            Url       = 'https://example.invalid/rustdesk.exe'
+            MirrorUrl = 'http://mirror.invalid/rustdesk/rustdesk.exe'
+            Sha256    = ('a' * 64)
+            Page      = $script:release.Page
+        }
+
+        # 记录每次调用的预算参数：t6e-fix2 的关键就是镜像与 GitHub 各有一份截止时间。
+        $global:VegaDownloadCalls = @()
+        Mock -ModuleName $script:ModuleName Invoke-VegaHttpsDownload {
+            param($Uri, $OutFile, $TimeoutSeconds, $Deadline, [switch]$AllowHttp, [switch]$NoProxy)
+            $null = $AllowHttp, $NoProxy
+            $global:VegaDownloadCalls += [pscustomobject]@{
+                Uri              = $Uri
+                TimeoutSeconds   = $TimeoutSeconds
+                RemainingSeconds = [double]($Deadline - [datetime]::UtcNow).TotalSeconds
+            }
+            # 镜像按超时抛错：45 秒预算已经耗尽。
+            if ($Uri -like 'http://*') { throw '下载超时（45 秒）' }
+            Set-Content -LiteralPath $OutFile -Value 'installer' -Encoding UTF8
+        }
+        Mock -ModuleName $script:ModuleName Get-FileHash {
+            [pscustomobject]@{ Hash = ('a' * 64) }
+        }
+
+        $result = Get-VegaRustDeskInstaller -DestinationDirectory $script:downloadDir -Release $mirrored
+        $result.Success | Should -BeTrue
+        $result.Source | Should -Be '官方 GitHub'
+
+        $mirrorCalls = @($global:VegaDownloadCalls | Where-Object { $_.Uri -like 'http://*' })
+        $githubCalls = @($global:VegaDownloadCalls | Where-Object { $_.Uri -like 'https://*' })
+        # 超时即判该源失败：镜像不在耗尽的预算里再重试一次。
+        $mirrorCalls.Count | Should -Be 1
+        $githubCalls.Count | Should -Be 1
+
+        $mirrorCalls[0].TimeoutSeconds | Should -Be 45
+        $mirrorCalls[0].RemainingSeconds | Should -BeLessOrEqual 45
+        # GitHub 用的是自己的 -TimeoutSeconds，并且回退时重新起算：
+        # 镜像那 45 秒没有从这份预算里扣掉，所以剩余仍接近 120 秒。
+        $githubCalls[0].TimeoutSeconds | Should -Be 120
+        $githubCalls[0].RemainingSeconds | Should -BeGreaterThan 100
+
+        $result.Lock.Dispose()
+        Remove-Item -LiteralPath $result.Path -Force -ErrorAction SilentlyContinue
+        Remove-Variable -Name VegaDownloadCalls -Scope Global -ErrorAction SilentlyContinue
+    }
+
+    It 't6e 镜像与 GitHub 都失败时返回失败，Error 含每个源的原因' {
+        $mirrored = [pscustomobject]@{
+            Version   = $script:release.Version
+            FileName  = $script:release.FileName
+            Url       = 'https://example.invalid/rustdesk.exe'
+            MirrorUrl = 'http://mirror.invalid/rustdesk/rustdesk.exe'
+            Sha256    = ('a' * 64)
+            Page      = $script:release.Page
+        }
+
+        Mock -ModuleName $script:ModuleName Invoke-VegaHttpsDownload {
+            param($Uri, $OutFile, $TimeoutSeconds, $Deadline, [switch]$AllowHttp, [switch]$NoProxy)
+            $null = $OutFile, $TimeoutSeconds, $Deadline, $AllowHttp, $NoProxy
+            if ($Uri -like 'http://*') { throw '镜像不可用' }
+            throw 'GitHub 不可用'
+        }
+
+        $result = Get-VegaRustDeskInstaller -DestinationDirectory $script:downloadDir -Release $mirrored
+        $result.Success | Should -BeFalse
+        $result.Error | Should -Match '已尝试 4 次'
+        $result.Error | Should -Match 'Vega 镜像'
+        $result.Error | Should -Match '镜像不可用'
+        $result.Error | Should -Match '官方 GitHub'
+        $result.Error | Should -Match 'GitHub 不可用'
+        Test-Path -LiteralPath (Join-Path $script:downloadDir $mirrored.FileName) | Should -BeFalse
+    }
+
     It '校验通过返回安装包路径，并保持独占读句柄到启动' {
         Mock -ModuleName $script:ModuleName Invoke-VegaHttpsDownload {
-            param($Uri, $OutFile, $TimeoutSeconds, $Deadline)
-            $null = $Uri, $OutFile, $TimeoutSeconds, $Deadline
+            param($Uri, $OutFile, $TimeoutSeconds, $Deadline, [switch]$AllowHttp, [switch]$NoProxy)
+            # t6e-fix4：Mock 里声明了 -AllowHttp/-NoProxy 就必须引用，否则 PSReviewUnusedParameter 失败。
+            $null = $Uri, $OutFile, $TimeoutSeconds, $Deadline, $AllowHttp, $NoProxy
             Set-Content -LiteralPath $OutFile -Value 'installer' -Encoding UTF8
         }
         Mock -ModuleName $script:ModuleName Get-FileHash {
@@ -179,8 +304,9 @@ Describe 'Get-VegaRustDeskInstaller' {
         $global:VegaTestPayload = $payload
 
         Mock -ModuleName $script:ModuleName Invoke-VegaHttpsDownload {
-            param($Uri, $OutFile, $TimeoutSeconds, $Deadline)
-            $null = $Uri, $OutFile, $TimeoutSeconds, $Deadline
+            param($Uri, $OutFile, $TimeoutSeconds, $Deadline, [switch]$AllowHttp, [switch]$NoProxy)
+            # t6e-fix4：Mock 里声明了 -AllowHttp/-NoProxy 就必须引用，否则 PSReviewUnusedParameter 失败。
+            $null = $Uri, $OutFile, $TimeoutSeconds, $Deadline, $AllowHttp, $NoProxy
             Copy-Item -LiteralPath $global:VegaTestPayload -Destination $OutFile -Force
         }
 
@@ -243,6 +369,30 @@ Describe 'Invoke-VegaHttpsDownload' {
         finally {
             [System.Net.ServicePointManager]::SecurityProtocol = $before
         }
+    }
+    It 't6e-fix2 镜像跨主机重定向一律拒绝，https 也不行；同主机放行' {
+        # Assert-VegaMirrorRedirectHost 是模块内部函数，用模块作用域调用来测（不需要真网络）。
+        $module = Get-Module $script:ModuleName
+        $assertRedirect = {
+            param($firstUri, $currentUri, $allowHttp)
+            Assert-VegaMirrorRedirectHost -First $firstUri -Current $currentUri -Hop 1 -AllowHttp:([bool]$allowHttp)
+        }
+
+        $first = [uri]'http://mirror.invalid/vega/updates/rustdesk/1.5.3/rustdesk-1.5.3-x86_64.exe'
+
+        # 这是本次的阻断项：镜像被跨主机 https 重定向时，旧实现只判了明文分支，直接放行。
+        { & $module $assertRedirect $first ([uri]'https://evil.invalid/rustdesk.exe') $true } |
+            Should -Throw '*跨主机*'
+        { & $module $assertRedirect $first ([uri]'http://other.invalid/rustdesk.exe') $true } |
+            Should -Throw '*跨主机*'
+
+        # 同主机（换路径、换协议都不跨主机）继续放行。
+        { & $module $assertRedirect $first ([uri]'http://mirror.invalid/other/rustdesk.exe') $true } |
+            Should -Not -Throw
+
+        # 官方 GitHub 源不走这条规则：github.com -> objects.githubusercontent.com 必须能过。
+        { & $module $assertRedirect ([uri]'https://github.com/rustdesk/rustdesk') ([uri]'https://objects.githubusercontent.com/blob') $false } |
+            Should -Not -Throw
     }
 }
 
@@ -410,10 +560,16 @@ Describe 'Invoke-VegaRustDeskBootstrap' {
     }
 
     It '未安装时下载、静默安装、写用户级与服务级配置并记录到 state.json' {
-        & (Get-Module $script:ModuleName) { $script:VegaProbeCount = 0 }
+        # t6e-fix3：mock 体按**创建它的脚本作用域**执行（Pester 5 的 ExecuteBehavior 只把包装器
+        # 切到模块作用域，behavior 自身的 SessionState 仍是本测试文件），所以 Mock 里的
+        # `$script:` 是测试文件作用域，不是模块作用域。原来用
+        # `& (Get-Module ...) { $script:VegaProbeCount = 0 }` 重置的是模块作用域里的同名变量，
+        # mock 根本看不到，计数器会从上个用例的值接着往上加。统一改用 $global:（两处作用域都
+        # 能读写），每个用例开头显式归零。
+        $global:VegaProbeCount = 0
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall {
-            $script:VegaProbeCount += 1
-            if ($script:VegaProbeCount -le 1) { '' } else { 'C:\Program Files\RustDesk\rustdesk.exe' }
+            $global:VegaProbeCount += 1
+            if ($global:VegaProbeCount -le 1) { '' } else { 'C:\Program Files\RustDesk\rustdesk.exe' }
         }
         Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstaller {
             [pscustomobject]@{ Success = $true; Path = 'C:\temp\rustdesk.exe'; Sha256 = ('a' * 64); Lock = $null; Error = '' }
@@ -450,6 +606,43 @@ Describe 'Invoke-VegaRustDeskBootstrap' {
         # 用户级基线落在 host-state（与安装记录同一份清单），回滚按 SID 记录的路径校验。
         $hostState = Read-VegaState -Path $script:statePath
         @($hostState.RustDeskConfigKeys | ForEach-Object { [string]$_.Path } | Select-Object -Unique) | Should -Contain $script:userConfig
+    }
+
+    It 't6e-fix2 镜像失败但 GitHub 成功时，安装日志写入镜像失败原因' {
+        # t6e-fix3：同上，计数器必须归零在本测试文件作用域（$global:），否则首次探测就直接
+        # 返回“已安装”，Bootstrap 走跳过安装的分支，日志里只剩最后一行 OK 中继。
+        $global:VegaProbeCount = 0
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstall {
+            $global:VegaProbeCount += 1
+            if ($global:VegaProbeCount -le 1) { '' } else { 'C:\Program Files\RustDesk\rustdesk.exe' }
+        }
+        Mock -ModuleName $script:ModuleName Get-VegaRustDeskInstaller {
+            [pscustomobject]@{
+                Success     = $true
+                Path        = 'C:\temp\rustdesk.exe'
+                Sha256      = ('a' * 64)
+                Lock        = $null
+                Source      = '官方 GitHub'
+                Url         = 'https://example.invalid/rustdesk.exe'
+                Error       = ''
+                MirrorError = '下载超时（45 秒）'
+            }
+        }
+        Mock -ModuleName $script:ModuleName Install-VegaRustDeskSilently {
+            [pscustomobject]@{ Success = $true; ExitCode = 0; Error = '' }
+        }
+        Mock -ModuleName $script:ModuleName Get-Service { [pscustomobject]@{ Name = 'RustDesk'; Status = 'Running' } }
+
+        $log = Join-Path $TestDrive ('setup-' + [guid]::NewGuid().ToString('N') + '.log')
+        $result = Invoke-VegaRustDeskBootstrap -DefaultsFile $script:defaults -HostStatePath $script:statePath `
+            -ServiceStatePath $script:serviceStatePath -UserConfigPath $script:userConfig `
+            -ServiceConfigPath $script:serviceConfig -DownloadDirectory $script:downloadDir -LogFile $log -Confirm:$false
+
+        $result.Success | Should -BeTrue
+        $logText = Get-Content -LiteralPath $log -Raw -Encoding UTF8
+        $logText | Should -Match '镜像失败：下载超时（45 秒），已回退 GitHub'
+        # 成功那一行仍然要写明最终用的源，两者不互相顶替。
+        $logText | Should -Match '校验通过（源：官方 GitHub'
     }
 
     It 'P1-5 服务没出现时返回非零，不把失败当成功' {

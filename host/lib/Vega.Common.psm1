@@ -6167,8 +6167,10 @@ function Get-VegaRustDeskDefaultConfig {
 
 function Get-VegaRustDeskRelease {
     <#
-      固定版本 + 官方 Release URL + SHA256。
-      RustDesk 是 AGPL：安装包不内嵌二进制，只允许从官方 GitHub Release 下载这一份。
+      固定版本 + 官方 Release URL + Vega 镜像 URL + SHA256。
+      RustDesk 是 AGPL：安装包仍然不内嵌二进制，下载的是官方未修改原版。
+      下载顺序：先试 Vega 镜像（国内直连，不走系统代理），失败再走官方 GitHub；
+      两个源都用同一份固定 SHA256 校验，镜像被篡改只会校验失败，不会装上。
       SHA256 固定为 1.5.3 官方资产摘要；升级版本时必须同步更新版本号与摘要，
       全 0 占位值永远校验失败（提醒维护者别忘填）。
     #>
@@ -6181,10 +6183,11 @@ function Get-VegaRustDeskRelease {
 
     return [pscustomobject]@{
         Version  = $version
-        FileName = ("rustdesk-{0}-x86_64.exe" -f $version)
-        Url      = ("https://github.com/rustdesk/rustdesk/releases/download/{0}/rustdesk-{0}-x86_64.exe" -f $version)
-        Sha256   = $sha256
-        Page     = 'https://rustdesk.com/download'
+        FileName  = ("rustdesk-{0}-x86_64.exe" -f $version)
+        Url       = ("https://github.com/rustdesk/rustdesk/releases/download/{0}/rustdesk-{0}-x86_64.exe" -f $version)
+        MirrorUrl = ("http://60.205.95.98/vega/updates/rustdesk/{0}/rustdesk-{0}-x86_64.exe" -f $version)
+        Sha256    = $sha256
+        Page      = 'https://rustdesk.com/download'
     }
 }
 
@@ -6309,11 +6312,43 @@ function Enable-VegaTls12 {
     }
 }
 
+function Assert-VegaMirrorRedirectHost {
+    <#
+      t6e-fix2：镜像源（-AllowHttp）的重定向同主机校验，抽出来便于单测（不需要真网络）。
+      只允许留在起始主机；跨主机一律拒绝，http 和 https 都拒 —— 之前只判了明文分支，
+      镜像被跨主机 https 重定向就能把请求带出固定主机。
+      官方 GitHub 源不调用这里：它本来就只走 https，且会跳到 objects.githubusercontent.com。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [uri]$First,
+
+        [Parameter(Mandatory)]
+        [uri]$Current,
+
+        [int]$Hop = 0,
+
+        [switch]$AllowHttp
+    )
+
+    if (-not $AllowHttp) { return }
+    if ($Hop -le 0) { return }
+    if ($Current.Host -eq $First.Host) { return }
+    throw "镜像重定向跨主机被拒绝：$Current"
+}
+
 function Invoke-VegaHttpsDownload {
     <#
       P2b：一次 HTTPS 下载，遵守统一截止时间（含响应体）：
-        - 只接受 https://，重定向也只接受 https://；最多 5 跳；
+        - 默认只接受 https://，重定向也只接受 https://；最多 5 跳；
+         - t6e：-AllowHttp 只给受 SHA256 固定的镜像源用，允许 http 起始地址；
+         - t6e-fix2：镜像请求的重定向只允许留在同一主机，跨主机一律拒绝（http 和 https 都拒），
+           避免开放重定向把明文请求或校验过的下载带到别的主机；
+        - t6e：-NoProxy 让本次请求直连（Proxy=$null），国内镜像不经系统代理；
         - 每次请求与读流的超时都按剩余时间现算，不会“每个分块重新计时”；
+        - t6e-fix4：镜像请求（-AllowHttp）的 Timeout 与 ReadWriteTimeout 都取 min(剩余预算, 15000 ms)，
+          单次阻塞等待不再能吃满 45 秒，最坏回退延迟约 60 秒；GitHub 源保持原行为；
         - 失败抛异常，由调用方决定重试与报错文案。
     #>
     [CmdletBinding()]
@@ -6325,6 +6360,11 @@ function Invoke-VegaHttpsDownload {
         [string]$OutFile,
 
         [int]$TimeoutSeconds = 120,
+
+        # t6e：镜像源是 http，且必须直连；官方 GitHub 源保持 https + 系统代理。
+        [switch]$AllowHttp,
+
+        [switch]$NoProxy,
 
         # P1-1：这里是真正的 [datetime]，不是 [Nullable[datetime]]。Windows PowerShell 5.1 会把
         # 非空的 Nullable 值装箱成 DateTime，$Deadline.Value 直接取不到时间；未传时用
@@ -6341,8 +6381,17 @@ function Invoke-VegaHttpsDownload {
     try { $current = [uri]$Uri }
     catch { throw "下载地址无效：$Uri" }
 
+    $first = $current
+
     for ($hop = 0; $hop -lt 5; $hop++) {
-        if ($current.Scheme -ne 'https') { throw "只接受 HTTPS 下载地址（含重定向）：$current" }
+        if ($current.Scheme -ne 'https') {
+            if (-not ($AllowHttp -and $current.Scheme -eq 'http')) {
+                throw "只接受 HTTPS 下载地址（含重定向）：$current"
+            }
+        }
+        # t6e-fix2：镜像源（-AllowHttp）的重定向只许留在同一主机，http 与 https 都拒。
+        # 官方 GitHub 源不放行 http，其 https 跨主机跳转（github.com -> objects.githubusercontent.com）不受影响。
+        Assert-VegaMirrorRedirectHost -First $first -Current $current -Hop $hop -AllowHttp:$AllowHttp
 
         $remainingMs = [int][Math]::Max(0, ($Deadline - [datetime]::UtcNow).TotalMilliseconds)
         if ($remainingMs -lt 1000) { throw ("下载超时（{0} 秒）" -f $TimeoutSeconds) }
@@ -6350,9 +6399,16 @@ function Invoke-VegaHttpsDownload {
         $request = [System.Net.HttpWebRequest]::Create($current)
         $request.Method = 'GET'
         $request.AllowAutoRedirect = $false
-        $request.Timeout = $remainingMs
-        $request.ReadWriteTimeout = $remainingMs
+        # t6e-fix4：镜像请求的连接与每次读都最多等 15 秒，不能只把 ReadWriteTimeout 设成剩余预算
+        # （45 秒预算下，一次阻塞读就能再等近 45 秒，回退 GitHub 被拖到 90 秒）。
+        # 45 秒预算 + 最长 15 秒读流停滞 => 最坏约 60 秒回退。GitHub 源保持 main 原行为。
+        $requestTimeoutMs = $remainingMs
+        if ($AllowHttp) { $requestTimeoutMs = [Math]::Min($remainingMs, 15000) }
+        $request.Timeout = $requestTimeoutMs
+        $request.ReadWriteTimeout = $requestTimeoutMs
         $request.UserAgent = 'Vega-Setup'
+        # t6e：镜像直连，避免客户机上不可用的系统代理把国内请求也带坏。
+        if ($NoProxy) { $request.Proxy = $null }
 
         $response = $null
         $stream = $null
@@ -6399,13 +6455,18 @@ function Invoke-VegaHttpsDownload {
 function Get-VegaRustDeskInstaller {
     <#
       下载固定版本的 Windows x64 安装包并校验 SHA256。
+      - t6e：先在 Vega 镜像（官方未修改原版，http 直连）下载，失败再走官方 GitHub；
+        每个源都按同一份固定 SHA256 校验，镜像被篡改只会被拒。
       - P1-3：目标目录必须是调用方用 New-VegaSecureDirectory 建的随机目录；
         下载完成后立即以只读共享打开文件（禁止写/删除），句柄交给调用方，
         一直保护到进程启动；调用方在 finally 里 Dispose 并删目录。
-      - P2b：整个下载（重定向 + 响应体）共用一个截止时间，最多 2 次尝试；
-        只走 HTTPS，证书校验保持默认开启。
-      - 哈希不匹配立即中止，不重试：内容被替换时重试没有意义。
-      返回 { Success, Path, Sha256, Lock, Error }。
+      - P2b：每个源最多 2 次尝试，同一源内共用一份截止时间；
+        HTTPS 源只走 HTTPS，镜像源允许 http 但只直连、不跟跨主机重定向。
+      - t6e-fix2：镜像与 GitHub 不再共用一份预算。镜像源单独 45 秒截止（含连接与读流停滞，
+        超时即判该源失败），GitHub 回退时重新拿到完整 -TimeoutSeconds（默认 120 秒），
+        镜像的任何等待都不再吃掉 GitHub 的预算。
+      - 哈希不匹配立即换下一个源：内容被替换时重试同一个源没有意义。
+      返回 { Success, Path, Sha256, Lock, Source, Url, Error, MirrorError, SourceErrors }。
     #>
     [CmdletBinding()]
     param(
@@ -6416,6 +6477,9 @@ function Get-VegaRustDeskInstaller {
         $Release = $null,
 
         [int]$TimeoutSeconds = 120,
+
+        # t6e-fix2：镜像源自己的预算，超时不再消耗 GitHub 的 -TimeoutSeconds。
+        [int]$MirrorTimeoutSeconds = 45,
 
         [int]$MaxAttempts = 2
     )
@@ -6439,79 +6503,126 @@ function Get-VegaRustDeskInstaller {
         return [pscustomobject]@{ Success = $false; Path = ''; Sha256 = ''; Lock = $null; Error = "下载目录是重解析点，拒绝使用：$DestinationDirectory" }
     }
 
-    $deadline = [datetime]::UtcNow.AddSeconds([Math]::Max(1, $TimeoutSeconds))
     $target = Join-Path $DestinationDirectory ([string]$Release.FileName)
-    $lastError = ''
     $attempts = [Math]::Max(1, $MaxAttempts)
+    $vendorTimeoutSeconds = [Math]::Max(1, $TimeoutSeconds)
+    $mirrorBudgetSeconds = [Math]::Max(1, $MirrorTimeoutSeconds)
 
-    for ($attempt = 1; $attempt -le $attempts; $attempt++) {
+    # t6e：源顺序 = Vega 镜像（http，直连，不经系统代理）后官方 GitHub（https，走系统代理）。
+    # 任一源下载失败或 SHA256 不符：删掉这次的文件、记下原因、换下一个源；全部失败才返回失败。
+    # t6e-fix2：每个源各带一份预算（镜像 45 秒，GitHub 完整 -TimeoutSeconds），
+    # 截止时间在进入该源时重新计算，镜像超时不会让 GitHub 拿到 0 秒。
+    $sources = @()
+    $mirrorUrl = ''
+    if ($null -ne $Release.PSObject.Properties['MirrorUrl']) { $mirrorUrl = [string]$Release.MirrorUrl }
+    if (-not [string]::IsNullOrWhiteSpace($mirrorUrl)) {
+        $sources += [pscustomobject]@{ Name = 'Vega 镜像'; Url = $mirrorUrl.Trim(); AllowHttp = $true; NoProxy = $true; IsMirror = $true; TimeoutSeconds = $mirrorBudgetSeconds }
+    }
+    $sources += [pscustomobject]@{ Name = '官方 GitHub'; Url = ([string]$Release.Url).Trim(); AllowHttp = $false; NoProxy = $false; IsMirror = $false; TimeoutSeconds = $vendorTimeoutSeconds }
+
+    $sourceErrors = @()
+    $mirrorError = ''
+    $totalAttempts = 0
+
+    foreach ($source in $sources) {
         if (Test-Path -LiteralPath $target) {
             Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
         }
-
-        $remaining = [int][Math]::Max(0, ($deadline - [datetime]::UtcNow).TotalSeconds)
-        if ($remaining -lt 1) {
-            $lastError = ("下载超时（{0} 秒）" -f $TimeoutSeconds)
-            break
-        }
-
-        try {
-            Invoke-VegaHttpsDownload -Uri ([string]$Release.Url) -OutFile $target -TimeoutSeconds $TimeoutSeconds -Deadline $deadline
-        }
-        catch {
-            $lastError = $_.Exception.Message
+        if ([string]::IsNullOrWhiteSpace($source.Url)) {
+            $sourceErrors += ("{0}：未配置下载地址" -f $source.Name)
+            if ($source.IsMirror) { $mirrorError = '未配置下载地址' }
             continue
         }
 
-        if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
-            $lastError = '下载命令结束但文件不存在'
-            continue
-        }
-
+        # t6e-fix2：进入这个源时才起算，GitHub 拿到的是全新的完整预算。
+        $sourceDeadline = [datetime]::UtcNow.AddSeconds($source.TimeoutSeconds)
+        $sourceError = ''
         $actual = ''
-        try {
-            $actual = (Get-FileHash -LiteralPath $target -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
-        }
-        catch {
-            $lastError = "计算 SHA256 失败：$($_.Exception.Message)"
-            Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
-            return [pscustomobject]@{ Success = $false; Path = ''; Sha256 = ''; Lock = $null; Error = $lastError }
-        }
+        for ($attempt = 1; $attempt -le $attempts; $attempt++) {
+            if (Test-Path -LiteralPath $target) {
+                Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
+            }
 
-        if ($actual -ne $expected) {
-            Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
+            $remaining = [int][Math]::Max(0, ($sourceDeadline - [datetime]::UtcNow).TotalSeconds)
+            if ($remaining -lt 1) {
+                $sourceError = ("下载超时（{0} 秒）" -f $source.TimeoutSeconds)
+                break
+            }
+
+            $totalAttempts++
+            try {
+                Invoke-VegaHttpsDownload -Uri $source.Url -OutFile $target -TimeoutSeconds $source.TimeoutSeconds -Deadline $sourceDeadline `
+                    -AllowHttp:$source.AllowHttp -NoProxy:$source.NoProxy
+            }
+            catch {
+                $sourceError = $_.Exception.Message
+                # 该源的预算已经耗尽，重试同一个源没有意义，直接把预算让给下一个源。
+                if ($sourceError -match '下载超时') { break }
+                continue
+            }
+
+            if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
+                $sourceError = '下载命令结束但文件不存在'
+                continue
+            }
+
+            try {
+                $actual = (Get-FileHash -LiteralPath $target -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+            }
+            catch {
+                $sourceError = "计算 SHA256 失败：$($_.Exception.Message)"
+                Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
+                break
+            }
+
+            if ($actual -ne $expected) {
+                # 内容被替换：同一个源重试没有意义，删掉换下一个源。
+                $sourceError = ("SHA256 不匹配（期望 {0}，实际 {1}），已删除该文件" -f $expected, $actual)
+                Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
+                break
+            }
+
+            # 保护到进程启动：FileShare.Read 只允许别人读，写/删/替换都会失败。
+            $handle = $null
+            try {
+                $handle = [System.IO.File]::Open($target, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+            }
+            catch {
+                Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
+                return [pscustomobject]@{ Success = $false; Path = ''; Sha256 = $actual; Lock = $null; Error = "无法锁定已下载的安装包：$($_.Exception.Message)" }
+            }
+
             return [pscustomobject]@{
-                Success = $false
-                Path    = ''
-                Sha256  = $actual
-                Lock    = $null
-                Error   = ("下载的 RustDesk 安装包 SHA256 不匹配（期望 {0}，实际 {1}），已删除并中止。请到 {2} 手动下载安装。" -f $expected, $actual, $Release.Page)
+                Success      = $true
+                Path         = $target
+                Sha256       = $actual
+                Lock         = $handle
+                Source       = $source.Name
+                Url          = $source.Url
+                Error        = ''
+                MirrorError  = $mirrorError
+                SourceErrors = $sourceErrors
             }
         }
 
-        # 保护到进程启动：FileShare.Read 只允许别人读，写/删/替换都会失败。
-        $handle = $null
-        try {
-            $handle = [System.IO.File]::Open($target, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
-        }
-        catch {
+        if (Test-Path -LiteralPath $target) {
             Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
-            return [pscustomobject]@{ Success = $false; Path = ''; Sha256 = $actual; Lock = $null; Error = "无法锁定已下载的安装包：$($_.Exception.Message)" }
         }
-
-        return [pscustomobject]@{ Success = $true; Path = $target; Sha256 = $actual; Lock = $handle; Error = '' }
-    }
-
-    if (Test-Path -LiteralPath $target) {
-        Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
+        if ([string]::IsNullOrWhiteSpace($sourceError)) { $sourceError = '未知错误' }
+        $sourceErrors += ("{0}（{1}）：{2}" -f $source.Name, $source.Url, $sourceError)
+        if ($source.IsMirror) { $mirrorError = $sourceError }
     }
 
     return [pscustomobject]@{
-        Success = $false
-        Path    = ''
-        Sha256  = ''
-        Lock    = $null
-        Error   = ("下载 RustDesk 安装包失败（已尝试 {0} 次）：{1}。请到 {2} 手动下载安装。" -f $attempts, $lastError, $Release.Page)
+        Success      = $false
+        Path         = ''
+        Sha256       = ''
+        Lock         = $null
+        Source       = ''
+        Url          = ''
+        Error        = ("下载 RustDesk 安装包失败（已尝试 {0} 次）：{1}。请到 {2} 手动下载安装。" -f $totalAttempts, ($sourceErrors -join '；'), $Release.Page)
+        MirrorError  = $mirrorError
+        SourceErrors = $sourceErrors
     }
 }
 
@@ -7119,7 +7230,10 @@ function Invoke-VegaRustDeskBootstrap {
         if ([string]::IsNullOrWhiteSpace($existing)) {
             $release = Get-VegaRustDeskRelease
             $releaseVersion = [string]$release.Version
-            Write-VegaSetupLog -Path $LogFile -Message ("下载 RustDesk {0}：{1}" -f $releaseVersion, $release.Url)
+            # t6e：镜像优先，GitHub 兜底；实际用了哪个源在下载成功后记一行。
+            $mirrorUrl = ''
+            if ($null -ne $release.PSObject.Properties['MirrorUrl']) { $mirrorUrl = [string]$release.MirrorUrl }
+            Write-VegaSetupLog -Path $LogFile -Message ("下载 RustDesk {0}：镜像 {1}，兜底 {2}" -f $releaseVersion, $mirrorUrl, $release.Url)
 
             try {
                 $secureDirectory = New-VegaSecureDirectory -Parent $DownloadDirectory
@@ -7147,7 +7261,14 @@ function Invoke-VegaRustDeskBootstrap {
                 return (& $fail -Message ([string]$download.Error))
             }
             $downloadLock = $download.Lock
-            Write-VegaSetupLog -Path $LogFile -Message ("校验通过：{0}" -f $download.Sha256)
+            # t6e-fix2：回退成功也要把镜像为什么失败写进安装日志，否则现场只剩“用了 GitHub”，
+            # 排查镜像不可用时没有任何原因可看。
+            $mirrorFailure = ''
+            if ($null -ne $download.PSObject.Properties['MirrorError']) { $mirrorFailure = [string]$download.MirrorError }
+            if (-not [string]::IsNullOrWhiteSpace($mirrorFailure) -and [string]$download.Source -ne 'Vega 镜像') {
+                Write-VegaSetupLog -Path $LogFile -Message ("镜像失败：{0}，已回退 GitHub" -f $mirrorFailure)
+            }
+            Write-VegaSetupLog -Path $LogFile -Message ("校验通过（源：{0} {1}）：{2}" -f $download.Source, $download.Url, $download.Sha256)
 
             if (-not $PSCmdlet.ShouldProcess('RustDesk', '静默安装 RustDesk')) {
                 return [pscustomobject]@{

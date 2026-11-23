@@ -17,7 +17,7 @@
    先 `/reset` 让 0.6.1 空 DACL 的子项继承根目录的 Administrators 完全控制，再改所有者才不会被拒绝。
    0.6.2 起不再对目录带 `/T` 做 `/inheritance:r`
    （那会让子文件 DACL 变空，装完连 exe 都跑不起来）。失败时完成页提示「安装目录权限设置失败，长期密码不可用」。
-3. 安装过程会自动装好 RustDesk 并写入自建中继配置（默认 `60.205.95.98`，见 `console/src-tauri/resources/vega-defaults.json`）。RustDesk 是 AGPL，安装包里**不含**它的二进制，安装时从官方 GitHub Release 下载固定版本并校验 SHA256。在线更新（安装器 `/UPDATE` 模式）与覆盖重装默认跳过这一步：不下载 RustDesk、不改写中继配置；只有 `C:\Program Files` 下找不到 `rustdesk.exe` 时才补装并配置。安装器没有上游的「重新安装 / 已安装」页，也不会运行旧卸载器。
+3. 安装过程会自动装好 RustDesk 并写入自建中继配置（默认 `60.205.95.98`，见 `console/src-tauri/resources/vega-defaults.json`）。RustDesk 是 AGPL，安装包里**不含**它的二进制：安装时先用 Vega 镜像（`http://60.205.95.98/vega/updates/rustdesk/`，官方未修改原版，国内直连、不走系统代理）下载固定版本，失败再回落到官方 GitHub Release，两者都按同一份固定 SHA256 校验；源码见官方仓库。在线更新（安装器 `/UPDATE` 模式）与覆盖重装默认跳过这一步：不下载 RustDesk、不改写中继配置；只有 `C:\Program Files` 下找不到 `rustdesk.exe` 时才补装并配置。安装器没有上游的「重新安装 / 已安装」页，也不会运行旧卸载器。
 4. 如果 RustDesk 没装好（下载失败/哈希不符），Vega 仍会正常安装完成，并提示「RustDesk 未装好，请打开 Vega 按提示手动安装」；也可以直接到 <https://rustdesk.com/download> 手动下载安装。
 5. 卸载 Vega 时，安装包会按 `%ProgramData%\Vega\host-state.json` 里的记录回滚 RustDesk 中继配置；只有记录标明「由 Vega 安装」时才会连带卸载 RustDesk。
 6. 旧版 Vega 可能装在别处（更早的安装器有「选择安装目录」页，例如 `D:\Vega`）。新版安装包在复制文件前读 Tauri 的卸载注册表项
