@@ -1,7 +1,7 @@
 ﻿#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod access;
 mod doctor;
-mod password;
 mod peers;
 mod rustdesk;
 mod scm;
@@ -57,9 +57,10 @@ fn main() {
             streaming::start_moonlight_stream,
             doctor::run_doctor,
             doctor::export_doctor_log,
-            password::get_password_status,
-            password::set_permanent_password,
-            password::clear_permanent_password,
+            access::get_access_code,
+            access::refresh_access_code,
+            access::set_fixed_access_code,
+            access::set_rotate_access_code,
             updater::check_update,
             updater::install_update,
         ])

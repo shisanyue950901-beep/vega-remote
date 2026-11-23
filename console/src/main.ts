@@ -68,6 +68,12 @@ interface OpResult {
   message: string;
 }
 
+/** `get_access_code` 返回值；后端未实现时 invoke 失败，界面退回「在 RustDesk 中查看」。 */
+interface AccessCodeView {
+  code: string;
+  rotatesAfterSession: boolean;
+}
+
 interface StatusView {
   installed: boolean;
   running: boolean;
@@ -136,42 +142,8 @@ let refreshAssistStatus: (() => void) | null = null;
 let refreshDeviceList: (() => void) | null = null;
 let runDoctorAction: (() => void) | null = null;
 
-/** 长期密码状态（`get_password_status`）。密码本身永不出现在这里。 */
-interface PasswordStatus {
-  hasPermanent: boolean;
-  verifyMethod: string;
-}
-
-/** 验证方式：协助页只读显示，设置页提交长期密码时一起带给 Rust。 */
-type VerifyMethod = "temporary" | "permanent" | "both";
-
-let selectedVerify: VerifyMethod = "temporary";
-/** 设置页或清除进行中（含等待 UAC）：任何输入事件都不能把提交按钮重新点亮。 */
-let pwBusy = false;
-/** 设置页读到的密码状态刷新；协助页「未设置」文案由它统一更新。 */
-let refreshPasswordStatus: (() => void) | null = null;
-/** 协助页注册：验证方式只读展示跟随密码状态。 */
-let applyPasswordAvailability: ((status: PasswordStatus) => void) | null = null;
-/** 设置页注册：展开长期密码内联表单（主页「设置」跳转时用）。 */
-let openFixedPasswordForm: (() => void) | null = null;
-
-function asVerifyMethod(raw: string): VerifyMethod {
-  return raw === "permanent" || raw === "both" ? raw : "temporary";
-}
-
-/** 只改分段的高亮与记忆值，不写 RustDesk：写盘发生在设置长期密码时。 */
-function selectVerifyMethod(method: VerifyMethod): void {
-  selectedVerify = method;
-  const group = document.getElementById("verify-method");
-  if (!group) {
-    return;
-  }
-  group.querySelectorAll<HTMLButtonElement>(".seg__btn[data-verify]").forEach((btn) => {
-    const active = btn.dataset.verify === selectedVerify;
-    btn.classList.toggle("is-active", active);
-    btn.setAttribute("aria-pressed", active ? "true" : "false");
-  });
-}
+/** 协助页注册：设置页改完访问码后让主页重新读一次。 */
+let refreshAssistAccessCode: (() => void) | null = null;
 
 /** 设置页与远程协助页共用同一份配置快照，避免 focus 时各读一遍。 */
 type ConfigHandler = (config: ServerConfigView | null) => void;
@@ -216,7 +188,7 @@ async function refreshOnFocus(): Promise<void> {
   refreshAssistDevice?.();
   refreshAssistStatus?.();
   refreshDeviceList?.();
-  refreshPasswordStatus?.();
+  refreshAssistAccessCode?.();
   refreshStreaming?.();
 }
 
@@ -385,10 +357,6 @@ function setupAssistPage(): void {
   const codeStatus = byId<HTMLParagraphElement>("device-code-status");
   const copyCodeButton = byId<HTMLButtonElement>("copy-code");
   const copyShareButton = byId<HTMLButtonElement>("copy-share");
-  const showPasswordButton = byId<HTMLButtonElement>("show-password");
-  // 两个独立元素：临时密码的「查看」结果绝不能写进长期密码状态行。
-  const temporaryPasswordStatus = byId<HTMLSpanElement>("temporary-password-status");
-  const openFixedPasswordButton = byId<HTMLButtonElement>("open-fixed-password");
   const idDot = byId<HTMLSpanElement>("id-dot");
   const idStatusText = byId<HTMLSpanElement>("id-status-text");
   const idTestButton = byId<HTMLButtonElement>("id-test");
@@ -405,6 +373,158 @@ function setupAssistPage(): void {
   const recentList = byId<HTMLDataListElement>("recent-devices");
   const connectButton = byId<HTMLButtonElement>("connect-peer");
   const connectStatus = byId<HTMLSpanElement>("connect-status");
+  const recentChips = byId<HTMLDivElement>("recent-chips");
+  const accessCodeEl = byId<HTMLSpanElement>("access-code");
+  const accessCodeToggle = byId<HTMLButtonElement>("access-code-toggle");
+  const accessCodeRefresh = byId<HTMLButtonElement>("access-code-refresh");
+  const accessCodeFallback = byId<HTMLButtonElement>("access-code-fallback");
+  const accessCodeHint = byId<HTMLSpanElement>("access-code-hint");
+
+  // 访问码只活在内存里：默认显示掩码，眼睛切换明文，10 秒后自动遮回。
+  const ACCESS_CODE_MASK = "••••••";
+  let accessCode = "";
+  let accessCodeVisible = false;
+  let accessCodeHideTimer = 0;
+
+  const hideAccessCode = (): void => {
+    window.clearTimeout(accessCodeHideTimer);
+    accessCodeVisible = false;
+    if (accessCode) {
+      accessCodeEl.textContent = ACCESS_CODE_MASK;
+    }
+    accessCodeToggle.setAttribute("aria-label", "显示访问码");
+    accessCodeToggle.setAttribute("aria-pressed", "false");
+  };
+
+  /** 访问码服务不可达：不假造密码，也不回退到 RustDesk 临时密码。 */
+  const showAccessCodeUnavailable = (): void => {
+    window.clearTimeout(accessCodeHideTimer);
+    accessCode = "";
+    accessCodeVisible = false;
+    accessCodeEl.textContent = "—";
+    accessCodeToggle.classList.add("is-hidden");
+    accessCodeRefresh.classList.add("is-hidden");
+    accessCodeFallback.classList.remove("is-hidden");
+    accessCodeHint.textContent = "访问码服务未运行";
+  };
+
+  const applyAccessCode = (view: AccessCodeView): void => {
+    window.clearTimeout(accessCodeHideTimer);
+    accessCode = view.code;
+    accessCodeVisible = false;
+    accessCodeEl.textContent = ACCESS_CODE_MASK;
+    accessCodeToggle.classList.remove("is-hidden");
+    accessCodeRefresh.classList.remove("is-hidden");
+    accessCodeFallback.classList.add("is-hidden");
+    accessCodeHint.textContent = view.rotatesAfterSession ? "每次连接后自动更换" : "固定访问码";
+    accessCodeToggle.setAttribute("aria-label", "显示访问码");
+    accessCodeToggle.setAttribute("aria-pressed", "false");
+  };
+
+  const loadAccessCode = (): void => {
+    void invoke<AccessCodeView>("get_access_code").then((view) => {
+      if (!view || !view.code) {
+        showAccessCodeUnavailable();
+        return;
+      }
+      applyAccessCode(view);
+    });
+  };
+
+  accessCodeToggle.addEventListener("click", () => {
+    if (!accessCode) {
+      return;
+    }
+    if (accessCodeVisible) {
+      hideAccessCode();
+      return;
+    }
+    accessCodeVisible = true;
+    accessCodeEl.textContent = accessCode;
+    accessCodeToggle.setAttribute("aria-label", "隐藏访问码");
+    accessCodeToggle.setAttribute("aria-pressed", "true");
+    window.clearTimeout(accessCodeHideTimer);
+    accessCodeHideTimer = window.setTimeout(hideAccessCode, 10_000);
+  });
+
+  accessCodeRefresh.addEventListener("click", () => {
+    if (!accessCode) {
+      return;
+    }
+    accessCodeRefresh.disabled = true;
+    accessCodeHint.textContent = "正在刷新访问码…";
+    void invoke<AccessCodeView>("refresh_access_code").then((view) => {
+      accessCodeRefresh.disabled = false;
+      if (!view || !view.code) {
+        showAccessCodeUnavailable();
+        return;
+      }
+      applyAccessCode(view);
+    });
+  });
+
+  // 「修复」跳到设置页的诊断分组并直接跑一次 doctor。
+  accessCodeFallback.addEventListener("click", () => {
+    navigateTo("settings");
+    runDoctorAction?.();
+    document.getElementById("doctor-card")?.scrollIntoView({ block: "start" });
+  });
+
+  const aliasOf = (aliases: Record<string, string>, id: string): string =>
+    aliases[id] ?? aliases[parsePeerId(id) ?? id] ?? "";
+
+  /** 最近连接 chips：别名或格式化设备码；× 调用既有 remove_peer 后重读。 */
+  const renderChips = (ids: string[], aliases: Record<string, string>): void => {
+    recentChips.textContent = "";
+    if (ids.length === 0) {
+      const empty = document.createElement("span");
+      empty.className = "chips__empty";
+      empty.textContent = "还没有连接记录";
+      recentChips.append(empty);
+      return;
+    }
+    ids.forEach((id) => {
+      const name = aliasOf(aliases, id) || formatDeviceCode(parsePeerId(id) ?? id);
+      const chip = document.createElement("span");
+      chip.className = "chip";
+      chip.tabIndex = 0;
+      chip.setAttribute("role", "button");
+      chip.setAttribute("aria-label", `连接 ${name}`);
+      const text = document.createElement("span");
+      text.textContent = name;
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "chip__remove";
+      remove.textContent = "×";
+      remove.setAttribute("aria-label", `移除 ${name}`);
+      remove.addEventListener("click", (event) => {
+        event.stopPropagation();
+        remove.disabled = true;
+        void invoke<OpResult>("remove_peer", { peerId: parsePeerId(id) ?? id }).then((result) => {
+          if (!result?.ok) {
+            remove.disabled = false;
+            setStatus(connectStatus, result?.message ?? "浏览器预览：命令不可用", result ? "error" : "warn");
+            return;
+          }
+          refreshDeviceList?.();
+          loadRecents();
+        });
+      });
+      const connect = (): void => {
+        peerInput.value = formatDeviceCode(id);
+        connectButton.click();
+      };
+      chip.addEventListener("click", connect);
+      chip.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          connect();
+        }
+      });
+      chip.append(text, remove);
+      recentChips.append(chip);
+    });
+  };
 
   const renderRecents = (ids: string[]): void => {
     recentList.innerHTML = "";
@@ -416,10 +536,15 @@ function setupAssistPage(): void {
   };
 
   const loadRecents = (): void => {
-    void invoke<string[]>("get_recent_peers").then((ids) => {
+    void Promise.all([
+      invoke<string[]>("get_recent_peers"),
+      invoke<Record<string, string>>("get_peer_aliases"),
+    ]).then(([ids, aliases]) => {
+      const peers = ids ?? [];
       if (ids) {
-        renderRecents(ids);
+        renderRecents(peers);
       }
+      renderChips(peers, aliases ?? {});
     });
   };
 
@@ -499,6 +624,24 @@ function setupAssistPage(): void {
       serviceDot.classList.toggle("dot--off", !status.running);
       openInstallPageButton.classList.toggle("is-hidden", status.installed);
       installHint.classList.toggle("is-hidden", status.installed);
+
+      // 侧栏底部与「本机」胶囊跟随同一份状态，正常时不出横幅。
+      const sidebarDot = document.getElementById("sidebar-dot");
+      const sidebarText = document.getElementById("sidebar-status-text");
+      if (sidebarDot) {
+        sidebarDot.className = `dot ${status.running ? "dot--ok" : "dot--off"}`;
+      }
+      if (sidebarText) {
+        sidebarText.textContent = status.running ? "服务正常" : "RustDesk 未运行";
+      }
+      const localState = document.getElementById("local-state");
+      if (localState) {
+        localState.textContent = status.running ? "在线" : "离线";
+        localState.classList.toggle("pill--off", !status.running);
+      }
+      // 正常时收起横幅：异常（未安装/未运行）才显示。
+      const healthy = status.installed && status.running;
+      serviceStatusRow.classList.toggle("is-hidden", healthy);
     });
   };
 
@@ -546,7 +689,10 @@ function setupAssistPage(): void {
       }, 1600);
       return;
     }
-    const text = `Vega 远程协助：设备码 ${currentDeviceCode}。临时密码请在 RustDesk 主窗口查看（我不读取它）。`;
+    // 有访问码时一并分享；没有就保持原文案（绝不编造密码）。
+    const text = accessCode
+      ? `Vega 远程协助\n设备码：${currentDeviceCode}\n访问码：${accessCode}`
+      : `Vega 远程协助：设备码 ${currentDeviceCode}。访问码服务未运行，请在控制台修复后重试。`;
     void copyText(text).then((ok) => {
       copyShareButton.textContent = ok ? "已复制到剪贴板" : "复制失败";
       window.setTimeout(() => {
@@ -554,26 +700,6 @@ function setupAssistPage(): void {
       }, 1600);
     });
   });
-
-  showPasswordButton.addEventListener("click", () => {
-    setStatus(temporaryPasswordStatus, "正在打开 RustDesk…");
-    void invoke<OpResult>("open_rustdesk_window").then((result) => {
-      if (!result) {
-        setStatus(temporaryPasswordStatus, "浏览器预览：命令不可用", "warn");
-        return;
-      }
-      setStatus(temporaryPasswordStatus, result.message, result.ok ? "ok" : "error");
-    });
-  });
-
-  // 主页「长期密码 · 设置」：跳到设置页并展开内联表单。
-  const gotoFixedPassword = (): void => {
-    navigateTo("settings");
-    openFixedPasswordForm?.();
-  };
-  openFixedPasswordButton.addEventListener("click", gotoFixedPassword);
-  const fixedPasswordRow = document.getElementById("fixed-password-row");
-  fixedPasswordRow?.addEventListener("click", gotoFixedPassword);
 
   openInstallPageButton.addEventListener("click", () => {
     // 安装入口只有一条：交给 Rust 侧用默认浏览器打开官方发行页，由用户手动安装。
@@ -628,38 +754,21 @@ function setupAssistPage(): void {
     });
   });
 
-  // 验证方式分段只读：显示 RustDesk 里当前生效的值，点击一律跳到设置页的长期密码表单。
-  // 写盘只发生在设置/清除长期密码时，协助页不再单独改这个值。
-  const verifyGroup = byId<HTMLDivElement>("verify-method");
-  const verifyHint = byId<HTMLSpanElement>("verify-hint");
-  const verifyButtons = Array.from(
-    verifyGroup.querySelectorAll<HTMLButtonElement>(".seg__btn[data-verify]"),
-  );
-  verifyGroup.setAttribute("aria-readonly", "true");
-  verifyButtons.forEach((btn) => {
-    btn.setAttribute("aria-pressed", btn.classList.contains("is-active") ? "true" : "false");
-    // 只读按钮仍可点：点击不是「选择」，而是跳到能改它的地方。
-    btn.addEventListener("click", () => {
-      navigateTo("settings");
-      openFixedPasswordForm?.();
-    });
+  // 横幅里的「诊断」：跳到设置页的诊断分组并直接跑一次 doctor。
+  byId<HTMLButtonElement>("service-diagnose").addEventListener("click", () => {
+    navigateTo("settings");
+    runDoctorAction?.();
+    document.getElementById("doctor-card")?.scrollIntoView({ block: "start" });
   });
-
-  // 高亮跟随已生效的验证方式；未设长期密码时给出「先设置长期密码」提示。
-  applyPasswordAvailability = (status: PasswordStatus): void => {
-    verifyButtons.forEach((btn) => {
-      btn.removeAttribute("aria-disabled");
-    });
-    verifyHint.classList.toggle("is-hidden", status.hasPermanent);
-    selectVerifyMethod(asVerifyMethod(status.verifyMethod));
-  };
 
   configHandlers.push(applyServerConfig);
   refreshAssistDevice = loadDeviceCode;
   refreshAssistStatus = loadStatus;
+  refreshAssistAccessCode = loadAccessCode;
   loadDeviceCode();
   loadStatus();
   loadRecents();
+  loadAccessCode();
 }
 
 /* ---------- 我的设备：远程协助设备列表 ---------- */
@@ -883,55 +992,146 @@ function setupSettingsPage(): void {
   const relayDefaultsHint = byId<HTMLSpanElement>("relay-defaults");
   const runDoctorButton = byId<HTMLButtonElement>("run-doctor");
   const exportButton = byId<HTMLButtonElement>("export-log");
-  const fixedPasswordButton = byId<HTMLButtonElement>("save-fixed-password");
-  const fixedPasswordInput = byId<HTMLInputElement>("set-fixed-password");
-  const fixedPasswordConfirm = byId<HTMLInputElement>("set-fixed-password-confirm");
-  const clearPasswordButton = byId<HTMLButtonElement>("clear-fixed-password");
-  const togglePasswordButton = byId<HTMLButtonElement>("toggle-fixed-password");
-  const passwordForm = byId<HTMLDivElement>("fixed-password-form");
-  const formVerifyGroup = byId<HTMLDivElement>("pw-form-verify");
-  const formVerifyButtons = Array.from(
-    formVerifyGroup.querySelectorAll<HTMLButtonElement>(".seg__btn[data-pw-verify]"),
-  );
   const trayCheckbox = byId<HTMLInputElement>("set-tray");
+  const unattendedToggle = byId<HTMLInputElement>("allow-unattended");
+  const unattendedDetail = byId<HTMLDivElement>("unattended-detail");
+  const fixedAccessRow = byId<HTMLDivElement>("fixed-access-row");
+  const openFixedAccessButton = byId<HTMLButtonElement>("open-fixed-access");
+  const accessModeStatus = byId<HTMLSpanElement>("access-mode-status");
+  const fixedAccessSheet = byId<HTMLDialogElement>("fixed-access-sheet");
+  const fixedAccessInput = byId<HTMLInputElement>("set-fixed-access-code");
+  const fixedAccessStatus = byId<HTMLParagraphElement>("fixed-access-status");
+  const saveFixedAccessButton = byId<HTMLButtonElement>("save-fixed-access");
+  const cancelFixedAccessButton = byId<HTMLButtonElement>("cancel-fixed-access");
 
-  // 表单里的验证方式：默认「两者」，提交时和密码一起发出，避免「先设密码、再改验证方式」两步。
-  // formVerifyPending 只在用户点过分段时为 true，此时焦点刷新不能覆盖他的选择。
-  let formVerify: VerifyMethod = "both";
-  let formVerifyPending = false;
+  // 无人值守分组：开关表示「每次连接后自动更换」，关掉就是固定访问码。
+  let autoRotate = true;
+  let hasFixedAccessCode = false;
+  let accessBusy = false;
 
-  const renderFormVerify = (): void => {
-    formVerifyButtons.forEach((btn) => {
-      const active = btn.dataset.pwVerify === formVerify;
-      btn.classList.toggle("is-active", active);
-      btn.setAttribute("aria-pressed", active ? "true" : "false");
-    });
+  const renderAccessMode = (): void => {
+    unattendedToggle.checked = autoRotate;
+    // 「设置固定访问码」只在固定模式下显示。
+    unattendedDetail.classList.toggle("is-hidden", autoRotate);
+    fixedAccessRow.classList.toggle("is-hidden", autoRotate);
+    setStatus(
+      accessModeStatus,
+      autoRotate ? "每次连接后自动更换" : hasFixedAccessCode ? "固定访问码" : "未设置固定访问码",
+      autoRotate ? "ok" : hasFixedAccessCode ? "ok" : "warn",
+    );
   };
 
-  formVerifyButtons.forEach((btn) => {
-    btn.setAttribute("aria-pressed", btn.classList.contains("is-active") ? "true" : "false");
-    btn.addEventListener("click", () => {
-      formVerify = asVerifyMethod(btn.dataset.pwVerify ?? "");
-      formVerifyPending = true;
-      renderFormVerify();
-    });
-  });
+  const applyAccessView = (view: AccessCodeView): void => {
+    autoRotate = view.rotatesAfterSession;
+    hasFixedAccessCode = !view.rotatesAfterSession;
+    renderAccessMode();
+    refreshAssistAccessCode?.();
+  };
 
-  // 长期密码表单默认折叠：只在用户点开或从主页跳过来时展开。
-  const setPasswordFormOpen = (open: boolean): void => {
-    passwordForm.classList.toggle("is-hidden", !open);
-    togglePasswordButton.setAttribute("aria-expanded", open ? "true" : "false");
-    togglePasswordButton.textContent = open ? "收起" : "设置长期密码";
-    if (open) {
-      fixedPasswordInput.focus();
+  const setAccessBusy = (busy: boolean): void => {
+    accessBusy = busy;
+    unattendedToggle.disabled = busy;
+    openFixedAccessButton.disabled = busy;
+    saveFixedAccessButton.disabled = busy;
+  };
+
+  const openFixedAccessSheet = (): void => {
+    fixedAccessInput.value = "";
+    setStatus(fixedAccessStatus, "");
+    if (!fixedAccessSheet.open) {
+      fixedAccessSheet.showModal();
+    }
+    fixedAccessInput.focus();
+  };
+
+  const closeFixedAccessSheet = (): void => {
+    if (fixedAccessSheet.open) {
+      fixedAccessSheet.close();
     }
   };
-  togglePasswordButton.addEventListener("click", () => {
-    setPasswordFormOpen(passwordForm.classList.contains("is-hidden"));
-  });
-  openFixedPasswordForm = (): void => {
-    setPasswordFormOpen(true);
+
+  const loadAccessMode = (): void => {
+    void invoke<AccessCodeView>("get_access_code").then((view) => {
+      if (!view || !view.code) {
+        accessModeStatus.textContent = "访问码服务未运行";
+        unattendedToggle.disabled = true;
+        openFixedAccessButton.disabled = true;
+        return;
+      }
+      unattendedToggle.disabled = false;
+      openFixedAccessButton.disabled = false;
+      autoRotate = view.rotatesAfterSession;
+      hasFixedAccessCode = !view.rotatesAfterSession;
+      renderAccessMode();
+    });
   };
+
+  const submitFixedAccessCode = (): void => {
+    const code = fixedAccessInput.value.trim();
+    const valid = /^[A-Za-z0-9]{6,32}$/.test(code);
+    if (!valid) {
+      setStatus(fixedAccessStatus, "访问码需为 6–32 位字母或数字", "warn");
+      return;
+    }
+    setAccessBusy(true);
+    setStatus(fixedAccessStatus, "正在保存固定访问码…");
+    void invoke<AccessCodeView>("set_fixed_access_code", { code }).then((view) => {
+      setAccessBusy(false);
+      if (!view || !view.code) {
+        setStatus(fixedAccessStatus, "保存失败：访问码服务未运行", "error");
+        return;
+      }
+      fixedAccessInput.value = "";
+      closeFixedAccessSheet();
+      applyAccessView(view);
+    });
+  };
+
+  unattendedToggle.addEventListener("change", () => {
+    if (accessBusy) {
+      return;
+    }
+    if (unattendedToggle.checked) {
+      // 打开自动更换：立即切回 rotate 模式并换新码。
+      setAccessBusy(true);
+      void invoke<AccessCodeView>("set_rotate_access_code").then((view) => {
+        setAccessBusy(false);
+        if (!view || !view.code) {
+          unattendedToggle.checked = false;
+          accessModeStatus.textContent = "切换失败：访问码服务未运行";
+          return;
+        }
+        applyAccessView(view);
+      });
+      return;
+    }
+    if (hasFixedAccessCode) {
+      // 已经有固定码：只展开设置行，不重复写。
+      autoRotate = false;
+      renderAccessMode();
+      return;
+    }
+    // 没有固定码就先弹层设置；取消时把开关拨回自动更换。
+    unattendedToggle.checked = true;
+    openFixedAccessSheet();
+  });
+
+  openFixedAccessButton.addEventListener("click", openFixedAccessSheet);
+  saveFixedAccessButton.addEventListener("click", submitFixedAccessCode);
+  cancelFixedAccessButton.addEventListener("click", () => {
+    closeFixedAccessSheet();
+    unattendedToggle.checked = autoRotate;
+  });
+  fixedAccessInput.addEventListener("input", () => {
+    if (fixedAccessStatus.textContent) {
+      setStatus(fixedAccessStatus, "");
+    }
+  });
+  fixedAccessSheet.addEventListener("close", () => {
+    if (fixedAccessStatus.textContent) {
+      setStatus(fixedAccessStatus, "");
+    }
+  });
 
   // 关闭到托盘：默认开启，启动时把当前勾选状态交给 Rust，变更时再同步。
   syncCloseToTray(trayCheckbox.checked);
@@ -1090,7 +1290,7 @@ function setupSettingsPage(): void {
   // 手机扫码配置：把当前 RustDesk 配置画成官方 App 能扫的二维码。
   // 弹层是原生 <dialog>：showModal() 负责焦点限制在弹层内、Esc 关闭，
   // 关闭后焦点回到「显示二维码」，键盘不会退到遮罩下的设置控件。
-  const mobileButton = byId<HTMLButtonElement>("show-mobile-qr");
+  const mobileQuick = byId<HTMLButtonElement>("mobile-qr-quick");
   const mobileSheet = byId<HTMLDialogElement>("mobile-qr-sheet");
   const mobileCanvas = byId<HTMLCanvasElement>("mobile-qr-canvas");
   const mobileStatus = byId<HTMLParagraphElement>("mobile-qr-status");
@@ -1258,7 +1458,8 @@ function setupSettingsPage(): void {
   };
 
   mobileCanvas.addEventListener("contextlost", handleMobileContextLost);
-  mobileButton.addEventListener("click", openMobileSheet);
+  // 主页「本机」卡片右上角的「手机扫码」是唯一入口。
+  mobileQuick.addEventListener("click", openMobileSheet);
   mobileClose.addEventListener("click", closeMobileSheet);
   // 浏览器对 showModal() 的弹层自己处理 Esc（cancel → close），
   // 这里只做收尾：作废进行中的请求并把焦点还给入口按钮。
@@ -1271,7 +1472,7 @@ function setupSettingsPage(): void {
       return;
     }
     mobileGeneration += 1;
-    mobileButton.focus();
+    mobileQuick.focus();
   });
 
   const doctorResults = byId<HTMLUListElement>("doctor-results");
@@ -1384,172 +1585,8 @@ function setupSettingsPage(): void {
     });
   });
 
-  /* ----- 长期密码：两次输入一致 + ≥8 位含字母数字才允许提交 ----- */
-  // 状态行插在「设置 / 清除」按钮行下面；不改 index.html 的结构。
-  const passwordResult = document.createElement("p");
-  passwordResult.className = "row__sub";
-  passwordResult.setAttribute("role", "status");
-  passwordResult.setAttribute("aria-live", "polite");
-  (fixedPasswordButton.closest(".row__actions") ?? fixedPasswordButton).insertAdjacentElement(
-    "afterend",
-    passwordResult,
-  );
-
-  // 协助页的「长期密码」状态行：有就一起更新，没有（别的页面结构）就跳过。
-  const assistPasswordStatus = document.getElementById("password-status");
-
-  /**
-   * 与 Rust 侧保持一致：8-64 位、含字母和数字，
-   * 且只允许字母数字和 `!#$%&*+,-./:;<=>?@^_~`（其他符号会被 CLI 当成参数或转义）。
-   */
-  const PASSWORD_CHARS = /^[A-Za-z0-9!#$%&*+,\-./:;<=>?@^_~]+$/;
-  const PASSWORD_RULE =
-    "密码需 8-64 位，含字母和数字，只能用字母数字和 !#$%&*+,-./:;<=>?@^_~";
-  const passwordValid = (value: string): boolean =>
-    value.length >= 8 &&
-    value.length <= 64 &&
-    PASSWORD_CHARS.test(value) &&
-    /[A-Za-z]/.test(value) &&
-    /\d/.test(value);
-
-  const refreshSubmitState = (): void => {
-    const value = fixedPasswordInput.value;
-    const confirm = fixedPasswordConfirm.value;
-    // 进行中始终禁用：input/confirm 的编辑事件会反复调用这里，不能把按钮重新点亮。
-    fixedPasswordButton.disabled = pwBusy || !(passwordValid(value) && value === confirm);
-  };
-
-  // 设置或清除进行中（含等待 UAC）时，三个控件全部禁用，避免状态写入乱序。
-  const setPasswordBusy = (busy: boolean): void => {
-    pwBusy = busy;
-    formVerifyButtons.forEach((btn) => {
-      btn.disabled = busy;
-    });
-    clearPasswordButton.disabled = busy;
-    if (busy) {
-      fixedPasswordButton.disabled = true;
-    } else {
-      refreshSubmitState();
-    }
-  };
-
-  const applyPasswordStatus = (status: PasswordStatus): void => {
-    if (assistPasswordStatus) {
-      setStatus(
-        assistPasswordStatus,
-        status.hasPermanent ? "已设置" : "未设置",
-        status.hasPermanent ? "ok" : undefined,
-      );
-    }
-    // 分段高亮跟随 RustDesk 里实际生效的验证方式；可用性由协助页按 hasPermanent 决定。
-    selectVerifyMethod(asVerifyMethod(status.verifyMethod));
-    // 设置页表单的分段：用户已选但还没提交时保持原样，否则跟随状态（首次设置默认「两者」）。
-    if (!formVerifyPending) {
-      formVerify = status.hasPermanent ? asVerifyMethod(status.verifyMethod) : "both";
-      renderFormVerify();
-    }
-    applyPasswordAvailability?.(status);
-  };
-
-  const loadPasswordStatus = (): void => {
-    void invoke<PasswordStatus>("get_password_status").then((status) => {
-      if (!status) {
-        if (assistPasswordStatus) {
-          setStatus(assistPasswordStatus, "预览模式：无法读取密码状态", "warn");
-        }
-        return;
-      }
-      applyPasswordStatus(status);
-    });
-  };
-
-  refreshPasswordStatus = (): void => {
-    loadPasswordStatus();
-  };
-
-  fixedPasswordInput.addEventListener("input", () => {
-    refreshSubmitState();
-    if (!fixedPasswordInput.value) {
-      setStatus(passwordResult, "");
-    } else if (!passwordValid(fixedPasswordInput.value)) {
-      setStatus(passwordResult, PASSWORD_RULE, "warn");
-    } else if (fixedPasswordConfirm.value && fixedPasswordInput.value !== fixedPasswordConfirm.value) {
-      setStatus(passwordResult, "两次输入的密码不一致", "warn");
-    } else {
-      setStatus(passwordResult, "");
-    }
-  });
-
-  fixedPasswordConfirm.addEventListener("input", () => {
-    refreshSubmitState();
-    if (!fixedPasswordConfirm.value) {
-      setStatus(passwordResult, "");
-      return;
-    }
-    setStatus(
-      passwordResult,
-      fixedPasswordInput.value === fixedPasswordConfirm.value ? "" : "两次输入的密码不一致",
-      fixedPasswordInput.value === fixedPasswordConfirm.value ? undefined : "warn",
-    );
-  });
-
-  fixedPasswordButton.addEventListener("click", () => {
-    const password = fixedPasswordInput.value;
-    if (!passwordValid(password)) {
-      setStatus(passwordResult, PASSWORD_RULE, "error");
-      return;
-    }
-    if (password !== fixedPasswordConfirm.value) {
-      setStatus(passwordResult, "两次输入的密码不一致", "error");
-      return;
-    }
-    setPasswordBusy(true);
-    setStatus(passwordResult, "正在请求管理员确认（Windows 会弹一次 UAC）…");
-    void invoke<OpResult>("set_permanent_password", { password, verify: formVerify })
-      .then((result) => {
-        if (!result) {
-          setStatus(passwordResult, "浏览器预览：命令不可用", "warn");
-          return;
-        }
-        setStatus(passwordResult, result.message, result.ok ? "ok" : "error");
-        if (result.ok) {
-          loadPasswordStatus();
-        }
-      })
-      .finally(() => {
-        // 无论成败都立刻清空两个输入框并恢复控件：密码不在页面上多留一秒。
-        fixedPasswordInput.value = "";
-        fixedPasswordConfirm.value = "";
-        formVerifyPending = false;
-        setPasswordBusy(false);
-      });
-  });
-
-  clearPasswordButton.addEventListener("click", () => {
-    if (!window.confirm("清除长期密码后将只能用临时密码连接，确定清除吗？")) {
-      return;
-    }
-    setPasswordBusy(true);
-    setStatus(passwordResult, "正在请求管理员确认（Windows 会弹一次 UAC）…");
-    void invoke<OpResult>("clear_permanent_password")
-      .then((result) => {
-        if (!result) {
-          setStatus(passwordResult, "浏览器预览：命令不可用", "warn");
-          return;
-        }
-        setStatus(passwordResult, result.message, result.ok ? "ok" : "error");
-        if (result.ok) {
-          loadPasswordStatus();
-        }
-      })
-      .finally(() => {
-        setPasswordBusy(false);
-      });
-  });
-
-  renderFormVerify();
-  refreshSubmitState();
-  loadPasswordStatus();
+  renderAccessMode();
+  loadAccessMode();
 }
 
 /* ---------- 我的设备：高性能串流 ---------- */

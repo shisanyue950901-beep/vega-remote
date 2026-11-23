@@ -24,7 +24,7 @@
    `HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall\Vega 控制台` 的 `InstallLocation` / `UninstallString`，
    归一化（去引号、去尾反斜杠、`GetFullPathNameW` + `GetLongPathNameW` 解析长路径）后与 `C:\Program Files\Vega` 不同、旧目录或其 `resources` 不是重解析点、旧目录里又有 `vega-console.exe` 时，
    **不会运行旧卸载器**（旧卸载器会回滚 RustDesk 中继配置），只按清单删除旧目录里的已知 Vega 文件
-   （`vega-console.exe`、`uninstall.exe`、`resources\vega-pwhelper.ps1`、`resources\vega-defaults.json` 与 `resources\host\` 下的脚本/模块），
+   （`vega-console.exe`、`uninstall.exe`、`resources\vega-agent.exe`、`resources\vega-defaults.json` 与 `resources\host\` 下的脚本/模块），
    再非递归删除 `resources` 与旧目录；旧快捷方式只在指向旧目录时删除（Tauri 随后按新目录重建）。同一路径的重装/升级/`/UPDATE` 不做任何事（长路径相同即跳过）；
    在线更新也会执行这段文件删除，所以用户以前装在别处的旧目录同样会被清掉。
    目录里若有其他文件则保留并在完成页提示。整个清理只针对旧安装目录本身：RustDesk 配置（`%ProgramData%\RustDesk`、`%APPDATA%\RustDesk`）、
@@ -72,7 +72,7 @@ Vega Remote 只下载官方发行版并写入配置，不修改、不打包上�
 - **硬件通用**：编码器自动选择 NVIDIA NVENC / AMD AMF / Intel QuickSync，独显集显都能用
 - **分辨率自适应**：被控端自动切换到主控端的分辨率和刷新率，断开后恢复
 - **两条线路**：主线 IPv6 / Tailscale 直连（低延迟），备线 RustDesk 自建中继（兜底）
-- **长期密码可控**：设置页可设置/清除 RustDesk 长期密码；只在保存时通过 UAC 提权一次，密码经收紧权限的临时文件交给助手，不进日志与命令行
+- **访问码自管**：`VegaAgent` 服务生成访问码并写成 RustDesk 永久密码；主页直接显示、可刷新，设置页可切换「每次连接后自动更换」或固定访问码
 - **手机控制电脑**：官方 RustDesk + 设置页扫码（二维码自动带好本机 ID 服务器、中继与公钥）
 - **自动更新**：启动静默检查、设置页可手动检查与安装；优先阿里云镜像、回落 GitHub Release，安装包经 minisign 签名校验。国内镜像直连，不经系统代理（开着 VPN/Clash 也能检查与下载）；GitHub 端点仍走系统代理
 - **零费用**：全部组件免费，中继服务器用你自己的 VPS
