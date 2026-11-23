@@ -68,6 +68,12 @@ interface OpResult {
   message: string;
 }
 
+/** `get_access_code` 返回值；后端未实现时 invoke 失败，界面退回「在 RustDesk 中查看」。 */
+interface AccessCodeView {
+  code: string;
+  rotatesAfterSession: boolean;
+}
+
 interface StatusView {
   installed: boolean;
   running: boolean;
@@ -405,6 +411,158 @@ function setupAssistPage(): void {
   const recentList = byId<HTMLDataListElement>("recent-devices");
   const connectButton = byId<HTMLButtonElement>("connect-peer");
   const connectStatus = byId<HTMLSpanElement>("connect-status");
+  const recentChips = byId<HTMLDivElement>("recent-chips");
+  const accessCodeEl = byId<HTMLSpanElement>("access-code");
+  const accessCodeToggle = byId<HTMLButtonElement>("access-code-toggle");
+  const accessCodeRefresh = byId<HTMLButtonElement>("access-code-refresh");
+  const accessCodeFallback = byId<HTMLButtonElement>("access-code-fallback");
+  const accessCodeHint = byId<HTMLSpanElement>("access-code-hint");
+
+  // 访问码只活在内存里：默认显示掩码，眼睛切换明文，10 秒后自动遮回。
+  const ACCESS_CODE_MASK = "••••••";
+  let accessCode = "";
+  let accessCodeVisible = false;
+  let accessCodeHideTimer = 0;
+
+  const hideAccessCode = (): void => {
+    window.clearTimeout(accessCodeHideTimer);
+    accessCodeVisible = false;
+    if (accessCode) {
+      accessCodeEl.textContent = ACCESS_CODE_MASK;
+    }
+    accessCodeToggle.setAttribute("aria-label", "显示访问码");
+    accessCodeToggle.setAttribute("aria-pressed", "false");
+  };
+
+  /** 后端没有这两个命令时的降级：不假造密码，只给一个去 RustDesk 看的入口。 */
+  const showAccessCodeFallback = (): void => {
+    window.clearTimeout(accessCodeHideTimer);
+    accessCode = "";
+    accessCodeVisible = false;
+    accessCodeEl.textContent = "—";
+    accessCodeToggle.classList.add("is-hidden");
+    accessCodeRefresh.classList.add("is-hidden");
+    accessCodeFallback.classList.remove("is-hidden");
+    accessCodeHint.textContent = "由 RustDesk 管理，可在 RustDesk 中查看";
+  };
+
+  const loadAccessCode = (): void => {
+    void invoke<AccessCodeView>("get_access_code").then((view) => {
+      if (!view || !view.code) {
+        showAccessCodeFallback();
+        return;
+      }
+      window.clearTimeout(accessCodeHideTimer);
+      accessCode = view.code;
+      accessCodeVisible = false;
+      accessCodeEl.textContent = ACCESS_CODE_MASK;
+      accessCodeToggle.classList.remove("is-hidden");
+      accessCodeRefresh.classList.remove("is-hidden");
+      accessCodeFallback.classList.add("is-hidden");
+      accessCodeHint.textContent = view.rotatesAfterSession ? "每次连接后自动更换" : "仅本次会话有效";
+      accessCodeToggle.setAttribute("aria-label", "显示访问码");
+      accessCodeToggle.setAttribute("aria-pressed", "false");
+    });
+  };
+
+  accessCodeToggle.addEventListener("click", () => {
+    if (!accessCode) {
+      return;
+    }
+    if (accessCodeVisible) {
+      hideAccessCode();
+      return;
+    }
+    accessCodeVisible = true;
+    accessCodeEl.textContent = accessCode;
+    accessCodeToggle.setAttribute("aria-label", "隐藏访问码");
+    accessCodeToggle.setAttribute("aria-pressed", "true");
+    window.clearTimeout(accessCodeHideTimer);
+    accessCodeHideTimer = window.setTimeout(hideAccessCode, 10_000);
+  });
+
+  accessCodeRefresh.addEventListener("click", () => {
+    if (!accessCode) {
+      return;
+    }
+    accessCodeRefresh.disabled = true;
+    accessCodeHint.textContent = "正在刷新访问码…";
+    void invoke<OpResult>("refresh_access_code").then((result) => {
+      accessCodeRefresh.disabled = false;
+      if (!result) {
+        showAccessCodeFallback();
+        return;
+      }
+      if (!result.ok) {
+        accessCodeHint.textContent = result.message;
+        return;
+      }
+      loadAccessCode();
+    });
+  });
+
+  accessCodeFallback.addEventListener("click", () => {
+    accessCodeHint.textContent = "正在打开 RustDesk…";
+    void invoke<OpResult>("open_rustdesk_window").then((result) => {
+      accessCodeHint.textContent = result ? result.message : "浏览器预览：命令不可用";
+    });
+  });
+
+  const aliasOf = (aliases: Record<string, string>, id: string): string =>
+    aliases[id] ?? aliases[parsePeerId(id) ?? id] ?? "";
+
+  /** 最近连接 chips：别名或格式化设备码；× 调用既有 remove_peer 后重读。 */
+  const renderChips = (ids: string[], aliases: Record<string, string>): void => {
+    recentChips.textContent = "";
+    if (ids.length === 0) {
+      const empty = document.createElement("span");
+      empty.className = "chips__empty";
+      empty.textContent = "还没有连接记录";
+      recentChips.append(empty);
+      return;
+    }
+    ids.forEach((id) => {
+      const name = aliasOf(aliases, id) || formatDeviceCode(parsePeerId(id) ?? id);
+      const chip = document.createElement("span");
+      chip.className = "chip";
+      chip.tabIndex = 0;
+      chip.setAttribute("role", "button");
+      chip.setAttribute("aria-label", `连接 ${name}`);
+      const text = document.createElement("span");
+      text.textContent = name;
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "chip__remove";
+      remove.textContent = "×";
+      remove.setAttribute("aria-label", `移除 ${name}`);
+      remove.addEventListener("click", (event) => {
+        event.stopPropagation();
+        remove.disabled = true;
+        void invoke<OpResult>("remove_peer", { peerId: parsePeerId(id) ?? id }).then((result) => {
+          if (!result?.ok) {
+            remove.disabled = false;
+            setStatus(connectStatus, result?.message ?? "浏览器预览：命令不可用", result ? "error" : "warn");
+            return;
+          }
+          refreshDeviceList?.();
+          loadRecents();
+        });
+      });
+      const connect = (): void => {
+        peerInput.value = formatDeviceCode(id);
+        connectButton.click();
+      };
+      chip.addEventListener("click", connect);
+      chip.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          connect();
+        }
+      });
+      chip.append(text, remove);
+      recentChips.append(chip);
+    });
+  };
 
   const renderRecents = (ids: string[]): void => {
     recentList.innerHTML = "";
@@ -416,10 +574,15 @@ function setupAssistPage(): void {
   };
 
   const loadRecents = (): void => {
-    void invoke<string[]>("get_recent_peers").then((ids) => {
+    void Promise.all([
+      invoke<string[]>("get_recent_peers"),
+      invoke<Record<string, string>>("get_peer_aliases"),
+    ]).then(([ids, aliases]) => {
+      const peers = ids ?? [];
       if (ids) {
-        renderRecents(ids);
+        renderRecents(peers);
       }
+      renderChips(peers, aliases ?? {});
     });
   };
 
@@ -499,6 +662,24 @@ function setupAssistPage(): void {
       serviceDot.classList.toggle("dot--off", !status.running);
       openInstallPageButton.classList.toggle("is-hidden", status.installed);
       installHint.classList.toggle("is-hidden", status.installed);
+
+      // 侧栏底部与「本机」胶囊跟随同一份状态，正常时不出横幅。
+      const sidebarDot = document.getElementById("sidebar-dot");
+      const sidebarText = document.getElementById("sidebar-status-text");
+      if (sidebarDot) {
+        sidebarDot.className = `dot ${status.running ? "dot--ok" : "dot--off"}`;
+      }
+      if (sidebarText) {
+        sidebarText.textContent = status.running ? "服务正常" : "RustDesk 未运行";
+      }
+      const localState = document.getElementById("local-state");
+      if (localState) {
+        localState.textContent = status.running ? "在线" : "离线";
+        localState.classList.toggle("pill--off", !status.running);
+      }
+      // 正常时收起横幅：异常（未安装/未运行）才显示。
+      const healthy = status.installed && status.running;
+      serviceStatusRow.classList.toggle("is-hidden", healthy);
     });
   };
 
@@ -546,7 +727,10 @@ function setupAssistPage(): void {
       }, 1600);
       return;
     }
-    const text = `Vega 远程协助：设备码 ${currentDeviceCode}。临时密码请在 RustDesk 主窗口查看（我不读取它）。`;
+    // 有访问码时一并分享；没有就保持原文案（绝不编造密码）。
+    const text = accessCode
+      ? `Vega 远程协助\n设备码：${currentDeviceCode}\n访问码：${accessCode}`
+      : `Vega 远程协助：设备码 ${currentDeviceCode}。临时密码请在 RustDesk 主窗口查看（我不读取它）。`;
     void copyText(text).then((ok) => {
       copyShareButton.textContent = ok ? "已复制到剪贴板" : "复制失败";
       window.setTimeout(() => {
@@ -654,12 +838,20 @@ function setupAssistPage(): void {
     selectVerifyMethod(asVerifyMethod(status.verifyMethod));
   };
 
+  // 横幅里的「诊断」：跳到设置页的诊断分组并直接跑一次 doctor。
+  byId<HTMLButtonElement>("service-diagnose").addEventListener("click", () => {
+    navigateTo("settings");
+    runDoctorAction?.();
+    document.getElementById("doctor-card")?.scrollIntoView({ block: "start" });
+  });
+
   configHandlers.push(applyServerConfig);
   refreshAssistDevice = loadDeviceCode;
   refreshAssistStatus = loadStatus;
   loadDeviceCode();
   loadStatus();
   loadRecents();
+  loadAccessCode();
 }
 
 /* ---------- 我的设备：远程协助设备列表 ---------- */
@@ -894,6 +1086,16 @@ function setupSettingsPage(): void {
     formVerifyGroup.querySelectorAll<HTMLButtonElement>(".seg__btn[data-pw-verify]"),
   );
   const trayCheckbox = byId<HTMLInputElement>("set-tray");
+  const unattendedToggle = byId<HTMLInputElement>("allow-unattended");
+  const unattendedDetail = byId<HTMLDivElement>("unattended-detail");
+
+  // 无人值守分组：开关只控制这一组是否展开（写盘仍走长期密码表单）。
+  let unattendedOn = false;
+  let hasPermanentPassword = false;
+  const setUnattendedOpen = (open: boolean): void => {
+    unattendedOn = open;
+    unattendedDetail.classList.toggle("is-hidden", !open);
+  };
 
   // 表单里的验证方式：默认「两者」，提交时和密码一起发出，避免「先设密码、再改验证方式」两步。
   // formVerifyPending 只在用户点过分段时为 true，此时焦点刷新不能覆盖他的选择。
@@ -932,6 +1134,27 @@ function setupSettingsPage(): void {
   openFixedPasswordForm = (): void => {
     setPasswordFormOpen(true);
   };
+
+  unattendedToggle.addEventListener("change", () => {
+    if (unattendedToggle.checked) {
+      unattendedOn = true;
+      setUnattendedOpen(true);
+      setPasswordFormOpen(true);
+      return;
+    }
+    if (hasPermanentPassword) {
+      if (window.confirm("关闭后将清除长期密码，只能用临时密码连接，继续吗？")) {
+        setUnattendedOpen(false);
+        clearPasswordButton.click();
+      } else {
+        unattendedToggle.checked = true;
+        return;
+      }
+    }
+    unattendedOn = false;
+    setUnattendedOpen(false);
+    setPasswordFormOpen(false);
+  });
 
   // 关闭到托盘：默认开启，启动时把当前勾选状态交给 Rust，变更时再同步。
   syncCloseToTray(trayCheckbox.checked);
@@ -1259,6 +1482,8 @@ function setupSettingsPage(): void {
 
   mobileCanvas.addEventListener("contextlost", handleMobileContextLost);
   mobileButton.addEventListener("click", openMobileSheet);
+  // 主页「本机」卡片右上角的扫码图标复用同一个弹层与生成逻辑。
+  document.getElementById("mobile-qr-quick")?.addEventListener("click", openMobileSheet);
   mobileClose.addEventListener("click", closeMobileSheet);
   // 浏览器对 showModal() 的弹层自己处理 Esc（cancel → close），
   // 这里只做收尾：作废进行中的请求并把焦点还给入口按钮。
@@ -1434,6 +1659,13 @@ function setupSettingsPage(): void {
   };
 
   const applyPasswordStatus = (status: PasswordStatus): void => {
+    hasPermanentPassword = status.hasPermanent;
+    // 开关跟随 RustDesk 实际状态；用户刚打开但还没设密码时表单开着，不能把分组收起。
+    if (status.hasPermanent || !passwordForm.classList.contains("is-hidden")) {
+      unattendedOn = true;
+    }
+    unattendedToggle.checked = unattendedOn;
+    setUnattendedOpen(unattendedOn);
     if (assistPasswordStatus) {
       setStatus(
         assistPasswordStatus,
