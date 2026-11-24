@@ -1824,6 +1824,7 @@ function setupUpdater(): void {
     }
     if (view.current) {
       byId<HTMLSpanElement>("about-version").textContent = `v${view.current}`;
+      byId<HTMLSpanElement>("sidebar-version").textContent = `v${view.current}`;
       idleStatusText = `当前版本 v${view.current}`;
     }
     if (view.error) {
